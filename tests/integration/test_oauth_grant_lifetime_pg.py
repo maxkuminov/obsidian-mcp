@@ -296,7 +296,9 @@ async def seed_family(sessionmaker, *, grant_id="g1", issued_at, client_id="c1",
 
 async def exchange(*, code=CODE, verifier=VERIFIER, client_id=None,
                    redirect_uri=REDIRECT_URI, client_secret=None):
-    form = {"code": code, "code_verifier": verifier, "redirect_uri": redirect_uri}
+    form = {"code": code, "code_verifier": verifier}
+    if redirect_uri is not None:
+        form["redirect_uri"] = redirect_uri
     if client_id:
         form["client_id"] = client_id
     if client_secret:
@@ -411,28 +413,86 @@ async def test_a_valid_replay_revokes_the_family_and_answers_like_an_unknown_cod
     assert len(named(events, "oauth_code_replay_detected")) == 1
 
 
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        dict(verifier="w" * 64),
-        dict(verifier="malformed"),
-        dict(redirect_uri="https://elsewhere.example.com/callback"),
-        dict(client_id="someone-else"),
-        dict(client_secret="wrong" * 10),
-    ],
-    ids=["wrong_verifier", "malformed_verifier", "wrong_redirect", "wrong_client_id",
-         "wrong_secret"],
-)
-async def test_a_replay_failing_revalidation_revokes_nothing(clean, events, kwargs):
+# Every failed revalidation of a *spent* code, and the reason the bounded
+# record keeps. The response must be the unknown-code response byte for byte
+# (Codex review of #325): spent codes are retained and found by hash alone, so
+# anything else would tell a holder of the bare code that it exists and was
+# redeemed.
+SPENT_REVALIDATION_FAILURES = [
+    (dict(verifier="w" * 64), "pkce_verification_failed"),
+    (dict(verifier="malformed"), "pkce_verifier_invalid"),
+    (dict(redirect_uri="https://elsewhere.example.com/callback"), "redirect_uri_mismatch"),
+    (dict(redirect_uri=None), "redirect_uri_mismatch"),
+    (dict(client_id="someone-else"), "client_id_mismatch"),
+    (dict(client_secret="wrong" * 10), "authentication_failed"),
+    (dict(client_secret=None), "authentication_failed"),
+]
+SPENT_IDS = ["wrong_verifier", "malformed_verifier", "wrong_redirect",
+             "missing_redirect", "wrong_client_id", "wrong_secret", "missing_secret"]
+
+
+@pytest.mark.parametrize("kwargs,check", SPENT_REVALIDATION_FAILURES, ids=SPENT_IDS)
+async def test_a_replay_failing_revalidation_revokes_nothing_and_looks_unknown(
+    clean, events, kwargs, check
+):
     sessionmaker = clean
     _response, grant_id = await first_exchange(sessionmaker, confidential=True)
-    if "client_secret" not in kwargs:
-        kwargs = {**kwargs, "client_secret": SECRET}
+    kwargs = {"client_secret": SECRET, **kwargs}
 
     response = await exchange(**kwargs)
-    assert response.status_code in (400, 401)
+    assert_identical(response, await unknown_code_response())
     assert await live(sessionmaker, grant_id) == 2
     assert named(events, "oauth_code_replay_detected") == []
+    reasons = [r.reason for r in named(events, "oauth_token_refused")]
+    assert f"invalid_grant.spent_code_{check}" in reasons
+    refused = [
+        r for r in named(events, "oauth_token_refused")
+        if r.reason == f"invalid_grant.spent_code_{check}"
+    ][0]
+    # The record keeps the specifics; it carries the row's client, never a
+    # secret, verifier or URI.
+    assert refused.client_id == "c1"
+    for field in ("code", "code_verifier", "client_secret", "redirect_uri"):
+        assert not hasattr(refused, field)
+
+
+@pytest.mark.parametrize(
+    "kwargs,status,expected",
+    [
+        (dict(verifier="w" * 64), 400,
+         {"error": "invalid_grant", "error_description": "PKCE verification failed"}),
+        (dict(verifier="malformed"), 400,
+         {"error": "invalid_grant", "error_description": "Invalid PKCE verifier"}),
+        (dict(redirect_uri=None), 400,
+         {"error": "invalid_grant", "error_description": "redirect_uri mismatch"}),
+        (dict(client_secret="wrong" * 10), 401, {"error": "invalid_client"}),
+        (dict(client_id="someone-else"), 400, {"error": "invalid_grant"}),
+    ],
+    ids=["wrong_verifier", "malformed_verifier", "missing_redirect", "wrong_secret",
+         "wrong_client_id"],
+)
+async def test_a_live_code_keeps_its_specific_refusals(clean, kwargs, status, expected):
+    """Unchanged from before #325: a connector debugging a live exchange still
+    learns which check failed, and the code stays redeemable."""
+    sessionmaker = clean
+    await seed_client(sessionmaker, confidential=True)
+    await seed_code(sessionmaker)
+    response = await exchange(**{"client_secret": SECRET, **kwargs})
+    assert response.status_code == status
+    assert body(response) == expected
+    assert (await code_row(sessionmaker)).used is False
+
+
+async def test_an_expired_live_code_reports_expiry_before_anything_else(clean):
+    """The pre-#325 order for a live code: expiry is checked before the
+    redirect URI and PKCE, so the answer does not change with them."""
+    sessionmaker = clean
+    await seed_client(sessionmaker)
+    await seed_code(sessionmaker, expires_at=datetime.now(UTC) - timedelta(minutes=1))
+    for kwargs in (dict(), dict(verifier="w" * 64), dict(redirect_uri=None)):
+        response = await exchange(**kwargs)
+        assert response.status_code == 400
+        assert body(response) == {"error": "invalid_grant", "error_description": "code expired"}
 
 
 async def test_a_replay_after_the_codes_expiry_still_revokes(clean, clock):

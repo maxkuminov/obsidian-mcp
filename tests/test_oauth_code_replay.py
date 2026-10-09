@@ -81,6 +81,11 @@ class _Client:
     client_secret_hash = None
 
 
+class _ConfidentialClient(_Client):
+    token_endpoint_auth_method = "client_secret_post"
+    client_secret_hash = oauth._hash("s" * 64)
+
+
 class _Result:
     def __init__(self, obj=None, rowcount=0):
         self._obj = obj
@@ -95,8 +100,9 @@ class _Session:
     can be told to fail at the UPDATE, the commit or the rollback."""
 
     def __init__(self, code, *, rowcount=2, fail_update=None, fail_commit=None,
-                 fail_rollback=None):
+                 fail_rollback=None, client=_Client):
         self.code = code
+        self.client = client
         self.rowcount = rowcount
         self.fail_update = fail_update
         self.fail_commit = fail_commit
@@ -123,7 +129,7 @@ class _Session:
         if entity is OAuthCode:
             return _Result(self.code)
         if entity is OAuthClient:
-            return _Result(_Client())
+            return _Result(self.client() if self.client else None)
         return _Result()  # advisory locks
 
     def add(self, obj):
@@ -141,12 +147,16 @@ class _Session:
 
 
 def exchange(session, monkeypatch, *, verifier=VERIFIER, client_id=None,
-             redirect_uri=REDIRECT_URI):
+             redirect_uri=REDIRECT_URI, client_secret=None):
     monkeypatch.setattr(oauth, "async_session", lambda: session)
     monkeypatch.setattr(oauth.settings, "multi_user_mode", False, raising=False)
-    form = {"code": CODE, "code_verifier": verifier, "redirect_uri": redirect_uri}
+    form = {"code": CODE, "code_verifier": verifier}
+    if redirect_uri is not None:
+        form["redirect_uri"] = redirect_uri
     if client_id:
         form["client_id"] = client_id
+    if client_secret:
+        form["client_secret"] = client_secret
     return asyncio.run(oauth._handle_auth_code(form))
 
 
@@ -212,23 +222,63 @@ def test_a_spent_code_without_lineage_revokes_and_commits_nothing(monkeypatch, e
     assert refused.reason == "invalid_grant.code_reused"
 
 
-@pytest.mark.parametrize(
-    "kwargs,reason",
-    [
-        (dict(verifier="w" * 64), "invalid_grant.pkce_verification_failed"),
-        (dict(verifier="short"), "invalid_grant.pkce_verifier_invalid"),
-        (dict(redirect_uri="https://elsewhere.test/cb"), "invalid_grant.redirect_uri_mismatch"),
-        (dict(client_id="someone-else"), "invalid_grant.client_id_mismatch"),
-    ],
-)
+SPENT_FAILURES = [
+    (dict(verifier="w" * 64), _Client, "pkce_verification_failed"),
+    (dict(verifier="short"), _Client, "pkce_verifier_invalid"),
+    (dict(redirect_uri="https://elsewhere.test/cb"), _Client, "redirect_uri_mismatch"),
+    (dict(redirect_uri=None), _Client, "redirect_uri_mismatch"),
+    (dict(client_id="someone-else"), _Client, "client_id_mismatch"),
+    (dict(client_secret="wrong"), _ConfidentialClient, "authentication_failed"),
+    (dict(), _ConfidentialClient, "authentication_failed"),
+    (dict(), None, "unknown_client"),
+]
+
+
+@pytest.mark.parametrize("kwargs,client,check", SPENT_FAILURES)
 def test_a_replay_failing_revalidation_never_reaches_the_update(
-    monkeypatch, events, kwargs, reason
+    monkeypatch, events, kwargs, client, check
 ):
-    session = _Session(_Code(used=True, grant_id="g1"))
+    """And answers exactly as an unknown code does (Codex review of #325): a
+    spent code is retained and found by hash alone, so a specific refusal
+    would confirm to a holder of the bare code that it exists and was spent.
+    The specific check survives only in the bounded record."""
+    session = _Session(_Code(used=True, grant_id="g1"), client=client)
     response = exchange(session, monkeypatch, **kwargs)
-    assert response.status_code == 400
+    assert_constant(response)
     assert session.updates == 0 and session.commits == 0
     assert named(events, "oauth_code_replay_detected") == []
+    (refused,) = named(events, "oauth_token_refused")
+    assert refused.reason == f"invalid_grant.spent_code_{check}"
+    assert refused.client_id == "client123"
+    assert getattr(refused, "client_id_submitted", None) is None
+
+
+@pytest.mark.parametrize(
+    "kwargs,client,status,body,reason",
+    [
+        (dict(verifier="w" * 64), _Client, 400,
+         {"error": "invalid_grant", "error_description": "PKCE verification failed"},
+         "invalid_grant.pkce_verification_failed"),
+        (dict(verifier="short"), _Client, 400,
+         {"error": "invalid_grant", "error_description": "Invalid PKCE verifier"},
+         "invalid_grant.pkce_verifier_invalid"),
+        (dict(redirect_uri=None), _Client, 400,
+         {"error": "invalid_grant", "error_description": "redirect_uri mismatch"},
+         "invalid_grant.redirect_uri_mismatch"),
+        (dict(client_secret="wrong"), _ConfidentialClient, 401,
+         {"error": "invalid_client"}, "invalid_client.authentication_failed"),
+        (dict(), None, 401, {"error": "invalid_client"}, "invalid_client.unknown_client"),
+        (dict(client_id="someone-else"), _Client, 400, UNKNOWN_BODY,
+         "invalid_grant.client_id_mismatch"),
+    ],
+)
+def test_a_live_code_keeps_its_specific_refusals(
+    monkeypatch, events, kwargs, client, status, body, reason
+):
+    session = _Session(_Code(), client=client)
+    response = exchange(session, monkeypatch, **kwargs)
+    assert response.status_code == status
+    assert json.loads(response.body) == body
     (refused,) = named(events, "oauth_token_refused")
     assert refused.reason == reason
 
@@ -249,14 +299,20 @@ def test_a_replay_after_the_code_expired_still_revokes(monkeypatch, events):
     assert len(named(events, "oauth_code_replay_detected")) == 1
 
 
-def test_an_expired_unspent_code_with_a_wrong_verifier_reports_pkce_first(
-    monkeypatch, events
+@pytest.mark.parametrize(
+    "kwargs",
+    [dict(verifier="w" * 64), dict(verifier="short"), dict(redirect_uri=None)],
+)
+def test_an_expired_unspent_code_reports_expiry_first_as_before(
+    monkeypatch, events, kwargs
 ):
-    """D7's visible consequence: expiry moved after PKCE and the used branch."""
+    """A live code keeps the pre-#325 order (D7): expiry before the redirect
+    URI and PKCE, so its answer is what it always was."""
     expired = datetime.now(timezone.utc) - timedelta(minutes=1)
     session = _Session(_Code(expires_at=expired))
-    response = exchange(session, monkeypatch, verifier="w" * 64)
-    assert json.loads(response.body)["error_description"] == "PKCE verification failed"
+    response = exchange(session, monkeypatch, **kwargs)
+    assert response.status_code == 400
+    assert json.loads(response.body)["error_description"] == "code expired"
 
 
 def test_an_expired_unspent_code_is_still_refused_as_expired(monkeypatch, events):

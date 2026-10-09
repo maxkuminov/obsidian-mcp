@@ -1059,6 +1059,15 @@ async def token_endpoint(request: Request):
         return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
 
+def _unknown_code_response() -> JSONResponse:
+    """The one response for a code that names no row.
+
+    A spent code's failed revalidation and its replay branch answer with this
+    too (#325), so status, headers and body cannot drift between them.
+    """
+    return JSONResponse({"error": "invalid_grant"}, status_code=400)
+
+
 async def _handle_auth_code(form, request=None):
     code = form.get("code")
     client_id = form.get("client_id")
@@ -1127,7 +1136,29 @@ async def _handle_auth_code(form, request=None):
                 "invalid_grant.unknown_code",
                 submitted_client_id=submitted_client_id,
             )
-            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+            return _unknown_code_response()
+
+        # A **spent** code answers every failed revalidation below exactly as
+        # an unknown code does (Codex review of #325). Spent codes are now
+        # retained for seven days past expiry and resolved by hash alone, so a
+        # distinct "PKCE verification failed" or `invalid_client` 401 for one
+        # would tell a caller holding only the code that it exists and was
+        # redeemed — something the pre-#325 lookup (`used == False`) never
+        # disclosed. The specific reason survives only in the bounded
+        # `oauth_token_refused` record, as `invalid_grant.spent_code_<check>`.
+        # A **live** code keeps its specific responses unchanged: legitimate
+        # connectors debug against them, and they were already the answer for
+        # a live code before #325, so they disclose nothing new.
+        spent = bool(oauth_code.used)
+
+        def _refuse_spent(check: str) -> JSONResponse:
+            _token_refused(
+                request,
+                f"invalid_grant.spent_code_{check}",
+                client_id=oauth_code.client_id,
+                user_id=oauth_code.user_id,
+            )
+            return _unknown_code_response()
 
         if client_id and oauth_code.client_id != client_id:
             # The caller named a client the code was not issued to. Refused
@@ -1135,19 +1166,23 @@ async def _handle_auth_code(form, request=None):
             # case *was* reported as unknown before the lookup stopped
             # filtering on it), and nothing is revoked: a caller guessing at a
             # `client_id` must never be able to end somebody's grant.
+            if spent:
+                return _refuse_spent("client_id_mismatch")
             _token_refused(
                 request,
                 "invalid_grant.client_id_mismatch",
                 client_id=oauth_code.client_id,
                 user_id=oauth_code.user_id,
             )
-            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+            return _unknown_code_response()
 
         result = await session.execute(
             select(OAuthClient).where(OAuthClient.client_id == oauth_code.client_id)
         )
         client = result.scalar_one_or_none()
         if not client:
+            if spent:
+                return _refuse_spent("unknown_client")
             _token_refused(
                 request,
                 "invalid_client.unknown_client",
@@ -1158,6 +1193,8 @@ async def _handle_auth_code(form, request=None):
 
         if not _client_authenticated(client, client_secret):
             # The presented `client_secret` is never recorded, in any form.
+            if spent:
+                return _refuse_spent("authentication_failed")
             _token_refused(
                 request,
                 "invalid_client.authentication_failed",
@@ -1167,20 +1204,35 @@ async def _handle_auth_code(form, request=None):
             return JSONResponse({"error": "invalid_client"}, status_code=401)
 
         client_id = oauth_code.client_id
+        now = _now()
 
-        # Check order (#325, design D7): client → redirect_uri → PKCE → the
-        # `used` branch → code expiry. Everything up to and including PKCE is
-        # what a party must prove to *redeem* the code, so a replay that
-        # reaches the revocation below is a second party able to redeem it —
-        # the two-holder evidence §4.1.2 acts on. A caller holding only the
-        # code (or only its hash) is refused by those checks and changes
-        # nothing. Expiry comes *after* the `used` branch: a late replay is
-        # necessarily near or past the code's ten-minute life, and checking
-        # expiry first would turn every such replay into an ordinary "code
-        # expired" refusal and let the stolen family live.
+        # Check order (#325, design D7). A **live** code keeps the pre-#325
+        # order exactly: client → code expiry → redirect_uri → PKCE, so an
+        # expired live code answers "code expired" whatever else is wrong, as
+        # it always did. A **spent** code skips the expiry check and goes
+        # client → redirect_uri → PKCE → the replay branch. Everything up to
+        # and including PKCE is what a party must prove to *redeem* the code,
+        # so a replay that reaches the revocation is a second party able to
+        # redeem it — the two-holder evidence §4.1.2 acts on. A caller holding
+        # only the code (or only its hash) is refused by those checks, with the
+        # unknown-code response, and changes nothing. Expiry is never checked
+        # on the spent path: a late replay is necessarily near or past the
+        # code's ten-minute life, and an expiry refusal would let the stolen
+        # family live.
+        if not spent and oauth_code.expires_at < now:
+            _token_refused(
+                request,
+                "invalid_grant.code_expired",
+                client_id=client_id,
+                user_id=oauth_code.user_id,
+            )
+            return JSONResponse({"error": "invalid_grant", "error_description": "code expired"}, status_code=400)
+
         if not redirect_uri or oauth_code.redirect_uri != redirect_uri:
             # The URI itself is not recorded: the reason says which check
             # refused, and the allow-list has no field a URL could ride in.
+            if spent:
+                return _refuse_spent("redirect_uri_mismatch")
             _token_refused(
                 request,
                 "invalid_grant.redirect_uri_mismatch",
@@ -1191,6 +1243,8 @@ async def _handle_auth_code(form, request=None):
 
         # Verify PKCE
         if not isinstance(code_verifier, str) or not _PKCE_RE.fullmatch(code_verifier):
+            if spent:
+                return _refuse_spent("pkce_verifier_invalid")
             _token_refused(
                 request,
                 "invalid_grant.pkce_verifier_invalid",
@@ -1203,6 +1257,8 @@ async def _handle_auth_code(form, request=None):
             # Neither the verifier nor the challenge is recorded — the verifier
             # is a bearer secret, and a failed exchange is exactly when one
             # would be most tempting to log.
+            if spent:
+                return _refuse_spent("pkce_verification_failed")
             _token_refused(
                 request,
                 "invalid_grant.pkce_verification_failed",
@@ -1211,20 +1267,10 @@ async def _handle_auth_code(form, request=None):
             )
             return JSONResponse({"error": "invalid_grant", "error_description": "PKCE verification failed"}, status_code=400)
 
-        if oauth_code.used:
+        if spent:
             # A fully revalidated replay of a spent code (#325, RFC 6749
             # §4.1.2): revoke what its first exchange issued.
             return await _replay_spent_code(session, oauth_code, request)
-
-        now = _now()
-        if oauth_code.expires_at < now:
-            _token_refused(
-                request,
-                "invalid_grant.code_expired",
-                client_id=client_id,
-                user_id=oauth_code.user_id,
-            )
-            return JSONResponse({"error": "invalid_grant", "error_description": "code expired"}, status_code=400)
 
         # In multi-user mode every token must have an owner. A code stamped
         # with a NULL `user_id` predates the flag flip (or escaped the
@@ -1418,7 +1464,7 @@ async def _replay_spent_code(session, oauth_code, request):
     lineage = oauth_code.grant_id
     replay_client_id = oauth_code.client_id
     replay_user_id = oauth_code.user_id
-    response = JSONResponse({"error": "invalid_grant"}, status_code=400)
+    response = _unknown_code_response()
 
     if lineage is None:
         try:
