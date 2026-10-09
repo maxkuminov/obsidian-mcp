@@ -694,6 +694,15 @@ cp .env.example .env
 $EDITOR .env
 ```
 
+Using a bundled stack (`docker-compose.simple.yml` or
+`docker-compose.proxy.yml`)? It runs PostgreSQL with two identities: set
+`OBSIDIAN_DB_PASSWORD` in `.env` (the app's non-superuser role, from
+which the compose file builds `DATABASE_URL`) and copy
+`postgres.env.example` to `postgres.env` with its own
+`POSTGRES_PASSWORD` (the database superuser, which only the postgres
+container sees). `make init` generates both. See
+[`DEPLOYMENT.md`](./DEPLOYMENT.md#step-2-clone-and-configure).
+
 In `docker-compose.yml`, point the `/obsidian` volume at your vault:
 
 ```yaml
@@ -790,6 +799,19 @@ Pull, then `make deploy` (or rebuild your compose stack); migrations
 run on start. Read this first when upgrading across the internal-transport
 and panel-CSP release:
 
+- **Breaking: the server refuses to run as a PostgreSQL superuser
+  (#324).** A Compose install created from `docker-compose.simple.yml` or
+  `docker-compose.proxy.yml` before this release connects as the cluster
+  superuser and must run the one-time conversion in
+  [DEPLOYMENT.md, "Upgrading: split database roles"](./DEPLOYMENT.md#upgrading-split-database-roles)
+  (a backup, a new `postgres.env`, `OBSIDIAN_DB_PASSWORD` in `.env`, one
+  script); the new compose files will not serve on an unconverted volume.
+  Any other deployment whose `DATABASE_URL` names a superuser is refused
+  at startup with a message; switch it to a non-superuser owner of the
+  database, or set `DATABASE_ALLOW_SUPERUSER=true` as a stop-gap. The
+  Kubernetes bundle is unaffected. A `DATABASE_URL` password of
+  `changeme` / `CHANGE_ME` is now refused, and the built-in default URL
+  carries no password.
 - **Breaking: plaintext embedding endpoints must be acknowledged.** If
   the active embedding URL (`OLLAMA_URL`, or `OPENAI_BASE_URL` with the
   OpenAI provider) is `http://` to a non-loopback host — the
@@ -998,7 +1020,8 @@ to multi-user later resumes where you left off without re-bootstrapping
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `DATABASE_URL` | — | `postgresql+asyncpg://user:pass@host/db`. No TLS parameters here — they are refused; use `DATABASE_SSL_MODE`. |
+| `DATABASE_URL` | — | `postgresql+asyncpg://user:pass@host/db`. No TLS parameters here — they are refused; use `DATABASE_SSL_MODE`. A `changeme` / `CHANGE_ME` password is refused. The bundled compose files set it themselves from `OBSIDIAN_DB_PASSWORD`. |
+| `DATABASE_ALLOW_SUPERUSER` | `false` | The server refuses to start when its database role is a PostgreSQL superuser. `true` downgrades that to a warning; a stop-gap while converting an install, not a setting to keep. |
 | `DATABASE_SSL_MODE` | `prefer` | Database TLS: `disable`, `prefer` (try TLS, fall back to plaintext), `require` (encrypt, no verification), `verify-ca`, `verify-full`. Strict modes exit if the session is not encrypted. Any `PGSSL*` variable is refused. |
 | `DATABASE_SSL_CA_FILE` | — | CA bundle (PEM) for `verify-ca` / `verify-full`; required by both, refused with any other mode. No system-store fallback. |
 | `DATABASE_SSL_CERT_FILE` | — | Client certificate (PEM). Strict modes (`require`, `verify-ca`, `verify-full`) only; set together with `DATABASE_SSL_KEY_FILE` or not at all. |

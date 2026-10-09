@@ -33,6 +33,7 @@ DB_EXEC = DB_BACKEND=$(DB_BACKEND) DB_CONTAINER=$(DB_CONTAINER) CNPG_NAMESPACE=$
 CONTAINER ?= obsidian-mcp
 COMPOSE_FILE := $(DEPLOY_DIR)/docker-compose.yml
 ENV_FILE := $(DEPLOY_DIR)/.env
+POSTGRES_ENV_FILE := $(DEPLOY_DIR)/postgres.env
 COMPOSE := docker compose --project-directory $(DEPLOY_DIR) -f $(COMPOSE_FILE)
 
 GREEN := \033[0;32m
@@ -107,12 +108,25 @@ init:
 		cp .env.example $(ENV_FILE); \
 		DB_PASS=$$(openssl rand -hex 16); \
 		SECRET=$$(openssl rand -hex 32); \
-		sed -i "s/CHANGE_ME/$$DB_PASS/" $(ENV_FILE); \
-		sed -i "s/SECRET_KEY=.*/SECRET_KEY=$$SECRET/" $(ENV_FILE); \
+		sed -i "s/^\(DATABASE_URL=.*\)CHANGE_ME/\1$$DB_PASS/" $(ENV_FILE); \
+		sed -i "s/^OBSIDIAN_DB_PASSWORD=.*/OBSIDIAN_DB_PASSWORD=$$DB_PASS/" $(ENV_FILE); \
+		sed -i "s/^SECRET_KEY=.*/SECRET_KEY=$$SECRET/" $(ENV_FILE); \
 		chmod 600 $(ENV_FILE); \
 		echo "$(GREEN)$(ENV_FILE) created with random secrets$(NC)"; \
 	else \
 		echo "$(YELLOW)$(ENV_FILE) already exists$(NC)"; \
+	fi
+	# The database SUPERUSER password for the bundled compose stacks (#324):
+	# its own file, loaded by the postgres service only, never by the app.
+	@if [ ! -f "$(POSTGRES_ENV_FILE)" ]; then \
+		echo "$(GREEN)Creating $(POSTGRES_ENV_FILE) from template...$(NC)"; \
+		(umask 077 && cp postgres.env.example $(POSTGRES_ENV_FILE)); \
+		ADMIN_PASS=$$(openssl rand -hex 32); \
+		sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$$ADMIN_PASS/" $(POSTGRES_ENV_FILE); \
+		chmod 600 $(POSTGRES_ENV_FILE); \
+		echo "$(GREEN)$(POSTGRES_ENV_FILE) created with a random superuser password$(NC)"; \
+	else \
+		echo "$(YELLOW)$(POSTGRES_ENV_FILE) already exists$(NC)"; \
 	fi
 	@echo "$(GREEN)Setup complete. Next: make db-init && make deploy$(NC)"
 
