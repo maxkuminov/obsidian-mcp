@@ -82,13 +82,15 @@ New `_handle_auth_code` order (bootstrap lock first, unchanged):
 2. No row → `invalid_grant.unknown_code` (unchanged).
 3. Caller supplied a `client_id` and it differs from the row's → refuse `invalid_grant.client_id_mismatch`, revoke nothing. Today this case is reported as `unknown_code`; the response stays the same constant body.
 4. Client exists, client authenticates (secret for confidential clients) — unchanged reasons.
-5. `redirect_uri` equals the code's — unchanged reason.
-6. PKCE verifier well-formed and matches — unchanged reasons.
-7. **`used` is true → the replay branch (D8).** No other check follows on this branch.
-8. Code expiry — **moved here** from before step 5. A spent code is necessarily past or near its ten-minute expiry by the time a late replay arrives; checking expiry first would turn every replay older than ten minutes into an ordinary "code expired" refusal and let the family survive. The visible consequence is that an *unspent*, expired code presented with a wrong verifier now reports the PKCE failure rather than the expiry — both are `invalid_grant` 400; only `error_description` differs. Accepted.
+5. **Live code only:** code expiry — in its pre-#325 place, before the redirect URI and PKCE, so a live code (expired or not) answers every request exactly as before. A spent code skips it: a spent code is necessarily past or near its ten-minute expiry by the time a late replay arrives, and an expiry refusal would turn every replay older than ten minutes into an ordinary "code expired" and let the family survive.
+6. `redirect_uri` equals the code's — unchanged reason.
+7. PKCE verifier well-formed and matches — unchanged reasons.
+8. **`used` is true → the replay branch (D8).** No other check follows on this branch.
 9. Ownerless / cross-user / scope / mark used + write `grant_id` / mint — unchanged, plus D3's clamp.
 
-Revalidating before revoking is the constraint that makes this safe to ship: everything up to step 6 is what a party must prove to *redeem* a code, so a replay that triggers revocation is exactly a second party able to redeem it — the two-holder evidence RFC 6749 §4.1.2 acts on. A caller holding only the code hash, or the code without the verifier, gets the unknown/PKCE refusal and changes nothing.
+**A spent code's failed revalidation answers as an unknown code** (Codex review, MAJOR, accepted). Spent codes are now retained ≥ 7 days and found by hash alone, so the specific responses of steps 3, 4, 6 and 7 — "PKCE verification failed", "Invalid PKCE verifier", "redirect_uri mismatch", the `invalid_client` 401 — would confirm to a holder of the bare code that it exists and was spent, which the pre-#325 `used == False` lookup never disclosed. When the locked row is spent, every such failure returns the unknown-code response (step 2: status, headers and body), revokes nothing, and records `oauth_token_refused` with `invalid_grant.spent_code_<check>` (`client_id_mismatch`, `unknown_client`, `authentication_failed`, `redirect_uri_mismatch`, `pkce_verifier_invalid`, `pkce_verification_failed`) — the specifics live only in the bounded record. A **live** code keeps the specific responses: legitimate connectors debug against them and they were the answer for a live code before this change, so they disclose nothing new. Timing is outside this (L6).
+
+Revalidating before revoking is the constraint that makes this safe to ship: everything up to step 7 is what a party must prove to *redeem* a code, so a replay that triggers revocation is exactly a second party able to redeem it — the two-holder evidence RFC 6749 §4.1.2 acts on. A caller holding only the code hash, or the code without the verifier, gets a refusal (the unknown-code response, if the code is spent) and changes nothing.
 
 ### D8. The replay branch
 
@@ -144,7 +146,7 @@ Recorded so they are not re-fixed when re-reported.
 - **L3 Codes spent before 029, or by a pre-029 process during the rollout, carry no lineage**; their replay refuses and revokes nothing. Codes live ten minutes, so the window closes within minutes of the rollout.
 - **L4 A legitimate client that retries a code exchange after losing the response loses that grant** and must re-authorize. RFC 6749 §4.1.2 behaviour; indistinguishable from theft at the server.
 - **L5 Replay detection lasts seven days past the code's expiry** (D6). A later replay finds no row and is an ordinary unknown-code refusal.
-- **L6 Timing.** The replay branch locks, reads and writes, so it is slower than an unknown-code refusal; status, headers and body are what is constant (#182's residual, same reasoning).
+- **L6 Timing.** The replay branch locks, reads and writes, and a spent code's failed revalidation reads the client and hashes the verifier, so both are slower than an unknown-code refusal; status, headers and body are what is constant (#182's residual, same reasoning).
 - **L7 The alarm is written after the commit**; a crash in between keeps the revocation and loses the record (#182's residual).
 - **L8 A request already in flight at the deadline completes** — the middleware resolves the token once per request, as for revocation.
 - **L9 Rolling-deploy gap.** While old pods serve: they mint unclamped tokens (bounded by the old 30-day refresh life, then clamped at their next rotation by a new pod), rotations they perform restart that family's clock at the insert time, and their cleanup still deletes used codes. Bounded to the rollout.

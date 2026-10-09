@@ -14,7 +14,7 @@ When the token endpoint exchanges an authorization code it SHALL record, on the 
 ### Requirement: A replayed authorization code SHALL revoke the grant family its first exchange issued, and only after full revalidation
 The token endpoint SHALL resolve an authorization code by its hash alone — never narrowed by the code's used flag or by any client identifier the caller supplied — and, when the resolved code is already spent, SHALL revoke every still-live token in the grant family recorded on it, provided the request first passes every check a first exchange must pass: the caller's client identifier, where supplied, equals the code's; the client exists and authenticates by its registered method; the redirect URI equals the code's; and the PKCE verifier is well-formed and matches the code's challenge.
 
-A replay that fails any of those checks SHALL be refused and SHALL revoke nothing, because revocation keyed on a code value alone would let anyone who observed a code end another party's grant. The used-flag decision SHALL be taken after those checks and before the code's expiry is checked, so that a replay arriving after the code's ten-minute lifetime still revokes the family. A spent code with no recorded lineage SHALL be refused with nothing revoked.
+A replay that fails any of those checks SHALL be refused and SHALL revoke nothing, because revocation keyed on a code value alone would let anyone who observed a code end another party's grant. Such a refusal of a spent code SHALL be identical in error code, HTTP status, headers and body to the response for a code that names no row, so that a holder of the bare code cannot learn that it exists or was spent; the specific failed check SHALL appear only in the bounded refusal record. A code that is not yet spent SHALL keep the specific refusal responses and the check order it had before this change, including the code-expiry check preceding the redirect-URI and PKCE checks. For a spent code the code's expiry SHALL NOT be checked, so that a replay arriving after the code's ten-minute lifetime still revokes the family. A spent code with no recorded lineage SHALL be refused with nothing revoked.
 
 The revocation SHALL be performed while holding the grant-family lock, so no rotation can insert a token into the family between the decision and the write. The response SHALL be identical in error code, HTTP status, headers and body to the response for a code that names no row, and every database operation on the replay path — the revocation, its commit and any rollback — SHALL be guarded so a failure still produces that response. Response timing is outside this requirement.
 
@@ -35,6 +35,17 @@ The server SHALL emit one WARNING-level event `oauth_code_replay_detected` carry
 #### Scenario: A replay with a wrong redirect URI or client revokes nothing
 - **WHEN** a spent code is presented with the correct verifier but a different redirect URI, a different client identifier, or a failing client secret for a confidential client
 - **THEN** the request SHALL be refused and no token of the issued family SHALL be revoked
+
+#### Scenario: A spent code's failed revalidation is indistinguishable from an unknown code
+- **WHEN** a spent code is presented with a wrong or malformed PKCE verifier, a wrong or missing redirect URI, a client identifier other than the code's, or a failing or missing client secret for a confidential client
+- **THEN** the response SHALL be identical in HTTP status, headers and body to the response for a code that names no row
+- **AND** nothing SHALL be revoked
+- **AND** the refusal record SHALL name the failed check and SHALL carry no code, verifier, secret or redirect URI
+
+#### Scenario: A live code keeps its specific refusals
+- **WHEN** a code that has not been spent is presented with a wrong PKCE verifier, a wrong redirect URI or a failing client secret
+- **THEN** the response SHALL be the same specific refusal it was before this change
+- **AND** an expired live code SHALL be refused as expired regardless of its redirect URI or verifier
 
 #### Scenario: A replay after the code's expiry still revokes
 - **WHEN** a spent code is replayed with valid client, redirect URI and verifier after the code's own expiry has passed

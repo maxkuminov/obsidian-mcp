@@ -242,19 +242,38 @@ the thief kept the family.
   `client_id` that differs from the row's is refused
   (`invalid_grant.client_id_mismatch`, the same constant body the unknown-code
   refusal uses) and revokes nothing.
-- **Revalidate everything a first exchange validates, then decide.** Order:
-  client exists and authenticates → `redirect_uri` → PKCE → **the `used`
-  branch** → code expiry → ownerless / cross-user / scope → mark used + write
-  lineage → mint. Everything up to PKCE is what a party must prove to
-  *redeem* the code, so a replay that triggers revocation is exactly a second
-  party able to redeem it. Revocation keyed on a code value alone would hand
-  anyone who saw a code (a proxy log, browser history, a referrer) a way to
-  end somebody's grant; with the verifier required, a party holding only the
-  code cannot (L11). **Expiry moved after the `used` branch**: a late replay is
-  necessarily near or past the code's ten-minute life, and checking expiry
-  first would turn every such replay into an ordinary "code expired" and let
-  the family live. The visible cost: an *unspent*, expired code with a wrong
-  verifier now reports the PKCE failure, not the expiry — both `invalid_grant`.
+- **Revalidate everything a first exchange validates, then decide.** The
+  order forks on the locked row's `used` flag:
+  - **spent:** client exists and authenticates → `redirect_uri` → PKCE →
+    **the replay branch**. Code expiry is never checked on this path: a late
+    replay is necessarily near or past the code's ten-minute life, and an
+    expiry refusal would let the stolen family live.
+  - **live:** client exists and authenticates → code expiry → `redirect_uri`
+    → PKCE → ownerless / cross-user / scope → mark used + write lineage →
+    mint. Exactly the pre-#325 order, so a live code — expired or not —
+    answers every request as it always did.
+
+  Everything up to PKCE is what a party must prove to *redeem* the code, so a
+  replay that triggers revocation is exactly a second party able to redeem it.
+  Revocation keyed on a code value alone would hand anyone who saw a code (a
+  proxy log, browser history, a referrer) a way to end somebody's grant; with
+  the verifier required, a party holding only the code cannot (L11).
+- **A spent code fails revalidation exactly like an unknown code** (Codex
+  review of #325). Spent codes are now retained for seven days and found by
+  hash alone, so the specific refusals a live code gets ("PKCE verification
+  failed", "redirect_uri mismatch", the `invalid_client` 401 for a failed
+  secret or a vanished client, a mismatched `client_id`) would tell a holder
+  of the bare code that it exists and was redeemed — something the pre-#325
+  `used == False` lookup never disclosed. Every one of those failures on a
+  spent code answers the unknown-code response (status, headers, body), and
+  the specific check survives only in the bounded `oauth_token_refused`
+  record as `invalid_grant.spent_code_<check>`
+  (`client_id_mismatch`, `unknown_client`, `authentication_failed`,
+  `redirect_uri_mismatch`, `pkce_verifier_invalid`,
+  `pkce_verification_failed`). A **live** code keeps its specific responses:
+  connectors debug against them, and they were already the answer for a live
+  code, so they disclose nothing new. Do not "simplify" the fork away in
+  either direction. Timing is outside this (L6).
 - **The replay branch** (`_replay_spent_code`) is #182's reuse branch line for
   line: no lineage → refuse (`invalid_grant.code_reused`), nothing revoked or
   committed; otherwise `lock_grant` then `revoke_grant_family`, commit only if
@@ -366,9 +385,10 @@ when re-reported.
   theft at the server. Owner-accepted.
 - **L5 Replay detection lasts seven days past the code's expiry**; a later
   replay is an ordinary unknown-code refusal.
-- **L6 Timing.** The replay branch locks, reads and writes, so it is slower
-  than an unknown-code refusal; status, headers and body are what is constant
-  (#182's residual).
+- **L6 Timing.** The replay branch locks, reads and writes, and a spent code's
+  failed revalidation reads the client and hashes the verifier, so both are
+  slower than an unknown-code refusal; status, headers and body are what is
+  constant (#182's residual).
 - **L7 The alarm is written after the commit**; a crash in between keeps the
   revocation and loses the record.
 - **L8 A request already in flight at the deadline completes** — the

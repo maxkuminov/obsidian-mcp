@@ -251,11 +251,13 @@ update it in the same change.** What stays here is the short list:
   both mint sites (clamped), the refresh (a live token past it: `invalid_grant`,
   nothing revoked; a rotated-away one is still #182 reuse), the middleware, the
   panel and the transfer credential predicate. Every `OAuthToken(` in `src/`
-  passes `grant_issued_at=` (AST guard; the server default is only for a
-  rolling deploy). A spent code keeps its `grant_id` lineage and is retained 7
-  days past expiry; its replay revokes the family **only after full
-  revalidation** (client, redirect URI, PKCE), with a response identical to an
-  unknown code. See [oauth and grants](docs/architecture/oauth-and-grants.md).
+  passes `grant_issued_at=` (AST guard, Core inserts too; the server default
+  is only for a rolling deploy). A spent code keeps its `grant_id` lineage and
+  is retained 7 days past expiry; its replay revokes the family **only after
+  full revalidation** (client, redirect URI, PKCE), with a response identical
+  to an unknown code — and so does **every failed revalidation of a spent
+  code** (reason only in the log). A live code keeps its specific refusals
+  and the pre-#325 check order (expiry first). See [oauth and grants](docs/architecture/oauth-and-grants.md).
 - **Machine-facing paths refuse plaintext HTTP** (#196): a priority-200
   Traefik router on the `http` entrypoint, in `docker-compose.yml`'s labels,
   answers 403 via `ipAllowList` on `192.0.2.0/32` for `/mcp`, `/transfer`,
