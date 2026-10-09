@@ -477,6 +477,58 @@ enforced, a metric or mode outside the set rejected, the chain from 027 with no
 rows written, stamp-back acceptance keeping rows, creation in `public` under a
 redirected `search_path`, the impostor-shape refusals, and downgrade.
 
+## 029: `oauth_codes.grant_id` and `oauth_tokens.grant_issued_at` (#325, #326)
+
+Two columns, owned as one marked unit (each carries 029's `COMMENT` marker,
+mirrored byte-identically in `src/models/db.py` so `alembic check` compares
+it). The *why* of both lives in [oauth-and-grants.md](oauth-and-grants.md);
+what is here is the schema side.
+
+- **`oauth_codes.grant_id varchar(64) NULL`**, no default, no index (codes are
+  looked up by the unique `code_hash`), no FK (there is no grants table), **no
+  backfill**: a code spent before 029 has no recoverable lineage, and NULL is
+  what says so.
+- **`oauth_tokens.grant_issued_at timestamptz NOT NULL DEFAULT now()`**. Every
+  pre-existing row is stamped with **the migration transaction's timestamp —
+  one value for all rows** (owner decision: no connector is logged out by the
+  deploy, and every family stays uniform). It is added nullable, stamped
+  `WHERE grant_issued_at IS NULL`, then defaulted and constrained, rather than
+  leaning on `ADD COLUMN … DEFAULT now()`'s fast-default evaluation, so the
+  backfill reads as what it is and a value already present is never
+  overwritten (the stamp-back re-run changes nothing).
+- **Why a server default, when 025 refused one.** 025's default would have
+  been a lie the sweep acts on. Here the risk runs the other way: during a
+  rolling deploy the previous image serves on the migrated schema and inserts
+  tokens without the column, and without a default that is a NOT NULL
+  violation — a 500 on every token exchange for the rollout. With one, an
+  old-image row gets its insert time (bounded, L9). The default's own hazard
+  — a future mint site that forgets to copy the value silently restarts its
+  family's clock, i.e. #326 again — is closed by an **AST guard**
+  (`tests/test_oauth_grant_lifetime.py`) requiring every `OAuthToken(`
+  construction under `src/` to pass `grant_issued_at=` explicitly, the same
+  device that pins the async-commit allow-list. Application code must never
+  rely on the default.
+- **Autogenerate does not compare server defaults**, so the gate verifies
+  `now()` through the catalogue (`pg_get_expr`) or nowhere, and the migration
+  itself refuses a same-named column without it.
+- **Reconcile or refuse, both columns before either is touched**: a marked
+  column of the exact shape is reconciled; anything else (wrong type, a
+  nullable `grant_issued_at`, one without the default, a NOT NULL `grant_id`,
+  a missing marker) is refused naming the column and the disagreement, and
+  nothing changes. `downgrade()` checks both markers before dropping either.
+  `lock_timeout` / `statement_timeout` set and `RESET`; `search_path` pinned
+  to `public` and `RESET`; `oauth_codes` before `oauth_tokens`, the
+  application's own lock direction.
+
+The gate's head literal is `029`, with `028` in the chain. Its 029 cases: the
+fresh shape (types, nullability, default, markers) with `alembic check` clean,
+the chain from 028, the one-timestamp backfill over pre-existing tokens (and no
+lineage invented for spent codes), stamp-back changing no value, the
+impostor-shape refusals (atomic across both columns), and downgrade of marked
+and unmarked columns. `tests/integration/test_oauth_grant_lifetime_pg.py`
+additionally upgrades a 028 database holding a live family and refreshes it
+immediately after.
+
 ## Database transport (#184)
 
 Before this change the engine passed no `ssl` argument and `DATABASE_URL`
