@@ -633,8 +633,11 @@ async def test_concurrent_refreshes_near_the_deadline(clean, clock):
     for r in results:
         assert not isinstance(r, BaseException), r
     assert sorted(r.status_code for r in results) == [200, 400]
-    tokens = await family(sessionmaker, "g1")
-    assert all(t.expires_at <= deadline for t in tokens if t.created_at)
+    (winner,) = [r for r in results if r.status_code == 200]
+    for key in ("access_token", "refresh_token"):
+        minted = await by_value(sessionmaker, body(winner)[key])
+        assert minted.expires_at <= deadline
+        assert minted.grant_issued_at == issued
     assert await live(sessionmaker, "g1") == 0, "the loser is reuse (#182)"
 
 
