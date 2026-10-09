@@ -317,7 +317,10 @@ async def test_immediate_admission_starts_no_watcher(harness, monkeypatch):
     monkeypatch.setattr(auth.APIKeyMiddleware, '_authenticate', authenticate)
     await auth.APIKeyMiddleware(app)(scope(), wire.receive, record(harness))
     assert started == [] and wire.delivered == 0
-    assert seen == [wire.receive], 'an unwatched request must get the real receive'
+    # #322: a POST's `receive` is the body-budget byte counter, directly over
+    # the real `receive` — no replay layer in between, and nothing read early.
+    assert len(seen) == 1
+    assert await seen[0]() == body(b'{}', False) and wire.delivered == 1
     assert c.requests.active == c.authentication.active == 0
 
 
