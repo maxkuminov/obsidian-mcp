@@ -79,7 +79,15 @@ cancelled admission SHALL leave daily quota counters unchanged.
 
 ### Requirement: New API keys receive a configurable default daily request limit
 
-Key creation SHALL apply `DEFAULT_DAILY_REQUEST_LIMIT` (default 5,000) as the `daily_request_limit` of a newly created key when the creator did not choose a value, and SHALL apply it in application code rather than as a database column default, so that keys created before this change keep whatever limit they carry — including NULL — with no migration and no backfill. On the JSON API an **omitted** `daily_request_limit` field SHALL mean "apply the default" while an **explicit null** SHALL continue to mean unlimited, distinguished by whether the field was set on the request rather than by the value's truthiness. On the control panel the default SHALL be materialised only as the create form's pre-filled value: a **blank submitted field SHALL mean unlimited**, and the create handler SHALL NOT substitute the default for a blank submission, so that what the operator saw is what they get and there is exactly one place the default can be overridden. Setting `DEFAULT_DAILY_REQUEST_LIMIT` to null SHALL restore the previous behaviour exactly. The configured default SHALL be subject to the same 1..1,000,000 domain as any other limit and SHALL be rejected at startup if outside it.
+Key creation SHALL apply `DEFAULT_DAILY_REQUEST_LIMIT` (default 5,000) as the `daily_request_limit` of a newly created key whenever the creator did not choose a value. It SHALL do so in application code rather than as a database column default, so that keys created before this requirement keep whatever limit they carry, including NULL, with no migration and no backfill.
+
+"Did not choose a value" SHALL mean an **omitted** field on the JSON API, distinguished from an explicit null by whether the field was set on the request and not by the value's truthiness. On the control panel it SHALL mean a **blank** submitted limit field. The panel create handler SHALL substitute the default for a blank field, and the create form SHALL continue to pre-fill the field with it.
+
+A key SHALL be created unlimited only by an administrator's explicit request: an explicit JSON `null`, or the panel's `unlimited` control. A non-admin's explicit request SHALL be refused as the api-key-issuance capability specifies.
+
+When `DEFAULT_DAILY_REQUEST_LIMIT` is null, a create request that chose no value SHALL be refused as missing a required limit (400 on the JSON API, a flashed error on the panel) instead of creating an unlimited key. An administrator's explicit unlimited request SHALL still succeed.
+
+The configured default SHALL be subject to the same 1..1,000,000 domain as any other limit and SHALL be rejected at startup if outside it.
 
 #### Scenario: Existing keys keep their current quota
 - **WHEN** the change is deployed to a database whose active keys all carry `daily_request_limit = NULL`
@@ -89,21 +97,26 @@ Key creation SHALL apply `DEFAULT_DAILY_REQUEST_LIMIT` (default 5,000) as the `d
 - **WHEN** an operator creates a key through the control panel without altering the pre-filled limit field
 - **THEN** the created key SHALL carry `daily_request_limit = DEFAULT_DAILY_REQUEST_LIMIT` and the keys page SHALL show it
 
-#### Scenario: A blank panel field means unlimited, with no substitution
-- **WHEN** the operator clears the pre-filled limit field and submits
-- **THEN** the created key SHALL be unlimited, and the create handler SHALL NOT have substituted the configured default
+#### Scenario: A blank panel field receives the default
+- **WHEN** any account, administrator or not, clears the pre-filled limit field and submits without the `unlimited` control
+- **THEN** the created key SHALL carry `DEFAULT_DAILY_REQUEST_LIMIT` and SHALL NOT be unlimited
 
 #### Scenario: Omitted and explicit null differ on the JSON API
-- **WHEN** one create request omits `daily_request_limit` entirely and another sends `{"daily_request_limit": null}`
+- **WHEN** an administrator sends one create request omitting `daily_request_limit` and another sending `{"daily_request_limit": null}`
 - **THEN** the first key SHALL carry the configured default and the second SHALL be unlimited
+
+#### Scenario: A non-admin explicit null is refused
+- **WHEN** a non-admin sends a create request with `{"daily_request_limit": null}`
+- **THEN** the response SHALL be 403 and no key SHALL be created
 
 #### Scenario: An explicit value still wins
 - **WHEN** a create request sends `{"daily_request_limit": 250}`
 - **THEN** the created key SHALL carry 250 regardless of the configured default
 
-#### Scenario: The default can be turned off
-- **WHEN** `DEFAULT_DAILY_REQUEST_LIMIT` is null
-- **THEN** a key created without a chosen limit SHALL be unlimited, as it is today
+#### Scenario: A null default makes the limit required
+- **WHEN** `DEFAULT_DAILY_REQUEST_LIMIT` is null and a create request omits the field (JSON) or submits it blank without the `unlimited` control (panel)
+- **THEN** the request SHALL be refused as missing a required limit and no key SHALL be created
+- **AND** an administrator's explicit unlimited request SHALL still create an unlimited key
 
 ### Requirement: Quota admission SHALL commit asynchronously, and a crash SHALL only ever undercount
 The quota admission statement and the prune that follows it SHALL each be committed with `SET LOCAL synchronous_commit = off` in their own transactions. Everything else about the quota stays as it is:
