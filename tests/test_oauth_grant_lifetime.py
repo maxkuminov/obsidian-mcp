@@ -77,6 +77,35 @@ def test_zero_out_of_range_and_every_off_spelling_are_refused(value):
     assert "oauth_grant_absolute_lifetime_days" in str(excinfo.value)
 
 
+_ENV_REQUIRED = {
+    "SECRET_KEY": "x" * 48,
+    "DATABASE_URL": "postgresql+asyncpg://u:p@localhost/db",
+    "VAULT_PATH": "/tmp",
+}
+
+
+def _settings_from_env(monkeypatch, raw):
+    """Construct `Settings` with the lifetime coming from the *environment* —
+    the path a deployment actually takes, where every value is a string and a
+    blank line is `""` rather than a missing keyword."""
+    for name, value in _ENV_REQUIRED.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("OAUTH_GRANT_ABSOLUTE_LIFETIME_DAYS", raw)
+    return Settings()
+
+
+@pytest.mark.parametrize("raw", ["", "null", "none", "0", "366"])
+def test_the_environment_cannot_disable_or_exceed_the_lifetime(monkeypatch, raw):
+    with pytest.raises(Exception) as excinfo:
+        _settings_from_env(monkeypatch, raw)
+    assert "oauth_grant_absolute_lifetime_days" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("raw,days", [("1", 1), ("365", 365)])
+def test_the_environment_bounds_are_accepted(monkeypatch, raw, days):
+    assert _settings_from_env(monkeypatch, raw).oauth_grant_absolute_lifetime_days == days
+
+
 # ── the deadline and the clamp ─────────────────────────────────────────────
 
 
@@ -264,10 +293,91 @@ def _oauth_token_constructions():
                 yield path, node
 
 
+def _is_oauth_token_insert(node) -> bool:
+    """`insert(OAuthToken)`, `sa.insert(OAuthToken)` or
+    `OAuthToken.__table__.insert()` — a Core INSERT into `oauth_tokens`."""
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+    if name != "insert":
+        return False
+    if node.args and isinstance(node.args[0], ast.Name) and node.args[0].id == "OAuthToken":
+        return True
+    return (
+        isinstance(func, ast.Attribute)
+        and isinstance(func.value, ast.Attribute)
+        and func.value.attr == "__table__"
+        and isinstance(func.value.value, ast.Name)
+        and func.value.value.id == "OAuthToken"
+    )
+
+
+def _sets_grant_issued_at(call) -> bool:
+    if any(kw.arg == "grant_issued_at" for kw in call.keywords):
+        return True
+    for arg in call.args:
+        for sub in ast.walk(arg):
+            if isinstance(sub, ast.Dict) and any(
+                isinstance(k, ast.Constant) and k.value == "grant_issued_at"
+                for k in sub.keys
+            ):
+                return True
+    return False
+
+
+def _unstamped_oauth_token_inserts(tree):
+    """Every Core INSERT into `oauth_tokens` whose method chain has no
+    `.values(...)` naming `grant_issued_at` (keyword or dict key)."""
+    parents = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    for node in ast.walk(tree):
+        if not _is_oauth_token_insert(node):
+            continue
+        stamped = False
+        current = node
+        while True:
+            attr = parents.get(current)
+            if not isinstance(attr, ast.Attribute):
+                break
+            call = parents.get(attr)
+            if not isinstance(call, ast.Call) or call.func is not attr:
+                break
+            if attr.attr == "values" and _sets_grant_issued_at(call):
+                stamped = True
+            current = call
+        if not stamped:
+            yield node
+
+
+def test_the_insert_guard_catches_what_it_claims():
+    """The guard below is only as good as its matcher; pin it on samples."""
+    flagged = [
+        "insert(OAuthToken).values(token_hash=h)",
+        "sa.insert(OAuthToken).values({'token_hash': h})",
+        "OAuthToken.__table__.insert().values(token_hash=h)",
+        "insert(OAuthToken)",
+    ]
+    clean = [
+        "insert(OAuthToken).values(token_hash=h, grant_issued_at=now)",
+        "OAuthToken.__table__.insert().values({'grant_issued_at': now})",
+        "insert(OAuthToken).values(grant_issued_at=now).returning(OAuthToken.id)",
+        "insert(OAuthClient).values(client_id=c)",
+    ]
+    for source in flagged:
+        assert list(_unstamped_oauth_token_inserts(ast.parse(source))), source
+    for source in clean:
+        assert not list(_unstamped_oauth_token_inserts(ast.parse(source))), source
+
+
 def test_every_oauth_token_construction_sets_grant_issued_at_explicitly():
     """The column's server default exists only for a rolling deploy's old
     image. A new mint site that relied on it would restart its family's clock
-    on every rotation — #326 reintroduced silently."""
+    on every rotation — #326 reintroduced silently. Covers both the ORM
+    constructor and a Core INSERT (`insert(OAuthToken)` /
+    `OAuthToken.__table__.insert()`)."""
     found = list(_oauth_token_constructions())
     assert len(found) >= 4, found  # two at the exchange, two at the rotation
     for path, call in found:
@@ -276,6 +386,38 @@ def test_every_oauth_token_construction_sets_grant_issued_at_explicitly():
             f"{path.relative_to(ROOT)}:{call.lineno} constructs OAuthToken without "
             "an explicit grant_issued_at"
         )
+    for path in sorted((ROOT / "src").rglob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in _unstamped_oauth_token_inserts(tree):
+            pytest.fail(
+                f"{path.relative_to(ROOT)}:{node.lineno} inserts into oauth_tokens "
+                "without an explicit grant_issued_at"
+            )
+
+
+def test_the_model_and_migration_029_agree_on_both_markers():
+    """Byte identical on both sides, or `alembic check` reports a pending
+    `alter_column(comment=...)` and 029's `downgrade()` stops recognising its
+    own columns."""
+    import importlib.util
+
+    from src.models import db as models
+
+    path = ROOT / "alembic" / "versions" / "029_oauth_grant_lifetime.py"
+    spec = importlib.util.spec_from_file_location("_migration_029", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert module.CODE_GRANT_MARKER == models._OAUTH_CODE_GRANT_ID_COLUMN_MARKER
+    assert module.ISSUED_AT_MARKER == models._OAUTH_GRANT_ISSUED_AT_COLUMN_MARKER
+    assert (
+        models.OAuthCode.__table__.c.grant_id.comment
+        == models._OAUTH_CODE_GRANT_ID_COLUMN_MARKER
+    )
+    assert (
+        OAuthToken.__table__.c.grant_issued_at.comment
+        == models._OAUTH_GRANT_ISSUED_AT_COLUMN_MARKER
+    )
 
 
 def test_rotation_copies_issuance_from_the_locked_row():

@@ -258,6 +258,10 @@ def downgrade() -> None:
     and spent codes lose their lineage (their replay then revokes nothing).
     """
     bind = op.get_bind()
+    # The same bounds as `upgrade()`: a blocked downgrade fails fast rather
+    # than queueing every token request behind its ACCESS EXCLUSIVE lock.
+    op.execute("SET LOCAL lock_timeout = '10s'")
+    op.execute("SET LOCAL statement_timeout = '60s'")
     _pin_search_path()
     present = []
     for table, column, _type, _nn, _default, marker in COLUMNS:
@@ -277,4 +281,6 @@ def downgrade() -> None:
     # Reverse of creation order: tokens, then codes.
     for table, column in reversed(present):
         op.drop_column(table, column)
+    op.execute("RESET lock_timeout")
+    op.execute("RESET statement_timeout")
     op.execute("RESET search_path")
