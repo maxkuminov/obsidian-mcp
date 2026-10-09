@@ -17,7 +17,15 @@
 #                     clients like claude.ai cannot complete the OAuth flow.
 #   SECRET_KEY        itsdangerous signer. python3 -c "import secrets; print(secrets.token_hex(32))"
 #   VAULT_HOST_PATH   Host path to your Obsidian vault (bind-mounted at /obsidian).
-#   POSTGRES_PASSWORD Strong DB password (also propagate into DATABASE_URL in .env).
+#   OBSIDIAN_DB_PASSWORD  The application role's DB password (openssl rand -hex 32).
+#                     This file builds DATABASE_URL from it; do not set
+#                     DATABASE_URL or POSTGRES_PASSWORD in .env.
+#
+# ── Required postgres.env (copy from postgres.env.example, chmod 600) ─────
+#   POSTGRES_PASSWORD The database SUPERUSER password. Only the postgres service
+#                     reads this file; the app never sees it. `make init`
+#                     generates both passwords. Upgrading an install created
+#                     before #324: DEPLOYMENT.md, "Upgrading: split database roles".
 #   OPENAI_API_KEY    If EMBEDDING_PROVIDER=openai (the realistic path without a GPU).
 #
 # ── Point your proxy at the app — pick ONE pattern ────────────────────────
@@ -56,19 +64,34 @@
 # only responsible for TLS and (optionally) protecting the human-facing /admin UI.
 
 services:
+  # Two database identities (#324): the bootstrap SUPERUSER `postgres`, whose
+  # password lives in postgres.env and is loaded by this service only, and the
+  # application's NON-superuser role `obsidian_mcp`, created by
+  # docker/db-init-compose.sh on the first start of an empty volume with
+  # OBSIDIAN_DB_PASSWORD from .env. The entrypoint wrapper validates both
+  # passwords before the image's own entrypoint (and so before initdb) runs.
+  # Keep this service identical in docker-compose.simple.yml and
+  # docker-compose.proxy.yml (tests/test_compose_db_roles.py enforces it).
   postgres:
     image: pgvector/pgvector:pg16
     container_name: obsidian-mcp-postgres
     restart: unless-stopped
+    entrypoint: ["bash", "/usr/local/bin/obsidian-mcp-postgres-entrypoint.sh"]
+    command: ["postgres"]
+    env_file:
+      - postgres.env
     environment:
-      POSTGRES_USER: obsidian_mcp
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
-      POSTGRES_DB: obsidian_mcp
+      POSTGRES_USER: postgres
+      OBSIDIAN_DB_PASSWORD: ${OBSIDIAN_DB_PASSWORD:?set OBSIDIAN_DB_PASSWORD in .env (openssl rand -hex 32), see DEPLOYMENT.md}
     volumes:
       - pg_data:/var/lib/postgresql/data
-      - ./docker/db-init-simple.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./docker/postgres-entrypoint.sh:/usr/local/bin/obsidian-mcp-postgres-entrypoint.sh:ro
+      - ./docker/db-init-compose.sh:/docker-entrypoint-initdb.d/10-obsidian-mcp.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U obsidian_mcp -d obsidian_mcp"]
+      # Over TCP on purpose: during first-start initialisation the image's
+      # temporary server listens on the Unix socket only, so a socket probe
+      # could report healthy before the application role exists.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U obsidian_mcp -d obsidian_mcp"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -86,6 +109,13 @@ services:
         condition: service_healthy
     env_file:
       - .env
+    # Set here, so they override anything in .env (environment beats env_file):
+    # DATABASE_URL is built from the one statement of the runtime password, and
+    # POSTGRES_PASSWORD is blanked so a superuser password left in .env by the
+    # pre-#324 instructions never reaches this container.
+    environment:
+      DATABASE_URL: postgresql+asyncpg://obsidian_mcp:${OBSIDIAN_DB_PASSWORD:?set OBSIDIAN_DB_PASSWORD in .env (openssl rand -hex 32), see DEPLOYMENT.md}@postgres:5432/obsidian_mcp
+      POSTGRES_PASSWORD: ""
     # Forwarded headers (X-Forwarded-Proto/For) are handled by the app's built-in
     # ProxyHeadersMiddleware (main.py), scoped by TRUSTED_PROXY_IPS to loopback +
     # private ranges. Do not set FORWARDED_ALLOW_IPS or --proxy-headers: uvicorn's
