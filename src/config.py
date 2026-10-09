@@ -3,7 +3,7 @@ import logging
 import resource
 import sys
 from typing import Annotated, Any, Literal
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse, urlsplit
 
 from pydantic import (
     BeforeValidator,
@@ -319,7 +319,16 @@ class _FieldFilteredSource(PydanticBaseSettingsSource):
 
 
 class Settings(BaseSettings):
-    database_url: str = "postgresql+asyncpg://obsidian_mcp:changeme@postgres:5432/obsidian_mcp"
+    # No password in the default (#324): an unset DATABASE_URL must not
+    # authenticate with a known value. The bundled compose files set it from
+    # OBSIDIAN_DB_PASSWORD; `_reject_placeholder_database_password` refuses the
+    # placeholders this repository used to ship.
+    database_url: str = "postgresql+asyncpg://obsidian_mcp@postgres:5432/obsidian_mcp"
+    # Opt-out of the startup refusal to run as a PostgreSQL superuser (#324,
+    # src/services/database_role.py). The long-lived process must not hold
+    # cluster administration; set this only as a stop-gap while converting an
+    # install (DEPLOYMENT.md, "Upgrading: split database roles").
+    database_allow_superuser: bool = False
     # ── Database transport (#184) ──────────────────────────────────────────
     #
     # The **only** statement of TLS for the database hop; see "Database
@@ -1364,6 +1373,35 @@ class Settings(BaseSettings):
             # Parse now, so an unloadable file refuses the boot here rather
             # than at `src.database` import; the engine builds its own copy.
             build_database_ssl_context(mode, ca, cert, key)
+        return self
+
+    # The database passwords this repository has shipped as placeholders,
+    # compared trimmed and case-folded (#324).
+    _DATABASE_PASSWORD_PLACEHOLDERS = frozenset({"changeme", "change_me"})
+
+    @model_validator(mode="after")
+    def _reject_placeholder_database_password(self) -> "Settings":
+        """Refuse a DATABASE_URL whose password is a shipped placeholder (#324).
+
+        An absent or empty password is accepted: peer, trust and certificate
+        authentication are legitimate outside the bundles. The message names
+        the setting and how to generate a value, never the URL (it carries
+        the credential).
+        """
+        try:
+            raw = urlsplit(self.database_url).password
+        except ValueError:
+            return self
+        if raw is None:
+            return self
+        if unquote(raw).strip().casefold() in self._DATABASE_PASSWORD_PLACEHOLDERS:
+            raise ValueError(
+                "DATABASE_URL carries a placeholder password (changeme / "
+                "CHANGE_ME). Generate one with `openssl rand -hex 32` and set "
+                "it on the database role and in DATABASE_URL; the bundled "
+                "compose files build DATABASE_URL from OBSIDIAN_DB_PASSWORD in "
+                ".env (see DEPLOYMENT.md)."
+            )
         return self
 
     @model_validator(mode="after")
