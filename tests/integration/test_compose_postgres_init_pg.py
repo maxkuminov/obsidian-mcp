@@ -7,8 +7,9 @@ TCP healthcheck on a fresh, project-scoped volume.
 
 * fresh volume: the runtime role exists with every privileged attribute off,
   owns the database, `vector` is installed and owned by `postgres`, the init
-  marker reads `complete`, the runtime password authenticates over TCP, and a
-  restart on the initialised volume comes back healthy;
+  marker reads `complete`, the runtime password authenticates over TCP, the
+  upgrade script's self-check reports it "already split", and a restart on the
+  initialised volume comes back healthy;
 * injected init failure: the init script is made to fail after its marker
   reads `started`; on the automatic restart the wrapper refuses the
   half-initialised volume with the recovery instructions.
@@ -100,6 +101,17 @@ def test_fresh_volume_gets_role_separation(tmp_path):
         admin = p.compose("exec", "-T", "-e", f"PGPASSWORD={ADMIN_PW}", "postgres", "psql", "-X", "-qAt",
                           "-h", "127.0.0.1", "-U", "postgres", "-d", "postgres", "-c", "SELECT 1")
         assert admin.stdout.strip() == "1"
+        # The upgrade script's full self-check accepts the fresh-install shape
+        # as already split (and so would refuse anything less).
+        script = (ROOT / "docker" / "upgrade-split-db-roles.sql").read_text()
+        upgrade = p.compose(
+            "exec", "-T", "postgres", "sh", "-c",
+            'psql -X -v ON_ERROR_STOP=1 -U obsidian_mcp -d obsidian_mcp '
+            '-v admin_pw="$POSTGRES_PASSWORD" -v app_pw="$OBSIDIAN_DB_PASSWORD"',
+            input=script, check=False,
+        )
+        assert upgrade.returncode == 0, upgrade.stdout + upgrade.stderr
+        assert "already split" in upgrade.stdout
         # An initialised volume with a complete marker restarts cleanly.
         p.compose("restart", "postgres")
         p.compose("up", "-d", "--wait", "--wait-timeout", "120", "postgres", timeout=160)

@@ -8,6 +8,7 @@
 --     'psql -X -v ON_ERROR_STOP=1 -U obsidian_mcp -d obsidian_mcp \
 --           -v admin_pw="$POSTGRES_PASSWORD" -v app_pw="$OBSIDIAN_DB_PASSWORD"' \
 --     < docker/upgrade-split-db-roles.sql
+--   docker compose -f <bundle> restart postgres
 --   docker compose -f <bundle> up -d
 --
 -- The two passwords come from the NEW postgres container's environment
@@ -30,17 +31,29 @@
 --     have no pg_shdepend rows), so ownership moves catalog by catalog;
 --   * all of it is ONE transaction ending in a self-check, so a failure
 --     leaves the cluster exactly as it was (plus the temporary role, which a
---     re-run removes).
+--     re-run removes);
+--   * a session that authenticated as the old obsidian_mcp before the commit
+--     is still OID 10 afterwards, i.e. still a superuser under the new name,
+--     so after the commit every other OID-10 client session is terminated and
+--     the script fails unless none is left;
+--   * every session that carries a password sets log_statement = none and
+--     log_min_error_statement = panic first, so neither a logged statement nor
+--     a failing ALTER/CREATE ROLE ... PASSWORD writes a password to the
+--     server log.
 --
--- Re-running it on a converted cluster prints "already split", removes a
--- temporary role an interrupted earlier run left behind, and changes nothing
--- else.
+-- On a cluster that is already split it removes a temporary role an
+-- interrupted earlier run left behind, runs the same self-check as the
+-- conversion (the fresh-install shape), prints "already split" and changes
+-- nothing else; a partly-split cluster fails that check and is refused with
+-- what is wrong.
 
 \set ON_ERROR_STOP on
 \set QUIET on
 
 -- ── 1. Preflight ───────────────────────────────────────────────────────────
 
+-- Input presence is checked client-side; no password is sent to the server
+-- before logging is turned off below.
 \if :{?admin_pw}
 \else
 DO $$ BEGIN RAISE EXCEPTION 'upgrade-split-db-roles: admin_pw is not set (pass -v admin_pw="$POSTGRES_PASSWORD"); nothing was changed'; END $$;
@@ -48,16 +61,6 @@ DO $$ BEGIN RAISE EXCEPTION 'upgrade-split-db-roles: admin_pw is not set (pass -
 \if :{?app_pw}
 \else
 DO $$ BEGIN RAISE EXCEPTION 'upgrade-split-db-roles: app_pw is not set (pass -v app_pw="$OBSIDIAN_DB_PASSWORD"); nothing was changed'; END $$;
-\endif
-
-SELECT length(:'admin_pw') = 0 AS admin_pw_empty,
-       length(:'app_pw') = 0 AS app_pw_empty
-\gset
-\if :admin_pw_empty
-DO $$ BEGIN RAISE EXCEPTION 'upgrade-split-db-roles: admin_pw is empty (is POSTGRES_PASSWORD set in postgres.env?); nothing was changed'; END $$;
-\endif
-\if :app_pw_empty
-DO $$ BEGIN RAISE EXCEPTION 'upgrade-split-db-roles: app_pw is empty (is OBSIDIAN_DB_PASSWORD set in .env?); nothing was changed'; END $$;
 \endif
 
 SELECT
@@ -80,18 +83,11 @@ DO $$ BEGIN RAISE EXCEPTION 'upgrade-split-db-roles: connect to database obsidia
 \endif
 
 \if :already_split
-    -- A previous run may have committed the conversion and stopped before its
-    -- last step. The temporary role is a passwordless SUPERUSER reachable over
-    -- the local socket, so it must not survive.
+    -- The documented command connects as obsidian_mcp, which is no longer a
+    -- superuser here; the check below needs one.
     \c obsidian_mcp postgres
     \set QUIET on
-    SET client_min_messages = warning;
-    DROP ROLE IF EXISTS obsidian_mcp_split_tmp;
-    \echo 'upgrade-split-db-roles: already split (bootstrap superuser is postgres, obsidian_mcp is not a superuser); nothing to do.'
-    \quit
-\endif
-
-\if :pre_split
+\elif :pre_split
 \else
 SELECT set_config('omcp.shape_message', format(
     'upgrade-split-db-roles: unrecognised cluster shape (bootstrap superuser named %s; role postgres %s; role obsidian_mcp superuser=%s). Expected either the pre-#324 shape (bootstrap superuser obsidian_mcp, no role postgres) or the split shape. Nothing was changed.',
@@ -103,8 +99,32 @@ SELECT set_config('omcp.shape_message', format(
 DO $$ BEGIN RAISE EXCEPTION '%', current_setting('omcp.shape_message'); END $$;
 \endif
 
+-- A superuser session from here on (OID 10 under either name).
 SET client_min_messages = warning;
+SET log_statement = 'none';
+SET log_min_duration_statement = -1;
+SET log_min_error_statement = 'panic';
+
+SELECT length(:'admin_pw') = 0 AS admin_pw_empty,
+       length(:'app_pw') = 0 AS app_pw_empty
+\gset
+\if :admin_pw_empty
+DO $$ BEGIN RAISE EXCEPTION 'upgrade-split-db-roles: admin_pw is empty (is POSTGRES_PASSWORD set in postgres.env?); nothing was changed'; END $$;
+\endif
+\if :app_pw_empty
+DO $$ BEGIN RAISE EXCEPTION 'upgrade-split-db-roles: app_pw is empty (is OBSIDIAN_DB_PASSWORD set in .env?); nothing was changed'; END $$;
+\endif
+
+-- The temporary role is a passwordless SUPERUSER reachable over the local
+-- socket. A previous run may have committed the conversion and stopped before
+-- its last step, so it is dropped on both paths.
 DROP ROLE IF EXISTS obsidian_mcp_split_tmp;
+
+\if :already_split
+SELECT set_config('omcp.mode', 'check', false) AS ignored
+\gset
+BEGIN;
+\else
 CREATE ROLE obsidian_mcp_split_tmp LOGIN SUPERUSER;
 
 -- ── 2. The conversion, as the temporary superuser, in one transaction ──────
@@ -112,6 +132,11 @@ CREATE ROLE obsidian_mcp_split_tmp LOGIN SUPERUSER;
 \c obsidian_mcp obsidian_mcp_split_tmp
 \set QUIET on
 SET client_min_messages = warning;
+SET log_statement = 'none';
+SET log_min_duration_statement = -1;
+SET log_min_error_statement = 'panic';
+SELECT set_config('omcp.mode', 'convert', false) AS ignored
+\gset
 
 BEGIN;
 
@@ -120,6 +145,7 @@ ALTER ROLE obsidian_mcp RENAME TO postgres;
 ALTER ROLE postgres PASSWORD :'admin_pw';
 CREATE ROLE obsidian_mcp LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD :'app_pw';
 ALTER DATABASE obsidian_mcp OWNER TO obsidian_mcp;
+\endif
 
 -- Objects created by an extension (pg_depend deptype 'e'), and recursively
 -- whatever is internally bound to them (deptype 'i', e.g. an extension type's
@@ -136,6 +162,8 @@ WITH RECURSIVE closure(classid, objid) AS (
 )
 SELECT classid, objid FROM closure;
 
+\if :already_split
+\else
 DO $convert$
 DECLARE
     app oid := (SELECT oid FROM pg_roles WHERE rolname = 'obsidian_mcp');
@@ -389,23 +417,42 @@ BEGIN
     END LOOP;
 END
 $convert$;
+\endif
 
--- Self-check. Any failure raises, and the whole transaction rolls back.
+-- Self-check: the fresh-install shape. On the conversion path any failure
+-- raises and the whole transaction rolls back; on the already-split path it
+-- refuses a cluster that is only partly in that shape (database owned by
+-- postgres, a privileged obsidian_mcp, objects or default privileges left with
+-- the superuser), naming every problem it found.
 DO $check$
 DECLARE
-    leftovers text;
+    problems text[] := '{}';
+    attrs text;
+    found text;
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'obsidian_mcp' AND NOT rolsuper
-                     AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolreplication
-                     AND NOT rolbypassrls AND rolcanlogin) THEN
-        RAISE EXCEPTION 'upgrade-split-db-roles: self-check failed: obsidian_mcp is not a plain login role';
+    SELECT concat_ws(', ',
+               CASE WHEN rolsuper THEN 'SUPERUSER' END,
+               CASE WHEN rolcreatedb THEN 'CREATEDB' END,
+               CASE WHEN rolcreaterole THEN 'CREATEROLE' END,
+               CASE WHEN rolreplication THEN 'REPLICATION' END,
+               CASE WHEN rolbypassrls THEN 'BYPASSRLS' END,
+               CASE WHEN NOT rolcanlogin THEN 'NOLOGIN' END)
+      INTO attrs
+      FROM pg_roles WHERE rolname = 'obsidian_mcp';
+    IF attrs IS NULL THEN
+        problems := problems || 'role obsidian_mcp does not exist'::text;
+    ELSIF attrs <> '' THEN
+        problems := problems || format('role obsidian_mcp has %s (expected a plain LOGIN role)', attrs);
     END IF;
-    IF (SELECT rolname FROM pg_roles WHERE oid = 10) <> 'postgres' THEN
-        RAISE EXCEPTION 'upgrade-split-db-roles: self-check failed: OID 10 is not named postgres';
+
+    found := (SELECT rolname FROM pg_roles WHERE oid = 10);
+    IF found <> 'postgres' THEN
+        problems := problems || format('the bootstrap superuser (OID 10) is named %s, not postgres', found);
     END IF;
-    IF (SELECT r.rolname FROM pg_database d JOIN pg_roles r ON r.oid = d.datdba
-         WHERE d.datname = current_database()) <> 'obsidian_mcp' THEN
-        RAISE EXCEPTION 'upgrade-split-db-roles: self-check failed: obsidian_mcp does not own the database';
+
+    found := (SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = current_database());
+    IF found <> 'obsidian_mcp' THEN
+        problems := problems || format('database obsidian_mcp is owned by %s, not obsidian_mcp', found);
     END IF;
 
     WITH owned(catalog, oid, owner) AS (
@@ -431,30 +478,87 @@ BEGIN
         UNION ALL SELECT 'pg_event_trigger'::regclass, oid, evtowner FROM pg_event_trigger
         UNION ALL SELECT 'pg_publication'::regclass, oid, pubowner FROM pg_publication
     )
-    SELECT string_agg(pg_describe_object(o.catalog, o.oid, 0), '; ' ORDER BY o.catalog::text, o.oid)
-      INTO leftovers
+    SELECT string_agg(pg_describe_object(o.catalog, o.oid, 0), ', ' ORDER BY o.catalog::text, o.oid)
+      INTO found
       FROM owned o
      WHERE o.owner = 10
        AND (o.oid >= 16384 OR (o.catalog = 'pg_namespace'::regclass))
        AND NOT EXISTS (SELECT 1 FROM omcp_ext_closure x
                         WHERE x.classid = o.catalog AND x.objid = o.oid);
-    IF leftovers IS NOT NULL THEN
-        RAISE EXCEPTION 'upgrade-split-db-roles: self-check failed: objects still owned by the superuser: %; nothing was changed', leftovers;
+    IF found IS NOT NULL THEN
+        problems := problems || format('objects still owned by the superuser: %s', found);
     END IF;
 
-    IF EXISTS (SELECT 1 FROM pg_default_acl WHERE defaclrole = 10) THEN
-        RAISE EXCEPTION 'upgrade-split-db-roles: self-check failed: default privileges still held by the superuser; nothing was changed';
+    SELECT string_agg(format('%s %s',
+               CASE d.defaclobjtype WHEN 'r' THEN 'TABLES' WHEN 'S' THEN 'SEQUENCES'
+                    WHEN 'f' THEN 'FUNCTIONS' WHEN 'T' THEN 'TYPES' WHEN 'n' THEN 'SCHEMAS'
+                    ELSE d.defaclobjtype::text END,
+               CASE WHEN d.defaclnamespace = 0 THEN 'database-wide'
+                    ELSE 'in schema ' || quote_ident(n.nspname) END), ', ' ORDER BY d.oid)
+      INTO found
+      FROM pg_default_acl d LEFT JOIN pg_namespace n ON n.oid = d.defaclnamespace
+     WHERE d.defaclrole = 10;
+    IF found IS NOT NULL THEN
+        problems := problems || format('default privileges still held by the superuser: %s', found);
+    END IF;
+
+    IF cardinality(problems) > 0 THEN
+        IF current_setting('omcp.mode') = 'check' THEN
+            RAISE EXCEPTION 'upgrade-split-db-roles: the cluster looks split (bootstrap superuser postgres, obsidian_mcp not a superuser) but is not in the fresh-install shape: %. Nothing was converted. Fix these as postgres and run the script again; see DEPLOYMENT.md, "Upgrading: split database roles".',
+                array_to_string(problems, '; ');
+        ELSE
+            RAISE EXCEPTION 'upgrade-split-db-roles: self-check failed: %; nothing was changed',
+                array_to_string(problems, '; ');
+        END IF;
     END IF;
 END
 $check$;
 
 COMMIT;
 
--- ── 3. Remove the temporary superuser ──────────────────────────────────────
+\if :already_split
+\echo 'upgrade-split-db-roles: already split (bootstrap superuser is postgres; obsidian_mcp is a plain login role that owns database obsidian_mcp and everything in it); nothing to do.'
+\quit
+\endif
+
+-- ── 3. Disconnect the old superuser identity ───────────────────────────────
+
+-- A session that authenticated as the old obsidian_mcp before the COMMIT is
+-- still OID 10, and OID 10 is the superuser now named postgres: it would keep
+-- superuser rights for as long as it stays connected. No legitimate OID-10
+-- session can exist yet (its password was set by this transaction), so every
+-- other OID-10 client backend is terminated, waiting up to 5 s for each.
+DO $disconnect$
+DECLARE
+    r record;
+BEGIN
+    FOR r IN SELECT pid FROM pg_stat_activity
+              WHERE usesysid = 10 AND backend_type = 'client backend'
+                AND pid <> pg_backend_pid()
+    LOOP
+        PERFORM pg_terminate_backend(r.pid, 5000);
+    END LOOP;
+END
+$disconnect$;
+
+-- ── 4. Remove the temporary superuser, then verify ─────────────────────────
 
 \c obsidian_mcp postgres
 \set QUIET on
 SET client_min_messages = warning;
 DROP ROLE obsidian_mcp_split_tmp;
 
-\echo 'upgrade-split-db-roles: done. The bootstrap superuser is now postgres; obsidian_mcp is a non-superuser that owns database obsidian_mcp. Start the app: docker compose -f <bundle> up -d'
+DO $verify$
+DECLARE
+    left_over int;
+BEGIN
+    SELECT count(*) INTO left_over FROM pg_stat_activity
+     WHERE usesysid = 10 AND backend_type = 'client backend'
+       AND pid <> pg_backend_pid();
+    IF left_over > 0 THEN
+        RAISE EXCEPTION 'upgrade-split-db-roles: the conversion is committed, but % session(s) of the old superuser identity are still connected and keep superuser rights. Restart the database before starting the app: docker compose -f <bundle> restart postgres', left_over;
+    END IF;
+END
+$verify$;
+
+\echo 'upgrade-split-db-roles: done. The bootstrap superuser is now postgres; obsidian_mcp is a non-superuser that owns database obsidian_mcp. Restart the database, then start the app: docker compose -f <bundle> restart postgres && docker compose -f <bundle> up -d'

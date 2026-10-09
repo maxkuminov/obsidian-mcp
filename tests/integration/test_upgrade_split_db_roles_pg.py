@@ -134,13 +134,63 @@ def test_missing_input_aborts_before_any_change(cluster):
     assert any(line.startswith("10|obsidian_mcp|t") for line in before_roles)
 
 
+def test_missing_admin_password_aborts_before_any_change(cluster):
+    before_roles = roles(cluster, "obsidian_mcp")
+    before_owners = owners(cluster, "obsidian_mcp")
+    result = run_script(cluster, env={"OBSIDIAN_DB_PASSWORD": APP_PW},
+                        command='psql -X -v ON_ERROR_STOP=1 -U obsidian_mcp -d obsidian_mcp '
+                                '-v app_pw="$OBSIDIAN_DB_PASSWORD"')
+    assert result.returncode != 0
+    assert "admin_pw is not set" in result.stderr
+    assert APP_PW not in result.stdout + result.stderr
+    assert roles(cluster, "obsidian_mcp") == before_roles
+    assert owners(cluster, "obsidian_mcp") == before_owners
+    # Passed but empty in the environment (no postgres.env value). The
+    # container's own POSTGRES_PASSWORD (the old one) is blanked for the exec.
+    result = run_script(cluster, env={"POSTGRES_PASSWORD": "", "OBSIDIAN_DB_PASSWORD": APP_PW})
+    assert result.returncode != 0
+    assert "admin_pw is empty" in result.stderr
+    assert roles(cluster, "obsidian_mcp") == before_roles
+    assert owners(cluster, "obsidian_mcp") == before_owners
+
+
 def test_pre_split_cluster_is_converted(cluster):
-    result = run_script(cluster, env={"POSTGRES_PASSWORD": ADMIN_PW, "OBSIDIAN_DB_PASSWORD": APP_PW})
-    output = result.stdout + result.stderr
-    assert result.returncode == 0, output
-    assert "upgrade-split-db-roles: done" in result.stdout
-    for secret in (ADMIN_PW, APP_PW, OLD_PW):
-        assert secret not in output
+    import asyncpg
+
+    # A session that authenticated as the old superuser before the conversion,
+    # over TCP like the app: it must not survive the commit (Codex, MAJOR).
+    loop = asyncio.new_event_loop()
+    dsn = f"postgresql://%s:%s@127.0.0.1:{cluster.port}/obsidian_mcp"
+    held = loop.run_until_complete(asyncpg.connect(dsn % ("obsidian_mcp", OLD_PW)))
+    try:
+        assert loop.run_until_complete(held.fetchval("SELECT usesuper FROM pg_user WHERE usesysid = 10"))
+        assert loop.run_until_complete(held.fetchval(
+            "SELECT rolsuper FROM pg_roles WHERE rolname = current_user"))
+
+        result = run_script(cluster, env={"POSTGRES_PASSWORD": ADMIN_PW, "OBSIDIAN_DB_PASSWORD": APP_PW})
+        output = result.stdout + result.stderr
+        assert result.returncode == 0, output
+        assert "upgrade-split-db-roles: done" in result.stdout
+        assert "restart postgres" in result.stdout
+        for secret in (ADMIN_PW, APP_PW, OLD_PW):
+            assert secret not in output
+            assert secret not in cluster.logs()
+
+        # The held session was terminated by the script.
+        with pytest.raises((asyncpg.PostgresError, asyncpg.InterfaceError, ConnectionError, OSError)):
+            loop.run_until_complete(asyncio.wait_for(held.fetchval("SELECT 1"), 10))
+        assert held.is_closed()
+        assert q(cluster, "SELECT count(*) FROM pg_stat_activity WHERE usesysid = 10 "
+                          "AND backend_type = 'client backend' AND pid <> pg_backend_pid()") == ["0"]
+
+        # Nor can the old identity come back: neither name accepts the old password.
+        for user in ("obsidian_mcp", "postgres"):
+            with pytest.raises(asyncpg.InvalidPasswordError):
+                loop.run_until_complete(asyncpg.connect(dsn % (user, OLD_PW)))
+    finally:
+        if not held.is_closed():
+            held.terminate()
+        loop.close()
 
     r = dict(line.split("|", 1)[::-1] for line in roles(cluster, "postgres"))
     assert r["postgres|t"] == "10"
@@ -303,5 +353,74 @@ def test_unrecognised_shape_is_refused():
         assert "unrecognised cluster shape" in result.stderr
         assert "Nothing was changed" in result.stderr
         assert q(c, "SELECT count(*) FROM pg_roles WHERE rolname LIKE 'obsidian_mcp%'") == ["0"]
+    finally:
+        c.remove()
+
+
+# The fresh-install shape, as docker/db-init-compose.sh builds it.
+FRESH_SHAPE = """
+CREATE ROLE obsidian_mcp LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD 'x';
+CREATE DATABASE obsidian_mcp OWNER obsidian_mcp;
+"""
+
+# (defect applied as postgres in obsidian_mcp, its undo, what the refusal must name)
+MALFORMED_SPLITS = [
+    ("ALTER DATABASE obsidian_mcp OWNER TO postgres;",
+     "ALTER DATABASE obsidian_mcp OWNER TO obsidian_mcp;",
+     ["database obsidian_mcp is owned by postgres"]),
+    ("ALTER ROLE obsidian_mcp CREATEDB CREATEROLE;",
+     "ALTER ROLE obsidian_mcp NOCREATEDB NOCREATEROLE;",
+     ["role obsidian_mcp has CREATEDB, CREATEROLE"]),
+    ("CREATE TABLE leftover (i int); CREATE FUNCTION leftover_fn() RETURNS int LANGUAGE sql AS 'SELECT 1';",
+     "DROP TABLE leftover; DROP FUNCTION leftover_fn();",
+     ["objects still owned by the superuser:", "table leftover", "function leftover_fn()"]),
+    ("ALTER DEFAULT PRIVILEGES FOR ROLE postgres GRANT SELECT ON TABLES TO PUBLIC;",
+     "ALTER DEFAULT PRIVILEGES FOR ROLE postgres REVOKE SELECT ON TABLES FROM PUBLIC;",
+     ["default privileges still held by the superuser: TABLES database-wide"]),
+    ("ALTER DATABASE obsidian_mcp OWNER TO postgres; ALTER ROLE obsidian_mcp BYPASSRLS;",
+     "ALTER DATABASE obsidian_mcp OWNER TO obsidian_mcp; ALTER ROLE obsidian_mcp NOBYPASSRLS;",
+     ["database obsidian_mcp is owned by postgres", "role obsidian_mcp has BYPASSRLS"]),
+]
+
+
+def test_partly_split_cluster_is_refused():
+    # Bootstrap superuser `postgres` plus a non-superuser `obsidian_mcp`: the
+    # name-level "already split" shape. Only the full self-check may call it
+    # done (Codex, MINOR).
+    c = Container(unique("partsplit"), ["-e", f"POSTGRES_PASSWORD={OLD_PW}"])
+    env = {"POSTGRES_PASSWORD": ADMIN_PW, "OBSIDIAN_DB_PASSWORD": APP_PW}
+    try:
+        c.wait_ready("postgres")
+        c.psql(FRESH_SHAPE, user="postgres", db="postgres")
+        c.psql("CREATE EXTENSION vector;", user="postgres")
+
+        # The real fresh-install shape passes.
+        result = run_script(c, env=env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "already split" in result.stdout
+
+        for defect, undo, named in MALFORMED_SPLITS:
+            c.psql(defect, user="postgres")
+            # A temporary role left by an interrupted run is still removed.
+            c.psql("CREATE ROLE obsidian_mcp_split_tmp LOGIN SUPERUSER;", user="postgres")
+            before = (roles(c, "postgres"), owners(c, "postgres"))
+            result = run_script(c, env=env)
+            output = result.stdout + result.stderr
+            assert result.returncode != 0, (defect, output)
+            assert "already split" not in result.stdout, defect
+            assert "not in the fresh-install shape" in result.stderr, (defect, output)
+            for text in named:
+                assert text in result.stderr, (defect, text, output)
+            for secret in (ADMIN_PW, APP_PW):
+                assert secret not in output
+            after_roles = roles(c, "postgres")
+            assert not any("obsidian_mcp_split_tmp" in line for line in after_roles)
+            assert after_roles == [r for r in before[0] if "obsidian_mcp_split_tmp" not in r]
+            assert owners(c, "postgres") == before[1]
+            c.psql(undo, user="postgres")
+
+        result = run_script(c, env=env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "already split" in result.stdout
     finally:
         c.remove()
