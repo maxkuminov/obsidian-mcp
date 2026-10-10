@@ -38,7 +38,7 @@ Slice A (renderer) and slice B (outcome + coalescer drop) touch different functi
 ## 5. Gates
 
 - [x] 5.1 `openspec validate usage-params-sanitiser --strict`.
-- [ ] 5.2 `openspec-verifier` against this change.
-- [ ] 5.3 Adversarial Codex pass. This change touches the usage-log write path that an agent's audit trail depends on, and the coalescer's arithmetic. Frame it so that the expensive failures are a row silently lost, a rendering that can be confused with literal input, and a non-data failure wrongly dropped.
-- [ ] 5.4 After deploy, an end-to-end exercise against the live server: call `read_note` with a NUL in `section` (a logged argument), and `list_notes` with a NaN in its logged `frontmatter` filter (`{"x": NaN}` has to be sent as a raw JSON-RPC body, because most clients refuse to serialise NaN). Confirm both rows on `/admin/usage`, carrying `rendered_params`. Report which tools were called.
-- [ ] 5.5 Archive (`openspec archive usage-params-sanitiser -y`) as the last commit of the feature PR, with `Closes #310`.
+- [x] 5.2 `openspec-verifier` against this change.
+- [x] 5.3 Adversarial Codex pass. This change touches the usage-log write path that an agent's audit trail depends on, and the coalescer's arithmetic. Frame it so that the expensive failures are a row silently lost, a rendering that can be confused with literal input, and a non-data failure wrongly dropped.
+- [ ] 5.4 **Open: runs after deploy, not part of the archived PR.** After deploy, an end-to-end exercise against the live server: call `read_note` with a NUL in `section` (a logged argument), and `list_notes` with a NaN in its logged `frontmatter` filter (`{"x": NaN}` has to be sent as a raw JSON-RPC body, because most clients refuse to serialise NaN). Confirm both rows on `/admin/usage`, carrying `rendered_params`. Report which tools were called.
+- [x] 5.5 Archive (`openspec archive usage-params-sanitiser -y`) as the last commit of the feature PR, with `Closes #310`.
