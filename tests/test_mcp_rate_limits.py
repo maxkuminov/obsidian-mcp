@@ -49,6 +49,24 @@ OTHER_PRINCIPAL = ("api_key", 8)
 # ── plumbing ────────────────────────────────────────────────────────────────
 
 
+def _as_outcome(fake_bool_writer):
+    """Adapt a boolean fake writer to the coalescer's outcome writer (#310).
+
+    `write_planned_row` calls `write_usage_row_outcome` since #310; these
+    tests were written against `write_usage_row`'s boolean. `True` is
+    `LANDED`, `False` is `FAILED` (requeued); exceptions pass through.
+    """
+
+    async def outcome(values):
+        landed = await fake_bool_writer(values)
+        return (
+            tools.UsageWriteOutcome.LANDED if landed
+            else tools.UsageWriteOutcome.FAILED
+        )
+
+    return outcome
+
+
 class _QuotaSpySession:
     """Stands in for the quota admission's own `async_session()`, counting."""
 
@@ -135,7 +153,7 @@ def _run(
 
     mp = pytest.MonkeyPatch()
     mp.setattr(tools, "_log_usage", fake_log_usage)
-    mp.setattr(tools, "write_usage_row", fake_write_usage_row)
+    mp.setattr(tools, "write_usage_row_outcome", _as_outcome(fake_write_usage_row))
     mp.setattr(quotas, "async_session", quota_spy)
 
     async def run():
@@ -495,7 +513,7 @@ def _flush(*, fails=False, every_window=False):
         return True
 
     mp = pytest.MonkeyPatch()
-    mp.setattr(tools, "write_usage_row", fake_write)
+    mp.setattr(tools, "write_usage_row_outcome", _as_outcome(fake_write))
     try:
         asyncio.run(
             rate_limits.flush_all() if every_window else rate_limits.flush_expired()
@@ -671,7 +689,7 @@ def test_a_write_that_raises_is_requeued_like_one_that_returns_false(
         raise RuntimeError("the pool is gone")
 
     mp = pytest.MonkeyPatch()
-    mp.setattr(tools, "write_usage_row", exploding_write)
+    mp.setattr(tools, "write_usage_row_outcome", _as_outcome(exploding_write))
     try:
         assert asyncio.run(rate_limits.flush_expired()) == 0
     finally:
@@ -779,7 +797,7 @@ def test_a_flush_whose_write_fails_does_not_raise():
         return False
 
     mp = pytest.MonkeyPatch()
-    mp.setattr(tools, "write_usage_row", failing_write)
+    mp.setattr(tools, "write_usage_row_outcome", _as_outcome(failing_write))
     try:
         assert asyncio.run(rate_limits.flush_expired()) == 0
     finally:
@@ -1245,7 +1263,7 @@ async def test_cancelled_writer_preserves_current_and_unattempted_counts(monkeyp
         rows.append(values)
         return True
 
-    monkeypatch.setattr(tools, "write_usage_row", persist)
+    monkeypatch.setattr(tools, "write_usage_row_outcome", _as_outcome(persist))
 
     def refuse(principal):
         return rate_limits.record_rate_refusal(
@@ -1269,14 +1287,14 @@ async def test_cancelled_writer_preserves_current_and_unattempted_counts(monkeyp
         entered.set()
         await asyncio.Event().wait()
 
-    monkeypatch.setattr(tools, "write_usage_row", blocked)
+    monkeypatch.setattr(tools, "write_usage_row_outcome", _as_outcome(blocked))
     task = asyncio.create_task(operation)
     await asyncio.wait_for(entered.wait(), timeout=1)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
     assert all(entry.in_flight == 0 for entry in rate_limits._entries.values())
-    monkeypatch.setattr(tools, "write_usage_row", persist)
+    monkeypatch.setattr(tools, "write_usage_row_outcome", _as_outcome(persist))
     await rate_limits.flush_all()
     assert sum(_weight(row) for row in rows) == expected
     assert await rate_limits.flush_all() == 0
@@ -1294,7 +1312,7 @@ async def test_in_flight_flush_pins_idle_entry_without_exceeding_cap(monkeypatch
         rows.append(values)
         return True
 
-    monkeypatch.setattr(tools, "write_usage_row", persist)
+    monkeypatch.setattr(tools, "write_usage_row_outcome", _as_outcome(persist))
     principal = ("api_key", 1)
 
     def refuse():
@@ -1318,10 +1336,10 @@ async def test_in_flight_flush_pins_idle_entry_without_exceeding_cap(monkeypatch
             rows.append(values)
         return landed
 
-    monkeypatch.setattr(tools, "write_usage_row", write_during_admission)
+    monkeypatch.setattr(tools, "write_usage_row_outcome", _as_outcome(write_during_admission))
     await rate_limits.flush_expired()
     assert entry.in_flight == 0
-    monkeypatch.setattr(tools, "write_usage_row", persist)
+    monkeypatch.setattr(tools, "write_usage_row_outcome", _as_outcome(persist))
     await rate_limits.flush_all()
     assert sum(_weight(row) for row in rows) == 2
     rate_limits._sweep(clock.now)

@@ -56,6 +56,7 @@ from src.control_panel.routes import (
     _log_panel_forbidden,
     _panel_context,
     _request_route,
+    actor_snapshot,
     require_admin_panel,
 )
 from src.csrf import verify_csrf
@@ -580,8 +581,9 @@ async def edit_user_submit(
     # could otherwise change between this read and our write.
     await _lock_admin_guard(session)
     if not await _actor_still_privileged(session, user):
+        actor = actor_snapshot(user)  # before the rollback expires `user` (#332)
         await session.rollback()
-        _log_actor_revoked(request, user)
+        _log_actor_revoked(request, actor)
         return _back_to_list_with_error(request, _ACTOR_REVOKED_MSG)
     result = await session.execute(select(User).where(User.id == user_id))
     target = result.scalar_one_or_none()
@@ -772,8 +774,9 @@ async def delete_user(
     # other, not just their own kind.
     await _lock_admin_guard(session)
     if not await _actor_still_privileged(session, user):
+        actor = actor_snapshot(user)  # before the rollback expires `user` (#332)
         await session.rollback()
-        _log_actor_revoked(request, user)
+        _log_actor_revoked(request, actor)
         return _back_to_list_with_error(request, _ACTOR_REVOKED_MSG)
     result = await session.execute(select(User).where(User.id == user_id))
     target = result.scalar_one_or_none()
@@ -895,8 +898,9 @@ async def reset_password(
     # write below.
     await _lock_admin_guard(session)
     if not await _actor_still_privileged(session, user):
+        actor = actor_snapshot(user)  # before the rollback expires `user` (#332)
         await session.rollback()
-        _log_actor_revoked(request, user)
+        _log_actor_revoked(request, actor)
         return _back_to_list_with_error(request, _ACTOR_REVOKED_MSG)
     result = await session.execute(select(User).where(User.id == user_id))
     target = result.scalar_one_or_none()

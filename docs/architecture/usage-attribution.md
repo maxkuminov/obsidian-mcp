@@ -65,7 +65,8 @@ credential and then opens the Usage page to see what it did was shown
   HDD; ~2.5 ms since the reference deployment moved it to NVMe on 2026-09-23). An asynchronously committed row is visible to every other session
   at commit, so `write_usage_row` still returns `True` only after a commit a
   second session can read, and the writer lease, the single FK retry and the
-  #193 coalescer requeue are unchanged. What is weakened is durability across
+  #193 coalescer requeue are unchanged (save the #310 drop of an unstorable
+  row, below). What is weakened is durability across
   a **PostgreSQL server or host crash**: rows committed in the preceding
   ~600 ms (`3 × wal_writer_delay`) can be lost. An application crash or
   restart loses nothing committed, and WAL is flushed in order, so a later
@@ -144,6 +145,85 @@ credential and then opens the Usage page to see what it did was shown
   row and degrades only if the credential is later deleted. Symmetric with
   016's treatment (NULL record ⇒ re-derive; NULL label ⇒ join fallback). No
   barrier and no quiesce: the window is seconds long and the fallback works.
+
+
+## What reaches `params` is rendered, not trusted (#310)
+
+`usage_logs.params` is JSONB, and what goes into it is the caller's own
+arguments (bound by `named_params()`, top-level strings truncated by
+`_truncate_params`) plus server telemetry (`timing.current()`, which includes
+`result_paths` and `source_path`, which are vault paths). SQLAlchemy serialises it with a plain
+`json.dumps`, because no `json_serializer` is set on the engine. Python's JSON
+layer accepts three things PostgreSQL's `jsonb` refuses, each with a class-22
+SQLSTATE:
+
+- **U+0000** in a string. `json.dumps` writes `"\u0000"` and `jsonb` refuses it (22P05).
+- **An unpaired surrogate.** `json.dumps` writes the escape and `jsonb` refuses it.
+- **A non-finite float.** `json.dumps` writes the bare `NaN` / `Infinity`, which is not JSON (22P02).
+
+All three arrive over the wire, because the Streamable HTTP transport parses
+the body with `json.loads`. Unrendered, the row was lost. A NUL in any logged
+argument therefore kept a call out of `usage_logs`, and the
+`argument_not_encodable` refusal (#149) lost its own row because the row
+quoted the surrogate it refused. The coalesced refusal rows were also
+retried forever (see [rate limits](rate-limits.md)).
+
+**The renderer** is `render_usage_params` in `src/services/usage_params.py`.
+It runs **once**, at the top of `_write_usage_row_admitted`, which is the one
+function every MCP-side row passes through after every telemetry and
+observation merge. The FK-cleared retry is built from its output. It does not
+run in `named_params()`, the place the issue first suggested, because that
+would have missed the telemetry merge, and a telemetry path such as `source_path` can hold a
+surrogate-escaped non-UTF-8 filename. An absent `params` stays absent and
+`None` stays `None`.
+
+- **The decision is per top-level key.** A top-level value is stored byte for
+  byte unless it contains, at any depth, an unstorable string (key or value),
+  a non-finite float, a non-string key, or a non-JSON type. A clean row is
+  unchanged and has no marker.
+- **Inside a rendered value, every string follows one grammar:** `\` → `\\`,
+  U+0000 → `\x00`, an unpaired surrogate → `\udXXX` (lowercase, what
+  `backslashreplace` emits). Every backslash then begins exactly one of those
+  sequences, so a NUL the caller sent (`\x00`) cannot be confused with the
+  literal four characters `\x00` (stored `\\x00`). `\0` was rejected because it
+  is ambiguous against a following octal digit.
+- **Other conversions.** Non-finite floats take the #154 tokens `.nan` / `.inf`
+  / `-.inf` (`vault.non_finite_token`). Tuples and sets become lists. Any other
+  non-JSON value becomes its escaped `str()`. Non-string keys become their
+  string form, and **the first key wins** a post-render collision, which is
+  the indexer's `_jsonb_value` rule.
+- **`params["rendered_params"]`** is a sorted list of the rendered top-level
+  keys. The name is reserved, and a test enumerates every tool parameter and
+  marker to prove it.
+- **Total and unbounded in depth.** The walk is iterative with no depth limit.
+  A container already on the current path becomes `<cycle>`. A value that
+  cannot be rendered (a raising `__str__`) becomes `<unrenderable>` and is
+  listed, and the server's markers on the row survive.
+- **Length.** Truncation runs first and counts code points, so a stored
+  top-level string is at most 6 × 200 + 1 characters. Nested strings were
+  never truncated, and they grow by at most 6×.
+- **Not covered: the transfer rows** (`upload_file`, `download_file`,
+  `src/transfer/routes.py` `_log_row`). They are written in their own session
+  from a `transfer_tokens.path` that PostgreSQL already stored as `text`, plus
+  an integer, so they cannot carry any of the three values. A test pins the
+  shape.
+
+Accepted, audit-only ambiguities:
+
+- **L1.** A rendered NaN (`".nan"`) and a caller-sent string `".nan"` in the
+  same value look the same.
+- **L2.** A non-string key can collide with a string key. That is reachable
+  only through `transforms` or in-process callers, because JSON keys are
+  strings.
+- **L4.** A non-finite *server-measured* timing would render as a token and
+  break the unguarded `::double precision` cast in
+  `usage_stats.phase_breakdown`. Those timings are monotonic-clock deltas, so
+  this cannot happen.
+
+`write_usage_row` still returns a bool. `write_usage_row_outcome` returns
+`landed | failed | unstorable`, and `unstorable` (class 22, 54000, a bare
+`UnicodeEncodeError`, classified by the indexer's `poison_sqlstate`) is what
+the refusal coalescer drops instead of requeueing.
 
 
 ## The read-only consumer (#160)

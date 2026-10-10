@@ -97,6 +97,10 @@ def server_env(migrated_url, tmp_path, **extra):
         "ALLOWED_HOSTS": '["127.0.0.1", "localhost"]',
         "MULTI_USER_MODE": "false",
         "LOG_LEVEL": "WARNING",
+        # The throwaway cluster's URL is its superuser, which the server
+        # refuses to start on since #324; these tests measure memory, not
+        # the role check (#332 follow-up).
+        "DATABASE_ALLOW_SUPERUSER": "true",
     }
     env.update({k: str(v) for k, v in extra.items()})
     return env

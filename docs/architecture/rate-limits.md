@@ -351,6 +351,35 @@ tick rather than after another whole interval; a requeue after an *immediate*
 failure adds to whatever has accumulated since. Exceptions count as failures:
 an exception is not evidence the row landed.
 
+**The one exception: a row the database rejects for its data is dropped**
+(#310). The requeue used to cover every failure, and that was a loop. The
+template captures the caller's arguments, and a NUL, a lone surrogate or a
+NaN in one of them made the INSERT fail with a class-22 SQLSTATE. A
+flush-path requeue restores the original start, so the same unstorable row
+was due again on the very next tick, forever: one failing INSERT and one
+`usage_log_failed` per tick until the process restarted. `params` is now
+rendered before every insert (see "What reaches `params` is rendered, not
+trusted" in [usage attribution](usage-attribution.md)), so this should not
+happen any more. The coalescer still classifies, as a fallback.
+`write_planned_row` calls `write_usage_row_outcome`, which returns
+`landed | failed | unstorable`. `unstorable` means the terminal insert failed
+with class 22, 54000 or a bare `UnicodeEncodeError`, by the indexer's own
+`poison_sqlstate`. Such a row is released **without** requeue: no window is
+re-created and nothing is added to an open window's `pending`. Its weight is
+reported by one `usage_refusal_row_dropped` emission attempt. Every other
+failure (writer permit refused, connection lost, an exception) is requeued
+exactly as before.
+
+So the exact Σ `(1 + suppressed)` invariant holds **while every row for a key
+is storable**. A dropped row's weight is accounted for only best effort. The
+event goes through the suppressor, whose summary counts records, not their
+`count` weights, and it names neither the principal nor the scope, so two
+coalescer keys for one user and tool cannot be separated. That is accepted
+(design L3 in the archived change): it is reachable only through a renderer
+defect. A deterministic failure that carries **no** SQLSTATE (a serialisation
+`TypeError`) is still `failed` and still requeued (L5). Widening the drop to
+unclassified errors would risk dropping rows over transient faults.
+
 **In-flight rows pin their entry.** Planning increments an entry-local count;
 acknowledgement or requeue releases it. The idle sweep refuses an entry while
 that count is nonzero, even after a flush retired all its windows. Otherwise a
@@ -526,6 +555,16 @@ a synchronous function both handlers call, beside the login budget it copies:
   subject the same exact account identity (never the address — the sentinel
   has no id, and an address subject would give a rotating caller fresh log
   allowance). The JSON route's 5/min slowapi limit stays, in addition.
+- **The refusal records an actor captured *before* the rollback (#332).** The
+  rollback that releases the cap's row lock expires the acting `User`, which
+  was loaded through the same request session; reading `user.id` after it is a
+  lazy load — `MissingGreenlet`, so the refusal became a 500 and the event was
+  never emitted. Both routes take `actor_snapshot(user)` first and hand that to
+  `_log_key_creation_throttled`. Do not move the snapshot below the rollback,
+  and do not "simplify" it back to passing `user`: the hermetic tests use a
+  `SimpleNamespace` that nothing can expire, so only
+  `tests/integration/test_issue_332_rollback_expiry_pg.py` (and the expiring
+  stand-in in `tests/test_issue_332_refusal_after_rollback.py`) would notice.
 
 **The active-key cap bounds the stock, not the flow.** At 10/hour a non-admin
 could add 240 keys a day and thousands a month, each with its own bursts, which

@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import secrets
+from dataclasses import dataclass
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -157,6 +158,34 @@ def _actor(user) -> tuple[int | None, str | None]:
     carries the name and no id rather than inventing one.
     """
     return getattr(user, "id", None), getattr(user, "username", None)
+
+
+@dataclass(frozen=True)
+class ActorSnapshot:
+    """The acting user's identity as plain values, read **before** a rollback.
+
+    `AsyncSession.rollback()` expires every persistent instance in the
+    session, and the panel's acting `User` is loaded through the request's own
+    session — so after a rollback, `user.id` is not an attribute read but a
+    lazy load, which under asyncio raises `MissingGreenlet` and turns a refusal
+    into a 500 (#332). A refusal branch that rolls back and then records who
+    acted takes this snapshot first and hands *it* to the recorder. It carries
+    the attributes `_actor`, `api_keys.account_subject` and the panel's admin
+    checks read, so it is a drop-in for the user on those paths.
+    """
+
+    id: int | None
+    username: str | None
+    is_admin: bool
+
+
+def actor_snapshot(user) -> ActorSnapshot:
+    """Capture `ActorSnapshot` from a `User` or the single-user sentinel."""
+    return ActorSnapshot(
+        id=getattr(user, "id", None),
+        username=getattr(user, "username", None),
+        is_admin=bool(getattr(user, "is_admin", False)),
+    )
 
 
 def _reembed_serializer() -> URLSafeTimedSerializer:
@@ -646,11 +675,12 @@ async def change_password(
 
     if not verify_password(current_password, fresh.password_hash, user_id=fresh.id):
         await session.rollback()
+        # `actor_id`, not `fresh.id`: the rollback expired `fresh` (#332).
         return _refuse_password_change(
             request,
             CREDENTIAL_REFUSAL,
             reason="wrong_current_password",
-            user_id=fresh.id,
+            user_id=actor_id,
         )
 
     if verify_password(new_password, fresh.password_hash, user_id=fresh.id):
@@ -662,7 +692,7 @@ async def change_password(
             request,
             CREDENTIAL_REFUSAL,
             reason="same_as_current",
-            user_id=fresh.id,
+            user_id=actor_id,
         )
 
     fresh.password_hash = hash_password(new_password)
@@ -1217,9 +1247,11 @@ async def create_key_form(
         session, user, security_events.client_ip(request)
     )
     if admission is not None:
+        # Before the rollback, which expires `user` (#332).
+        actor = actor_snapshot(user)
         await session.rollback()
         if isinstance(admission, KeyCreationRefusal):
-            _log_key_creation_throttled(request, user, admission)
+            _log_key_creation_throttled(request, actor, admission)
             _flash_key_error(request, key_creation_throttled_message(admission))
         else:
             _flash_key_error(request, admission.message)
@@ -2353,14 +2385,28 @@ async def _health_strip_or_degraded(session: AsyncSession, user) -> dict:
     `InFailedSQLTransaction` instead of the original error. It runs first, so
     the render that follows has a usable session.
 
+    **The rollback expires the acting user, so it is re-loaded (#332).** The
+    dashboard's `User` was loaded through this same session, and a rollback
+    expires every persistent instance in it; the caller's very next step is
+    `_panel_context(request, user)`, whose `user.is_admin` would then be a lazy
+    load — `MissingGreenlet` under asyncio, a 500 on exactly the page this
+    boundary exists to save. So the identity this function records is captured
+    before the rollback, and a real `User` is refreshed after it (one primary-
+    key read on a session the rollback has just made usable again). A refresh
+    that fails too is recorded and left: the database is then down, not merely
+    two tables, and nothing here can render around that.
+
     The failure is logged at ERROR, which means the ring buffer catches it and
     the health page shows an operator *why* their strip is missing.
     """
+    actor = actor_snapshot(user)
     try:
         return await _health_strip(session, user)
     except Exception as exc:  # noqa: BLE001 - the strip must never take the page down
         try:
             await session.rollback()
+            if isinstance(user, User):
+                await session.refresh(user)
         except Exception as rollback_exc:  # noqa: BLE001 - best effort; the render is what matters
             # Same event as the read failure below (D18's table names both):
             # they are two ways for the same feature to be unavailable, and an
@@ -2369,14 +2415,14 @@ async def _health_strip_or_degraded(session: AsyncSession, user) -> dict:
             security_events.emit(
                 "panel_health_strip_failed",
                 level=logging.ERROR,
-                subject=security_events.subject_for(user_id=getattr(user, "id", None)),
+                subject=security_events.subject_for(user_id=actor.id),
                 exc_info=True,
                 error_type=type(rollback_exc).__name__,
             )
         security_events.emit(
             "panel_health_strip_failed",
             level=logging.ERROR,
-            subject=security_events.subject_for(user_id=getattr(user, "id", None)),
+            subject=security_events.subject_for(user_id=actor.id),
             exc_info=True,
             error_type=type(exc).__name__,
         )
@@ -2390,8 +2436,8 @@ async def _health_strip_or_degraded(session: AsyncSession, user) -> dict:
         # strip is gone; this is not.
         return {
             "unavailable": True,
-            "show_ops": _is_admin(user),
-            "quarantine": _quarantine_view(_is_admin(user)),
+            "show_ops": actor.is_admin,
+            "quarantine": _quarantine_view(actor.is_admin),
         }
 
 
