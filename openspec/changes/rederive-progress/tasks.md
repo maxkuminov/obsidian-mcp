@@ -20,7 +20,8 @@
 - [ ] 3.5 Invariant re-read (D6): after 3.4 and before the NOWAIT stamp, re-read the scope's rows in the transaction and count rows whose `derived_under` ≠ their expected digest; stamp iff withholding empty and count zero, else `REDERIVE_INCOMPLETE`; log the count and (when withholding is empty) the first `SKIP_REPORT_LIMIT` such paths
 - [ ] 3.6 `IndexPassResult.rederive_pending: int` (0 when recorded or not a re-derive); the incomplete WARNING includes it
 - [ ] 3.7 `_reconcile_provenance` / `_index_vault_pinned`: the re-derive branch already returns `facts`; thread them to the scan and attempt. Move `clear_sweep_state(user_id)` to after a committed re-derive that upserted, moved or deleted at least one row (D8)
-- [ ] 3.8 Grep-check: no writer outside `_index_vault_attempt` sets `derived_under` to a non-NULL value (`move_note`, link backfill, tsvector rebuild, embed pass, panel resets, the setup adoption UPDATE are untouched); add an AST/grep test pinning that
+- [ ] 3.8 Clearing writers (design D3 table): `move_note`'s metadata transaction NULLs the moved row, every `source_note_id` whose `note_links` row its `target_path` UPDATE changes, and every planned backlink-rewrite source; the pass's `move_tp_sql` rewrite NULLs every source whose rows it changes; the link backfill NULLs every note whose links it writes
+- [ ] 3.9 Grep-check every `notes_metadata` / `note_links` write outside the attempt's upsert against the D3 table; a test pins that only the pass's tail writes a non-NULL `derived_under`
 
 ## 4. Unit tests (offline)
 
@@ -33,12 +34,14 @@
 
 Run with `make test-integration SCHEMA_TEST_CONTAINER=omcp-schema-w2b SCHEMA_TEST_PORT=55443`.
 
-- [ ] 5.1 The #311 reproduction: a scope in re-derive (no record) with N notes and one row-backed unreadable file (chmod 000); pass 1 commits incomplete and marks N−1 rows; pass 2 upserts zero rows, rewrites no keyword vector and no link rows (assert `indexed_at`, `note_links` ids unchanged) and is still incomplete; `rederive_incomplete` reaches the threshold and `/health` reports `degraded`
+- [ ] 5.1 The #311 reproduction: a scope in re-derive (no record) with N notes and one row-backed unreadable file — the read failure injected through the established `read_note_at` monkeypatch seam, not `chmod 000` (root ignores it); pass 1 commits incomplete and marks N−1 rows; pass 2 upserts zero rows and rewrites no keyword vector and no link rows — asserted by every resolved `notes_metadata` row's `xmin` (and every `note_links` row's `xmin`) being unchanged across pass 2, not by `indexed_at` — and is still incomplete; `rederive_incomplete` reaches the threshold and `/health` reports `degraded`
 - [ ] 5.2 File becomes readable → recorded, keep next tick, counter reset; file deleted instead → pruned and recorded
 - [ ] 5.3 Restart: clear the in-process backstop/quarantine state between passes; the next pass reads every file and upserts only unresolved rows
 - [ ] 5.4 A→B→A by `users.vault_path` edits that produce re-derive verdicts at each step (one fact changed): rows rewritten under B are forced under A; untouched A-marked rows are not
 - [ ] 5.5 Handle-mismatch re-derive marks nothing current from the previous handle
-- [ ] 5.6 `move_note` on a current row → not current → re-marked next pass; external rename → move-paired and marked in the same pass
+- [ ] 5.6 `move_note` on a current row → not current → re-marked next pass; external rename → move-paired and marked in the same pass, its backlink sources NULLed
+- [ ] 5.6a Codex r1 failing input: unresolved scope, S marked under A; reassign B (re-derive verdict); `move_note(T.md, U.md)` before B's pass rewrites S; reassign A; assert S is not current, and that when A records, S's `note_links.target_path` is `T…` as A's bytes name it
+- [ ] 5.6b Link backfill on a marked row NULLs it
 - [ ] 5.7 Link/keyword skip leaves the row NULL and withholds; a forced `PoisonNote` restart leaves no marker from the rolled-back attempt
 - [ ] 5.8 Completion re-resolution: the bare-name link to a protected-then-pruned row resolves to the remaining candidate after recording (spec scenario)
 - [ ] 5.9 Walk-failure narrowing: unlistable dir over current rows records; over a NULL row withholds

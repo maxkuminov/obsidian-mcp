@@ -215,7 +215,7 @@ When a file is re-read and its hash is unchanged but its stat differs from the r
 
 The marker SHALL be set to a non-NULL value only by a re-deriving pass, in the same transaction as the derived state it describes, and only for a row that pass fully derived from bytes it read under the pinned root: upserted or move-repaired, with its keyword vector written and its links extracted without a skip. Every upsert and id-preserving move written by the index pass SHALL set the marker NULL unless that same transaction then marks the row; a keep-mode or single-user pass SHALL NOT write a non-NULL marker. A row that the pass failed to fully derive SHALL be left NULL. The marker SHALL be compared only inside a re-deriving pass, and a mismatch, NULL included, SHALL mean "not derived under the current root".
 
-Writers outside the index pass (`move_note`, the link backfill, the keyword-vector rebuild, the embedding pass, the panel's resets) SHALL NOT write a non-NULL marker. They are not required to clear it: a change to a row's path, content hash or extraction version invalidates its marker by the binding, and these writers' other outputs are functions of hash-verified bytes and configuration, except link resolution, which the recording pass recomputes.
+Writers outside the index pass (`move_note`, the link backfill, the keyword-vector rebuild, the embedding pass, the panel's resets) SHALL NOT write a non-NULL marker. Any writer — inside or outside the pass — that changes a row's derived state, or the extracted state of that row's `note_links` rows (`target_path`, `link_text`, `kind`, `position`, or the row set), other than as part of that row's own full derivation by a re-deriving pass, SHALL set that row's marker NULL in the same transaction. In particular `move_note` SHALL clear it for the moved row, for every source note whose link rows its `target_path` rewrite changes, and for every backlink source it plans to rewrite; the pass's id-preserving move SHALL clear it for every source note whose link rows its `target_path` rewrite changes; and the link backfill SHALL clear it for every note whose link rows it writes. Writes of `target_note_id` alone need not clear it, because the recording pass re-resolves every link target; writers whose outputs are functions of hash-verified bytes and configuration alone (the keyword-vector rebuild, the embedding pass) need not clear it either.
 
 Migration 030 SHALL add the column as `varchar(64) NULL` with no default, no index and a comment marker shared with the ORM; it SHALL backfill nothing, so every existing row reads "not derived under the current root"; it SHALL reconcile or refuse a pre-existing same-named column on a re-run, and its downgrade SHALL drop only a marked column. `alembic check` SHALL report no new upgrade operations after it.
 
@@ -240,10 +240,21 @@ Migration 030 SHALL add the column as `varchar(64) NULL` with no default, no ind
 - **WHEN** a row was marked under root facts F by an incomplete re-derive, a later keep-mode pass upserts that row, and a still later re-derive observes F again
 - **THEN** that row SHALL NOT be derived under the current root
 
-#### Scenario: move_note invalidates the marker without writing it
+#### Scenario: move_note clears the moved row's marker
 
 - **WHEN** `move_note` moves a note whose row is derived under the current root, and the next pass re-derives with the same facts
 - **THEN** the moved row SHALL NOT be derived under the current root, and that pass SHALL read the file at its new path and mark the row
+
+#### Scenario: move_note clears the markers of the sources whose links it rewrites
+
+- **WHEN** an unresolved scope marks source note S under root A by an incomplete re-derive, the user is reassigned to root B (re-derive), `move_note` moves the note S links to while S's row still carries A's marker, and the user is reassigned back to A (re-derive)
+- **THEN** S SHALL NOT be derived under the current root under A
+- **AND** before any pass records provenance A, S's link rows SHALL have been re-extracted from S's file under A, so their `target_path` is the one A's bytes name
+
+#### Scenario: The link backfill clears the markers of the notes it writes
+
+- **WHEN** the link backfill writes link rows for a note whose row carries a marker
+- **THEN** that row's marker SHALL be NULL in the same transaction
 
 #### Scenario: An external rename is re-marked from the bytes read
 

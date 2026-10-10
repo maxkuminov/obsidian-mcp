@@ -121,21 +121,40 @@ derived_under = sha256(json.dumps(
 - The stat refresh, the grammar invalidation, the embedding writes and the
   prune do not touch it.
 
-**Outside the pass** — `move_note`, the link backfill, the tsvector rebuild,
-the embed pass, panel resets — nothing changes, and this is the point of the
-binding. A marker is valid only for the `(file_path, content_hash,
-extraction_version)` it was computed with. Every writer that changes what a
-row was derived *from* changes one of those (move_note changes the path; any
-content rewrite changes the hash; a grammar bump changes the version), so its
-marker stops matching without the writer knowing the column exists. The
-writers that change none of them (link backfill, tsvector rebuild, embed pass)
-write values that are functions of bytes whose hash they verify plus
-configuration — identical whichever root presented those bytes — except link
-**resolution**, which D7 recomputes at completion. The same binding protects
-against a previous build (deploy overlap, or an image rollback without
-`alembic downgrade`) rewriting a marked row without maintaining the column: a
-rewrite with different content or path invalidates the marker; one with the
-same path and bytes wrote the same derived values.
+**Rule for every other writer** (Codex spec review r1, MAJOR). A marker is
+valid only for the `(file_path, content_hash, extraction_version)` it was
+computed with, so a writer that changes one of those invalidates it without
+knowing the column exists. But some writers change a row's **root-dependent
+extracted link state without changing any bound field**, and the binding does
+not see them. The failing input: an unresolved scope marks source S under
+root A; the user is reassigned to B; `move_note(T.md, U.md)` rewrites every
+`note_links.target_path = 'T.md'` row — S's included — to `U.md`; reassigned
+back to A, S's marker still matches, S is not re-extracted, and D7 can only
+re-resolve the already-mutated `U.md`, never recover `T.md` from A's bytes.
+Provenance A would be stamped over B-era graph state. So:
+
+> Any writer that changes a row's derived state, or the extracted state of
+> its link rows (`target_path`, `link_text`, `kind`, `position`, the row set
+> itself), outside that row's own full derivation by a re-deriving pass,
+> SHALL set that row's `derived_under` to NULL in the same transaction.
+
+Applied to every such writer (found by grepping every `notes_metadata` /
+`note_links` write outside the attempt's upsert):
+
+| Writer | Rows cleared |
+| --- | --- |
+| `move_note` metadata transaction | the moved row; every `source_note_id` whose `note_links` row the `target_path` UPDATE changes; every backlink source in the call's planned rewrites (their files are about to change — the hash check would catch them, the clear makes it unconditional) |
+| the pass's id-preserving move `target_path` rewrite (`move_tp_sql`) | every `source_note_id` whose rows it changes (the moved row itself is NULLed by the move UPDATE; D3 above). Sources in the pass's fully-derived set are re-marked by the tail as usual; others are re-derived by the next re-deriving pass |
+| link backfill (`link_backfill_pass`) | every note whose link rows it deletes and inserts. Clearing was chosen over hash-certifying its input: the backfill reads bodies without comparing them with `content_hash`, it runs only on a keep verdict, and a clear costs at most one forced re-derivation of the row if a re-derive ever follows |
+| dangling re-resolution, D7 re-resolution | none: they write only `target_note_id`, which D7 recomputes at completion |
+| tsvector rebuild, embed pass, panel resets, stat refresh, grammar invalidation | none: they write values that are functions of hash-verified bytes plus configuration (or no derived state at all) |
+| setup-time adoption (`user_id NULL → uid`) | none needed: single-user rows always carry NULL |
+
+The binding still covers what it covers: a previous build (deploy overlap, or
+an image rollback without `alembic downgrade`) that rewrites a marked row with
+different content or path invalidates its marker; one with the same path and
+bytes wrote the same derived values. A previous build's `target_path` rewrite
+on a move is **not** covered — that is inside L2.
 
 ## D4 — Per-row force and change detection
 
@@ -283,9 +302,13 @@ they rewrite, so only untouched A-derived rows stay A-marked.
 
 **External move/rename of a current row.** The new path is new (not in the
 locked rows), so it is upserted or move-paired from bytes read this pass; the
-move UPDATE sets NULL and the tail marks the new path. **`move_note`** changes
-`file_path`, so the bound digest mismatches: the row is not current and the
-next re-derive pass re-derives it (one read). **Move of a not-current row**
+move UPDATE sets NULL and the tail marks the new path; backlink sources whose
+`target_path` the move rewrote are NULLed and re-derived. **`move_note`**
+NULLs the moved row and every source whose link rows it mutates or whose file
+it plans to rewrite: each is not current and the next re-derive pass
+re-derives it (one read each). **A→B→A with `move_note` under B** is the
+review's failing input: S's A marker is cleared by the move, so A re-extracts
+S's link from A's bytes before it can stamp. **Move of a not-current row**
 (file moved, unreadable at neither end): same-hash pairing rewrites it from
 the new path's bytes and marks it; unreadable at the new path: the old path is
 pruned, the new path is a row-less read skip → no withholding.
@@ -335,14 +358,14 @@ as today.
   assignment back to the recorded root): already a keep verdict, unchanged.
 - Read amplification from the backstop on a persistently unreadable file.
 
-## Open questions (owner)
+## Owner decisions (2026-10-10)
 
-1. Should `/health` expose a pending-row count per degraded re-derive? Proposed
+1. Should `/health` expose a pending-row count per degraded re-derive? Decided
    **no** (counts only, but it is one more field for a rare state; the log and
    `IndexPassResult` carry it).
 2. The walk-failure narrowing (D5) lets a re-derive **record** while a
    directory is unlistable, provided every row beneath it is current;
-   `walk_incomplete` still reports `degraded`. Proposed **yes** — the record
+   `walk_incomplete` still reports `degraded`. Decided **yes** — the record
    is about foreign rows, and #309 already reports the unlisted directory.
 
 ## Noticed, not in scope

@@ -93,7 +93,8 @@ No new setting.
   head literal and 030 cases.
 - Docs: `docs/architecture/indexing-and-embeddings.md`,
   `docs/architecture/schema-and-migrations.md`, CLAUDE.md's indexer decisions.
-- Not touched: `move_note` and every other writer outside the pass (the digest
-  binding invalidates the marker when they change path or content — see
-  design D3), `/health` shape, usage logging, rate limits, OAuth, transfer,
+- `src/mcp_server/tools.py` (`move_note`'s metadata transaction) and the
+  link backfill: clear `derived_under` on every row whose link state they
+  mutate without changing its path, hash or extraction version (design D3).
+- Not touched: `/health` shape, usage logging, rate limits, OAuth, transfer,
   panel.
