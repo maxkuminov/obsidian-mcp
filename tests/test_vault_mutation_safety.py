@@ -309,11 +309,12 @@ async def test_move_end_to_end_scopes_null_owner_and_rewrites_unindexed_self_lin
     assert (offline / "new" / "target.md").read_text() == "Self: [[new/target]]"
     sql = [str(statement.compile()) for statement in statements]
     # metadata index, backlinks, the #150 stale-extraction guard, metadata
-    # update, link update.
-    assert len(sql) == 5
+    # update, the re-derive-marker clear (#311, D3), link update.
+    assert len(sql) == 6
     assert all("notes_metadata.user_id IS NULL" in query for query in sql)
     assert "extraction_version" in sql[2]
-    assert "source_note_id IN" in sql[4]
+    assert "derived_under" in sql[3] and "derived_under" in sql[4]
+    assert "source_note_id IN" in sql[5]
 
 
 def test_bounded_read_uses_open_inode_when_path_is_swapped(offline, monkeypatch):

@@ -22,6 +22,7 @@ from sqlalchemy import (
     delete,
     func,
     literal,
+    null,
     or_,
     select,
     text,
@@ -2088,11 +2089,17 @@ def _row_stat(row) -> StatTuple | None:
 
 @dataclass(frozen=True)
 class SnapshotRow:
-    """One owner-scoped `notes_metadata` row, as C4 compares it."""
+    """One owner-scoped `notes_metadata` row, as C4 compares it.
+
+    `derived_under` is the re-derive progress marker (#311): part of the C4
+    comparison, so a row whose marker moved between the snapshot and the lock
+    is re-processed under the lock.
+    """
 
     content_hash: str
     extraction_version: int
     stat: StatTuple | None
+    derived_under: str | None = None
 
     @classmethod
     def of(cls, row) -> "SnapshotRow":
@@ -2100,7 +2107,71 @@ class SnapshotRow:
             content_hash=row.content_hash,
             extraction_version=row.extraction_version,
             stat=_row_stat(row),
+            derived_under=getattr(row, "derived_under", None),
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Re-derive progress (#311, migration 030)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# A re-derive used to be stateless: every re-deriving pass forced every file
+# into `to_upsert`, so one row-backed unreadable file made every tick a
+# full-scope rewrite. `notes_metadata.derived_under` records, per row, that a
+# re-deriving pass whose pinned root presented `facts` fully derived it — and
+# the digest binds the row's own path, content hash and extraction version, so
+# any writer that changes what the row was derived *from* invalidates it
+# without knowing the column exists. Writers that change a row's link rows'
+# extracted state without changing those fields (`move_note`'s and the move
+# branch's `target_path` rewrite, the link backfill) clear it explicitly.
+# Only `_index_vault_attempt`'s tail writes it non-NULL.
+
+#: The digest's version tag. Changing the definition means changing this, and
+#: every existing marker then reads "not derived" — the safe direction.
+DERIVED_UNDER_VERSION = "derived-under-v1"
+
+
+def derived_under_digest(
+    facts: "RootFacts",
+    file_path: str,
+    content_hash: str,
+    extraction_version: int,
+) -> str:
+    """The `derived_under` value for a row derived under `facts`.
+
+    The three facts are the provenance stamp's own triple, compared **exactly**
+    (a NULL handle is a value): unlike `classify_provenance`, which tolerates a
+    handle absent on one side, a marker is consulted only inside a re-derive,
+    and a handle-mismatch re-derive must not find the replaced directory's
+    rows current. `ensure_ascii` makes the encoding total over
+    surrogate-escaped strings.
+    """
+    payload = json.dumps(
+        [
+            DERIVED_UNDER_VERSION,
+            facts.assignment,
+            facts.realpath_hex,
+            facts.handle,
+            file_path,
+            content_hash,
+            int(extraction_version),
+        ],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("ascii")).hexdigest()
+
+
+def _row_is_current(
+    facts: "RootFacts | None", rel: str, row: "SnapshotRow | None"
+) -> bool:
+    """Whether `row` (at `rel`) is derived under the root that presented
+    `facts`. False without facts, without a row, or on any mismatch."""
+    if facts is None or row is None or row.derived_under is None:
+        return False
+    return row.derived_under == derived_under_digest(
+        facts, rel, row.content_hash, row.extraction_version
+    )
 
 
 @dataclass
@@ -2174,11 +2245,15 @@ def _read_and_hash(
 
 
 def _needs_body(
-    rel: str, h: str, snapshot: dict[str, SnapshotRow], re_derive: bool
+    rel: str,
+    h: str,
+    snapshot: dict[str, SnapshotRow],
+    re_derive: bool,
+    facts: "RootFacts | None" = None,
 ) -> bool:
     row = snapshot.get(rel)
     return (
-        re_derive
+        (re_derive and not _row_is_current(facts, rel, row))
         or row is None
         or row.content_hash != h
         or row.extraction_version != CURRENT_EXTRACTION_VERSION
@@ -2192,6 +2267,7 @@ def _scan_vault(
     force_read: bool,
     re_derive: bool,
     stop: threading.Event,
+    facts: "RootFacts | None" = None,
 ) -> ScanResult:
     """Walk, stat, read and hash the pinned root. **Runs on a worker thread.**
 
@@ -2202,10 +2278,12 @@ def _scan_vault(
     pass waits for at most one file.
 
     A file is read unless **all** of these hold (D10's eligibility): the
-    shortcut is allowed (`force_read` is False — not a backstop pass, not a
-    re-derive, `INDEX_STAT_SHORTCUT` on), the snapshot has a row for the path
-    with a current extraction marker and a non-NULL stat, and the file's
-    current stat equals it in all four fields.
+    shortcut is allowed (`force_read` is False — not a backstop pass,
+    `INDEX_STAT_SHORTCUT` on), the snapshot has a row for the path with a
+    current extraction marker and a non-NULL stat, the file's current stat
+    equals it in all four fields, and — under a re-derive — the row is
+    derived under the root that presented `facts` (#311, D4). A re-derive
+    with no `facts` treats every row as not derived.
     """
     result = ScanResult()
     # Walk failures (a directory that could not be listed or opened) are
@@ -2237,6 +2315,7 @@ def _scan_vault(
                 and row is not None
                 and row.stat is not None
                 and row.extraction_version == CURRENT_EXTRACTION_VERSION
+                and (not re_derive or _row_is_current(facts, rel, row))
             ):
                 try:
                     current = _stat_tuple(_stat_follow(found.parent_fd, found.name))
@@ -2279,7 +2358,11 @@ def _scan_vault(
                 read=True,
                 size=st.st_size,
                 mtime=st.st_mtime,
-                raw=raw if _needs_body(rel, h, snapshot, re_derive) else None,
+                raw=(
+                    raw
+                    if _needs_body(rel, h, snapshot, re_derive, facts)
+                    else None
+                ),
             )
     result.skips.extend(walk_failures)
     result.unverified.extend(walk_failures)
@@ -2312,6 +2395,7 @@ async def _run_scan(
     *,
     force_read: bool,
     re_derive: bool,
+    facts: "RootFacts | None" = None,
 ) -> ScanResult:
     """`_scan_vault` in a worker thread, with stop-on-cancel.
 
@@ -2329,6 +2413,7 @@ async def _run_scan(
             force_read=force_read,
             re_derive=re_derive,
             stop=stop,
+            facts=facts,
         )
     )
     try:
@@ -2535,6 +2620,9 @@ class IndexPassResult(tuple):
       beneath them were protected from the prune; the run record names them
       and `walk_incomplete` counts the pass toward degradation.
     - `walk_protected`: how many locked rows that protection kept.
+    - `rederive_pending`: on a committed re-derive, how many surviving rows
+      are not derived under the current root (#311, D6); 0 when it recorded
+      or was not a re-derive.
     """
 
     rederive: str | None
@@ -2542,6 +2630,7 @@ class IndexPassResult(tuple):
     quarantined: tuple[str, ...]
     walk_failed: tuple[str, ...]
     walk_protected: int
+    rederive_pending: int
 
     def __new__(
         cls,
@@ -2553,8 +2642,10 @@ class IndexPassResult(tuple):
         quarantined: tuple[str, ...] = (),
         walk_failed: tuple[str, ...] = (),
         walk_protected: int = 0,
+        rederive_pending: int = 0,
     ):
         obj = super().__new__(cls, (notes_scanned, notes_indexed))
+        obj.rederive_pending = rederive_pending
         obj.rederive = rederive
         obj.not_indexable = not_indexable
         obj.quarantined = tuple(quarantined)
@@ -2733,6 +2824,7 @@ def _owner_scoped_rows_stmt(user_id: int | None, *, with_id: bool):
         NoteMetadata.stat_mtime_ns,
         NoteMetadata.stat_ctime_ns,
         NoteMetadata.stat_ino,
+        NoteMetadata.derived_under,
     ]
     if with_id:
         columns.insert(0, NoteMetadata.id)
@@ -2772,10 +2864,9 @@ async def _index_vault_pinned(
         re_derive, facts = await _reconcile_provenance(
             user_id, vault, root_fd, log_suffix
         )
-    if re_derive:
-        # A re-derive rewrites the scope's rows from a root whose identity
-        # moved; nothing a previous sweep established about them stands.
-        clear_sweep_state(user_id)
+    # A re-derive's sweep-state reset happens after its attempt commits, and
+    # only if it changed a row (#311, D8): a carried-forward row was swept (or
+    # not) after it was derived, and nothing about it changed since.
 
     # Anything the pass discovered but could not fully process, for the log.
     #
@@ -2834,16 +2925,24 @@ async def _index_vault_pinned(
     # C7: `index_pass_lock` (held by every caller) covers the walk too, so no
     # two passes of this process interleave. C8: the quarantine refusal ran in
     # `index_vault` before the root was even resolved.
-    force_read = backstop or re_derive or not settings.index_stat_shortcut
+    # Under a re-derive the shortcut is decided per row (#311, D4): a row
+    # already derived under this root is as trustworthy as in keep mode.
+    force_read = (
+        backstop
+        or not settings.index_stat_shortcut
+        or (re_derive and facts is None)
+    )
     scan = await _run_scan(
-        root_fd, snapshot, force_read=force_read, re_derive=re_derive
+        root_fd, snapshot, force_read=force_read, re_derive=re_derive,
+        facts=facts if re_derive else None,
     )
     skips.extend(scan.skips)
     # Backstop-blocking failures (D12). From the scan: walk failures and read
     # errors (`ScanResult.unverified`).
     unverified: list[str] = list(scan.unverified)
-    # D8: a directory the walk could not list withholds unconditionally.
-    withholding.extend(scan.walk_failures)
+    # D8 / #311 D5: a directory the walk could not list withholds only if a
+    # locked row at or beneath it is not derived under this root — decided
+    # in the attempt, against the locked rows.
     seen = scan.seen
     logger.info(
         f"Found {len(seen)} markdown files{log_suffix}: {scan.reads} read, "
@@ -3028,6 +3127,21 @@ async def _index_vault_attempt(
             {p for p in scan.walk_failed_prefixes if p != ""}
         )
         protected = _walk_protected(locked, walk_failed)
+
+        # #311: whether a locked row is derived under the root this re-derive
+        # pinned. Meaningless (and never consulted) outside a re-derive.
+        rederive_facts = facts if re_derive else None
+
+        def _current(rel: str) -> bool:
+            return _row_is_current(rederive_facts, rel, locked.get(rel))
+
+        # D8 narrowed by #311 D5: a directory the walk could not list
+        # withholds only if a locked row at or beneath it is not derived under
+        # this root — the only kind of row it could leave certified wrongly.
+        if re_derive and any(not _current(p) for p in protected):
+            withholding.extend(scan.walk_failures or [
+                f"{pref}/ (not listed)" for pref in walk_failed
+            ])
         if walk_failed:
             logger.warning(
                 "Walk incomplete%s: %d director(y/ies) could not be listed "
@@ -3049,7 +3163,7 @@ async def _index_vault_attempt(
         # locked rows have that path — a row-less unreadable file cannot hide
         # a foreign row.
         for rel, entry in scan.read_failures:
-            if rel in locked:
+            if rel in locked and not _current(rel):
                 withholding.append(entry)
 
         reprocessed = 0
@@ -3080,7 +3194,7 @@ async def _index_vault_attempt(
                 entry = f"{rel} ({e})"
                 skips.append(entry)
                 unverified.append(entry)
-                if rel in locked:
+                if rel in locked and not _current(rel):
                     withholding.append(entry)
                 scan.files.pop(rel, None)
                 scan.not_indexable.pop(rel, None)
@@ -3119,6 +3233,9 @@ async def _index_vault_attempt(
 
         # Determine changes
         to_upsert = []
+        # Paths selected for upsert whose keyword vector or links this pass did
+        # not write: never marked derived under the current root (#311, D3).
+        underived: set[str] = set()
         # Unchanged notes whose recorded stat is stale or absent (a `touch`, a
         # no-op save, `move_note`'s NULL, the first pass after 026): the bytes
         # hash as the row says, so nothing but the stat is written.
@@ -3155,8 +3272,11 @@ async def _index_vault_attempt(
             # regardless of its hash — which is also what makes every note
             # "changed" for the link rebuild below, and therefore what
             # deletes and re-extracts every one of this user's link rows.
+            # Since #311 (D4) only for a row not already derived under the
+            # current root: a row a previous re-deriving pass fully derived
+            # from this root gets ordinary change detection.
             if (
-                not re_derive
+                (not re_derive or _current(rel_path))
                 and not marker_stale
                 and rel_path in existing
                 and existing[rel_path] == h
@@ -3187,7 +3307,7 @@ async def _index_vault_attempt(
                     logger.warning(f"Failed to read {rel_path}: {e}")
                     entry = f"{rel_path} ({e})"
                     skips.append(entry)
-                    if rel_path in locked:
+                    if rel_path in locked and not _current(rel_path):
                         withholding.append(entry)
                     continue
                 h = found.content_hash
@@ -3224,7 +3344,7 @@ async def _index_vault_attempt(
                 entry = f"{rel_path} (parse: {e})"
                 skips.append(entry)
                 # Not upserted, so a row at the path survives unrewritten.
-                if rel_path in locked:
+                if rel_path in locked and not _current(rel_path):
                     withholding.append(entry)
                 continue
             path_to_content[rel_path] = content
@@ -3294,7 +3414,7 @@ async def _index_vault_attempt(
                 p,
                 log_suffix,
             )
-            if re_derive:
+            if re_derive and not _current(p):
                 # A deferred path has a locked row by construction.
                 entry = f"{p} (row changed mid-walk; deferred)"
                 skips.append(entry)
@@ -3377,6 +3497,8 @@ async def _index_vault_attempt(
                 "file_size = :size, modified_at = :mtime, indexed_at = now(), "
                 "extraction_version = :xver, "
                 "embedded_content_hash = NULL, "
+                # #311, D3: re-marked by a re-deriving pass's tail, if at all.
+                "derived_under = NULL, "
                 # The new path's stat (D10): the bytes this pass hashed for the
                 # new path are the bytes whose hash identified the move.
                 "stat_size = :stat_size, stat_mtime_ns = :stat_mtime_ns, "
@@ -3394,6 +3516,12 @@ async def _index_vault_attempt(
             # markdown links. Bare-name `[[noteName]]` references survive
             # untouched — their `target_note_id` is preserved via id reuse
             # and the stem doesn't change on a folder-only move.
+            move_clear_sql = (
+                "UPDATE notes_metadata SET derived_under = NULL "
+                "WHERE derived_under IS NOT NULL AND id IN ("
+                "SELECT source_note_id FROM note_links WHERE target_path = :old "
+                f"AND source_note_id IN (SELECT id FROM notes_metadata WHERE {user_clause}))"
+            )
             move_tp_sql = (
                 "UPDATE note_links SET target_path = :new "
                 "WHERE target_path = :old "
@@ -3426,6 +3554,10 @@ async def _index_vault_attempt(
                         tp_params: dict = {"new": n, "old": o}
                         if user_id is not None:
                             tp_params["uid"] = user_id
+                        # #311, D3: the rewrite changes the sources' extracted
+                        # link state without changing their path, hash or
+                        # extraction version, so their markers are cleared.
+                        await session.execute(text(move_clear_sql), tp_params)
                         await session.execute(text(move_tp_sql), tp_params)
 
                 # One savepoint per move (D3, site 1): a poison failure,
@@ -3506,6 +3638,10 @@ async def _index_vault_attempt(
                         "stat_ctime_ns": stmt.excluded.stat_ctime_ns,
                         "stat_ino": stmt.excluded.stat_ino,
                         "indexed_at": text("now()"),
+                        # #311, D3: a rewrite of the row's derived state is
+                        # not derived under any root until a re-deriving
+                        # pass's tail marks it, in this same transaction.
+                        "derived_under": null(),
                     },
                 )
                 return stmt
@@ -3628,6 +3764,7 @@ async def _index_vault_attempt(
                     entry = f"{path} (no buffered body for the keyword vector)"
                     skips.append(entry)
                     withholding.append(entry)  # in `to_upsert`: always (D8)
+                    underived.add(path)  # never marked (#311, D3)
                     continue
                 content = path_to_content[path]
                 params: dict = {"path": path, **tsv_params}
@@ -3719,6 +3856,7 @@ async def _index_vault_attempt(
                 path_to_content=path_to_content,
                 skips=link_skips,
                 poisoned=poisoned_links,
+                skipped_paths=underived,
             )
             if poisoned_links:
                 raise PoisonNote([
@@ -3727,6 +3865,61 @@ async def _index_vault_attempt(
                 ])
             skips.extend(link_skips)
             withholding.extend(link_skips)
+
+        # ── Re-derive progress (#311, D3) ─────────────────────────────────
+        # Mark every row this re-deriving pass fully derived — upserted or
+        # move-repaired, keyword vector and links written without a skip —
+        # after its last derived-state write, in this transaction. The UPDATE
+        # names the path, hash and extraction version the digest binds, so it
+        # can only ever mark the row state the digest describes.
+        rederive_pending = 0
+        invariant_contended = False
+        if re_derive and facts is not None:
+            entry_hash = {e["file_path"]: e["content_hash"] for e in to_upsert}
+            for new in moved_new_paths:
+                entry_hash[new] = upsert_hash[new]
+            marks = [
+                {
+                    "d": derived_under_digest(
+                        facts, path, h, CURRENT_EXTRACTION_VERSION
+                    ),
+                    "p": path,
+                    "h": h,
+                    "v": CURRENT_EXTRACTION_VERSION,
+                    "uid": user_id,
+                }
+                for path, h in sorted(entry_hash.items())
+                if path not in underived
+            ]
+            if marks:
+                await session.execute(
+                    text(
+                        "UPDATE notes_metadata SET derived_under = :d "
+                        "WHERE user_id = :uid AND file_path = :p "
+                        "AND content_hash = :h AND extraction_version = :v"
+                    ),
+                    marks,
+                )
+
+            # ── Completion re-resolution (#311, D7), then the invariant ─────
+            # Order matters (Codex implementation review r1): the re-read is
+            # the pass's last statement before the stamp, so "every surviving
+            # row is derived under this root" is checked after the last write
+            # and nothing of ours runs between the check and the stamp.
+            if not withholding:
+                await _reresolve_scope_links(session, user_id)
+            rederive_pending, pending_paths, invariant_contended = (
+                await _rederive_invariant(
+                    session, user_id, facts, lock=not withholding
+                )
+            )
+            if pending_paths and not withholding:
+                # A row left unmarked with no named skip: a writer this pass
+                # did not foresee, or a concurrent insert. Still incomplete.
+                withholding.extend(
+                    f"{p} (not derived under the current root)"
+                    for p in pending_paths
+                )
 
         # ── The tail stamp ────────────────────────────────────────────────
         # Written where the state it describes is established. On the re-derive
@@ -3742,16 +3935,28 @@ async def _index_vault_attempt(
         # pass repairs again: bounded, idempotent, and never a stamp over a
         # half-repaired index.
         rederive: str | None = None
-        if re_derive and facts is not None:
+        if re_derive and facts is not None and invariant_contended:
+            rederive = REDERIVE_UNRECORDED
+            logger.warning(
+                "Re-derive complete but not recorded%s: another transaction "
+                "holds a row of this scope, so the final invariant re-read "
+                "could not lock them without risking a deadlock. The repairs "
+                "are committed; the next pass will re-derive again and stamp "
+                "then.",
+                log_suffix,
+            )
+        elif re_derive and facts is not None:
             if withholding:
                 rederive = REDERIVE_INCOMPLETE
                 logger.warning(
                     "Re-derive incomplete%s: %d discovered path(s) were not "
                     "fully processed and could hide a row, so no provenance "
-                    "was recorded and the next pass will re-derive again. "
+                    "was recorded and the next pass will re-derive again; "
+                    "%d row(s) not yet derived under the current root. "
                     "Offenders: %s",
                     log_suffix,
                     len(withholding),
+                    rederive_pending,
                     _format_skips(withholding),
                 )
                 if len(skips) > len(withholding):
@@ -3840,6 +4045,11 @@ async def _index_vault_attempt(
         # (which would make the next scan incorrectly skip the note).
         await session.commit()
 
+    # #311, D8: a committed re-derive that changed a row forgets the clean
+    # exclusion sweep; one that changed nothing keeps it.
+    if re_derive and (to_upsert or moved_new_paths or deleted_paths):
+        clear_sweep_state(user_id)
+
     # The backstop's clock advances only on a full-hash pass that committed
     # **and read and hashed every discovered file's bytes** (D12). One that
     # aborted, was refused or cancelled never reaches this line; one that
@@ -3894,7 +4104,102 @@ async def _index_vault_attempt(
         quarantined=tuple(quarantined_now),
         walk_failed=tuple(walk_failed),
         walk_protected=len(protected),
+        rederive_pending=rederive_pending,
     )
+
+
+async def _rederive_invariant(session, user_id: int, facts, *, lock: bool):
+    """#311, D6: re-read the scope's rows and name those not derived under
+    the root that presented `facts`. `(count, sorted paths, contended)`.
+
+    With `lock` (the pass is about to stamp) the read takes `FOR SHARE
+    NOWAIT` on every row of the scope inside a savepoint, so no other
+    transaction can change a row between this read and the stamp that follows
+    it in this transaction: a `move_note` that clears a marker or rewrites a
+    source's links either committed before the read (and the read sees it) or
+    blocks until this transaction commits. **NOWAIT, for the tail stamp's
+    reason**: this transaction already holds row locks on every row it wrote,
+    and `move_note` may hold one row and want another of ours, so waiting
+    could close a deadlock cycle. A refused lock is `contended` — the stamp is
+    withheld (`REDERIVE_UNRECORDED`), nothing is lost, the next pass retries.
+    Without `lock` (an incomplete pass, for its report) the read is plain.
+    """
+    stmt = select(
+        NoteMetadata.file_path,
+        NoteMetadata.content_hash,
+        NoteMetadata.extraction_version,
+        NoteMetadata.derived_under,
+    ).where(NoteMetadata.user_id == user_id)
+    if lock:
+        try:
+            async with session.begin_nested():
+                rows = (
+                    await session.execute(
+                        stmt.with_for_update(read=True, nowait=True)
+                    )
+                ).fetchall()
+        except Exception as exc:
+            if _is_lock_not_available(exc):
+                return 0, [], True
+            raise
+    else:
+        rows = (await session.execute(stmt)).fetchall()
+    pending = sorted(
+        r.file_path
+        for r in rows
+        if r.derived_under
+        != derived_under_digest(
+            facts, r.file_path, r.content_hash, r.extraction_version
+        )
+    )
+    return len(pending), pending, False
+
+
+async def _reresolve_scope_links(session, user_id: int) -> int:
+    """Re-resolve every link row of `user_id`'s scope against its final rows.
+
+    #311, D7. A re-derive that carried rows forward resolved their links in an
+    earlier pass, against a row set that may have held rows since pruned; a
+    single complete re-derive would have resolved them against the final set.
+    Resolution is `resolve_target(target_path, source path, index)` — the
+    stored target is exactly what the extractor resolved, except at the
+    1,024-character storage cap, where it may be truncated and is left as is
+    (L3). Reads no file; writes `target_note_id` only where it differs.
+    Returns the number of rows changed.
+    """
+    rows = (
+        await session.execute(
+            select(NoteMetadata.file_path, NoteMetadata.id).where(
+                NoteMetadata.user_id == user_id
+            )
+        )
+    ).all()
+    vault_index = build_vault_index([(r.file_path, r.id) for r in rows])
+    links = (
+        await session.execute(
+            select(
+                NoteLink.id,
+                NoteLink.target_path,
+                NoteLink.target_note_id,
+                NoteMetadata.file_path,
+            )
+            .join(NoteMetadata, NoteLink.source_note_id == NoteMetadata.id)
+            .where(NoteMetadata.user_id == user_id)
+        )
+    ).all()
+    changes = []
+    for link in links:
+        if len(link.target_path) >= 1024:
+            continue
+        target = resolve_target(link.target_path, link.file_path, vault_index)
+        if target != link.target_note_id:
+            changes.append({"lid": link.id, "tid": target})
+    if changes:
+        await session.execute(
+            text("UPDATE note_links SET target_note_id = :tid WHERE id = :lid"),
+            changes,
+        )
+    return len(changes)
 
 
 async def _recheck_empty_prune(
@@ -3937,6 +4242,7 @@ async def _update_links_for_changed(
     path_to_content: dict[str, str] | None = None,
     skips: list[str] | None = None,
     poisoned: list[tuple[str, str]] | None = None,
+    skipped_paths: set[str] | None = None,
 ):
     """Re-extract and upsert links for the given changed paths.
 
@@ -4025,11 +4331,15 @@ async def _update_links_for_changed(
                         skips.append(
                             f"{path} (no index row for the link rebuild)"
                         )
+                    if skipped_paths is not None:
+                        skipped_paths.add(path)
                     continue
                 content = bodies.get(path)
                 if content is None:
                     if skips is not None:
                         skips.append(f"{path} (no buffered body for the link rebuild)")
+                    if skipped_paths is not None:
+                        skipped_paths.add(path)
                     continue
                 # Off the loop (#180, D3) and bounded (#203, D4). A thread only
                 # yields between `re` calls, never inside one, so this bounds
@@ -4333,6 +4643,17 @@ async def _link_backfill_pinned(
             note_ids = [r.id for r in rows]
             await session.execute(
                 delete(NoteLink).where(NoteLink.source_note_id.in_(note_ids))
+            )
+            # #311, D3: the backfill rewrites these notes' link rows from bodies
+            # it does not hash-certify, outside any re-derive, so none of them
+            # may stay marked derived under a root.
+            await session.execute(
+                update(NoteMetadata)
+                .where(
+                    NoteMetadata.id.in_(note_ids),
+                    NoteMetadata.derived_under.is_not(None),
+                )
+                .values(derived_under=None)
             )
             # Same two rules as the changed-path rebuild (#180/#203): bounded
             # extraction, dispatched off the event loop, and a buffer that

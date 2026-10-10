@@ -479,8 +479,9 @@ walk → the locked transaction. The constraints, and how each is kept:
   walk.** A path in `L` that the walk did not see and whose `L` row differs
   from `S` (including "absent from `S`" — e.g. a `move_note` that landed
   mid-walk) is **deferred**: not pruned, not paired as a move, left for the
-  next pass. Under a re-derive a deferral is appended to `skips`, so A.7a
-  withholds the stamp exactly as for any other unprocessed path. Today's pass
+  next pass. Under a re-derive a deferral of a row not derived under the
+  current root is appended to `skips`, so A.7a withholds the stamp exactly as
+  for any other unprocessed path (#311). Today's pass
   has the same race at a narrower width (the walk and `move_note` already
   interleave); this rule makes the wider window no worse.
 - **C6 — provenance and the FTS fingerprint.** `_reconcile_provenance` still
@@ -529,8 +530,9 @@ and `stat_ino` (signed 64-bit) — all NULL or all set (the CHECK).
   `t_start`, which is never trusted. The kernel's coarse clock lags
   `time.time_ns()` by at most a tick; the window absorbs it.
 - **Eligibility.** A path skips its read iff `INDEX_STAT_SHORTCUT` is on, the
-  pass is not a full-hash pass, not a re-derive, the row's extraction marker is
-  current, the row's stat is non-NULL, and all four fields equal. Otherwise it
+  pass is not a full-hash pass, not a re-derive (or, since #311, the row is
+  derived under the current root), the row's extraction marker is current, the
+  row's stat is non-NULL, and all four fields equal. Otherwise it
   is read and hashed exactly as before.
 - **Refresh.** When a read's hash equals the row's but the stat differs or is
   NULL (a `touch`, a no-op save, the first pass after 026), the pass writes the
@@ -727,10 +729,13 @@ below close the NUL route and two same-class routes a bug hunt found;
   skip on a row-less path, and every D7 path, do not withhold. The old
   rationale for withholding on *any* skip — "a re-derive parses and upserts a
   vault the pass already reads in full" — stopped being true with the stat
-  shortcut (#282): a re-derive forces every file into `to_upsert` with a
+  shortcut (#282): a re-derive forced every file into `to_upsert` with a
   keyword-vector UPDATE and a link rebuild, so one never-indexed unreadable
   file made a **full-scope rewrite every tick, for ever**, #308's write
-  amplification by a route the spec accepted. All skips are still logged; the
+  amplification by a route the spec accepted. (A row-*backed* unreadable file
+  still did, until [#311](#re-derive-progress-311) made re-derive progress
+  per row; the "has a row" test is now "has a row not derived under the
+  current root".) All skips are still logged; the
   withholding ones are named as the offenders. The pass reports what happened
   on its return value: `index_vault` returns an `IndexPassResult` — still the
   `(notes_scanned, notes_indexed)` two-tuple every caller unpacks — whose
@@ -893,6 +898,111 @@ runs were recorded clean.
 - **L1: a wrong but non-empty mount is not detected.** A different, smaller
   directory mounted in place of the vault still prunes the difference; catching
   it would need a share-of-index threshold, a heuristic the owner did not want.
+
+## Re-derive progress (#311)
+
+A re-derive used to be stateless: every re-deriving pass forced every file
+into `to_upsert` (no hash check, no stat shortcut), with a keyword-vector
+UPDATE and a link delete-and-re-extract, and only the scope-wide stamp
+recorded success. So one **row-backed** unreadable file — whose row may be the
+previous root's, which is why it rightly withholds the stamp — made every
+tick a full-scope rewrite until the file was readable again: #308's write
+amplification by a rarer route. #308's accounting made it visible
+(`rederive_incomplete`, `/health` `degraded`); it did not bound it.
+
+- **The marker** (migration 030). `notes_metadata.derived_under varchar(64)
+  NULL` holds `sha256(json(["derived-under-v1", assignment, realpath_hex,
+  handle, file_path, content_hash, extraction_version]))` —
+  `derived_under_digest`. The three facts are the provenance stamp's own
+  triple for the pinned root, compared **exactly** (a NULL handle is a value;
+  unlike `classify_provenance`'s handle tolerance, because a marker is only
+  consulted inside a re-derive and a handle-mismatch re-derive must not trust
+  the replaced directory's rows). A row is **current** — derived under the
+  current root — iff its marker equals the digest the pass computes for it.
+  NULL means "not derived".
+- **The binding.** Path, hash and extraction version are in the digest, so any
+  writer that changes what a row was derived *from* invalidates its marker
+  without knowing the column exists — a previous build during deploy overlap
+  or an image rollback included.
+- **Who writes it.** Only `_index_vault_attempt`'s tail writes it non-NULL, on
+  a re-derive, for the *fully derived* set — `to_upsert ∪ moved_new_paths`
+  minus every path with a keyword-vector or link-rebuild skip — after the link
+  rebuild, by an UPDATE predicated on the path, hash and version it hashed.
+  Every upsert and id-preserving move sets it NULL first, so a keep pass, a
+  single-user pass or a partial derivation leaves NULL. A test pins that no
+  other non-NULL write exists.
+- **Who clears it** (Codex spec review r1, MAJOR). A writer that changes a
+  row's link rows' *extracted* state without changing its path, hash or
+  version escapes the binding, so it clears explicitly: `move_note` (the moved
+  row, every source whose `note_links.target_path` it rewrites, every planned
+  backlink-rewrite source), the pass's own move branch (`move_clear_sql`, the
+  sources of the `target_path` rewrite) and the link backfill (every note it
+  writes links for — clearing was simpler than hash-certifying its input).
+  Without it: S marked under A, reassigned to B, `move_note(T.md, U.md)`
+  rewrites S's link to `U.md`, reassigned back to A — S's A marker still
+  matches and provenance A would be stamped over B-era graph state.
+  `target_note_id`-only writes (the dangling re-resolution) need no clear: the
+  recording pass re-resolves every target. The keyword-vector rebuild and the
+  embed pass write functions of hash-verified bytes plus configuration.
+- **Per-row force.** Under a re-derive, a current row gets the ordinary rules:
+  the stat shortcut (when not a full-hash pass) and hash comparison. Only
+  rows that are not current, new paths and changed files are read with their
+  body, parsed and upserted. `SnapshotRow` carries the marker, so C4
+  re-processes a row whose marker moved between the snapshot and the lock;
+  every decision uses the locked row.
+- **Withholding, narrowed to its rationale.** A skip withholds the stamp only
+  if it could leave a row **not derived under the current root**: a read, C4
+  re-read, raw-body or parse skip on a locked row that is not current; a
+  non-root unlisted directory with such a row at or beneath it (owner
+  decision 2026-10-10: a directory over current rows does not withhold, and
+  #309's `walk_incomplete` still reports it); a C5 deferral of such a row; and,
+  as before, every keyword-vector and link-rebuild skip.
+- **The invariant gates the stamp.** After its last write — the completion
+  re-resolution below included — and as the last statement before the stamp,
+  the pass re-reads the scope's rows *in its own transaction* and counts those
+  not current. When it is about to record, that read takes `FOR SHARE NOWAIT`
+  in a savepoint, so no writer (a `move_note` clearing a marker or rewriting a
+  source's links) can change a row between the check and the stamp; NOWAIT
+  for the tail stamp's reason — the pass holds row locks of its own, and
+  waiting could deadlock — so a row held elsewhere withholds the stamp as
+  `REDERIVE_UNRECORDED` (Codex implementation review r1);
+  it records only if `withholding` is empty **and** that count is zero. A row
+  left unmarked with no named skip (a writer not foreseen, a concurrent insert
+  seen under READ COMMITTED) still makes the pass incomplete, and the first
+  `SKIP_REPORT_LIMIT` such paths are named. The count is
+  `IndexPassResult.rederive_pending` and is in the incomplete WARNING; `/health`
+  is unchanged (owner decision: no pending-count field).
+- **Completion re-resolution** (`_reresolve_scope_links`, run before the
+  invariant re-read). A carried-forward
+  note's links were resolved in an earlier pass against a row set that may
+  have held rows since pruned (a protected row beneath a directory that became
+  listable). Before stamping, the pass re-resolves every link row's
+  `target_note_id` from its stored `target_path` and source path against the
+  final rows, reading no file — exactly what one complete re-derive would have
+  produced. A `target_path` at the 1,024-character storage cap may be
+  truncated and is left as is (L3).
+- **The exclusion sweep** is forgotten after a committed re-derive only if it
+  upserted, moved or deleted a row.
+- **Restart.** Markers persist; the first pass after a start is a full-hash
+  pass, so it reads everything and rewrites only what is unresolved or
+  changed.
+- **What a stuck scope costs per tick now**: the unresolved rows' re-read, the
+  invariant re-read, and — unchanged and pre-existing — a full-hash read of
+  the scope, because a persistently unreadable file keeps it due for the
+  backstop (D12). Reads, not writes. It stays `degraded`, as it should: a
+  possibly foreign row is still served.
+- **Accepted limitations.** L1 filesystem substitution behind identical facts
+  (the record's own non-goal). L2 a previous build writing from a *different*
+  root during deploy overlap (the binding covers path or content changes; a
+  previous build's `target_path` rewrite on a move is not covered). L3 link
+  targets at the storage cap are not re-resolved. L4 a handle that flickers
+  between unobtainable and obtainable costs one full re-derive. L5 a
+  permanently unreadable row-backed file keeps the scope incomplete and
+  `degraded`, and due for the backstop. L6 a reassignment A→B→A completed inside
+  one pass's final window, with a `move_note` confirmed under B whose metadata
+  transaction commits only after the A stamp, is not detected (one committing
+  before the final re-read NULLs a marker and withholds the stamp) — the stamp matches A, so no re-derive follows (triaged
+  implausible; no cross-writer lock protocol).
 
 ## Non-finite frontmatter numbers, and the one title rule (#154)
 
