@@ -8,7 +8,7 @@ Refs #310
 - **A lone surrogate** (`"\ud800"`) in any string. `json.dumps` writes the escape, and `jsonb` refuses an unpaired surrogate escape (class 22).
 - **A non-finite float** (`NaN`, `Infinity`, `-Infinity`). `json.dumps` writes the bare tokens, which are not JSON (class 22, `22P02`).
 
-All three can arrive over the wire. The Streamable HTTP transport parses the body with `json.loads`, which accepts lone surrogate escapes, NUL escapes and the bare `NaN` / `Infinity` tokens. `set_frontmatter(updates={"x": NaN})`, `edit_note(find="a\u0000b")` and `read_note(path="\ud800")` all reach `_tracked` with the value intact (checked against the pinned SDK while writing this proposal).
+All three can arrive over the wire. The Streamable HTTP transport parses the body with `json.loads`, which accepts lone surrogate escapes, NUL escapes and the bare `NaN` / `Infinity` tokens. `list_notes(frontmatter={"x": NaN})`, `keyword_search(query="a\u0000b")` and `read_note(path="\ud800")` all reach `_tracked` with the value intact (checked against the pinned SDK while writing this proposal).
 
 `write_usage_row` treats any non-FK insert failure as final, so the audit row is lost and `usage_log_failed` (`reason=initial`, `error_type=DataError`) is emitted. The tool call itself is unaffected. Two consequences:
 
@@ -28,7 +28,7 @@ The indexer had the same class of failure (#154 non-finite frontmatter, #308 NUL
   - lists the top-level `params` keys whose value it changed in a new marker key, `rendered_params`.
 
   It is total (it never raises) and iterative (no depth limit). It changes nothing in a value that has no unstorable content.
-- **A planned refusal row the database rejects as data is dropped, not requeued.** The insert path classifies its failure with the indexer's existing `poison_sqlstate`: SQLSTATE class 22, 54000, or a bare `UnicodeEncodeError`. `write_planned_row` acknowledges an *unstorable* failure instead of requeueing it, and emits one new security event, `usage_refusal_row_dropped`, which carries the `1 + suppressed` weight that will not be recorded. Every other failure is requeued exactly as today: writer-capacity refusal, connection loss, FK recovery failing for a non-data reason, or an exception. The coalescer's arithmetic becomes: Σ (1 + suppressed) over written rows + Σ `count` over `usage_refusal_row_dropped` events = refusals observed.
+- **A planned refusal row the database rejects as data is dropped, not requeued.** The insert path classifies its failure with the indexer's existing `poison_sqlstate`: SQLSTATE class 22, 54000, or a bare `UnicodeEncodeError`. `write_planned_row` acknowledges an *unstorable* failure instead of requeueing it, and emits one new security event, `usage_refusal_row_dropped`, which carries the `1 + suppressed` weight that will not be recorded. Every other failure is requeued exactly as today: writer-capacity refusal, connection loss, FK recovery failing for a non-data reason, or an exception. The exact Σ (1 + suppressed) arithmetic keeps holding for storable rows. A dropped row's weight is accounted for on a best-effort basis: one emission attempt that the log suppressor may withhold, and that does not name the principal or scope (design L3).
 - `write_usage_row` keeps its `bool` contract for every existing caller. A sibling, `write_usage_row_outcome`, returns `landed | failed | unstorable` for the coalescer.
 - **Docs**:
   - `docs/architecture/usage-attribution.md`: a new "What reaches `params` is rendered, not trusted" section.
@@ -66,7 +66,7 @@ None.
 ## Out of scope
 
 - Transfer `usage_logs` rows (`upload_file`, `download_file`). Their params come from a `transfer_tokens.path` that PostgreSQL already stored as `text`, plus an integer, so they cannot carry any of the three values (D3).
-- Bounding nested strings in `params`. `_truncate_params` truncates only top-level strings, and a nested `set_frontmatter(updates=…)` value is logged at full length. That is pre-existing and bounded by the argument caps and the request-body budget. This change neither widens nor fixes it.
+- Bounding nested strings in `params`. `_truncate_params` truncates only top-level strings, and a nested `frontmatter` filter value (`keyword_search`, `list_notes`, `get_recent`) is logged at full length. That is pre-existing and bounded by the argument caps and the request-body budget. This change neither widens nor fixes it.
 - Changing what `argument_not_encodable` refuses, or adding NUL to that screen. A NUL is a valid Unicode scalar and is a vault-tool question, not a logging one.
 - Sanitising any other JSONB column.
 - Persisting coalescer state.

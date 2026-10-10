@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Logged usage parameters SHALL be rendered into a storable form before the row is inserted
-Every `usage_logs` row written through `write_usage_row` SHALL have its `params` passed through one rendering function, exactly once per write, before the first insert attempt. The foreign-key-cleared retry SHALL reuse the rendered values. Rows written through `write_usage_row` are the tracked call's success and refusal rows, the body-exception row, and every coalesced `rate_limited` and `slot_timeout` row, immediate or deferred. The function SHALL be applied after every merge of server telemetry and concurrency observations, so that values `timing` recorded are covered as well as caller arguments.
+Every `usage_logs` row written through `write_usage_row` SHALL have its `params` passed through one rendering function, exactly once per write, before the first insert attempt; a row whose `params` key is absent or `None` SHALL be written with it absent or `None` respectively, unchanged. The foreign-key-cleared retry SHALL reuse the rendered values. Rows written through `write_usage_row` are the tracked call's success and refusal rows, the body-exception row, and every coalesced `rate_limited` and `slot_timeout` row, immediate or deferred. The function SHALL be applied after every merge of server telemetry and concurrency observations, so that values `timing` recorded are covered as well as caller arguments.
 
 A top-level `params` value SHALL be stored unchanged unless it contains, at any depth and in any key or value position, at least one of: a string containing U+0000, a string containing an unpaired surrogate code point, a non-finite float, or a value of a type JSON cannot represent. Such a value SHALL be *rendered*: every string inside it, keys included, SHALL be stored with this escape grammar and no other:
 - a backslash SHALL become two backslashes;
@@ -21,12 +21,12 @@ Transfer redemption rows (`upload_file`, `download_file`) are written outside `w
 - **THEN** a `usage_logs` row SHALL be written for the call, the stored argument SHALL spell the NUL as `\x00`, and `rendered_params` SHALL name that argument
 
 #### Scenario: A nested unstorable value is rendered in place
-- **WHEN** a `set_frontmatter` call's `updates` argument holds a NUL in a nested key, a lone surrogate in a nested value, and `NaN`, `Infinity` and `-Infinity` as nested numbers
-- **THEN** the row SHALL be written, with the key and value escaped by the grammar, the floats stored as `.nan`, `.inf` and `-.inf`, and `rendered_params` equal to `["updates"]`
+- **WHEN** a `list_notes` call's logged `frontmatter` argument holds a NUL in a nested key and `NaN`, `Infinity` and `-Infinity` as nested values
+- **THEN** the row SHALL be written, with the key escaped by the grammar, the floats stored as `.nan`, `.inf` and `-.inf`, and `rendered_params` equal to `["frontmatter"]`
 
 #### Scenario: The unencodable-argument refusal is itself recorded
-- **WHEN** a call is refused with `argument_not_encodable` because an argument holds an unpaired surrogate
-- **THEN** the refusal's `usage_logs` row SHALL be written carrying the `argument_not_encodable` marker, with the surrogate stored as `\udXXX` and the argument named in `rendered_params`
+- **WHEN** a call is refused with `argument_not_encodable` because an argument the tool **logs** (one of its declared logged parameter names) holds an unpaired surrogate
+- **THEN** the refusal's `usage_logs` row SHALL be written carrying the `argument_not_encodable` marker, with the surrogate stored as `\udXXX` and the argument named in `rendered_params`; an offending argument the tool does not log never enters `params`, and its row is written as before without it
 
 #### Scenario: The grammar distinguishes a rendered NUL from a literal escape
 - **WHEN** one rendered argument contains both U+0000 and the literal four characters `\x00`
@@ -35,6 +35,10 @@ Transfer redemption rows (`upload_file`, `download_file`) are written outside `w
 #### Scenario: A clean row is unchanged
 - **WHEN** a call's parameters contain no unstorable value
 - **THEN** the stored `params` SHALL be identical to what was stored before this requirement, and no `rendered_params` key SHALL be present
+
+#### Scenario: Absent and null params are preserved
+- **WHEN** a row is written with no `params` key, and another with `params` set to `None`
+- **THEN** the first SHALL be inserted without a `params` value supplied and the second with SQL `NULL`, neither becoming an empty object
 
 #### Scenario: Server telemetry is covered
 - **WHEN** a tool records a result path containing an unpaired surrogate in its telemetry
