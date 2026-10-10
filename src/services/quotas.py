@@ -487,7 +487,7 @@ def limit_value_error(value: int) -> str | None:
     if value < DAILY_REQUEST_LIMIT_MIN:
         return (
             f"Daily request limit must be at least {DAILY_REQUEST_LIMIT_MIN}. "
-            "Leave it empty for unlimited; to stop a key entirely, revoke it."
+            "To stop a key entirely, revoke it."
         )
     if value > DAILY_REQUEST_LIMIT_MAX:
         return (
@@ -498,13 +498,14 @@ def limit_value_error(value: int) -> str | None:
 
 
 def parse_limit_form_value(raw: str | None) -> tuple[int | None, str | None]:
-    """A form field to `(limit, error)`. Empty means unlimited, not zero.
+    """A form field to `(limit, error)`. Empty means "no value", not zero.
 
-    `("", None)` and `(None, None)` both mean "no limit" — an operator clearing
-    the box is clearing the limit, which is the documented way to return a key
-    to unlimited. A value that is not an integer is an error rather than a
-    silent clear, because silently discarding "1oo" would look exactly like
-    success.
+    `(None, None)` is "the field was blank". What a blank *means* is not this
+    function's decision: since #323 a blank create field gets the default and a
+    blank edit is an error (`src/services/api_keys.py`), and unlimited is only
+    ever an administrator's explicit request. A value that is not an integer is
+    an error rather than a silent blank, because silently discarding "1oo"
+    would look exactly like success.
     """
     if raw is None:
         return None, None
@@ -515,7 +516,7 @@ def parse_limit_form_value(raw: str | None) -> tuple[int | None, str | None]:
         value = int(text_value)
     except ValueError:
         return None, (
-            "Daily request limit must be a whole number, or empty for unlimited."
+            "Daily request limit must be a whole number."
         )
     error = limit_value_error(value)
     if error is not None:

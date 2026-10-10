@@ -20,7 +20,10 @@ properties that must survive every edit:
   which further principals share one overflow entry. The panel login budget is
   the third registry and the only **exactly** keyed one: its key space is the
   `users` table, so it gets a plain dict swept on access, and merging two keys
-  there would be a cross-account denial rather than a bound.
+  there would be a cross-account denial rather than a bound. The key-creation
+  budget (#323) is the same shape twice over: an exact account dict, and an
+  address dict charged only on admitted creations, so both are bounded by what
+  was admitted in the window.
 * **An entry is evictable only when it is full and idle.** A fresh entry starts
   full, so evicting a *depleted* one would hand back free capacity — idling
   through the sweep would be a way to reset a spent bucket. An entry holding an
@@ -231,6 +234,7 @@ def reset_state_for_tests() -> None:
     _address_salt = secrets.token_bytes(16)
     _address_table = []
     _login_failures.clear()
+    reset_key_creation_for_tests()
 
 
 # ── Configuration ───────────────────────────────────────────────────────────
@@ -877,3 +881,130 @@ def record_login_failure(user_id: int) -> None:
         _login_failures[user_id] = _LoginWindow(window_start=now, count=1)
         return
     entry.count += 1
+
+
+# ── The key-creation budget (#323) ──────────────────────────────────────────
+#
+# Both key-creation routes — `POST /api/keys` and `POST /admin/keys/create` —
+# charge this one budget, so a caller alternating JSON and form requests draws
+# on one allowance rather than two. slowapi cannot express that: it namespaces
+# its storage by the decorated endpoint, so the same decorator on two routes is
+# two buckets, and `shared_limit` charges every request reaching the decorator,
+# including the invalid ones this budget deliberately does not count.
+
+#: An account key: `("user", users.id)`, or `("single-user",)` for the
+#: sentinel, whose `id` is None. Exact, never hashed — see `_login_failures`.
+AccountKey = tuple
+
+#: Two exact dicts, swept on access. The account dict holds at most one entry
+#: per account charged in the window; the address dict is charged only on an
+#: **admitted** creation, so it holds at most one entry per admitted creation in
+#: the window — an attacker cannot grow it without a session and spent account
+#: allowance, which is why it needs no salted fixed-size table.
+_key_creation_accounts: dict[AccountKey, "_LoginWindow"] = {}
+_key_creation_addresses: dict[str | None, "_LoginWindow"] = {}
+
+KEY_CREATION_REASON_ACCOUNT = "account_budget"
+KEY_CREATION_REASON_ADDRESS = "address_budget"
+
+
+@dataclass(frozen=True)
+class KeyCreationRefusal:
+    """Why a key creation was refused, for the 429/flash and the log record.
+
+    `reason` names the refusing counter for the log only — the response names
+    the window, not the counter. When both counters refuse, `reason` is the
+    account's and `retry_after_seconds` is the later of the two windows' ends,
+    because a creation needs both to admit.
+    """
+
+    reason: str
+    limit: int
+    window_seconds: int
+    retry_after_seconds: int
+
+
+def reset_key_creation_for_tests() -> None:
+    """Forget the key-creation budget. Tests only."""
+    _key_creation_accounts.clear()
+    _key_creation_addresses.clear()
+
+
+def _sweep_key_creation(now: float, window: int) -> None:
+    """Drop every counter whose window has passed, in both dicts.
+
+    A full scan, as `_sweep_login_failures` does: both key spaces are bounded
+    by what was charged in the last window (see the dicts above), so the scan
+    is O(that) and the dicts provably cannot grow past it.
+    """
+    for registry in (_key_creation_accounts, _key_creation_addresses):
+        expired = [
+            key for key, entry in registry.items()
+            if now - entry.window_start >= window
+        ]
+        for key in expired:
+            del registry[key]
+
+
+def try_charge_key_creation(
+    account_key: AccountKey, address: str | None
+) -> KeyCreationRefusal | None:
+    """Admit and charge one key creation, or refuse it. `None` means admitted.
+
+    Called by both create handlers **after** validation, the unlimited rule and
+    the active-key cap, so a refused or invalid request never spends allowance.
+
+    Synchronous on purpose, like every update in this module: both counters are
+    checked, then both are charged, with no `await` between, so on the single
+    event loop the operation is atomic and concurrent creates cannot overshoot.
+    If either counter refuses, **neither** is charged.
+
+    `address` is the trusted client address (`request.client.host` after the
+    app's `ProxyHeadersMiddleware`). A request with none is keyed `None` — one
+    shared bucket, a bound rather than a bypass. Either limit set to null
+    disables that counter; both null disables the budget.
+    """
+    account_limit = settings.key_creation_account_limit
+    address_limit = settings.key_creation_address_limit
+    if account_limit is None and address_limit is None:
+        return None
+    window = settings.key_creation_window_seconds
+    address = address or None
+    now = time.monotonic()
+    _sweep_key_creation(now, window)
+
+    refusals: list[tuple[str, int, float]] = []
+    for reason, limit, registry, key in (
+        (KEY_CREATION_REASON_ACCOUNT, account_limit, _key_creation_accounts, account_key),
+        (KEY_CREATION_REASON_ADDRESS, address_limit, _key_creation_addresses, address),
+    ):
+        if limit is None:
+            continue
+        entry = registry.get(key)
+        if entry is not None and entry.count >= limit:
+            refusals.append((reason, limit, entry.window_start + window - now))
+    if refusals:
+        reason, limit, _ = refusals[0]
+        remaining = max(r[2] for r in refusals)
+        return KeyCreationRefusal(
+            reason=reason,
+            limit=limit,
+            window_seconds=window,
+            # Ceil, but never past the window: the spec bounds `Retry-After`
+            # by the remaining window, and a window that ends in 0.2 s is
+            # "try again in one second", not zero.
+            retry_after_seconds=min(window, max(1, math.ceil(remaining))),
+        )
+
+    for limit, registry, key in (
+        (account_limit, _key_creation_accounts, account_key),
+        (address_limit, _key_creation_addresses, address),
+    ):
+        if limit is None:
+            continue
+        entry = registry.get(key)
+        if entry is None:
+            registry[key] = _LoginWindow(window_start=now, count=1)
+        else:
+            entry.count += 1
+    return None

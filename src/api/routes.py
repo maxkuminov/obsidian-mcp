@@ -9,7 +9,9 @@ from src.auth.session import _SingleUserSentinel
 from src.config import settings
 from src.control_panel.routes import (
     _assert_key_owner,
+    _log_key_creation_throttled,
     _log_panel_forbidden,
+    key_creation_throttled_message,
     require_admin_panel,
     require_user_panel,
 )
@@ -24,7 +26,10 @@ from src.models.db import (
     User,
     UsageLog,
 )
+from src.services import api_keys as key_issuance
+from src.services import security_events
 from src.services.quotas import apply_daily_request_limit
+from src.services.rate_limits import KeyCreationRefusal
 
 router = APIRouter(prefix="/api", tags=["api"])
 router.dependencies.append(Depends(require_user_panel))
@@ -46,22 +51,22 @@ class CreateKeyRequest(BaseModel):
 
     **Omitted and explicit-null are different requests** (#194). An omitted
     `daily_request_limit` means "whatever the server considers sensible" and
-    the handler applies `DEFAULT_DAILY_REQUEST_LIMIT`; an explicit
-    `{"daily_request_limit": null}` still means *unlimited*, as it always has,
-    and is the only way to ask for one. The two are told apart by
-    `model_fields_set` — whether the field was present in the request — never
-    by the value's truthiness, because a `None` default cannot distinguish
-    them and a sentinel default would leak into the schema. Any explicit value
-    wins over the default outright.
+    the handler applies `DEFAULT_DAILY_REQUEST_LIMIT` (or refuses as required
+    when that is null, #323); an explicit `{"daily_request_limit": null}` is a
+    request for *unlimited* — the JSON equivalent of the panel's Unlimited box
+    — honoured for an administrator and refused with 403 for anyone else
+    (#323). The two are told apart by `model_fields_set` — whether the field
+    was present in the request — never by the value's truthiness, because a
+    `None` default cannot distinguish them and a sentinel default would leak
+    into the schema. Any explicit value wins over the default outright.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(..., min_length=1, max_length=255, pattern=r"^[\w\-. ]+$")
     permission: str = Field("read", pattern="^(read|readwrite)$")
-    # Null is unlimited, matching the column and the form's empty box; absent
-    # is "apply the configured default", resolved in the handler (see
-    # `_created_key_limit`). The bounds are the same ones
+    # Null asks for unlimited (admin-only); absent is "apply the configured
+    # default" — both resolved by `key_issuance.resolve_create_limit`. The bounds are the same ones
     # `ck_api_keys_daily_request_limit` enforces, restated here so a bad value
     # is a 422 naming the field rather than a 500 out of the database.
     daily_request_limit: int | None = Field(
@@ -71,6 +76,9 @@ class CreateKeyRequest(BaseModel):
 
 class SetKeyLimitRequest(BaseModel):
     """Set, change, or clear one key's daily limit. Explicit `null` clears it.
+
+    Clearing is an administrator's request only (#323): a non-admin's `null`
+    is a 403 recorded as `panel_forbidden` (`unlimited_requires_admin`).
 
     **The field is required-but-nullable, and the distinction is the point.**
     With a `None` *default* this model made `PUT {}` a success that silently
@@ -124,37 +132,6 @@ class KeyInfo(BaseModel):
     daily_request_limit: int | None
 
 
-def _created_key_limit(req: CreateKeyRequest) -> int | None:
-    """The `daily_request_limit` a newly created key receives.
-
-    Three inputs, three answers, and the middle one is the whole reason this is
-    a function rather than an `or`:
-
-    * the field was **omitted** — apply `DEFAULT_DAILY_REQUEST_LIMIT`;
-    * the field was sent as **null** — unlimited, exactly as before #194;
-    * the field carries a **value** — that value, whatever the default is.
-
-    `model_fields_set` is what separates the first two: it holds the names the
-    request actually carried, so an absent field and a null field are
-    distinguishable even though both read as `None`. An `or` against the
-    default would silently turn the documented "unlimited" request into a
-    limited key — the same silent substitution the panel's create handler
-    deliberately refuses to perform (D9).
-
-    **Applied here, in application code, never as a column default** (D9). A
-    `server_default` would reach every future insert path, would be a schema
-    change, and — the point — could not express "grandfather the rows that
-    already exist": keys created before this setting existed keep whatever they
-    carry, including NULL, with no migration and no backfill.
-
-    The setting is read per request rather than captured at import, so this
-    module never holds a stale copy of it.
-    """
-    if "daily_request_limit" in req.model_fields_set:
-        return req.daily_request_limit
-    return settings.default_daily_request_limit
-
-
 @router.post("/keys", response_model=CreateKeyResponse)
 @limiter.limit("5/minute")
 async def create_key(
@@ -163,8 +140,48 @@ async def create_key(
     session: AsyncSession = Depends(get_session),
     user: User | _SingleUserSentinel = Depends(require_user_panel),
 ):
+    """Create a key owned by the caller (#323 D3 for the order).
+
+    Nothing before the budget charges anything: validation (pydantic, then the
+    permission), the limit rule, the active-key cap under a `users` row lock,
+    then the key-creation budget shared with the panel form — so a JSON caller
+    and a form caller draw on one allowance — then the insert. The 5/min
+    per-address slowapi limit above stays as it was, in addition.
+    """
     if req.permission not in ("read", "readwrite"):
         raise HTTPException(400, "Permission must be 'read' or 'readwrite'")
+
+    # Omitted → default (or "required" when the default is null); explicit
+    # null → unlimited, admin-only; a value → that value. `model_fields_set`
+    # separates omitted from null, never truthiness (#194).
+    field_sent = "daily_request_limit" in req.model_fields_set
+    limit, refusal = key_issuance.resolve_create_limit(
+        user,
+        provided=field_sent and req.daily_request_limit is not None,
+        value=req.daily_request_limit,
+        unlimited=field_sent and req.daily_request_limit is None,
+    )
+    if refusal is not None:
+        if refusal.code == key_issuance.REFUSAL_FORBIDDEN_UNLIMITED:
+            _log_panel_forbidden(
+                request, key_issuance.FORBIDDEN_UNLIMITED_REASON, user, user.id
+            )
+            raise HTTPException(403, refusal.message)
+        raise HTTPException(400, refusal.message)
+
+    admission = await key_issuance.admit_key_creation(
+        session, user, security_events.client_ip(request)
+    )
+    if admission is not None:
+        await session.rollback()
+        if isinstance(admission, KeyCreationRefusal):
+            _log_key_creation_throttled(request, user, admission)
+            raise HTTPException(
+                429,
+                key_creation_throttled_message(admission),
+                headers={"Retry-After": str(admission.retry_after_seconds)},
+            )
+        raise HTTPException(409, admission.message)
 
     raw_key = f"omcp_{secrets.token_hex(32)}"
     key_prefix = raw_key[:12]
@@ -177,9 +194,9 @@ async def create_key(
         user_id=user.id,
         # Persisted, not dropped (#162). A create that accepted this field and
         # then ignored it handed the caller an unlimited key while reporting
-        # success. Omitted now means the configured default (#194); explicit
-        # null still means unlimited.
-        daily_request_limit=_created_key_limit(req),
+        # success. Omitted means the configured default (#194); explicit null
+        # is unlimited for an administrator only (#323).
+        daily_request_limit=limit,
     )
     session.add(api_key)
     await session.commit()
@@ -251,9 +268,22 @@ async def set_key_limit(
     api_key = result.scalar_one_or_none()
     _assert_key_owner(api_key, user, request=request)
 
-    counter_reset = await apply_daily_request_limit(
-        session, api_key, req.daily_request_limit
+    # Ownership first, then the limit rule: an explicit null is a clear, and
+    # only an administrator may clear a limit (#323).
+    limit, refusal = key_issuance.resolve_edit_limit(
+        user,
+        value=req.daily_request_limit,
+        unlimited=req.daily_request_limit is None,
     )
+    if refusal is not None:
+        if refusal.code == key_issuance.REFUSAL_FORBIDDEN_UNLIMITED:
+            _log_panel_forbidden(
+                request, key_issuance.FORBIDDEN_UNLIMITED_REASON, user, api_key.user_id
+            )
+            raise HTTPException(403, refusal.message)
+        raise HTTPException(400, refusal.message)
+
+    counter_reset = await apply_daily_request_limit(session, api_key, limit)
     return KeyLimitResponse(
         id=api_key.id,
         daily_request_limit=api_key.daily_request_limit,

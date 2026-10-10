@@ -1061,7 +1061,11 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `MCP_BODY_MEMORY_BUDGET_BYTES` | unset | The `/mcp` body-memory budget (≥ 64 MiB). Unset derives it from the container's memory limit — it never means off. Refused at startup above half the limit (less fixed headroom). |
 | `MCP_BODY_MEMORY_FRACTION` / `MCP_BODY_MEMORY_MULTIPLIER` | `0.5` / `8` | The derivation: limit × fraction ÷ multiplier = raw body bytes in flight. Fraction 0.1–0.5, multiplier 8–32. |
 | `MCP_BODY_BUDGET_WAIT_SECONDS` / `MCP_BODY_BUDGET_WAITERS` | `15` / `8` | How long a body that does not fit waits before its 429, and how many may wait at once. |
-| `DEFAULT_DAILY_REQUEST_LIMIT` | `5000` | Daily quota a **newly created** API key receives when the caller does not say otherwise. Existing keys are untouched; an explicit null (or a blank panel field) still means unlimited. |
+| `DEFAULT_DAILY_REQUEST_LIMIT` | `5000` | Daily quota a **newly created** API key receives when the caller names none (an omitted JSON field or a blank panel field). Existing keys are untouched. Only an administrator can create or restore an unlimited key, with the panel's Unlimited box or an explicit JSON `null`. Null makes a limit required on create. |
+| `KEY_CREATION_ACCOUNT_LIMIT` | `10` | API keys one account may create per window, across `POST /api/keys` and the panel form together. Null disables. |
+| `KEY_CREATION_ADDRESS_LIMIT` | `20` | API keys created from one client address per window, across both routes and all accounts. Null disables. |
+| `KEY_CREATION_WINDOW_SECONDS` | `3600` | The fixed window both key-creation limits are counted over. |
+| `KEY_MAX_ACTIVE_PER_ACCOUNT` | `25` | Active API keys a non-admin account may hold; beyond it, creation is refused until a key is revoked. Admins exempt. Null disables. |
 | `MCP_REJECT_UNKNOWN_ARGUMENTS` | `true` | Refuse a tool call carrying an argument the tool does not declare (a tool error naming it), and publish `additionalProperties: false` on every input schema. `false` restores the SDK's silent ignore — a rollback for a client that sends extras; change it and recreate the container. `false` logs a WARNING at each start. |
 | `MCP_SANDBOX_MODE` | `false` | Registry-eval only. Skips DB, indexer, embedding provider, and `/mcp` auth so introspection works without external deps. Do not enable in production. |
 
@@ -1408,9 +1412,15 @@ it, so the same link is still redeemable once the bucket refills.
   disable one by setting it empty, `null` or `none` (zero is refused at
   startup).
 - The daily quota is the durable ceiling and it is separate: keys created
-  from now on get `DEFAULT_DAILY_REQUEST_LIMIT` (5,000), keys that
-  already existed keep whatever they had, and OAuth grants have no daily
-  ceiling at all — velocity bounds only.
+  from now on get `DEFAULT_DAILY_REQUEST_LIMIT` (5,000) unless they name a
+  limit — a blank panel field gets the default too — and only an
+  administrator can make a key unlimited, explicitly. Keys that already
+  existed keep whatever they had, and OAuth grants have no daily ceiling at
+  all — velocity bounds only.
+- Every new key is a new principal with full bursts, so key creation has its
+  own budget: 10 keys per account and 20 per client address per hour, shared
+  by the JSON API and the panel form, and a non-admin account may hold at
+  most 25 active keys.
 
 The rationale lives in
 [`docs/architecture/rate-limits.md`](docs/architecture/rate-limits.md).

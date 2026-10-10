@@ -384,6 +384,24 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
         {"reason", "actor_user_id", "actor_username", "user_id", "route", "method"}
     ),
     "csrf_refused": frozenset({"route", "method", "user_id", "client_ip"}),
+    # The key-creation budget refused a create on either route (#323). The
+    # subject is the budget's own exact account identity — never the address,
+    # which in single-user mode would let a caller rotating addresses mint log
+    # allowance — so `client_ip` is a field only. `reason` names the refusing
+    # counter (`account_budget` / `address_budget`). Cap refusals are not this
+    # event, and a non-admin unlimited request is `panel_forbidden`.
+    "key_creation_throttled": frozenset(
+        {
+            "actor_user_id",
+            "actor_username",
+            "client_ip",
+            "route",
+            "method",
+            "reason",
+            "limit_count",
+            "window_seconds",
+        }
+    ),
     "panel_ondemand_index_failed": frozenset({"user_id", "error_type"}),
     "panel_ondemand_embed_failed": frozenset({"user_id", "error_type"}),
     "panel_health_strip_failed": frozenset({"error_type"}),

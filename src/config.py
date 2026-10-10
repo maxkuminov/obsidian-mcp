@@ -718,12 +718,40 @@ class Settings(BaseSettings):
     )
 
     # The daily quota a **newly created** key receives when the caller does not
-    # say otherwise. Applied by the key-creation paths and never as a column
-    # default: existing keys are grandfathered, and an explicit null still
-    # means unlimited. ~1,600 calls per 30 days across every credential, so
-    # 5,000/day cannot interrupt a real session while a runaway stops the same
-    # day.
+    # say otherwise — an omitted JSON field or a blank panel field (#323).
+    # Applied by the key-creation paths and never as a column default: existing
+    # keys are grandfathered. Unlimited is an administrator's explicit request
+    # only (JSON `null`, or the panel's Unlimited box); with this setting null,
+    # a create that names no limit is refused as missing one rather than
+    # silently becoming unlimited. ~1,600 calls per 30 days across every
+    # credential, so 5,000/day cannot interrupt a real session while a runaway
+    # stops the same day.
     default_daily_request_limit: NullableDailyLimit = 5000
+
+    # ── The key-creation budget and active-key cap (#323) ──────────────────
+    #
+    # Every new API key is a fresh `/mcp` principal with full general and write
+    # bursts, so unthrottled creation resets the per-principal buckets. Both
+    # creation routes (`POST /api/keys` and `POST /admin/keys/create`) charge
+    # one in-process budget with two counters, both of which must admit: one
+    # keyed exactly on the account, one on the trusted client address. Neither
+    # key subsumes the other — rotating addresses must not outrun the account
+    # counter, rotating accounts must not outrun the address counter. A person
+    # creates a handful of keys in a session; the address limit is the looser
+    # so accounts behind one NAT do not refuse each other.
+    key_creation_account_limit: NullableLimit = 10
+    key_creation_address_limit: NullableLimit = 20
+    # Fixed window, opened by a counter's first charge — the login budget's
+    # shape. Not nullable: disable the counters above instead.
+    key_creation_window_seconds: int = Field(
+        3600, ge=1, le=LIMITER_WINDOW_SECONDS_MAX
+    )
+    # The budget bounds the *flow* of new keys, not the *stock*: at 10/hour a
+    # non-admin could hold thousands of active keys within a month, each with
+    # its own bursts. This caps the active keys a non-admin account may own;
+    # admins and the single-user operator are exempt, and nothing existing is
+    # revoked to get under it.
+    key_max_active_per_account: NullableLimit = 25
 
     # Process-local concurrency (#261, #188 `concurrency-enforce-ready`).
     # Modes: `off`; `shadow` (observe, never wait: configured waits are only
@@ -1557,8 +1585,9 @@ class Settings(BaseSettings):
                 f"DEFAULT_DAILY_REQUEST_LIMIT ({limit}) must be within "
                 f"{_DAILY_REQUEST_LIMIT_MIN}..{_DAILY_REQUEST_LIMIT_MAX}, the "
                 "domain every daily request limit obeys "
-                "(ck_api_keys_daily_request_limit). Null means new keys are "
-                "created unlimited."
+                "(ck_api_keys_daily_request_limit). Null means a new key "
+                "must name its limit (only an administrator may ask for "
+                "unlimited)."
             )
         return self
 

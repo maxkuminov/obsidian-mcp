@@ -10,17 +10,22 @@ feature could quietly become something else:
   unlimited and a backfill would start refusing their traffic the day this
   deploys.
 * **Only where the creator did not choose.** On the JSON API an *omitted*
-  field means "apply the default" and an *explicit null* still means unlimited;
-  the two are separated by `model_fields_set`, not by the value's truthiness,
-  because both read as `None`.
-* **Exactly one place on the panel.** The default is the create form's
-  pre-filled value and nothing else: the POST handler substitutes nothing, so
-  an operator who clears the box gets an unlimited key. A server-side
-  substitution would mean the field the operator emptied came back — the
-  surprise that gets a quota feature turned off — and would give the default
-  two places to be overridden instead of one.
-* **The edit path is untouched.** Changing a key's limit never consults the
-  default, on either surface.
+  field means "apply the default" and an *explicit null* means unlimited — for
+  an administrator only since #323; the two are separated by
+  `model_fields_set`, not by the value's truthiness, because both read as
+  `None`.
+* **A blank panel field gets the default (#323, owner decision).** It used to
+  mean unlimited, which made a scripted blank form a quota-bypass primitive.
+  The form is still pre-filled with the default; the POST handler now applies
+  it to a blank field too, through `src/services/api_keys.py`'s resolver, the
+  one place both surfaces share. Unlimited is an admin's explicit box.
+* **The edit path never consults the default**, on either surface. Since #323
+  a blank edit is an error rather than a clear.
+
+Edits for #323, called out rather than deleted: the "explicit null still
+means unlimited", "default turned off restores unlimited", "blank panel edit
+clears", "blank panel create is unlimited" and "handler never reads the
+setting" tests below were rewritten to the new rule; each says so.
 
 Hermetic: the request models and handlers are exercised directly against fake
 sessions, because what is under test is the substitution rule and the rendered
@@ -188,10 +193,12 @@ def test_an_omitted_limit_receives_the_configured_default():
     )
 
 
-def test_an_explicit_null_still_means_unlimited():
-    """The documented way to ask for an unlimited key, unchanged. A `x or
-    default` implementation would silently turn this into a limited key —
-    omitted and null both read as `None`."""
+def test_an_explicit_null_means_unlimited_for_an_admin():
+    """The documented way to ask for an unlimited key — for an administrator
+    (the fake user here) since #323; a non-admin's null is a 403, pinned in
+    `test_issue_323_key_creation_budget.py`. A `x or default` implementation
+    would silently turn this into a limited key — omitted and null both read
+    as `None`."""
     response, session = _create_json(daily_request_limit=None)
 
     assert session.added[0].daily_request_limit is None
@@ -215,17 +222,27 @@ def test_the_two_are_separated_by_model_fields_set_not_by_the_value():
     assert explicit.daily_request_limit is None
     assert "daily_request_limit" not in omitted.model_fields_set
     assert "daily_request_limit" in explicit.model_fields_set
-    assert api._created_key_limit(omitted) == SHIPPED_DEFAULT
-    assert api._created_key_limit(explicit) is None
+    # Through the handler (was `_created_key_limit`, removed by #323 in
+    # favour of the shared resolver): the admin fake gets the default for the
+    # omitted field and unlimited for the explicit null.
+    assert _create_json()[0].daily_request_limit == SHIPPED_DEFAULT
+    assert _create_json(daily_request_limit=None)[0].daily_request_limit is None
 
 
-def test_the_default_can_be_turned_off(monkeypatch):
-    """`DEFAULT_DAILY_REQUEST_LIMIT=null` restores the previous behaviour
-    exactly: an omitted field creates an unlimited key again."""
+def test_a_null_default_makes_the_limit_required(monkeypatch):
+    """#323 edit: `DEFAULT_DAILY_REQUEST_LIMIT=null` used to make an omitted
+    field create an unlimited key. It now refuses the create as missing a
+    required limit; an administrator's explicit null still works."""
+    from fastapi import HTTPException
+
     monkeypatch.setattr(settings, "default_daily_request_limit", None)
 
-    response, session = _create_json()
+    with pytest.raises(HTTPException) as exc:
+        _create_json()
+    assert exc.value.status_code == 400
+    assert "required" in exc.value.detail
 
+    response, session = _create_json(daily_request_limit=None)
     assert session.added[0].daily_request_limit is None
     assert response.daily_request_limit is None
 
@@ -274,9 +291,33 @@ def test_creating_a_key_issues_no_statement_against_existing_keys():
         )
 
 
-def test_an_unlimited_existing_key_stays_unlimited_through_the_panel_edit():
-    """The edit path never consults the default. An operator clearing the box
-    on a limited key returns it to unlimited even though new keys get 5,000."""
+def test_a_blank_panel_edit_is_refused_and_never_substitutes_the_default():
+    """#323 edit: clearing the box used to return a key to unlimited. A blank
+    edit is now a flashed error that leaves the key alone — and, as before,
+    the edit path never consults the default."""
+    key = _existing_key(100)
+    session = _FakeSession(key=key)
+    request = _FakeRequest()
+
+    response = asyncio.run(
+        panel.set_key_limit_form(
+            request=request,
+            key_id=4,
+            daily_request_limit="",
+            unlimited="",
+            session=session,
+            user=_FakeUser(),
+        )
+    )
+
+    assert response.status_code == 303
+    assert key.daily_request_limit == 100, (
+        "a blank edit changed the key's limit"
+    )
+    assert "Unlimited" in request.session["flash_key_error"]
+
+
+def test_an_admin_clears_a_limit_only_with_the_unlimited_box():
     key = _existing_key(100)
     session = _FakeSession(key=key)
 
@@ -285,15 +326,14 @@ def test_an_unlimited_existing_key_stays_unlimited_through_the_panel_edit():
             request=_FakeRequest(),
             key_id=4,
             daily_request_limit="",
+            unlimited="1",
             session=session,
             user=_FakeUser(),
         )
     )
 
     assert response.status_code == 303
-    assert key.daily_request_limit is None, (
-        "clearing an existing key's limit substituted the default instead"
-    )
+    assert key.daily_request_limit is None
 
 
 def test_the_json_edit_path_never_substitutes_the_default():
@@ -413,11 +453,11 @@ def test_the_create_form_is_prefilled_with_the_default():
     assert 'value="5000"' in create_form, (
         "the create form's limit field is not pre-filled with the default"
     )
-    # The copy has to say all three things, or the pre-filled number reads as
-    # a fixed ceiling rather than a suggestion the operator owns.
+    # The copy has to say what a blank box now means (#323 edit: it used to
+    # say an empty box creates an unlimited key) and who may ask for one.
     assert "default" in create_form
-    assert "clear it" in create_form
-    assert "empty box creates an unlimited key" in create_form
+    assert "empty box also gets that" in create_form
+    assert "Only an administrator can make a key unlimited" in create_form
 
 
 def test_the_edit_modal_is_not_prefilled():
@@ -444,16 +484,14 @@ def test_no_default_configured_leaves_the_field_empty(monkeypatch):
     assert "pre-filled" not in create_form
 
 
-def test_a_blank_panel_submission_creates_an_unlimited_key():
-    """**No POST-side substitution.** The operator cleared the box; the key is
-    unlimited, even though the form offered 5,000 a moment earlier."""
+def test_a_blank_panel_submission_receives_the_default():
+    """#323 edit, owner decision: a blank box used to create an unlimited key,
+    which made a scripted blank form a quota bypass. It now gets the default,
+    for an administrator too — unlimited is the explicit box."""
     assert settings.default_daily_request_limit == SHIPPED_DEFAULT
     session = _create_panel("")
 
-    assert session.added[0].daily_request_limit is None, (
-        "the panel substituted the configured default for a blank field, so "
-        "an operator who deliberately cleared it got a limited key anyway"
-    )
+    assert session.added[0].daily_request_limit == SHIPPED_DEFAULT
 
 
 def test_the_prefilled_value_submitted_unchanged_creates_a_limited_key():
@@ -469,16 +507,14 @@ def test_an_edited_panel_value_is_what_the_key_receives():
     assert session.added[0].daily_request_limit == 250
 
 
-def test_the_panel_create_handler_never_reads_the_setting():
-    """The guard against the substitution creeping back in by another route.
-
-    Asserting only the blank case would still pass if somebody added a branch
-    defaulting a *whitespace* field, or an "only when the operator did not
-    change anything" heuristic. The handler must not read the setting at all —
-    there is exactly one place the panel applies it, and it is the form.
-    """
+def test_both_create_handlers_apply_the_default_through_one_resolver():
+    """#323 edit: this pinned "the panel handler never reads the setting".
+    The panel now applies the default, so the guard becomes "neither handler
+    reads it itself": both go through `resolve_create_limit`, the one place
+    the rule lives, so the two surfaces cannot drift apart again."""
     import inspect
 
-    assert "settings.default_daily_request_limit" not in inspect.getsource(
-        panel.create_key_form
-    )
+    for handler in (panel.create_key_form, api.create_key):
+        source = inspect.getsource(handler)
+        assert "settings.default_daily_request_limit" not in source
+        assert "resolve_create_limit" in source

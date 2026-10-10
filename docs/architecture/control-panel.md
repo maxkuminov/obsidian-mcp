@@ -82,7 +82,8 @@
   delegated listeners in `src/control_panel/static/panel.js`, loaded by
   `base.html` with the nonce: `data-confirm`, `data-modal-open` / `-close` /
   `-backdrop`, `data-autosubmit`, `data-copy-from`, `data-limit-edit` (with
-  `data-key-id` / `data-limit`), `data-sidebar-open` / `-close`,
+  `data-key-id` / `data-limit`), `data-unlimited-toggle` (with
+  `data-unlimited-target`, #323), `data-sidebar-open` / `-close`,
   `data-async-reindex`. **A new template control is a `data-*` attribute
   plus a delegated listener in `panel.js`, never an `on*=`.** Attribute
   values are read as strings or element ids — never evaluated, never
@@ -664,6 +665,40 @@ cards between the latency table and the search phases.
   `error=` — those are protocol parameters on a redirect to the *client*, not
   panel flash. The pre-existing `flash_new_key` / `flash_key_error` /
   `flash_oauth_error` session entries keep their own dedicated render slots.
+
+## API keys: blank is the default, Unlimited is an admin's box (#323)
+
+The create form (`POST /admin/keys/create`) and the JSON twin share one
+key-creation budget and one non-admin active-key cap — see "Key creation is
+one budget across two representations" in [rate limits](rate-limits.md). What
+belongs here is the form's semantics, which changed by owner decision:
+
+- **A blank create field gets `DEFAULT_DAILY_REQUEST_LIMIT`.** It used to mean
+  unlimited, which made a scripted blank form a way to mint principals with no
+  daily quota. The field is still pre-filled with the default; with the default
+  null the field is required and a blank submission is a flashed error.
+- **The Unlimited checkbox** (`name="unlimited" value="1"`) is in both the
+  create and the edit-limit modal, **rendered only when `is_admin`** (from
+  `_panel_context`). It is the only panel control that produces or restores an
+  unlimited key, only the exact value `"1"` counts, and it wins over any number
+  submitted beside it. A non-admin `unlimited=1` is a tampered request: refused
+  with a flash, recorded as `panel_forbidden` (`unlimited_requires_admin`),
+  never downgraded to a limited key.
+- **`data-unlimited-toggle`** on the box, with `data-unlimited-target` naming
+  the number input's id, is handled by a delegated `change` listener in
+  `panel.js` that sets `disabled` on the input while the box is ticked (a
+  disabled input is not submitted). `editLimit` ticks the box and disables the
+  input when the key's current limit is empty — **only if the box exists**: a
+  non-admin's modal has none, so the input is always left enabled and a
+  non-admin can put a number on their own grandfathered unlimited key.
+- **A blank edit is an error for everyone**, never a clear, and the edit path
+  never applies the default. Cancelling leaves an unlimited key unlimited.
+- The rules live once in `src/services/api_keys.py`, shared with
+  `src/api/routes.py`, so the two surfaces cannot drift (#162 and #323 were
+  both a rule enforced on one surface and not the other).
+- Budget refusals flash "Too many keys created recently — try again in N
+  minutes."; cap refusals flash the cap and "revoke a key". Both 303 back to
+  `/admin/keys` through the existing `flash_key_error` slot.
 
 ## Destructive actions take the index pass lock
 

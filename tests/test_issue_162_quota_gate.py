@@ -398,7 +398,10 @@ def test_in_domain_limits_are_accepted(value):
 
 
 @pytest.mark.parametrize("raw", ["", "   ", None])
-def test_an_empty_field_means_unlimited_not_zero(raw):
+def test_an_empty_field_is_no_value_not_zero(raw):
+    # Renamed for #323: blank no longer means unlimited — what a blank means is
+    # decided by `src/services/api_keys.py` (default on create, error on edit).
+    # The parser still reports it as "no value", never as zero.
     assert quotas.parse_limit_form_value(raw) == (None, None)
 
 
