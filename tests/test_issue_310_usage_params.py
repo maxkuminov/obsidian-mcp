@@ -84,11 +84,12 @@ def test_every_string_in_a_rendered_value_follows_the_grammar():
 
 def test_nested_key_and_value_positions():
     out = render_usage_params(
-        {"frontmatter": {"k\x00": [NAN, {"deep\ud800": "v\x00"}, -INF]}}
+        {"frontmatter": {"k\x00": [NAN, {"deep\ud800": "v\x00"}, INF, -INF]}}
     )
     assert out["frontmatter"] == {
-        "k\\x00": [".nan", {"deep\\ud800": "v\\x00"}, "-.inf"]
+        "k\\x00": [".nan", {"deep\\ud800": "v\\x00"}, ".inf", "-.inf"]
     }
+    assert out[RENDERED_PARAMS_KEY] == ["frontmatter"]
     assert _storable(out)
 
 

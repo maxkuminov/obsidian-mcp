@@ -150,6 +150,47 @@ async def test_null_params_stay_null(harness):
     assert harness.inserts[0]["params"] is None
 
 
+@tools._tracked("issue_310_telemetry_probe", ["query"], resource_class="light")
+async def _telemetry_probe(query: str = "") -> str:
+    from src.services import timing
+
+    # `find_related`'s source path: a vault path, which a non-UTF-8 filename
+    # decoded with `surrogateescape` turns into a lone surrogate.
+    # `record_source_path` is total on it (`surrogatepass`). (`record_results`
+    # is not — it raises measuring such a path, a separate defect noted in
+    # the #310 report, so `result_paths` cannot carry one today.)
+    timing.record_source_path("a\udc80.md")
+    return "ran"
+
+
+async def test_server_telemetry_is_rendered_at_the_insert_boundary(harness, monkeypatch):
+    """Scenario "Server telemetry is covered". Telemetry is merged into
+    the row *after* `named_params()`, so this pins the renderer at the insert
+    boundary: rendering inside `named_params()` would leave the surrogate in
+    the stored row and fail this test."""
+    from src.auth.session import current_principal, current_user_id
+
+    monkeypatch.setattr(tools, "_bucket_admission", lambda write: None)
+    monkeypatch.setattr(tools, "_vault_admission_error", lambda: None)
+
+    async def no_quota():
+        return None
+
+    monkeypatch.setattr(tools, "_quota_admission_error", no_quota)
+    principal = current_principal.set(("api_key", 3102))
+    uid = current_user_id.set(7)
+    try:
+        assert await _telemetry_probe(query="clean") == "ran"
+    finally:
+        current_user_id.reset(uid)
+        current_principal.reset(principal)
+    (row,) = [v for v in harness.inserts if v["tool"] == "issue_310_telemetry_probe"]
+    params = row["params"]
+    assert params["query"] == "clean"
+    assert params["source_path"] == "a\\udc80.md"
+    assert params["rendered_params"] == ["source_path"]
+
+
 async def test_caller_values_are_not_mutated(harness):
     params = {"path": "a\x00b"}
     await tools.write_usage_row(_row(**params) | {"params": params})

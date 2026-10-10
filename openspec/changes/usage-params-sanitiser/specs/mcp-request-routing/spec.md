@@ -41,7 +41,7 @@ Transfer redemption rows (`upload_file`, `download_file`) are written outside `w
 - **THEN** the first SHALL be inserted without a `params` value supplied and the second with SQL `NULL`, neither becoming an empty object
 
 #### Scenario: Server telemetry is covered
-- **WHEN** a tool records a result path containing an unpaired surrogate in its telemetry
+- **WHEN** a tool records a vault path containing an unpaired surrogate in its telemetry (for example `find_related`'s `source_path`)
 - **THEN** the row SHALL be written, with the telemetry key rendered and named in `rendered_params`
 
 #### Scenario: Deep and self-referential input terminates

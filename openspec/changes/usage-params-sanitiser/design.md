@@ -57,7 +57,7 @@ Escape grammar inside a rendered value:
 
 At the top of `_write_usage_row_admitted`, before the first `_insert_usage`, so that:
 
-- one call site covers W1–W6. That includes `timing.current()` telemetry, which `named_params()` never sees: `result_paths` carries vault paths, and a non-UTF-8 filename decoded with `surrogateescape` yields lone surrogates;
+- one call site covers W1–W6. That includes `timing.current()` telemetry, which `named_params()` never sees: `result_paths` and `source_path` carry vault paths, and a non-UTF-8 filename decoded with `surrogateescape` yields lone surrogates (the test uses `source_path`, because `timing.record_results` currently raises on such a path before it can be recorded, a separate defect);
 - the FK-cleared retry (`retry = dict(values, …)`) is built from the **rendered** values, so the renderer runs exactly once per write and need not be idempotent;
 - a coalescer template stays raw in memory and is rendered afresh on each attempt. That is deterministic, so a retry after a non-data failure stores the same bytes.
 

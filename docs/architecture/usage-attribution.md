@@ -152,7 +152,7 @@ credential and then opens the Usage page to see what it did was shown
 `usage_logs.params` is JSONB, and what goes into it is the caller's own
 arguments (bound by `named_params()`, top-level strings truncated by
 `_truncate_params`) plus server telemetry (`timing.current()`, which includes
-`result_paths`, the vault paths). SQLAlchemy serialises it with a plain
+`result_paths` and `source_path`, which are vault paths). SQLAlchemy serialises it with a plain
 `json.dumps`, because no `json_serializer` is set on the engine. Python's JSON
 layer accepts three things PostgreSQL's `jsonb` refuses, each with a class-22
 SQLSTATE:
@@ -173,7 +173,7 @@ It runs **once**, at the top of `_write_usage_row_admitted`, which is the one
 function every MCP-side row passes through after every telemetry and
 observation merge. The FK-cleared retry is built from its output. It does not
 run in `named_params()`, the place the issue first suggested, because that
-would have missed the telemetry merge, and `result_paths` can hold a
+would have missed the telemetry merge, and a telemetry path such as `source_path` can hold a
 surrogate-escaped non-UTF-8 filename. An absent `params` stays absent and
 `None` stays `None`.
 
