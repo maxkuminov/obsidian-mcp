@@ -342,6 +342,16 @@ update it in the same change.** What stays here is the short list:
   it is absent from the index — row deleted, never served stale — without
   being a read failure or failing the pass. In-process; the full keyword
   rebuild is excluded and stays atomic.
+- **Re-derive progress is per row** (#311, migration 030).
+  `notes_metadata.derived_under` is a digest of the root facts a re-deriving
+  pass observed, bound to the row's path, hash and extraction version; only
+  the re-derive tail writes it non-NULL, for rows it fully derived, and any
+  writer that mutates a row's extracted link state without changing those
+  fields (`move_note`, the move branch, the link backfill) clears it. A
+  repeated re-derive rewrites only rows not derived under the current root;
+  the stamp records only when an in-transaction re-read finds every surviving
+  row current, after re-resolving every link target. A skip (including an
+  unlisted directory) withholds only over a row that is not current.
 - **The vector index is a `halfvec` expression index** (#283, migration 027),
   defined once in `src/services/vector_index.py` and excluded from `alembic
   check` by `include_object`; queries cast to match it and re-rank by
@@ -350,7 +360,8 @@ update it in the same change.** What stays here is the short list:
   model fingerprint, re-verified under the generation lock (#281).
 - **A pass does not prune what it could not see** (#309). Rows at or beneath
   a directory the walk could not list (or type) are neither pruned nor
-  move-paired, and the run is recorded `walk incomplete` (failed). An
+  move-paired, and the run is recorded `walk incomplete` (failed); under a
+  re-derive it withholds the stamp only over a row not yet re-derived (#311). An
   unlistable root, or an empty root over an existing index, raises
   `IndexIndeterminate` with nothing deleted — unless an admin confirmed the
   emptying in the panel: a single-use, 15-minute, in-process permission

@@ -529,6 +529,34 @@ and unmarked columns. `tests/integration/test_oauth_grant_lifetime_pg.py`
 additionally upgrades a 028 database holding a live family and refreshes it
 immediately after.
 
+## 030: `notes_metadata.derived_under` (#311)
+
+Per-row re-derive progress: a SHA-256 hex digest of the root facts a
+re-deriving pass observed, bound to the row's path, hash and extraction
+version (see [indexing and embeddings](indexing-and-embeddings.md#re-derive-progress-311)).
+`varchar(64) NULL`, no default, no index, 030's comment marker declared in the
+ORM so `alembic check` compares it.
+
+- **No backfill: every existing row reads NULL.** A backfill from the recorded
+  provenance would assert a derivation the migration never observed (016's
+  rule) and could never match anyway: a re-derive happens only when the
+  observed facts differ from the recorded ones, so a digest of the recorded
+  facts never equals what a re-derive expects. A scope in re-derive at deploy
+  time pays one more full re-derive, then progresses.
+- **Reconcile, don't adopt** (026's shape). On the stamp-back re-run a
+  same-named column must be `character varying(64)`, nullable, without a
+  default and carrying the marker; anything else is refused by name, because a
+  marker column of unknown provenance is a row the pass may treat as already
+  derived.
+- **`downgrade()` drops only a marked column** and prints a skip otherwise.
+  Safe: the previous build neither reads nor writes it, and a re-upgrade
+  leaves every row NULL.
+
+`search_path` pinned and asserted, `lock_timeout` / `statement_timeout` set
+and `RESET`. The gate's head literal is `030`; its cases cover the fresh
+shape, the chain from 029, no backfill, stamp-back with a recorded marker
+kept, four impostor-column refusals, and both downgrade directions.
+
 ## Database transport (#184)
 
 Before this change the engine passed no `ssl` argument and `DATABASE_URL`
