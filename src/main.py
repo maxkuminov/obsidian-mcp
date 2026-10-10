@@ -44,6 +44,10 @@ from src.services.transport_security import (
 )
 from src.services.rate_limits import flush_all
 from src.services import body_budget
+from src.services.database_role import (
+    check_database_role,
+    warn_admin_password_in_environment,
+)
 from src.services import concurrency
 from src.services import concurrency_counters
 from src.services import vault_fs
@@ -517,6 +521,7 @@ async def lifespan(app: FastAPI):
     error_log.attach()
     _log_panel_csp_mode()
     _log_unknown_arguments_mode()
+    warn_admin_password_in_environment()
     concurrency_controller = concurrency.reset_controller(settings)
     # Wrapped so the suppressor's outstanding counts are flushed on **every**
     # exit path, the sandbox-mode early return included. A window still holding
@@ -554,6 +559,10 @@ async def lifespan(app: FastAPI):
         # as itself, not as whatever the first query happened to be. Then the
         # embedding hop's line. Both below the sandbox short-circuit (#184/#185).
         await check_database_transport()
+        # #324: the long-lived process must not be a PostgreSQL superuser.
+        # After the transport assertion (so a strict-TLS failure reports as
+        # itself) and below the sandbox short-circuit.
+        await check_database_role()
         log_embedding_transport()
         await _check_embedding_dim()
         await _check_pgvector_version()

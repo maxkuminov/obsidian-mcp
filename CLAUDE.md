@@ -293,6 +293,19 @@ update it in the same change.** What stays here is the short list:
   (`trust_env=False`, no redirects). See
   [schema and migrations](docs/architecture/schema-and-migrations.md) and
   [indexing and embeddings](docs/architecture/indexing-and-embeddings.md).
+- **The app is never the PostgreSQL superuser** (#324). The lifespan reads
+  `rolsuper` for `current_user` after the transport assertion and exits
+  unless `DATABASE_ALLOW_SUPERUSER=true` — every deployment, by owner
+  decision; k3s (`obsidian_mcp`, non-superuser) passes. The compose bundles
+  bootstrap as `postgres` (password in gitignored `postgres.env`, postgres
+  service only; the app service blanks `POSTGRES_PASSWORD`) and create
+  `obsidian_mcp` NOSUPERUSER owning its database, validated before `initdb`
+  by `docker/postgres-entrypoint.sh`. Migrations need only database
+  ownership + `TEMP`; `test_nonsuperuser_migrations_pg.py` gates it, so a
+  new extension goes in the init scripts, never a migration. Pre-#324
+  compose volumes convert by hand with `docker/upgrade-split-db-roles.sql`
+  (nothing automatic). See
+  [schema and migrations](docs/architecture/schema-and-migrations.md).
 - **Bookkeeping writes commit asynchronously; credential writes never do**
   (#279). `SET LOCAL synchronous_commit = off` is issued in exactly three
   places — the `api_keys.last_used_at` UPDATE (itself skipped when the stamp

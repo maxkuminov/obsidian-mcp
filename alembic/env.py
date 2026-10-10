@@ -83,9 +83,29 @@ async def run_async_migrations():
     )
     if settings.database_ssl_mode in STRICT_DB_MODES:
         install_strict_transport_listener(connectable)
-    async with connectable.connect() as connection:
-        await connection.run_sync(do_run_migrations)
-    await connectable.dispose()
+    try:
+        async with connectable.connect() as connection:
+            await connection.run_sync(do_run_migrations)
+    except Exception as exc:
+        # #324 (design D6): an install created before the role split, brought
+        # up with the new compose files and a new runtime password, fails here.
+        # One line pointing at the upgrade procedure, then the original error.
+        from sqlalchemy.engine import make_url
+
+        from src.services.database_role import (
+            authentication_hint,
+            is_authentication_failure,
+        )
+
+        if is_authentication_failure(exc):
+            try:
+                role = make_url(url).username
+            except Exception:
+                role = None
+            print(authentication_hint(role), file=sys.stderr, flush=True)
+        raise
+    finally:
+        await connectable.dispose()
 
 
 def run_migrations_online():

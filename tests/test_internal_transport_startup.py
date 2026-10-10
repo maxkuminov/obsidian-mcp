@@ -227,7 +227,11 @@ async def test_the_probe_runs_first_and_the_report_right_after(monkeypatch):
         order.append("embedding_dim")
         raise _StopLifespan
 
+    async def _role():
+        order.append("database_role")
+
     monkeypatch.setattr(main, "check_database_transport", _db)
+    monkeypatch.setattr(main, "check_database_role", _role)
     monkeypatch.setattr(
         main, "log_embedding_transport", lambda: order.append("embedding_transport")
     )
@@ -239,6 +243,7 @@ async def test_the_probe_runs_first_and_the_report_right_after(monkeypatch):
         "openat2",
         "mount",
         "database_transport",
+        "database_role",
         "embedding_transport",
         "embedding_dim",
     ]

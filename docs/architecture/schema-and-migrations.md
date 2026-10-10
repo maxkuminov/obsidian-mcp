@@ -644,6 +644,104 @@ session. Sandbox mode skips it with the other database checks.
 6. `verify-full` checks the name in `DATABASE_URL`'s host, so a Docker service
    name must appear in the server certificate's SAN — an issuance requirement.
 
+## Database roles: the app is never the superuser (#324)
+
+Before #324 the two bundled compose stacks set `POSTGRES_USER=obsidian_mcp`,
+which the PostgreSQL image makes the **bootstrap cluster superuser** (OID
+10), and the app connected as it: a compromised app could read every
+database, run `COPY … PROGRAM` inside the postgres container and alter
+roles. Every bundle now has the role model the Kubernetes bundle always had.
+
+| | Role | Attributes | Owns |
+| --- | --- | --- | --- |
+| Bootstrap | `postgres` | superuser | the cluster, the `vector` extension and its member objects |
+| Runtime and migrations | `obsidian_mcp` | `LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS` | database `obsidian_mcp` and every object the migrations create |
+
+Load-bearing rules:
+
+- **Migrations need only ownership and `TEMP`.** The migration role must own
+  the database (which gives it `CREATE` on `public` through
+  `pg_database_owner`) and hold `TEMP` (PUBLIC has it by default; 013, 019,
+  023 and 027 use temp tables). `vector` is installed by the superuser in
+  the privileged init phase, so 001's `CREATE EXTENSION IF NOT EXISTS
+  vector` is a no-op. **A migration must not need anything else** — no
+  `CREATE EXTENSION` of a new extension, no `ALTER SYSTEM`, no role DDL, no
+  other database. `tests/integration/test_nonsuperuser_migrations_pg.py`
+  runs `upgrade head` and `check` as a fresh `NOSUPERUSER` owner in CI; a
+  migration that needs more fails there. A new extension goes into the
+  init scripts (`docker/db-init-compose.sh` and
+  `deploy/kubernetes/postgres/configmap-initdb.yaml`) and a documented
+  manual step for existing installs.
+- **The server refuses a superuser session.** The lifespan reads `rolsuper`
+  for `current_user` right after the transport assertion
+  (`src/services/database_role.py`, skipped in sandbox mode) and exits with
+  a CRITICAL line unless `DATABASE_ALLOW_SUPERUSER=true`, which logs a
+  WARNING instead. It applies to every deployment, by owner decision: the
+  property is the ASVS requirement, and the server is the only component
+  that sees the real session. Alembic does not check (it is an operator's
+  one-shot, and the test harnesses and `make test-schema` legitimately
+  migrate as `postgres`); on an authentication failure (`28P01` / `28000`
+  anywhere in the wrapped exception chain) `alembic/env.py` prints one line
+  pointing at the upgrade script.
+- **The admin password never reaches the app container.** It lives in
+  `postgres.env`, loaded only by the postgres service; the app service sets
+  `POSTGRES_PASSWORD: ""` in `environment:` so a value left in `.env` by
+  the old instructions is overridden (`environment` beats `env_file`). The
+  compose file builds `DATABASE_URL` from `OBSIDIAN_DB_PASSWORD`, so there
+  is one statement of the runtime password.
+- **Validation happens before `initdb`.** A failing init script leaves
+  `PG_VERSION` behind and the image never runs init again, so weak
+  passwords are refused by `docker/postgres-entrypoint.sh` before the image
+  entrypoint runs. The init script writes `started`, then `complete`, to
+  `$PGDATA/obsidian-mcp-init.state`; a volume left at `started` is refused
+  with recovery instructions. A volume with **no** marker is a pre-#324 one
+  and is allowed, because it must start for the conversion.
+- **Existing clusters are converted by hand, once.**
+  `docker/upgrade-split-db-roles.sql` renames OID 10 to `postgres` from a
+  temporary superuser's session (a session cannot rename its own role, and
+  OID 10 cannot lose `SUPERUSER`), creates the new `obsidian_mcp`, and moves
+  ownership catalog by catalog — `REASSIGN OWNED` refuses the bootstrap
+  role, whose objects have no `pg_shdepend` rows. "User object" means
+  `oid >= 16384` outside the extension closure (`deptype 'e'`, plus
+  recursively `deptype 'i'`, which catches an extension type's array type).
+  Default privileges (`pg_default_acl`) move too, as a diff against
+  `acldefault`. All of it is one transaction ending in a self-check that
+  names any object still owned by OID 10 and rolls back. Note: on PG 16
+  `ALTER TYPE … OWNER` on a range does **not** move its multirange, so
+  multiranges are moved explicitly. The real-container test
+  (`tests/integration/test_upgrade_split_db_roles_pg.py`) seeds every
+  category and asserts through the catalogs.
+
+  Two things the script does that look optional and are not (Codex review
+  of #324). **After the commit it terminates every other OID-10 client
+  backend and fails unless none is left:** a session that logged in as the
+  old `obsidian_mcp` is still OID 10 afterwards, i.e. still a superuser
+  under the new name, for as long as it stays connected. The procedure also
+  stops the app first and restarts postgres before the app comes back.
+  **"Already split" runs the full self-check:** role names plus `rolsuper`
+  also match a half-converted cluster (database owned by `postgres`, a
+  `CREATEDB` runtime role, objects left with OID 10), which must be refused
+  with what is wrong, not reported as done. The check also refuses a
+  runtime role that is a member, directly or through another role, of any
+  role with `SUPERUSER`/`CREATEDB`/`CREATEROLE`/`REPLICATION`/`BYPASSRLS`
+  (`GRANT postgres TO obsidian_mcp` passes a `rolsuper` test but allows
+  `SET ROLE postgres`), and any extension not owned by OID 10. Every session that sends a
+  password sets `log_statement = none` and `log_min_error_statement =
+  panic` first, because the default `error` level logs a failing
+  `ALTER ROLE … PASSWORD` with its password.
+
+**Accepted limitations** (full list in the change's design): password
+strength is length, charset and a placeholder list, not entropy; the
+superuser check is point-in-time at startup; the runtime role owns its
+tables and could drop them (there is no separate migrator role, as in
+Kubernetes); `postgres` can still log in over `mcp_internal` with the admin
+password; the upgrade script relies on local-socket `trust`; nothing proves
+an upgraded install's new runtime password differs from the old superuser
+password; a failure in the image's own init before our script runs leaves
+no marker and is not detected by the wrapper; the server's startup refusal
+checks the session role's own `rolsuper`, not membership in a privileged
+role (the upgrade script's self-check does catch that shape; L14).
+
 ## Backups are protected data, not just a rollback tool
 
 A `pg_dump` of this database is the complete text of every tenant's notes
@@ -671,9 +769,10 @@ contradiction of the "container cannot see backups" invariant that
   is the enforcement of the invariant `control-panel.md` states; do not add
   the mount back "for convenience" — `docker/record-backup.sh` exists
   precisely so the container never needs it.
-- **`.env` is `0600`.** It carries `DATABASE_URL` (with the password) and
-  `SECRET_KEY`; `make init` sets the mode, and a second local account on the
-  host is the reason this matters.
+- **`.env` and `postgres.env` are `0600`.** `.env` carries `DATABASE_URL`
+  or `OBSIDIAN_DB_PASSWORD` and `SECRET_KEY`; `postgres.env` carries the
+  bundled stacks' superuser password. `make init` sets both modes, and a
+  second local account on the host is the reason this matters.
 
 Encryption at rest for the dumps is not implemented; if it is added, keep a
 restore-tested copy with separately managed keys before switching it on, or

@@ -22,6 +22,8 @@ if str(ROOT) not in sys.path:
 # adding it here is a test failure rather than a silent hole.
 SETTINGS_ENV_KEYS = (
     "DATABASE_URL",
+    # Superuser opt-out (#324).
+    "DATABASE_ALLOW_SUPERUSER",
     # Database transport (#184).
     "DATABASE_SSL_MODE",
     "DATABASE_SSL_CA_FILE",
