@@ -68,6 +68,22 @@
         input.disabled = !!(toggle && toggle.checked);
     }
 
+    /* A dialog marked `data-modal-reset` opens in its first-open state every
+       time (#332): each form inside is reset to the values the server
+       rendered, and every Unlimited toggle is re-synced, because `reset()`
+       restores the checkbox without firing the `change` event that would
+       otherwise re-enable its number input. Without this, a box ticked and
+       then cancelled survived into the next open with the limit disabled.
+       Opt-in, so a dialog that is meant to keep a half-filled form (or is
+       filled by script, like the edit-limit modal) is untouched. */
+    function resetModal(el) {
+        if (!el.hasAttribute('data-modal-reset')) { return; }
+        el.querySelectorAll('form').forEach(function (form) { form.reset(); });
+        el.querySelectorAll('[data-unlimited-toggle]').forEach(function (toggle) {
+            syncUnlimited(toggle, document.getElementById(toggle.getAttribute('data-unlimited-target') || ''));
+        });
+    }
+
     /* Dashboard "Reindex Now": POST in the background with the CSRF token as
        a header, and report the result inline next to the button. */
     async function triggerReindex(form) {
@@ -135,7 +151,7 @@
         el = closest(event, '[data-modal-open]');
         if (el) {
             var target = document.getElementById(el.getAttribute('data-modal-open'));
-            if (target) { showModal(target); }
+            if (target) { resetModal(target); showModal(target); }
             return;
         }
 

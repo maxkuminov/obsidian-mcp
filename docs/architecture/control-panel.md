@@ -81,7 +81,8 @@
   declared with `data-*` attributes and implemented by document-level
   delegated listeners in `src/control_panel/static/panel.js`, loaded by
   `base.html` with the nonce: `data-confirm`, `data-modal-open` / `-close` /
-  `-backdrop`, `data-autosubmit`, `data-copy-from`, `data-limit-edit` (with
+  `-backdrop` (plus `data-modal-reset` on a dialog that must open in its
+  first-open state, #332), `data-autosubmit`, `data-copy-from`, `data-limit-edit` (with
   `data-key-id` / `data-limit`), `data-unlimited-toggle` (with
   `data-unlimited-target`, #323), `data-sidebar-open` / `-close`,
   `data-async-reindex`. **A new template control is a `data-*` attribute
@@ -455,7 +456,10 @@
   succeeds — on the page an operator opens *because* something is wrong. So
   `_health_strip_or_degraded` rolls the failed transaction back (without it the
   render's own queries raise `InFailedSQLTransaction` instead of the real
-  error), records `panel_health_strip_failed` at ERROR so the ring buffer
+  error), refreshes the acting `User` the rollback just expired (the render
+  reads `user.is_admin` next; an expired instance is a `MissingGreenlet` 500,
+  #332 — its own record uses values captured before the rollback), records
+  `panel_health_strip_failed` at ERROR so the ring buffer
   catches it, and renders a "health summary unavailable" strip. Saying so beats
   rendering "ok" from a query that never returned. It goes through
   `security_events.emit` rather than the bare logger because a caller can drive
@@ -691,6 +695,13 @@ belongs here is the form's semantics, which changed by owner decision:
   input when the key's current limit is empty — **only if the box exists**: a
   non-admin's modal has none, so the input is always left enabled and a
   non-admin can put a number on their own grandfathered unlimited key.
+- **The create dialog opens in its first-open state every time** (#332). It
+  carries `data-modal-reset`; the delegated `data-modal-open` branch resets its
+  form to the server-rendered values and re-syncs each Unlimited toggle
+  (`form.reset()` fires no `change`, so the sync is not optional) before
+  showing it. Before, a box ticked and then cancelled survived into the next
+  open with the limit disabled. The edit-limit modal does not opt in: it is
+  filled by `editLimit` from the row on every open.
 - **A blank edit is an error for everyone**, never a clear, and the edit path
   never applies the default. Cancelling leaves an unlimited key unlimited.
 - The rules live once in `src/services/api_keys.py`, shared with
@@ -891,6 +902,21 @@ action is how an administrator says it was on purpose.
   and the wait for that lock is precisely the window in which another admin's
   demotion of *this* actor commits; serializing the writes is no use if the
   loser of the race then performs the mutation anyway.
+
+- **A refusal that rolls back records values captured before the rollback,
+  never the `User`** (#332). The acting user is loaded through the request's
+  own session, and `AsyncSession.rollback()` expires every persistent instance
+  in it — whatever `expire_on_commit` says — so a `user.id` read afterwards is
+  a lazy load, `MissingGreenlet` under asyncio, and the refusal becomes a 500
+  with no record. The `actor_revoked` refusals take `actor_snapshot(user)`
+  (`src/control_panel/routes.py`) before rolling back, the password change's
+  `wrong_current_password` / `same_as_current` refusals record the `actor_id`
+  captured at the top rather than `fresh.id`, and the key-creation refusals do
+  the same (see [rate limits](rate-limits.md)). Hermetic tests cannot see this
+  class — a `SimpleNamespace` user never expires, and a `User` loaded in a
+  different session is detached, which a rollback leaves alone — so it is
+  pinned in `tests/integration/test_issue_332_rollback_expiry_pg.py`, which
+  loads the actor into the handler's own session.
 
 - **The guard's key now lives in `src/oauth/grants.py`, and its contention set
   is wider than the two admin handlers** (#197, #198). `ACCOUNT_GUARD_LOCK_KEY`

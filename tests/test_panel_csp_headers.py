@@ -564,6 +564,45 @@ def test_the_nonce_is_fresh_per_response(path, client, monkeypatch):
     assert a != b
 
 
+def test_multi_user_consent_after_login_keeps_the_https_form_action(client, monkeypatch):
+    """#332 item 3: the multi-user flow, hop by hop.
+
+    An anonymous `GET /authorize` is a bare 302 to the login page (no policy:
+    not a template render); the **login page** carries the ordinary
+    `form-action 'self'`; and the consent page rendered once the session
+    exists carries `'self' https:`. A header read off the navigation that
+    ended on the login page is the first, not the consent page's.
+    """
+    monkeypatch.setattr(settings, "multi_user_mode", True)
+    params = {
+        "response_type": "code",
+        "client_id": CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+        "code_challenge": VALID_PKCE_CHALLENGE,
+        "code_challenge_method": "S256",
+    }
+
+    anonymous = client.get("/authorize", params=params, follow_redirects=False)
+    assert anonymous.status_code == 302
+    assert anonymous.headers["location"].startswith("/admin/auth/login?next=")
+    assert "content-security-policy" not in anonymous.headers
+
+    login = client.get(anonymous.headers["location"], follow_redirects=False)
+    assert login.status_code == 200
+    login_policy = login.headers["content-security-policy"]
+    assert login_policy == panel_csp.build_policy(_nonce_of(login_policy), consent=False)
+
+    async def signed_in(request, session):
+        return _admin()
+
+    monkeypatch.setattr(oauth_routes, "get_active_session_user", signed_in)
+    consent = client.get("/authorize", params=params, follow_redirects=False)
+    assert consent.status_code == 200
+    policy = consent.headers["content-security-policy"]
+    assert policy == panel_csp.build_policy(_nonce_of(policy), consent=True)
+    assert policy.endswith("form-action 'self' https:")
+
+
 # ── the mode switch ─────────────────────────────────────────────────────────
 
 
