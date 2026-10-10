@@ -18,6 +18,9 @@ ignores. Skipped unless `PGVECTOR_TEST_ADMIN_URL` is set (see `_harness`).
 """
 import errno
 import hashlib
+import os
+import sys
+import time
 
 import pytest
 import pytest_asyncio
@@ -232,6 +235,11 @@ async def test_a_repeated_re_derive_rewrites_nothing_already_derived(
     root = vault / "t311"
     notes = {f"n{i}.md": f"note {i} links [[n{(i + 1) % 5}]]\n" for i in range(5)}
     write(root, {**notes, "Stuck.md": "unreadable\n"})
+    # Aged past the racy window, so the first pass records every stat and no
+    # later pass rewrites a row through a stat refresh (which would move xmin).
+    old_time = time.time() - 3600
+    for rel in [*notes, "Stuck.md"]:
+        os.utime(root / rel, (old_time, old_time))
     uid = await tenant(sessionmaker, root, "repro")
     try:
         await foreign_row(sessionmaker, uid, "Stuck.md")
@@ -718,4 +726,152 @@ async def test_the_sweep_record_is_kept_by_a_re_derive_that_changed_nothing(
         assert indexer._swept.get(uid) == "fingerprint"
     finally:
         indexer._swept.pop(uid, None)
+        vault_service.clear_user_vault_cache(user_id=uid)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Verifier r1 coverage and the stamp's final lock (Codex implementation r1)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+async def test_an_unreadable_file_whose_row_is_current_does_not_withhold(
+    sessionmaker, vault
+):
+    root = vault / "curunread"
+    write(root, {"a.md": "a\n", "b.md": "b\n", "Stuck.md": "x\n"})
+    uid = await tenant(sessionmaker, root, "curunread")
+    try:
+        await foreign_row(sessionmaker, uid, "Stuck.md")
+        UNREADABLE.add("Stuck.md")
+        first = await run(uid)
+        assert first.rederive == indexer.REDERIVE_INCOMPLETE
+        assert (await tuples(sessionmaker, uid))["a.md"][1] is not None
+
+        UNREADABLE.clear()
+        UNREADABLE.add("a.md")  # current row, now unreadable
+        done = await run(uid)
+        assert done.rederive == indexer.REDERIVE_RECORDED
+        assert await provenance(sessionmaker, uid) == canonical_vault_root(root)
+        assert (await tuples(sessionmaker, uid))["a.md"][1] is not None, "kept"
+    finally:
+        vault_service.clear_user_vault_cache(user_id=uid)
+
+
+async def test_a_keyword_vector_skip_leaves_the_row_unmarked_and_withholds(
+    sessionmaker, vault, monkeypatch
+):
+    """The keyword-vector half of "a partial derivation is not marked". The
+    skip is unreachable in ordinary operation (the body is buffered right
+    before the title is derived), so it is planted by removing a.md's body
+    from the pass's own buffer at that moment."""
+    root = vault / "tsvskip"
+    write(root, {"a.md": "a\n", "b.md": "b\n"})
+    uid = await tenant(sessionmaker, root, "tsvskip")
+    try:
+        real_title = indexer._note_title
+
+        def title_then_drop(frontmatter, name):
+            if name == "a.md":
+                buffer = sys._getframe(1).f_locals.get("path_to_content")
+                if buffer is not None:
+                    buffer.pop("a.md", None)
+            return real_title(frontmatter, name)
+
+        monkeypatch.setattr(indexer, "_note_title", title_then_drop)
+        result = await run(uid)
+        assert result.rederive == indexer.REDERIVE_INCOMPLETE
+        rows = await tuples(sessionmaker, uid)
+        assert rows["a.md"][1] is None
+        assert rows["b.md"][1] is not None
+        assert await provenance(sessionmaker, uid) is None
+    finally:
+        vault_service.clear_user_vault_cache(user_id=uid)
+
+
+async def test_a_keep_pass_rewrite_clears_the_marker(sessionmaker, vault):
+    root = vault / "keepnull"
+    write(root, {"a.md": "a\n", "b.md": "b\n"})
+    uid = await tenant(sessionmaker, root, "keepnull")
+    try:
+        assert (await run(uid)).rederive == indexer.REDERIVE_RECORDED
+        assert (await tuples(sessionmaker, uid))["a.md"][1] is not None
+        (root / "a.md").write_text("a, edited\n", encoding="utf-8")
+        keep = await run(uid)
+        assert keep.rederive is None and keep.notes_indexed == 1
+        rows = await tuples(sessionmaker, uid)
+        assert rows["a.md"][1] is None, "a keep pass never writes a marker"
+        assert rows["b.md"][1] is not None, "an untouched row keeps its own"
+    finally:
+        vault_service.clear_user_vault_cache(user_id=uid)
+
+
+async def test_the_link_backfill_clears_the_markers_of_the_notes_it_writes(
+    sessionmaker, vault
+):
+    """Task 5.6b: the backfill rewrites link rows from bodies it does not
+    hash-certify, so every note it writes loses its marker."""
+    root = vault / "backfill"
+    write(root, {"a.md": "See [[b]]\n", "b.md": "b\n"})
+    uid = await tenant(sessionmaker, root, "backfill")
+    try:
+        assert (await run(uid)).rederive == indexer.REDERIVE_RECORDED
+        rows = await tuples(sessionmaker, uid)
+        assert all(marker is not None for _x, marker in rows.values())
+        async with sessionmaker() as session:
+            # The backfill runs only for a scope with no link rows at all.
+            await session.execute(
+                text(
+                    "DELETE FROM note_links WHERE source_note_id IN "
+                    "(SELECT id FROM notes_metadata WHERE user_id = :u)"
+                ),
+                {"u": uid},
+            )
+            await session.commit()
+
+        await indexer.link_backfill_pass(user_id=uid)
+
+        assert [t for t, _ in await links_of(sessionmaker, uid, "a.md")] == ["b"]
+        rows = await tuples(sessionmaker, uid)
+        assert all(marker is None for _x, marker in rows.values()), rows
+    finally:
+        vault_service.clear_user_vault_cache(user_id=uid)
+
+
+async def test_a_row_held_by_another_transaction_withholds_the_stamp(
+    sessionmaker, vault
+):
+    """The final invariant re-read locks the scope's rows `FOR SHARE NOWAIT`
+    and the stamp follows it in the same transaction, so no writer can change
+    a row between the check and the stamp. A row another transaction holds —
+    a `move_note` mid-commit — makes the lock refuse instead of waiting (a
+    deadlock risk: the pass holds row locks of its own), and the stamp is
+    withheld, not written over state it could not pin."""
+    root = vault / "held"
+    write(root, {"a.md": "a\n", "b.md": "b\n", "Stuck.md": "x\n"})
+    uid = await tenant(sessionmaker, root, "held")
+    try:
+        await foreign_row(sessionmaker, uid, "Stuck.md")
+        UNREADABLE.add("Stuck.md")
+        await run(uid)  # a, b marked; Stuck unresolved
+        UNREADABLE.clear()
+
+        async with sessionmaker() as holder:
+            await holder.execute(
+                text(
+                    "SELECT id FROM notes_metadata WHERE user_id = :u "
+                    "AND file_path = 'b.md' FOR UPDATE"
+                ),
+                {"u": uid},
+            )
+            blocked = await indexer.index_vault(user_id=uid)
+            await holder.rollback()
+        assert blocked.rederive == indexer.REDERIVE_UNRECORDED
+        assert await provenance(sessionmaker, uid) is None
+        # The repairs committed: Stuck is now derived under this root.
+        assert (await tuples(sessionmaker, uid))["Stuck.md"][1] is not None
+
+        done = await indexer.index_vault(user_id=uid)
+        assert done.rederive == indexer.REDERIVE_RECORDED
+        assert done.notes_indexed == 0
+    finally:
         vault_service.clear_user_vault_cache(user_id=uid)

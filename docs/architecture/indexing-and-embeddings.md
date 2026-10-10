@@ -957,15 +957,23 @@ amplification by a rarer route. #308's accounting made it visible
   decision 2026-10-10: a directory over current rows does not withhold, and
   #309's `walk_incomplete` still reports it); a C5 deferral of such a row; and,
   as before, every keyword-vector and link-rebuild skip.
-- **The invariant gates the stamp.** After its last write the pass re-reads
-  the scope's rows *in its own transaction* and counts those not current;
+- **The invariant gates the stamp.** After its last write — the completion
+  re-resolution below included — and as the last statement before the stamp,
+  the pass re-reads the scope's rows *in its own transaction* and counts those
+  not current. When it is about to record, that read takes `FOR SHARE NOWAIT`
+  in a savepoint, so no writer (a `move_note` clearing a marker or rewriting a
+  source's links) can change a row between the check and the stamp; NOWAIT
+  for the tail stamp's reason — the pass holds row locks of its own, and
+  waiting could deadlock — so a row held elsewhere withholds the stamp as
+  `REDERIVE_UNRECORDED` (Codex implementation review r1);
   it records only if `withholding` is empty **and** that count is zero. A row
   left unmarked with no named skip (a writer not foreseen, a concurrent insert
   seen under READ COMMITTED) still makes the pass incomplete, and the first
   `SKIP_REPORT_LIMIT` such paths are named. The count is
   `IndexPassResult.rederive_pending` and is in the incomplete WARNING; `/health`
   is unchanged (owner decision: no pending-count field).
-- **Completion re-resolution** (`_reresolve_scope_links`). A carried-forward
+- **Completion re-resolution** (`_reresolve_scope_links`, run before the
+  invariant re-read). A carried-forward
   note's links were resolved in an earlier pass against a row set that may
   have held rows since pruned (a protected row beneath a directory that became
   listable). Before stamping, the pass re-resolves every link row's
@@ -990,7 +998,10 @@ amplification by a rarer route. #308's accounting made it visible
   targets at the storage cap are not re-resolved. L4 a handle that flickers
   between unobtainable and obtainable costs one full re-derive. L5 a
   permanently unreadable row-backed file keeps the scope incomplete and
-  `degraded`, and due for the backstop.
+  `degraded`, and due for the backstop. L6 a reassignment A→B→A completed inside
+  one pass's final window, with a `move_note` under B landing in it, is not
+  detected — the stamp matches A, so no re-derive follows (triaged
+  implausible; no cross-writer lock protocol).
 
 ## Non-finite frontmatter numbers, and the one title rule (#154)
 

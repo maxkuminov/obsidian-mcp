@@ -200,8 +200,11 @@ not foreign — the state a keep pass would leave it in.
 
 ## D6 — The stamp is gated on the row invariant
 
-After the pass's last write and the completion re-resolution (D7), and before
-the NOWAIT stamp, the pass re-reads the scope's rows **in its own transaction**
+After the pass's last write **including** the completion re-resolution (D7),
+as the last statement before the NOWAIT stamp, the pass re-reads the scope's
+rows **in its own transaction** — when it is about to record, with `FOR SHARE
+NOWAIT` in a savepoint (NOWAIT for the tail stamp's deadlock reason; a refused
+lock withholds the stamp as `REDERIVE_UNRECORDED`) —
 (`file_path, content_hash, extraction_version, derived_under`) and counts the
 rows that are not current. The stamp is recorded iff `withholding` is empty
 **and** that count is zero; otherwise the outcome is `REDERIVE_INCOMPLETE`.
@@ -345,6 +348,14 @@ as today.
   are not re-resolved at completion.
 - **L4 — a handle that flickers** between unobtainable and obtainable changes
   the digest and costs one more full re-derive.
+- **L6 — a reassignment A→B→A completed inside one pass's final window**,
+  with a `move_note` under B committing before the final locked re-read, or
+  one confirmed under B whose metadata transaction commits after the stamp,
+  is not detected: the stamp matches A, so no re-derive follows (Codex
+  implementation review r1, triaged implausible; no cross-writer lock
+  protocol). The final re-read takes `FOR SHARE NOWAIT` on the scope's rows
+  and the stamp follows in the same transaction, so a writer that is mid-commit
+  withholds the stamp instead.
 - **L5 — a scope with a permanently unreadable row-backed file** stays
   incomplete and `degraded` indefinitely and, as before #311, keeps the scope
   due for the full-hash backstop (a full read per tick). Only the write

@@ -224,6 +224,55 @@ def test_the_writers_that_mutate_link_state_clear_the_marker():
     # move_note: the moved row and the sources whose links it rewrites.
     assert "derived_under=None" in tools
     assert "NoteLink.target_path == from_rel" in tools
-    # The pass's move branch and the link backfill.
+    # The pass's move branch. (The link backfill's clear is pinned against
+    # real rows in the integration suite.)
     assert "move_clear_sql" in idx
-    assert idx.count(".values(derived_under=None)") >= 1
+
+
+@pytest.mark.asyncio
+async def test_re_resolution_precedes_the_locked_invariant_read_and_the_stamp(
+    monkeypatch, tmp_path
+):
+    """Codex implementation review r1: completion re-resolution runs before
+    the invariant re-read, and the re-read — `FOR SHARE NOWAIT`, in a
+    savepoint — is the last statement before the stamp's `users` lock, in
+    the same transaction (no commit between them)."""
+    from test_issue_91_indexed_root import FakeSession, install, make_vault
+
+    vault = make_vault(tmp_path, "vault", {"a.md": "a\n"})
+    session = FakeSession(provenance=(None, None, None), existing={}, note_ids={})
+    install(monkeypatch, session, vault)
+    calls: list[str] = []
+    real_reresolve = indexer._reresolve_scope_links
+    real_invariant = indexer._rederive_invariant
+
+    async def reresolve(*a, **k):
+        calls.append("reresolve")
+        return await real_reresolve(*a, **k)
+
+    async def invariant(*a, **k):
+        calls.append(f"invariant(lock={k.get('lock')})")
+        return await real_invariant(*a, **k)
+
+    monkeypatch.setattr(indexer, "_reresolve_scope_links", reresolve)
+    monkeypatch.setattr(indexer, "_rederive_invariant", invariant)
+    result = await indexer.index_vault(user_id=7)
+    assert result.rederive == indexer.REDERIVE_RECORDED
+    assert calls == ["reresolve", "invariant(lock=True)"]
+
+    # The default dialect does not render `FOR SHARE NOWAIT`, so the
+    # construct is read.
+    locked = [
+        s for s in session.statements
+        if "derived_under" in str(s)
+        and getattr(getattr(s, "_for_update_arg", None), "read", False)
+        and getattr(getattr(s, "_for_update_arg", None), "nowait", False)
+    ]
+    assert len(locked) == 1
+    tl = session.timeline
+    i = tl.index("lock:users:nowait")
+    # The invariant's savepoint, then the stamp's — nothing between them.
+    assert tl[i - 3:i + 2] == [
+        "savepoint", "savepoint:release", "savepoint", "lock:users:nowait",
+        "stamp",
+    ], tl

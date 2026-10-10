@@ -3873,6 +3873,7 @@ async def _index_vault_attempt(
         # names the path, hash and extraction version the digest binds, so it
         # can only ever mark the row state the digest describes.
         rederive_pending = 0
+        invariant_contended = False
         if re_derive and facts is not None:
             entry_hash = {e["file_path"]: e["content_hash"] for e in to_upsert}
             for new in moved_new_paths:
@@ -3900,29 +3901,18 @@ async def _index_vault_attempt(
                     marks,
                 )
 
-            # ── The row invariant (#311, D6) ──────────────────────────────
-            # The stamp claims every surviving row was derived under this
-            # root; re-read them in this transaction and check it, rather than
-            # trusting the skip list alone.
-            final_rows = (
-                await session.execute(
-                    select(
-                        NoteMetadata.file_path,
-                        NoteMetadata.content_hash,
-                        NoteMetadata.extraction_version,
-                        NoteMetadata.derived_under,
-                    ).where(NoteMetadata.user_id == user_id)
-                )
-            ).fetchall()
-            pending_paths = sorted(
-                r.file_path
-                for r in final_rows
-                if r.derived_under
-                != derived_under_digest(
-                    facts, r.file_path, r.content_hash, r.extraction_version
+            # ── Completion re-resolution (#311, D7), then the invariant ─────
+            # Order matters (Codex implementation review r1): the re-read is
+            # the pass's last statement before the stamp, so "every surviving
+            # row is derived under this root" is checked after the last write
+            # and nothing of ours runs between the check and the stamp.
+            if not withholding:
+                await _reresolve_scope_links(session, user_id)
+            rederive_pending, pending_paths, invariant_contended = (
+                await _rederive_invariant(
+                    session, user_id, facts, lock=not withholding
                 )
             )
-            rederive_pending = len(pending_paths)
             if pending_paths and not withholding:
                 # A row left unmarked with no named skip: a writer this pass
                 # did not foresee, or a concurrent insert. Still incomplete.
@@ -3930,9 +3920,6 @@ async def _index_vault_attempt(
                     f"{p} (not derived under the current root)"
                     for p in pending_paths
                 )
-            if not withholding:
-                # ── Completion re-resolution (#311, D7) ───────────────────
-                await _reresolve_scope_links(session, user_id)
 
         # ── The tail stamp ────────────────────────────────────────────────
         # Written where the state it describes is established. On the re-derive
@@ -3948,7 +3935,17 @@ async def _index_vault_attempt(
         # pass repairs again: bounded, idempotent, and never a stamp over a
         # half-repaired index.
         rederive: str | None = None
-        if re_derive and facts is not None:
+        if re_derive and facts is not None and invariant_contended:
+            rederive = REDERIVE_UNRECORDED
+            logger.warning(
+                "Re-derive complete but not recorded%s: another transaction "
+                "holds a row of this scope, so the final invariant re-read "
+                "could not lock them without risking a deadlock. The repairs "
+                "are committed; the next pass will re-derive again and stamp "
+                "then.",
+                log_suffix,
+            )
+        elif re_derive and facts is not None:
             if withholding:
                 rederive = REDERIVE_INCOMPLETE
                 logger.warning(
@@ -4109,6 +4106,53 @@ async def _index_vault_attempt(
         walk_protected=len(protected),
         rederive_pending=rederive_pending,
     )
+
+
+async def _rederive_invariant(session, user_id: int, facts, *, lock: bool):
+    """#311, D6: re-read the scope's rows and name those not derived under
+    the root that presented `facts`. `(count, sorted paths, contended)`.
+
+    With `lock` (the pass is about to stamp) the read takes `FOR SHARE
+    NOWAIT` on every row of the scope inside a savepoint, so no other
+    transaction can change a row between this read and the stamp that follows
+    it in this transaction: a `move_note` that clears a marker or rewrites a
+    source's links either committed before the read (and the read sees it) or
+    blocks until this transaction commits. **NOWAIT, for the tail stamp's
+    reason**: this transaction already holds row locks on every row it wrote,
+    and `move_note` may hold one row and want another of ours, so waiting
+    could close a deadlock cycle. A refused lock is `contended` — the stamp is
+    withheld (`REDERIVE_UNRECORDED`), nothing is lost, the next pass retries.
+    Without `lock` (an incomplete pass, for its report) the read is plain.
+    """
+    stmt = select(
+        NoteMetadata.file_path,
+        NoteMetadata.content_hash,
+        NoteMetadata.extraction_version,
+        NoteMetadata.derived_under,
+    ).where(NoteMetadata.user_id == user_id)
+    if lock:
+        try:
+            async with session.begin_nested():
+                rows = (
+                    await session.execute(
+                        stmt.with_for_update(read=True, nowait=True)
+                    )
+                ).fetchall()
+        except Exception as exc:
+            if _is_lock_not_available(exc):
+                return 0, [], True
+            raise
+    else:
+        rows = (await session.execute(stmt)).fetchall()
+    pending = sorted(
+        r.file_path
+        for r in rows
+        if r.derived_under
+        != derived_under_digest(
+            facts, r.file_path, r.content_hash, r.extraction_version
+        )
+    )
+    return len(pending), pending, False
 
 
 async def _reresolve_scope_links(session, user_id: int) -> int:
