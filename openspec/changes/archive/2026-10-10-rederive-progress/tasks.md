@@ -63,6 +63,6 @@ Run with `make test-integration SCHEMA_TEST_CONTAINER=omcp-schema-w2b SCHEMA_TES
 ## 8. Gates
 
 - [x] 8.1 `openspec validate rederive-progress --strict`
-- [ ] 8.2 `openspec-verifier` subagent against this change
-- [ ] 8.3 Adversarial Codex pass (mandatory: indexer re-derive / provenance path) framed on foreign rows certified as current and on silently wrong search/graph results; two rounds by default
-- [ ] 8.4 After deploy: `docker exec`-equivalent `alembic check` clean; end-to-end exercise of `keyword_search`, `semantic_search`, `get_links`, `get_backlinks` and `move_note` against the live server, named in the report
+- [x] 8.2 `openspec-verifier` subagent against this change (r1: 0 blocking gaps; coverage gaps and notes folded)
+- [x] 8.3 Adversarial Codex pass (mandatory: indexer re-derive / provenance path) framed on foreign rows certified as current and on silently wrong search/graph results; two rounds by default (spec r1 FAIL folded; implementation r1 FAIL — stamp TOCTOU — folded: re-resolution before the locked FOR SHARE NOWAIT re-read, residual L6)
+- [ ] 8.4 After deploy: `docker exec`-equivalent `alembic check` clean; end-to-end exercise of `keyword_search`, `semantic_search`, `get_links`, `get_backlinks` and `move_note` against the live server, named in the report — open: post-deploy, owned by the deploy step
