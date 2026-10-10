@@ -2,6 +2,7 @@ import asyncio
 import base64
 import binascii
 import copy
+import enum
 import errno
 import inspect
 import json
@@ -65,6 +66,7 @@ from src.services.embeddings import semantic_search
 from src.services.filters import apply_note_filters
 from src.services.quotas import admit as _admit_quota, quota_refusal_message
 from src.services.search import full_text_search
+from src.services.usage_params import render_usage_params
 from src.services.usage_stats import OVER_QUOTA_PARAM
 from src.services import transfer, vault_fs
 from src.services.vault import (
@@ -292,12 +294,34 @@ async def _log_usage(
     )
 
 
+class UsageWriteOutcome(enum.Enum):
+    """How one usage write ended (#310, design D5).
+
+    `unstorable` is the one a retry cannot fix: the terminal insert attempt was
+    refused for its *data* — SQLSTATE class 22, 54000, or a bare
+    `UnicodeEncodeError` — by the indexer's own poison classification. Every
+    other failure (writer permit refused, connection lost, a serialisation
+    error with no SQLSTATE) is `failed`, and a coalesced caller requeues it.
+    """
+
+    LANDED = "landed"
+    FAILED = "failed"
+    UNSTORABLE = "unstorable"
+
+
 async def write_usage_row(values: dict) -> bool:
     """Bound every usage write, including initial insert and dangling-FK retry.
 
     Acquire before opening any session; refusal is a failed audit, never a
-    failed completed tool. Coalesced callers requeue their unconfirmed weight.
+    failed completed tool. Coalesced callers requeue their unconfirmed weight
+    — they call `write_usage_row_outcome`, which tells them whether a failure
+    was the data (#310). This is that function collapsed to "did it land".
     """
+    return await write_usage_row_outcome(values) is UsageWriteOutcome.LANDED
+
+
+async def write_usage_row_outcome(values: dict) -> UsageWriteOutcome:
+    """`write_usage_row` without the collapse to a boolean (#310, D5)."""
     controller = concurrency.get_controller()
     admission = await controller.writer()
     if not admission.admitted:
@@ -313,7 +337,7 @@ async def write_usage_row(values: dict) -> bool:
             )
         except Exception:
             pass
-        return False
+        return UsageWriteOutcome.FAILED
     try:
         if admission.overrun is not None:
             # Queue mode: enforce would have refused this writer. The row is
@@ -366,7 +390,7 @@ def _with_provenance(params: dict) -> dict:
         return params
 
 
-async def _write_usage_row_admitted(values: dict) -> bool:
+async def _write_usage_row_admitted(values: dict) -> "UsageWriteOutcome":
     """Insert one prepared `usage_logs` row, and do not lose it to a dangling
     credential.
 
@@ -396,12 +420,25 @@ async def _write_usage_row_admitted(values: dict) -> bool:
     the log can tell "the tool failed and here is the row" from "the tool failed
     and the row is missing". Every existing caller ignores the value and is
     unchanged.
+
+    **`params` is rendered first, exactly once** (#310, design D2). Every row
+    the MCP side writes passes through here — the success tail, the
+    body-exception row, every pre-body refusal and every coalesced
+    `rate_limited` / `slot_timeout` row — after every telemetry and
+    observation merge, so `render_usage_params` sees what is about to be
+    inserted and the FK-cleared retry below is built from the rendered values.
+    An absent `params` key stays absent and `None` stays `None`. Since #310 the
+    answer is three-valued: a terminal failure the indexer's poison
+    classification calls *data* (class 22, 54000) is `UNSTORABLE`, which a
+    coalesced caller drops instead of requeueing; everything else is `FAILED`.
     """
+    if values.get("params") is not None:
+        values = dict(values, params=render_usage_params(values["params"]))
     tool = values.get("tool")
     subject = security_events.subject_for(user_id=values.get("user_id"))
     try:
         await _insert_usage(values)
-        return True
+        return UsageWriteOutcome.LANDED
     except Exception as e:
         if not _is_fk_violation(e):
             # `error_type` and not the exception's text: a failed insert's
@@ -416,7 +453,7 @@ async def _write_usage_row_admitted(values: dict) -> bool:
                 reason="initial",
                 error_type=type(e).__name__,
             )
-            return False
+            return _failure_outcome(e)
         retry = dict(values, key_id=None, oauth_token_id=None)
         if _violated_user_fk(e):
             retry["user_id"] = None
@@ -429,7 +466,7 @@ async def _write_usage_row_admitted(values: dict) -> bool:
 
     try:
         await _insert_usage(retry)
-        return True
+        return UsageWriteOutcome.LANDED
     except Exception as e:
         security_events.emit(
             "usage_log_failed",
@@ -438,10 +475,35 @@ async def _write_usage_row_admitted(values: dict) -> bool:
             reason="after_clearing_fks",
             error_type=type(e).__name__,
         )
-        return False
+        return _failure_outcome(e)
 
 
-_MAX_PARAM_LEN = 200  # truncate long string params (e.g. note content)
+def _failure_outcome(exc: BaseException) -> "UsageWriteOutcome":
+    """`UNSTORABLE` for a data-class failure, else `FAILED` (#310, D5).
+
+    The classification is the indexer's `poison_sqlstate`, reused rather than
+    reimplemented: it walks `orig` and `__cause__` (never `__context__`),
+    lets the first SQLSTATE decide, and never calls a connection or interface
+    failure poison. Imported here because `indexer` imports half the server.
+    Any failure to classify is `FAILED` — the conservative answer, which keeps
+    today's requeue.
+    """
+    try:
+        from src.services.indexer import poison_sqlstate  # local: avoids a cycle
+
+        if poison_sqlstate(exc) is not None:
+            return UsageWriteOutcome.UNSTORABLE
+    except Exception:  # noqa: BLE001
+        pass
+    return UsageWriteOutcome.FAILED
+
+
+# Truncate long top-level string params (e.g. note content). Counted in code
+# points, before rendering, so the cut cannot split a surrogate pair or an
+# escape; `render_usage_params` can then grow a rendered string to at most
+# 6 × _MAX_PARAM_LEN + 1 stored characters (every code point a lone
+# surrogate, `\udXXX`) — #310, design D4.
+_MAX_PARAM_LEN = 200
 _MAX_QUERY_RESULTS = 500
 _MAX_SEMANTIC_RESULTS = 50
 

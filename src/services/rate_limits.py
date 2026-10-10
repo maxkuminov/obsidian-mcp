@@ -417,7 +417,9 @@ class PlannedRow:
 
     `weight` is `1 + suppressed`: the number of observed refusals this row
     stands for, which is exactly what must return to `pending` if it does not
-    land.
+    land. A row is therefore acknowledged, requeued, or — only when the
+    database rejected its data (#310) — dropped, with its weight reported by
+    one `usage_refusal_row_dropped` attempt.
     """
 
     #: The complete row, ready for `write_usage_row`.
@@ -551,7 +553,9 @@ async def write_planned_row(planned: PlannedRow) -> bool:
     Returns whether the row landed. A `False` is not an error the caller has to
     handle — the count is back in the coalescer and the next rollover or tick
     will carry it — which is what makes this safe to call from the request path
-    and from housekeeping alike.
+    and from housekeeping alike. The one exception is a row the database
+    rejected for its *data* (`UNSTORABLE`, #310): that row is dropped, not
+    requeued, and reported once by `usage_refusal_row_dropped`.
     """
     # Deferred import, not a cycle: `tools.py` imports this module at load
     # time, so the reverse edge can only exist inside a function body. The
@@ -559,21 +563,53 @@ async def write_planned_row(planned: PlannedRow) -> bool:
     # a row whose credential has been deleted — the 23503 recovery that clears
     # the foreign keys and keeps the denormalised actor columns (#77), which is
     # exactly the path a deferred flush needs.
-    from src.mcp_server.tools import write_usage_row
+    from src.mcp_server import tools
 
     try:
-        landed = await write_usage_row(planned.values)
+        outcome = await tools.write_usage_row_outcome(planned.values)
     except Exception:  # noqa: BLE001 - a failed row must not fail its caller
-        landed = False
+        outcome = tools.UsageWriteOutcome.FAILED
     except BaseException:
         # Cancellation must propagate, but the unconfirmed weight survives.
         requeue(planned)
         raise
-    if not landed:
-        requeue(planned)
-    else:
+    if outcome is tools.UsageWriteOutcome.LANDED:
         planned.entry.in_flight -= 1
-    return landed
+        return True
+    if outcome is tools.UsageWriteOutcome.UNSTORABLE:
+        # #310, design D6. The database refused the row's *data*, and the
+        # template it came from will not improve: requeueing it (with its
+        # original start, on the flush path) retried the same failing INSERT
+        # on every tick for as long as the process lived. So the row is
+        # released without requeue — no window re-created, nothing added to
+        # an open window's `pending` — and its weight is reported, best
+        # effort, by one emission attempt (subject to the suppressor; it names
+        # neither principal nor scope, so it is not exact accounting, L3).
+        planned.entry.in_flight -= 1
+        _report_dropped(planned)
+        return False
+    requeue(planned)
+    return False
+
+
+def _report_dropped(planned: PlannedRow) -> None:
+    """One `usage_refusal_row_dropped` attempt. Never raises."""
+    try:
+        from src.services import security_events
+
+        values = planned.values
+        params = values.get("params") or {}
+        marker = params.get("error") if isinstance(params, dict) else None
+        security_events.emit(
+            "usage_refusal_row_dropped",
+            subject=security_events.subject_for(user_id=values.get("user_id")),
+            tool=values.get("tool"),
+            reason=marker if isinstance(marker, str) else None,
+            count=planned.weight,
+            user_id=values.get("user_id"),
+        )
+    except Exception:  # noqa: BLE001 - bookkeeping never fails its caller
+        pass
 
 
 #: The principal a refusal is coalesced under when there is none. Unreachable
