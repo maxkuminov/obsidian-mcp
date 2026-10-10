@@ -4797,7 +4797,7 @@ async def _move_note_locked(
     and never carries `nothing_written: true`: the move happened, and a caller
     told otherwise goes looking for a note that has already relocated.
     """
-    from sqlalchemy import select, update
+    from sqlalchemy import or_, select, update
     from src.models.db import NoteLink, NoteMetadata
     from src.services.links import build_vault_index
 
@@ -5347,6 +5347,9 @@ async def _move_note_locked(
                         file_path=to_rel,
                         title=title,
                         embedded_content_hash=None,
+                        # Re-derive progress (#311, D3): a move is not a
+                        # re-deriving pass's derivation of this row.
+                        derived_under=None,
                         # The scan's stat shortcut (#282, D10): NULL makes the
                         # next pass read and hash the moved file rather than
                         # trust a stat recorded for the old path. Carrying it
@@ -5366,6 +5369,30 @@ async def _move_note_locked(
                 # the legacy behavior is preserved.
                 user_note_ids = select(NoteMetadata.id).where(
                     _note_owner_predicate(uid)
+                )
+                # Re-derive progress (#311, D3). The `target_path` rewrite
+                # below changes these sources' extracted link state without
+                # changing their path, hash or extraction version, and the
+                # planned rewrites are about to change their files: neither may
+                # stay marked derived under a root, or a later re-derive could
+                # carry the mutated link state forward and certify it.
+                rewritten_sources = [planned[0] for planned in planned_rewrites]
+                await session.execute(
+                    update(NoteMetadata)
+                    .where(
+                        _note_owner_predicate(uid),
+                        NoteMetadata.derived_under.is_not(None),
+                        or_(
+                            NoteMetadata.id.in_(
+                                select(NoteLink.source_note_id).where(
+                                    NoteLink.target_path == from_rel,
+                                    NoteLink.source_note_id.in_(user_note_ids),
+                                )
+                            ),
+                            NoteMetadata.file_path.in_(rewritten_sources),
+                        ),
+                    )
+                    .values(derived_under=None)
                 )
                 link_update = (
                     update(NoteLink)

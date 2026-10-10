@@ -450,8 +450,20 @@ async def test_move_through_a_symlinked_folder_keeps_the_index_consistent(
     # move only got this far because it found nothing.
     assert "extraction_version" in str(statements[2].compile())
 
-    # Both UPDATEs are keyed on the resolved paths.
+    # Both UPDATEs are keyed on the resolved paths. The re-derive-marker
+    # clear between them (#311, D3) is keyed on the old path and the
+    # planned rewrite sources, and is checked apart.
+    clears = [
+        s for s in statements[3:]
+        if "SET derived_under" in str(s.compile())
+    ]
+    assert len(clears) == 1
+    clear_values = clears[0].compile().params
+    assert "Real/A.md" in clear_values.values()
+    assert "Shared/A.md" not in clear_values.values()
     for statement in statements[3:]:
+        if statement in clears:
+            continue
         values = set(statement.compile().params.values())
         assert "Real/A.md" in values
         assert "Real/B.md" in values

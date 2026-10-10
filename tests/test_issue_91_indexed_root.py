@@ -235,6 +235,16 @@ class FakeSession:
 
         if isinstance(stmt, Select):
             rendered = str(stmt)
+            # #311: the re-derive tail's in-transaction invariant re-read and
+            # its completion re-resolution. This stub executes no SQL, so it
+            # cannot model which rows the tail marked; it answers "no row
+            # pending, no link to re-resolve", which leaves these fixtures
+            # about the skip rules. The invariant is exercised on real
+            # Postgres (tests/integration/test_issue_311_rederive_progress_pg.py).
+            if "derived_under" in rendered and "stat_size" not in rendered:
+                return _Result([])
+            if "note_links.target_path" in rendered:
+                return _Result([])
             if "indexed_vault_assignment" in rendered:
                 return _Result([self.provenance])
             # The locked re-read that binds a delete or a stamp to the
@@ -1586,9 +1596,14 @@ async def test_a_row_less_unreadable_file_does_not_withhold_the_stamp(
 
 @pytest.mark.asyncio
 async def test_a_directory_walk_failure_withholds_the_stamp(monkeypatch, tmp_path):
-    """D8: anything beneath an unlistable directory could have a row."""
+    """D8, narrowed by #311 D5: an unlistable directory withholds when a row
+    beneath it is not derived under the current root (here: never marked)."""
     vault = make_vault(tmp_path, "vault", {"a.md": "a\n", "sub/b.md": "b\n"})
-    session = FakeSession(provenance=(None, None, None), existing={}, note_ids={})
+    session = FakeSession(
+        provenance=(None, None, None),
+        existing={"sub/b.md": "0" * 64},
+        note_ids={"sub/b.md": 1},
+    )
     install(monkeypatch, session, vault)
     os.chmod(vault / "sub", 0)
     try:
@@ -1600,6 +1615,29 @@ async def test_a_directory_walk_failure_withholds_the_stamp(monkeypatch, tmp_pat
 
     assert session.stamps == []
     assert result.rederive_incomplete is True
+
+
+@pytest.mark.asyncio
+async def test_a_directory_walk_failure_over_no_row_does_not_withhold(
+    monkeypatch, tmp_path
+):
+    """#311 D5: with no row at or beneath the unlisted directory there is no
+    row it could leave certified wrongly; #309's `walk_incomplete` still
+    reports the directory."""
+    vault = make_vault(tmp_path, "vault", {"a.md": "a\n", "sub/b.md": "b\n"})
+    session = FakeSession(provenance=(None, None, None), existing={}, note_ids={})
+    install(monkeypatch, session, vault)
+    os.chmod(vault / "sub", 0)
+    try:
+        if os.access(vault / "sub", os.R_OK):  # pragma: no cover - running as root
+            pytest.skip("permissions are not enforced for this user")
+        result = await indexer.index_vault(user_id=7)
+    finally:
+        os.chmod(vault / "sub", 0o755)
+
+    assert len(session.stamps) == 1
+    assert result.rederive_incomplete is False
+    assert result.walk_incomplete is True
 
 
 @pytest.mark.asyncio

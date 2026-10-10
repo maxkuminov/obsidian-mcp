@@ -337,6 +337,9 @@ _OAUTH_GRANT_ISSUED_AT_COLUMN_MARKER = (
 _NOTE_STAT_COLUMN_MARKER = (
     "stat of the bytes content_hash was computed from (026_note_stat_columns)"
 )
+# Migration 030's marker on `notes_metadata.derived_under`, byte identical to
+# its `MARKER`; declared as the column comment so `alembic check` compares it.
+_DERIVED_UNDER_COLUMN_MARKER = "re-derive progress digest (030_note_derived_under)"
 # The all-or-none CHECK over those four columns. The predicate is the
 # migration's `STAT_PREDICATE`, byte for byte.
 _NOTE_STAT_CHECK_NAME = "ck_notes_metadata_stat_all_or_none"
@@ -521,6 +524,22 @@ class NoteMetadata(Base):
     )
     stat_ino: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True, comment=_NOTE_STAT_COLUMN_MARKER
+    )
+    # Re-derive progress (#311, migration 030). SHA-256 hex of the root facts
+    # a **re-deriving** pass observed (assignment, real path, handle — the
+    # provenance stamp's triple) bound to this row's own `file_path`,
+    # `content_hash` and `extraction_version`; see
+    # `src.services.indexer.derived_under_digest`. Only a re-deriving pass's
+    # tail writes it non-NULL, for rows it fully derived. Every other write of
+    # the row's derived state or of its link rows' extracted state sets it
+    # NULL, and NULL means "not derived under the current root". A repeated
+    # re-derive skips rows whose marker matches the digest it expects; the
+    # provenance stamp is recorded only when every surviving row matches.
+    # No default and no backfill: a backfill would assert a derivation the
+    # migration never observed. See "Re-derive progress (#311)" in
+    # docs/architecture/indexing-and-embeddings.md.
+    derived_under: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, comment=_DERIVED_UNDER_COLUMN_MARKER
     )
     indexed_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

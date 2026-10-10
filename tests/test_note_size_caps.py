@@ -366,8 +366,9 @@ async def test_move_note_rewrites_unchanged_when_nothing_is_over_cap(
     # ...each under the `expected=` conflict guard, carrying the pre-move bytes.
     assert seen == [big_before, small_before]
 
-    # The move's DB updates still ran and committed.
-    assert len(journal.mutating()) == 2
+    # The move's DB updates still ran and committed: the metadata update,
+    # the re-derive-marker clear for the sources (#311, D3), the link update.
+    assert len(journal.mutating()) == 3
     assert journal.commits == 1
 
 
