@@ -103,6 +103,7 @@ def _key(last_used_at=None, user_id=UID, **kw):
 
 def _token(user_id=UID):
     return OAuthToken(
+        grant_issued_at=datetime.now(timezone.utc),
         id=91, token_hash="t", token_type="access", revoked=False,
         client_id="c1", grant_id="g1", user_id=user_id, scope="read",
         expires_at=datetime.now(timezone.utc) + timedelta(hours=1),

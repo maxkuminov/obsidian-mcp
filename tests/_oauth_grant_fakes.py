@@ -52,6 +52,7 @@ class FakeToken:
         created_at: datetime.datetime | None = None,
         token_hash: str | None = None,
         id: int | None = None,
+        grant_issued_at: datetime.datetime | None = None,
     ):
         if id is None:
             id = FakeToken._next_id
@@ -65,6 +66,9 @@ class FakeToken:
         self.revoked = revoked
         self.expires_at = expires_at or in_hours(1)
         self.created_at = created_at or utcnow()
+        # The family's absolute clock (#326); "just issued" unless a case
+        # says otherwise, so existing cases stay far from the deadline.
+        self.grant_issued_at = grant_issued_at or self.created_at
         self.token_hash = token_hash
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid

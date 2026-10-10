@@ -60,7 +60,7 @@ DIM = 64  # irrelevant here; keeps the migration cheap.
 # The current head. Every case that migrates forward asserts it, so adding a
 # revision without teaching this module about it fails loudly rather than
 # leaving the new migration unexercised.
-HEAD_REVISION = "028"
+HEAD_REVISION = "029"
 
 CONSTRAINT = "ck_oauth_clients_auth_method_secret"
 MARKER = "created by 013_schema_reconciliation"
@@ -6292,3 +6292,223 @@ def test_downgrade_028_leaves_a_table_it_did_not_create():
         assert alembic_version(url) == "027"
         assert fetchval(url, "SELECT to_regclass('public.concurrency_runs')") is not None
         assert fetchval(url, "SELECT to_regclass('public.concurrency_counters')") is None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 029 — oauth_codes.grant_id and oauth_tokens.grant_issued_at (#325, #326)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# `alembic check` sees both columns' type, nullability and comment, but **not
+# the server default** (`compare_server_default` is off), so the default on
+# `grant_issued_at` — the rolling-deploy safety net — is asserted here through
+# the catalogue or nowhere. The backfill is the other thing autogenerate cannot
+# see: every pre-existing token must carry one migration timestamp, or the
+# deploy logs connectors out (or leaves a family with two clocks).
+
+CODE_GRANT_MARKER_029 = (
+    "grant family the exchange of this code issued (029_oauth_grant_lifetime)"
+)
+ISSUED_AT_MARKER_029 = (
+    "grant family issuance time, inherited by rotation (029_oauth_grant_lifetime)"
+)
+
+
+def column_state_029(url, table, column):
+    rows = fetch(
+        url,
+        "SELECT format_type(a.atttypid, a.atttypmod) AS coltype, a.attnotnull, "
+        "       pg_get_expr(d.adbin, d.adrelid) AS coldefault, "
+        "       col_description(a.attrelid, a.attnum) AS comment "
+        "FROM pg_attribute a "
+        "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
+        "WHERE a.attrelid = $1::regclass "
+        "  AND a.attname = $2 AND a.attnum > 0 AND NOT a.attisdropped",
+        f"public.{table}",
+        column,
+    )
+    return tuple(rows[0]) if rows else None
+
+
+def refuse_029(url, *, must_mention):
+    _harness.run_alembic(url, "stamp", "028", dimensions=DIM)
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    assert result.returncode != 0, "029 should have refused"
+    combined = result.stdout + result.stderr
+    for phrase in must_mention:
+        assert phrase in combined, f"refusal did not mention {phrase!r}:\n{combined}"
+    assert alembic_version(url) == "028", "nothing should have been recorded"
+    return combined
+
+
+def test_029_creates_both_columns_with_shape_marker_and_default():
+    with throwaway_db("schema_029_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION
+        assert column_state_029(url, "oauth_codes", "grant_id") == (
+            "character varying(64)",
+            False,
+            None,
+            CODE_GRANT_MARKER_029,
+        )
+        assert column_state_029(url, "oauth_tokens", "grant_issued_at") == (
+            "timestamp with time zone",
+            True,
+            "now()",
+            ISSUED_AT_MARKER_029,
+        )
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_029_chains_from_028():
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config()
+    config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+    assert script.get_current_head() == HEAD_REVISION == "029"
+    assert script.get_revision("029").down_revision == "028"
+
+
+def test_029_backfills_every_pre_existing_token_with_one_migration_timestamp():
+    old = datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc)
+    with throwaway_db("schema_029_backfill", revision="028") as url:
+        insert_client(url, "client-a", "none", None)
+        insert_client(url, "client-b", "none", None)
+        insert_client_token(url, "a" * 64, "client-a", created_at=old)
+        insert_client_token(url, "b" * 64, "client-a")
+        insert_client_token(url, "c" * 64, "client-b", created_at=old)
+        insert_code(url, "d" * 64, "client-a", used=True)
+        before = fetchval(url, "SELECT now()")
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        after = fetchval(url, "SELECT now()")
+        assert alembic_version(url) == HEAD_REVISION
+        values = {
+            r[0] for r in fetch(url, "SELECT grant_issued_at FROM oauth_tokens")
+        }
+        assert len(values) == 1, values
+        stamped = values.pop()
+        assert before <= stamped <= after
+        # Not each row's own creation time: the clock starts at migration.
+        assert stamped > old
+        # A spent code has no recoverable lineage.
+        assert fetchval(
+            url, "SELECT count(*) FROM oauth_codes WHERE grant_id IS NOT NULL"
+        ) == 0
+
+
+def test_029_stamp_back_rerun_changes_no_value():
+    recorded = datetime.datetime(2030, 5, 5, tzinfo=datetime.timezone.utc)
+    with throwaway_db("schema_029_rerun") as url:
+        insert_client(url, "client-a", "none", None)
+        insert_client_token(url, "a" * 64, "client-a")
+        insert_code(url, "b" * 64, "client-a", used=True)
+        sql(url, "UPDATE oauth_tokens SET grant_issued_at = $1", recorded)
+        sql(url, "UPDATE oauth_codes SET grant_id = 'g-lineage'")
+
+        _harness.run_alembic(url, "stamp", "028", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(url, "SELECT grant_issued_at FROM oauth_tokens") == recorded
+        assert fetchval(url, "SELECT grant_id FROM oauth_codes") == "g-lineage"
+        assert_alembic_check_clean(url, DIM)
+
+
+@pytest.mark.parametrize(
+    "label,ddl,fragment",
+    [
+        (
+            "issued_at_nullable",
+            [
+                "ALTER TABLE oauth_tokens ADD COLUMN grant_issued_at timestamptz "
+                "DEFAULT now()",
+            ],
+            "oauth_tokens.grant_issued_at already exists but it is nullable",
+        ),
+        (
+            "issued_at_no_default",
+            [
+                "ALTER TABLE oauth_tokens ADD COLUMN grant_issued_at timestamptz "
+                "NOT NULL DEFAULT now()",
+                "ALTER TABLE oauth_tokens ALTER COLUMN grant_issued_at DROP DEFAULT",
+            ],
+            "it has no server default",
+        ),
+        (
+            "issued_at_wrong_type",
+            [
+                "ALTER TABLE oauth_tokens ADD COLUMN grant_issued_at timestamp "
+                "NOT NULL DEFAULT now()",
+            ],
+            "not timestamp with time zone",
+        ),
+        (
+            "issued_at_unmarked",
+            [
+                "ALTER TABLE oauth_tokens ADD COLUMN grant_issued_at timestamptz "
+                "NOT NULL DEFAULT now()",
+            ],
+            "does not carry 029's comment marker",
+        ),
+        (
+            "code_grant_not_null",
+            [
+                "ALTER TABLE oauth_codes ADD COLUMN grant_id varchar(64) NOT NULL "
+                "DEFAULT 'x'",
+            ],
+            "oauth_codes.grant_id already exists but it is NOT NULL",
+        ),
+        (
+            "code_grant_wrong_type",
+            ["ALTER TABLE oauth_codes ADD COLUMN grant_id text"],
+            "not character varying(64)",
+        ),
+    ],
+)
+def test_029_refuses_a_pre_existing_column_of_another_shape(label, ddl, fragment):
+    with throwaway_db(f"schema_029_foreign_{label}", revision="028") as url:
+        insert_client(url, "client-a", "none", None)
+        insert_client_token(url, "a" * 64, "client-a")
+        for statement in ddl:
+            sql(url, statement)
+        refuse_029(url, must_mention=[fragment, "Nothing has been changed"])
+        # Atomic: the other column was not added either.
+        if label.startswith("issued_at"):
+            assert column_state_029(url, "oauth_codes", "grant_id") is None
+        else:
+            assert column_state_029(url, "oauth_tokens", "grant_issued_at") is None
+
+
+def test_downgrade_029_drops_both_marked_columns_and_upgrade_rebuilds_them():
+    with throwaway_db("schema_029_downgrade") as url:
+        insert_client(url, "client-a", "none", None)
+        insert_client_token(url, "a" * 64, "client-a")
+        _harness.run_alembic(url, "downgrade", "028", dimensions=DIM)
+        assert alembic_version(url) == "028"
+        assert column_state_029(url, "oauth_codes", "grant_id") is None
+        assert column_state_029(url, "oauth_tokens", "grant_issued_at") is None
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(
+            url, "SELECT count(*) FROM oauth_tokens WHERE grant_issued_at IS NULL"
+        ) == 0
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_downgrade_029_refuses_an_unmarked_column_and_changes_nothing():
+    with throwaway_db("schema_029_downgrade_foreign") as url:
+        sql(url, "COMMENT ON COLUMN oauth_tokens.grant_issued_at IS 'somebody else'")
+        result = _harness.run_alembic(
+            url, "downgrade", "028", dimensions=DIM, check=False
+        )
+        assert result.returncode != 0
+        combined = result.stdout + result.stderr
+        assert (
+            "oauth_tokens.grant_issued_at does not carry 029's comment marker"
+            in combined
+        )
+        assert alembic_version(url) == HEAD_REVISION
+        # Both were checked before either was dropped.
+        assert column_state_029(url, "oauth_codes", "grant_id") is not None

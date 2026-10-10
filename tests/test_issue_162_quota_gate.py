@@ -583,6 +583,7 @@ def test_oauth_traffic_is_exempt_because_no_branch_binds_a_limit_for_it():
     from src.models.db import OAuthToken
 
     token = OAuthToken(
+        grant_issued_at=datetime.now(timezone.utc),
         id=42,
         token_hash="y",
         token_type="access",

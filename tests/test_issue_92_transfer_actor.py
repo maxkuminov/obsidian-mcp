@@ -109,6 +109,7 @@ def api_key(name="nightly sync", prefix="omcp_a1b2c3") -> APIKey:
 
 def oauth_token() -> OAuthToken:
     return OAuthToken(
+        grant_issued_at=datetime.datetime.now(datetime.timezone.utc),
         id=11,
         token_hash="y" * 64,
         token_type="access",

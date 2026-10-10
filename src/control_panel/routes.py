@@ -45,6 +45,7 @@ from src.models.db import (
     UsageLog,
 )
 from src.oauth.grants import (
+    grant_expired,
     live_family_scopes,
     lock_account_guard,
     revoke_grant_family,
@@ -1408,6 +1409,13 @@ def _token_status(token, now: datetime, owner_active: bool) -> str:
     if token.revoked:
         return "revoked"
     if token.expires_at <= now:
+        return "expired"
+    if grant_expired(token.grant_issued_at, now):
+        # The grant family is at or past its absolute deadline (#326), so the
+        # middleware refuses this token (`reason=grant_lifetime_exceeded`) and
+        # the token endpoint will not rotate it — even though its own
+        # `expires_at` is still ahead, which happens after the setting is
+        # shortened. The #76 rule: never show live what the middleware refuses.
         return "expired"
     if not has_vault_scope(token.scope):
         # `offline_access` says the grant may carry a refresh token, not that

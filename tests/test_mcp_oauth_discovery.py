@@ -161,6 +161,7 @@ def test_missing_bearer_returns_401_with_discovery_header():
 
 def test_inactive_user_oauth_token_is_rejected(monkeypatch):
     oauth_token = OAuthToken(
+        grant_issued_at=datetime.now(timezone.utc),
         id=9,
         user_id=42,
         token_hash=auth_mod.hash_key("access-token"),

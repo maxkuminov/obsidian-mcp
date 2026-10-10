@@ -956,6 +956,26 @@ class Settings(BaseSettings):
     # OAUTH_CLIENT_UNUSED_EXPIRY_DAYS.
     oauth_client_unused_expiry_days: NullableLimit = 30
 
+    # The absolute lifetime of an OAuth grant family, in days (#326, ASVS
+    # V10.4.8). Each rotation mints a fresh 30-day refresh token, so without a
+    # cap a party that refreshes at least monthly keeps the grant for ever. The
+    # deadline is `oauth_tokens.grant_issued_at` plus this, derived at use, so
+    # lowering it takes effect at the next request for every family and
+    # raising it extends existing ones (accepted, L1).
+    #
+    # Deliberately a plain int and **not** a `NullableLimit`: empty, `null`,
+    # `none` and `0` all fail at boot. The client sweep's kill switch exists
+    # because that sweep deletes things; nothing here deletes anything, and the
+    # worst outcome of a wrong value is a connector re-authorizing. A disabled
+    # spelling *is* #326 — an ASVS L2 control one blank env line silently
+    # removes. Zero would make every grant dead on arrival (an outage, not a
+    # setting). The 365-day ceiling keeps "absolute" meaning something: a value
+    # large enough to be indistinguishable from disabled is the same hole
+    # spelled differently. The rollback lever is raising the value. See
+    # `docs/architecture/oauth-and-grants.md`. Env:
+    # OAUTH_GRANT_ABSOLUTE_LIFETIME_DAYS.
+    oauth_grant_absolute_lifetime_days: int = Field(90, ge=1, le=365)
+
     # Registry-eval only: when true, lifespan skips the DB dim check,
     # indexer, and embedding provider, and the /mcp auth middleware
     # short-circuits. Lets Glama's sandbox build the image and validate

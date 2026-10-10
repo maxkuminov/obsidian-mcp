@@ -20,6 +20,7 @@ from src.auth.session import (
 from src.config import settings
 from src.database import async_session
 from src.models.db import APIKey, OAuthClient, OAuthToken, User
+from src.oauth.grants import grant_expired
 from src.oauth.scope import has_vault_scope, token_has_write
 from src.services import body_budget, concurrency, rate_limits, security_events
 from src.services.vault import apply_user_vault_row
@@ -1103,10 +1104,33 @@ class APIKeyMiddleware:
                         )
                         return response
 
-                if oauth_token.expires_at < datetime.now(timezone.utc):
+                now = datetime.now(timezone.utc)
+                if oauth_token.expires_at < now:
                     _emit_auth_failure(
                         request,
                         "key_expired",
+                        oauth_token_id=oauth_token.id,
+                        user_id=oauth_token.user_id,
+                    )
+                    response = JSONResponse(
+                        {"error": "Token expired"},
+                        status_code=401,
+                        headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
+                    )
+                    return response
+
+                # The grant family's absolute deadline (#326). Clamping at mint
+                # already guarantees this for every token minted since; the
+                # check exists for tokens minted *before* the setting was
+                # shortened, so a shortened policy takes effect at this request
+                # rather than up to an hour later. Dead **at** the deadline:
+                # a clamped token whose `expires_at` equals it passes the
+                # per-token check above at that instant and is refused here.
+                # A column of the row already loaded — no extra query.
+                if grant_expired(oauth_token.grant_issued_at, now):
+                    _emit_auth_failure(
+                        request,
+                        "grant_lifetime_exceeded",
                         oauth_token_id=oauth_token.id,
                         user_id=oauth_token.user_id,
                     )

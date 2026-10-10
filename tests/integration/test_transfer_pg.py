@@ -2183,3 +2183,191 @@ async def test_pool_exhaustion_fails_after_the_configured_pool_timeout(
         await small.dispose()
 
     assert 0.4 <= waited < 10, waited
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# #326 — an OAuth-minted capability dies with its grant family
+#
+# The transfer subsystem re-validates the minting credential on its own — at
+# mint, at redemption and inside the publish gate — never through the MCP
+# middleware. So the absolute grant deadline has to be read *here* too, or a
+# capability minted before the setting was shortened would still overwrite the
+# vault after the grant was supposed to be dead (Codex spec review, MAJOR).
+# ════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.fixture
+def grant_lifetime(monkeypatch):
+    from src.oauth import grants
+
+    def _set(days):
+        monkeypatch.setattr(
+            grants.settings, "oauth_grant_absolute_lifetime_days", days, raising=False
+        )
+
+    _set(90)
+    return _set
+
+
+async def _oauth_identity_issued(session, vault_root, *, issued_days_ago):
+    user, _key, oauth = await _seed_identity(session, vault_path=str(vault_root))
+    oauth.grant_issued_at = _now() - datetime.timedelta(days=issued_days_ago)
+    await session.commit()
+    return user, oauth
+
+
+async def _mint_oauth(session, vault_root, user, oauth, direction, path, **kwargs):
+    return await transfer.mint_token(
+        session,
+        direction,
+        path,
+        overwrite=False,
+        identity=transfer.Identity(oauth_token_id=oauth.id, user_id=user.id),
+        vault_root=str(vault_root),
+        **kwargs,
+    )
+
+
+async def test_the_mint_window_is_clamped_to_the_grant_deadline(
+    clean, vault_root, grant_lifetime
+):
+    async with clean() as session:
+        user, oauth = await _oauth_identity_issued(session, vault_root, issued_days_ago=90)
+        # Five minutes left on the grant, an hour on the token itself.
+        oauth.grant_issued_at = _now() - datetime.timedelta(days=90, minutes=-5)
+        await session.commit()
+        deadline = oauth.grant_issued_at + datetime.timedelta(days=90)
+        _token, row, window = await _mint_oauth(
+            session, vault_root, user, oauth, "upload", "Attachments/shot.png",
+            expected_fingerprint=None, expires_in=3600,
+        )
+    assert window.clamped is True
+    assert row.expires_at == deadline
+    assert row.expires_at < oauth.expires_at
+
+
+async def test_no_capability_is_minted_from_a_credential_past_its_deadline(
+    clean, vault_root, grant_lifetime
+):
+    async with clean() as session:
+        user, oauth = await _oauth_identity_issued(session, vault_root, issued_days_ago=91)
+        with pytest.raises(transfer.CredentialNotUsable):
+            await _mint_oauth(
+                session, vault_root, user, oauth, "upload", "Attachments/shot.png",
+                expected_fingerprint=None,
+            )
+        await session.rollback()
+    async with clean() as session:
+        count = (
+            await session.execute(select(func.count()).select_from(TransferToken))
+        ).scalar_one()
+    assert count == 0
+
+
+async def test_a_pending_upload_capability_dies_when_the_policy_is_shortened(
+    clean, vault_root, wired, grant_lifetime
+):
+    async with clean() as session:
+        user, oauth = await _oauth_identity_issued(session, vault_root, issued_days_ago=10)
+        token, row, _ = await _mint_oauth(
+            session, vault_root, user, oauth, "upload", "Attachments/shot.png",
+            expected_fingerprint=None,
+        )
+    # Both the access token and the capability are unexpired; only the grant
+    # deadline (issued 10 days ago, now a 7-day policy) has passed.
+    assert oauth.expires_at > _now() and row.expires_at > _now()
+    grant_lifetime(7)
+
+    async with _client("203.0.113.61") as client:
+        response = await client.put(
+            "/transfer/upload",
+            headers={"Authorization": f"Bearer {token}"},
+            content=PAYLOAD,
+        )
+    assert response.status_code == 404
+    assert response.json() == {"error": "not found"}
+    assert not (vault_root / "Attachments" / "shot.png").exists()
+
+    # Raising it again (accepted L1) brings the same link back.
+    grant_lifetime(90)
+    async with _client("203.0.113.62") as client:
+        again = await client.put(
+            "/transfer/upload",
+            headers={"Authorization": f"Bearer {token}"},
+            content=PAYLOAD,
+        )
+    assert again.status_code == 200, again.text
+
+
+async def test_a_pending_download_capability_dies_with_its_grant(
+    clean, vault_root, wired, grant_lifetime
+):
+    from src.services import vault_fs
+
+    target = vault_root / "Attachments" / "spec.pdf"
+    target.write_bytes(b"%PDF-1.4\n" + b"body " * 100)
+    root_fd = vault_fs.open_root(vault_root)
+    try:
+        dir_fd, name = vault_fs.open_parent(root_fd, "Attachments/spec.pdf")
+        try:
+            fingerprint = vault_fs.fingerprint(dir_fd, name, hash_up_to=10**9)
+        finally:
+            os.close(dir_fd)
+    finally:
+        os.close(root_fd)
+
+    async with clean() as session:
+        user, oauth = await _oauth_identity_issued(session, vault_root, issued_days_ago=10)
+        token, _row, _ = await _mint_oauth(
+            session, vault_root, user, oauth, "download", "Attachments/spec.pdf",
+            expected_fingerprint=fingerprint,
+        )
+
+    headers = {"Authorization": f"Bearer {token}"}
+    async with _client("203.0.113.63") as client:
+        assert (await client.get("/transfer/download/file", headers=headers)).status_code == 200
+        grant_lifetime(7)
+        refused = await client.get("/transfer/download/file", headers=headers)
+    assert refused.status_code == 404
+    assert refused.json() == {"error": "not found"}
+
+
+async def test_the_deadline_is_re_checked_before_publication(
+    clean, vault_root, wired, grant_lifetime
+):
+    """The entry check passes; the grant dies while the bytes are arriving; the
+    locked pre-publication re-validation refuses and nothing is published."""
+    async with clean() as session:
+        user, oauth = await _oauth_identity_issued(session, vault_root, issued_days_ago=10)
+        token, row, _ = await _mint_oauth(
+            session, vault_root, user, oauth, "upload", "Attachments/shot.png",
+            expected_fingerprint=None,
+        )
+
+    gate, released = asyncio.Event(), asyncio.Event()
+
+    async def upload():
+        async with _client("203.0.113.64") as client:
+            return await client.put(
+                "/transfer/upload",
+                headers={"Authorization": f"Bearer {token}"},
+                content=_gated_body(gate, released),
+            )
+
+    task = asyncio.create_task(upload())
+    await asyncio.wait_for(released.wait(), timeout=10)
+    grant_lifetime(7)
+    gate.set()
+
+    response = await asyncio.wait_for(task, timeout=20)
+    assert response.status_code == 404
+    assert not (vault_root / "Attachments" / "shot.png").exists()
+    async with wired() as session:
+        fresh = (
+            await session.execute(
+                select(TransferToken)
+                .where(TransferToken.id == row.id)
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one()
+    assert fresh.state == "pending"

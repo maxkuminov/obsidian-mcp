@@ -19,6 +19,9 @@ from src.database import async_session
 from src.limiter import limiter
 from src.models.db import OAuthClient, OAuthCode, OAuthToken
 from src.oauth.grants import (
+    clamp_token_expiry,
+    consent_lifetimes,
+    grant_deadline,
     lock_grant,
     lock_user_bootstrap,
     new_grant_id,
@@ -61,6 +64,16 @@ DEFAULT_CLIENT_SCOPE = "read readwrite offline_access"
 TOKEN_ENDPOINT_AUTH_METHODS = {"none", "client_secret_post"}
 _PKCE_RE = re.compile(r"^[A-Za-z0-9._~-]{43,128}$")
 _PKCE_CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
+
+
+def _now() -> datetime:
+    """The token endpoint's clock — one seam, so tests can inject time.
+
+    Each handler captures it **once** and uses that value for every expiry
+    comparison, the grant-issuance stamp and the clamp, so `expires_in` and
+    the stored `expires_at` can never disagree by the time between calls.
+    """
+    return datetime.now(timezone.utc)
 
 
 def _hash(value: str) -> str:
@@ -743,6 +756,8 @@ async def authorize_get(
         # server_state is for CSRF verification; client_state is echoed back to the client
         "state": server_state,
         "client_state": state,
+        # The effective credential lifetimes, from policy alone (#326).
+        "lifetimes": consent_lifetimes(),
     })
     response.set_cookie(
         "oauth_state",
@@ -1044,6 +1059,15 @@ async def token_endpoint(request: Request):
         return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
 
+def _unknown_code_response() -> JSONResponse:
+    """The one response for a code that names no row.
+
+    A spent code's failed revalidation and its replay branch answer with this
+    too (#325), so status, headers and body cannot drift between them.
+    """
+    return JSONResponse({"error": "invalid_grant"}, status_code=400)
+
+
 async def _handle_auth_code(form, request=None):
     code = form.get("code")
     client_id = form.get("client_id")
@@ -1077,13 +1101,29 @@ async def _handle_auth_code(form, request=None):
         # omit client_id at the public-client token exchange. PKCE still binds
         # the request to the initiating client, and the code tells us which
         # registered client and auth method must be enforced.
+        #
+        # Looked up by its hash **alone** (#325). Both predicates it used to
+        # carry are gone, for #182's reasons applied to codes:
+        #
+        # * no `used == False` — a spent code must still resolve, because a
+        #   second presentation of it is the one signal RFC 6749 §4.1.2 defines
+        #   for a stolen code, and the family its first exchange issued is
+        #   revoked below. The flag is *read* off the locked row, never
+        #   inferred from an empty result;
+        # * no caller `client_id` — a caller's claim must not make a row look
+        #   unknown. It is compared against the row just below, and a mismatch
+        #   refuses and revokes nothing.
+        #
+        # `populate_existing` because the replay decision reads `used` and
+        # `grant_id` off this object in Python after the row lock: a stale
+        # identity-map copy would be a pre-lock snapshot (#182's lesson).
         code_hash = _hash(code)
-        code_query = select(OAuthCode).where(
-            OAuthCode.code_hash == code_hash,
-            OAuthCode.used == False,
-        ).with_for_update()
-        if client_id:
-            code_query = code_query.where(OAuthCode.client_id == client_id)
+        code_query = (
+            select(OAuthCode)
+            .where(OAuthCode.code_hash == code_hash)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
         result = await session.execute(code_query)
         oauth_code = result.scalar_one_or_none()
 
@@ -1096,13 +1136,53 @@ async def _handle_auth_code(form, request=None):
                 "invalid_grant.unknown_code",
                 submitted_client_id=submitted_client_id,
             )
-            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+            return _unknown_code_response()
+
+        # A **spent** code answers every failed revalidation below exactly as
+        # an unknown code does (Codex review of #325). Spent codes are now
+        # retained for seven days past expiry and resolved by hash alone, so a
+        # distinct "PKCE verification failed" or `invalid_client` 401 for one
+        # would tell a caller holding only the code that it exists and was
+        # redeemed — something the pre-#325 lookup (`used == False`) never
+        # disclosed. The specific reason survives only in the bounded
+        # `oauth_token_refused` record, as `invalid_grant.spent_code_<check>`.
+        # A **live** code keeps its specific responses unchanged: legitimate
+        # connectors debug against them, and they were already the answer for
+        # a live code before #325, so they disclose nothing new.
+        spent = bool(oauth_code.used)
+
+        def _refuse_spent(check: str) -> JSONResponse:
+            _token_refused(
+                request,
+                f"invalid_grant.spent_code_{check}",
+                client_id=oauth_code.client_id,
+                user_id=oauth_code.user_id,
+            )
+            return _unknown_code_response()
+
+        if client_id and oauth_code.client_id != client_id:
+            # The caller named a client the code was not issued to. Refused
+            # with the same constant body the unknown-code refusal uses (this
+            # case *was* reported as unknown before the lookup stopped
+            # filtering on it), and nothing is revoked: a caller guessing at a
+            # `client_id` must never be able to end somebody's grant.
+            if spent:
+                return _refuse_spent("client_id_mismatch")
+            _token_refused(
+                request,
+                "invalid_grant.client_id_mismatch",
+                client_id=oauth_code.client_id,
+                user_id=oauth_code.user_id,
+            )
+            return _unknown_code_response()
 
         result = await session.execute(
             select(OAuthClient).where(OAuthClient.client_id == oauth_code.client_id)
         )
         client = result.scalar_one_or_none()
         if not client:
+            if spent:
+                return _refuse_spent("unknown_client")
             _token_refused(
                 request,
                 "invalid_client.unknown_client",
@@ -1113,6 +1193,8 @@ async def _handle_auth_code(form, request=None):
 
         if not _client_authenticated(client, client_secret):
             # The presented `client_secret` is never recorded, in any form.
+            if spent:
+                return _refuse_spent("authentication_failed")
             _token_refused(
                 request,
                 "invalid_client.authentication_failed",
@@ -1122,8 +1204,22 @@ async def _handle_auth_code(form, request=None):
             return JSONResponse({"error": "invalid_client"}, status_code=401)
 
         client_id = oauth_code.client_id
+        now = _now()
 
-        if oauth_code.expires_at < datetime.now(timezone.utc):
+        # Check order (#325, design D7). A **live** code keeps the pre-#325
+        # order exactly: client → code expiry → redirect_uri → PKCE, so an
+        # expired live code answers "code expired" whatever else is wrong, as
+        # it always did. A **spent** code skips the expiry check and goes
+        # client → redirect_uri → PKCE → the replay branch. Everything up to
+        # and including PKCE is what a party must prove to *redeem* the code,
+        # so a replay that reaches the revocation is a second party able to
+        # redeem it — the two-holder evidence §4.1.2 acts on. A caller holding
+        # only the code (or only its hash) is refused by those checks, with the
+        # unknown-code response, and changes nothing. Expiry is never checked
+        # on the spent path: a late replay is necessarily near or past the
+        # code's ten-minute life, and an expiry refusal would let the stolen
+        # family live.
+        if not spent and oauth_code.expires_at < now:
             _token_refused(
                 request,
                 "invalid_grant.code_expired",
@@ -1135,6 +1231,8 @@ async def _handle_auth_code(form, request=None):
         if not redirect_uri or oauth_code.redirect_uri != redirect_uri:
             # The URI itself is not recorded: the reason says which check
             # refused, and the allow-list has no field a URL could ride in.
+            if spent:
+                return _refuse_spent("redirect_uri_mismatch")
             _token_refused(
                 request,
                 "invalid_grant.redirect_uri_mismatch",
@@ -1145,6 +1243,8 @@ async def _handle_auth_code(form, request=None):
 
         # Verify PKCE
         if not isinstance(code_verifier, str) or not _PKCE_RE.fullmatch(code_verifier):
+            if spent:
+                return _refuse_spent("pkce_verifier_invalid")
             _token_refused(
                 request,
                 "invalid_grant.pkce_verifier_invalid",
@@ -1157,6 +1257,8 @@ async def _handle_auth_code(form, request=None):
             # Neither the verifier nor the challenge is recorded — the verifier
             # is a bearer secret, and a failed exchange is exactly when one
             # would be most tempting to log.
+            if spent:
+                return _refuse_spent("pkce_verification_failed")
             _token_refused(
                 request,
                 "invalid_grant.pkce_verification_failed",
@@ -1164,6 +1266,11 @@ async def _handle_auth_code(form, request=None):
                 user_id=oauth_code.user_id,
             )
             return JSONResponse({"error": "invalid_grant", "error_description": "PKCE verification failed"}, status_code=400)
+
+        if spent:
+            # A fully revalidated replay of a spent code (#325, RFC 6749
+            # §4.1.2): revoke what its first exchange issued.
+            return await _replay_spent_code(session, oauth_code, request)
 
         # In multi-user mode every token must have an owner. A code stamped
         # with a NULL `user_id` predates the flag flip (or escaped the
@@ -1231,9 +1338,6 @@ async def _handle_auth_code(form, request=None):
                 status_code=400,
             )
 
-        # Mark code as used
-        oauth_code.used = True
-
         # Mint tokens. In multi-user mode the issued tokens inherit the
         # `user_id` stamped on the auth code at /authorize time; in single-
         # user mode that value is NULL and tokens stay NULL too.
@@ -1271,13 +1375,30 @@ async def _handle_auth_code(form, request=None):
                 status_code=400,
             )
 
+        # The family's absolute clock starts here, at the exchange (#326) —
+        # not at the approval, which is what the consent page says. Both rows
+        # carry the one captured `now`; every rotation copies it verbatim.
+        # The clamp is a no-op at issuance (the full lifetime, at least a day,
+        # remains), but the same helper runs at both mint sites so the two can
+        # never disagree about what a token may promise.
+        clamped = clamp_token_expiry(now, grant_deadline(now))
+        if clamped is None:  # pragma: no cover - the setting is ≥ 1 day
+            raise RuntimeError("a fresh grant cannot be past its own deadline")
+
+        # Mark the code used and record its lineage in the same transaction as
+        # the tokens (#325): a later replay of this code revokes exactly the
+        # family minted here.
+        oauth_code.used = True
+        oauth_code.grant_id = grant_id
+
         session.add(OAuthToken(
             token_hash=_hash(access_token),
             token_type="access",
             client_id=client_id,
             scope=granted_scope,
             grant_id=grant_id,
-            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            grant_issued_at=now,
+            expires_at=clamped.access_expires_at,
             user_id=oauth_code.user_id,
         ))
         session.add(OAuthToken(
@@ -1286,7 +1407,8 @@ async def _handle_auth_code(form, request=None):
             client_id=client_id,
             scope=granted_scope,
             grant_id=grant_id,
-            expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+            grant_issued_at=now,
+            expires_at=clamped.refresh_expires_at,
             user_id=oauth_code.user_id,
         ))
         await session.commit()
@@ -1310,10 +1432,102 @@ async def _handle_auth_code(form, request=None):
     return _oauth_json({
         "access_token": access_token,
         "token_type": "Bearer",
-        "expires_in": 3600,
+        "expires_in": clamped.expires_in,
         "refresh_token": refresh_token,
         "scope": granted_scope,
     })
+
+
+async def _replay_spent_code(session, oauth_code, request):
+    """A spent code presented again, after every check a first exchange makes.
+
+    Modelled line for line on #182's refresh-reuse branch. The caller has
+    already authenticated the client, matched the redirect URI and verified
+    PKCE against this code, so reaching here means a second party able to
+    redeem it exists — RFC 6749 §4.1.2 says revoke what the first exchange
+    issued.
+
+    * **No lineage** (a code spent before 029, or by a pre-029 process during
+      the rollout): nothing can be named, so nothing is revoked or committed.
+    * **Otherwise** the grant lock is taken before the family UPDATE, so no
+      rotation can insert a pair between the decision and the write. Lock
+      order: bootstrap → this code row → grant → token rows; no other path
+      takes a code row lock while holding a grant key, so there is no cycle.
+    * **The response is constant**: status, headers and body identical to the
+      unknown-code refusal, and every database call here is guarded —
+      rollbacks included — so a failure still answers that same 400 rather
+      than a 500 on the replay path only. Timing is not covered (L6).
+    * **One WARNING on the path that killed something**, after the commit; a
+      failure records the exception's class name only — a SQLAlchemy error
+      renders bound parameters, one of which here is the code hash.
+    """
+    lineage = oauth_code.grant_id
+    replay_client_id = oauth_code.client_id
+    replay_user_id = oauth_code.user_id
+    response = _unknown_code_response()
+
+    if lineage is None:
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+        _token_refused(
+            request,
+            "invalid_grant.code_reused",
+            client_id=replay_client_id,
+            user_id=replay_user_id,
+        )
+        return response
+
+    revoked_count = 0
+    failure: str | None = None
+    try:
+        await lock_grant(session, lineage)
+        revoked_count = await revoke_grant_family(session, lineage)
+        if revoked_count:
+            await session.commit()
+        else:
+            await session.rollback()
+    except Exception as exc:
+        failure = type(exc).__name__
+        revoked_count = 0
+        try:
+            await session.rollback()
+        except Exception as rollback_exc:
+            failure = f"{failure}+{type(rollback_exc).__name__}"
+
+    if failure is not None:
+        security_events.emit(
+            "oauth_code_replay_revocation_failed",
+            level=logging.ERROR,
+            subject=security_events.subject_for(user_id=replay_user_id, request=request),
+            client_id=replay_client_id,
+            grant_id=lineage,
+            user_id=replay_user_id,
+            client_ip=security_events.client_ip(request),
+            error_type=failure,
+        )
+    elif revoked_count:
+        security_events.emit(
+            "oauth_code_replay_detected",
+            subject=security_events.subject_for(user_id=replay_user_id, request=request),
+            client_id=replay_client_id,
+            grant_id=lineage,
+            user_id=replay_user_id,
+            revoked_tokens=revoked_count,
+            client_ip=security_events.client_ip(request),
+        )
+    else:
+        # A family with nothing live left (an operator revocation, or a
+        # second replay after the first closed it): one ordinary record.
+        _token_refused(
+            request,
+            "invalid_grant.code_reused",
+            client_id=replay_client_id,
+            user_id=replay_user_id,
+            grant_id=lineage,
+        )
+    return response
 
 
 async def _handle_refresh(form, request=None):
@@ -1608,7 +1822,38 @@ async def _handle_refresh(form, request=None):
             resolved_client_id = old_token.client_id
             resolved_user_id = old_token.user_id
 
-            if old_token.expires_at < datetime.now(timezone.utc):
+            # The family's absolute deadline (#326). After the reuse branch and
+            # the client checks — a rotated-away token presented after the
+            # deadline is still reuse, revokes the family and gets the generic
+            # constant response; a patient thief gains nothing by waiting —
+            # and before the per-token expiry, because once tokens are clamped
+            # the two coincide and the operator should see the cause that
+            # actually ended the grant. `grant_issued_at` is read off the row
+            # re-read under the grant lock. Nothing is revoked and nothing is
+            # committed: a grant reaching its end is not evidence of theft,
+            # the same reasoning #182 applies to an expired, never-rotated
+            # token. Less than a second left is treated as past it.
+            now = _now()
+            clamped = clamp_token_expiry(
+                now, grant_deadline(old_token.grant_issued_at)
+            )
+            if clamped is None:
+                _token_refused(
+                    request,
+                    "invalid_grant.grant_lifetime_exceeded",
+                    client_id=client_id,
+                    user_id=old_token.user_id,
+                    grant_id=grant_id,
+                )
+                return JSONResponse(
+                    {
+                        "error": "invalid_grant",
+                        "error_description": "grant lifetime exceeded; re-authorize",
+                    },
+                    status_code=400,
+                )
+
+            if old_token.expires_at < now:
                 _token_refused(
                     request,
                     "invalid_grant.refresh_token_expired",
@@ -1723,7 +1968,11 @@ async def _handle_refresh(form, request=None):
                 # revocation or downgrade applied to the grant still covers the
                 # pair the client is about to start using.
                 grant_id=old_token.grant_id,
-                expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+                # Inherited verbatim, exactly like `grant_id` (#326): rotation
+                # must never restart the family's absolute clock. Read off the
+                # row re-read under the grant lock.
+                grant_issued_at=old_token.grant_issued_at,
+                expires_at=clamped.access_expires_at,
                 user_id=old_token.user_id,
             ))
             session.add(OAuthToken(
@@ -1732,7 +1981,8 @@ async def _handle_refresh(form, request=None):
                 client_id=client_id,
                 scope=granted_scope,
                 grant_id=old_token.grant_id,
-                expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+                grant_issued_at=old_token.grant_issued_at,
+                expires_at=clamped.refresh_expires_at,
                 user_id=old_token.user_id,
             ))
 
@@ -1791,7 +2041,9 @@ async def _handle_refresh(form, request=None):
     return _oauth_json({
         "access_token": new_access,
         "token_type": "Bearer",
-        "expires_in": 3600,
+        # The clamped lifetime: inside the last hour of the grant this is the
+        # seconds remaining, not 3600 (#326).
+        "expires_in": clamped.expires_in,
         "refresh_token": new_refresh,
         # The clamped scope, not the old token's — RFC 6749 §5.1 requires the
         # response to state the granted scope whenever it differs from what was

@@ -54,6 +54,7 @@ from sqlalchemy.orm import aliased
 from src.auth.session import actor_columns
 from src.config import settings
 from src.models.db import APIKey, OAuthToken, TransferToken, User
+from src.oauth.grants import grant_deadline
 from src.oauth.scope import token_has_write
 from src.services import vault_fs, vault_overlap
 from src.services.vault import classify_bytes
@@ -323,13 +324,24 @@ def credential_expires_at(cred) -> datetime.datetime | None:
     `expires_at` and live forever, an `OAuthToken` may not — a null there is
     already unusable, so it reads as "expired at the epoch" rather than
     "immortal". Getting that backwards would mint links against dead tokens.
+
+    **An OAuth token dies at the earlier of its own `expires_at` and its grant
+    family's absolute deadline** (#326). This subsystem re-validates the
+    minting credential on its own — at mint (`plan_mint_window`), at every
+    redemption (`resolve_identity`) and inside the publish gate
+    (`_identity_publish_ok`) — never through the MCP middleware, so without
+    the deadline here a capability minted before the setting was shortened
+    would still overwrite the vault after the grant was supposed to be dead.
+    `_credential_ok` reads this function for its OAuth expiry comparison, so
+    all three stay one predicate. `grant_deadline` fails closed on a missing
+    issuance time.
     """
     if isinstance(cred, APIKey):
         return _as_aware(cred.expires_at) if cred.expires_at is not None else None
     if isinstance(cred, OAuthToken):
         if cred.expires_at is None:
             return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
-        return _as_aware(cred.expires_at)
+        return min(_as_aware(cred.expires_at), grant_deadline(cred.grant_issued_at))
     raise CredentialTooShortLived(  # pragma: no cover - defensive
         "The credential backing this request cannot be re-validated"
     )
@@ -975,7 +987,9 @@ def _credential_ok(cred, *, need_write: bool, row: TransferToken) -> bool:
     elif isinstance(cred, OAuthToken):
         if cred.revoked:
             return False
-        if cred.expires_at is None or cred.expires_at <= now:
+        # `min(expires_at, grant deadline)` — the grant's absolute lifetime
+        # (#326) binds every capability this token minted.
+        if credential_expires_at(cred) <= now:
             return False
         if need_write and not token_has_write(cred.scope):
             return False
