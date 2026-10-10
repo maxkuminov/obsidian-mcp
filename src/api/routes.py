@@ -11,6 +11,7 @@ from src.control_panel.routes import (
     _assert_key_owner,
     _log_key_creation_throttled,
     _log_panel_forbidden,
+    actor_snapshot,
     key_creation_throttled_message,
     require_admin_panel,
     require_user_panel,
@@ -173,9 +174,11 @@ async def create_key(
         session, user, security_events.client_ip(request)
     )
     if admission is not None:
+        # Before the rollback, which expires `user` (#332).
+        actor = actor_snapshot(user)
         await session.rollback()
         if isinstance(admission, KeyCreationRefusal):
-            _log_key_creation_throttled(request, user, admission)
+            _log_key_creation_throttled(request, actor, admission)
             raise HTTPException(
                 429,
                 key_creation_throttled_message(admission),

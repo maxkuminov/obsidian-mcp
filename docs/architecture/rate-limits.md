@@ -526,6 +526,16 @@ a synchronous function both handlers call, beside the login budget it copies:
   subject the same exact account identity (never the address — the sentinel
   has no id, and an address subject would give a rotating caller fresh log
   allowance). The JSON route's 5/min slowapi limit stays, in addition.
+- **The refusal records an actor captured *before* the rollback (#332).** The
+  rollback that releases the cap's row lock expires the acting `User`, which
+  was loaded through the same request session; reading `user.id` after it is a
+  lazy load — `MissingGreenlet`, so the refusal became a 500 and the event was
+  never emitted. Both routes take `actor_snapshot(user)` first and hand that to
+  `_log_key_creation_throttled`. Do not move the snapshot below the rollback,
+  and do not "simplify" it back to passing `user`: the hermetic tests use a
+  `SimpleNamespace` that nothing can expire, so only
+  `tests/integration/test_issue_332_rollback_expiry_pg.py` (and the expiring
+  stand-in in `tests/test_issue_332_refusal_after_rollback.py`) would notice.
 
 **The active-key cap bounds the stock, not the flow.** At 10/hour a non-admin
 could add 240 keys a day and thousands a month, each with its own bursts, which
