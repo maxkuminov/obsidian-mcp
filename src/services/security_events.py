@@ -332,6 +332,12 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
     ),
     "usage_log_credential_gone": frozenset({"tool", "cleared_user_id"}),
     "usage_log_failed": frozenset({"tool", "error_type", "reason"}),
+    # The refusal coalescer dropping a planned row the database rejected for
+    # its data (#310): `reason` is the row's marker (`rate_limited` /
+    # `slot_timeout`), `count` its `1 + suppressed` weight. Best effort — the
+    # suppressor may withhold it and it names neither principal nor scope —
+    # so it reports dropped weight, it does not reconcile it.
+    "usage_refusal_row_dropped": frozenset({"tool", "reason", "count", "user_id"}),
     "tool_result_measure_failed": frozenset({"tool", "error_type"}),
     "move_rewrite_failed": frozenset({"tool", "error_type"}),
     # `move_note` aborting the whole move because one source holds a link
