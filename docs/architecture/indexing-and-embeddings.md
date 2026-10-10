@@ -999,8 +999,9 @@ amplification by a rarer route. #308's accounting made it visible
   between unobtainable and obtainable costs one full re-derive. L5 a
   permanently unreadable row-backed file keeps the scope incomplete and
   `degraded`, and due for the backstop. L6 a reassignment A→B→A completed inside
-  one pass's final window, with a `move_note` under B landing in it, is not
-  detected — the stamp matches A, so no re-derive follows (triaged
+  one pass's final window, with a `move_note` confirmed under B whose metadata
+  transaction commits only after the A stamp, is not detected (one committing
+  before the final re-read NULLs a marker and withholds the stamp) — the stamp matches A, so no re-derive follows (triaged
   implausible; no cross-writer lock protocol).
 
 ## Non-finite frontmatter numbers, and the one title rule (#154)

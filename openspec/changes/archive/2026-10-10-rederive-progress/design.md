@@ -349,9 +349,11 @@ as today.
 - **L4 — a handle that flickers** between unobtainable and obtainable changes
   the digest and costs one more full re-derive.
 - **L6 — a reassignment A→B→A completed inside one pass's final window**,
-  with a `move_note` under B committing before the final locked re-read, or
-  one confirmed under B whose metadata transaction commits after the stamp,
-  is not detected: the stamp matches A, so no re-derive follows (Codex
+  with a `move_note` confirmed under B whose metadata transaction commits only
+  after the A stamp, is not detected: the stamp matches A, so no re-derive
+  follows. (A move whose metadata commits *before* the final re-read is
+  caught: it NULLs the moved row's marker, which that READ COMMITTED read
+  sees, so the stamp is withheld — Codex r2.) (Codex
   implementation review r1, triaged implausible; no cross-writer lock
   protocol). The final re-read takes `FOR SHARE NOWAIT` on the scope's rows
   and the stamp follows in the same transaction, so a writer that is mid-commit
