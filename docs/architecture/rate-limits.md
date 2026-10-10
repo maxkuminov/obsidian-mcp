@@ -33,11 +33,12 @@ nothing to slow it and nothing to tell it to stop.
 | 1 | Failed-auth budget | `APIKeyMiddleware`, before the credential lookup | address slot (salted fixed table) | 60 / 300 s (`MCP_AUTH_FAILURE_LIMIT`, `MCP_AUTH_FAILURE_WINDOW_SECONDS`; null ⇒ off) | HTTP **429** + `Retry-After` — **transport, not a tool result** | none; one WARNING per slot per window |
 | 1a | Request occupancy (#261, #188) | `APIKeyMiddleware`, before auth session through ASGI completion | global / presented-bearer fingerprint | 64 / 20, waiters 64 / 16, sharing one 2 s transport deadline with 1b; mode default **shadow** | enforce: transport 429 after the deadline or on waiter overflow; queue: admitted with an overrun; shadow: observation only. A disconnected waiter is released at once | `mcp_concurrency_pressure` event; request-level `concurrency_counters`; authenticated observations can accompany tool rows |
 | 1b | Auth-session occupancy (#261, #188) | around the middleware's own DB session only | global | 2, waiters 32, same deadline as 1a | enforce: transport 429 before opening a session; queue/shadow as 1a | same transport event and counters |
+| 1c | Body-memory budget (#322) | `APIKeyMiddleware`, after authentication and the auth permit, before the app reads a byte; **POST only** | process (two lanes: ≤ 1 MiB small, the rest large) | cgroup limit × 0.5 ÷ 8 (128 MiB on 2 GiB), 15 s wait, 8 waiters; **always on, every mode** | transport **429** `code: body_memory` + `Retry-After: 2`; **413** for a declared length above the per-request limit | `mcp_concurrency_pressure`, `reason: body:memory`; **not** in `concurrency_counters` |
 | 2 | General velocity bucket | `_tracked`, first gate | principal | 120/min, burst 30 (`MCP_RATE_LIMIT_PER_MINUTE`, `MCP_RATE_LIMIT_BURST`) | in-band, sentinel line | `rate_limited`, scope `principal` — **coalesced** |
 | 3 | Write velocity bucket | `_tracked` (write tools) **and** `PUT /transfer/upload` | principal | 60/min, burst 15 (`MCP_WRITE_RATE_LIMIT_PER_MINUTE`, `MCP_WRITE_RATE_LIMIT_BURST`) | in-band on a tool; **429** on the transfer route | `rate_limited`, scope `principal_write` — **coalesced** |
 | 4 | Vault admission (#66) | `_tracked` | user | — | in-band | `no_vault_assigned` (and the three vault-root quarantine markers, #199) |
 | 5a | Unencodable-argument screen (#149) | `_tracked` | argument | — | in-band | `argument_not_encodable` |
-| 5b | Query length cap | `_tracked`, beside 5a | argument | 8,192 (`MAX_SEARCH_QUERY_CHARS`) | in-band | `argument_too_long` — **own row** |
+| 5b | Query and import-URL length caps | `_tracked`, beside 5a | argument | 8,192 (`MAX_SEARCH_QUERY_CHARS`; `MAX_IMPORT_URL_CHARS` for `import_from_url`'s `url`, #322) | in-band | `argument_too_long` — **own row** |
 | 5c | Atomic tool slots (#261, #188) | `_tracked`, after argument screens and before quota | class / principal / tenant / global | classes embedding 1 / vector 1 / write 1 / scan 2 / light 4; principal 3 / tenant 4 / global 6; 5 s wait; mode default **shadow** | enforce: in-band sentinel after the wait; queue: admitted with an overrun, call runs; shadow: call runs | `slot_timeout`, coalesced, only for actual enforcement refusals; `concurrency_shadow` / `concurrency_queue` annotate otherwise |
 | 6 | Daily quota (#162) | `_tracked`, last pre-body gate | api key | 5,000 for **new** keys (`DEFAULT_DAILY_REQUEST_LIMIT`) | in-band | `over_quota` |
 | 7 | Provider input rejection | inside the body, on the provider's answer | argument | the provider's own limit | in-band, `argument_too_long` **code** | `provider_input_rejected` — **post-body** |
@@ -783,6 +784,12 @@ the page to see. The full reading rules are in
 | `MCP_REFUSAL_LOG_INTERVAL_SECONDS` | `10` | How long one coalescing window stays open. |
 | `DEFAULT_DAILY_REQUEST_LIMIT` | `5000` | Daily quota a **newly created** key receives when the caller does not say otherwise. Null creates unlimited keys. |
 | `MAX_SEARCH_QUERY_CHARS` | `8192` | Module constant, not a setting: the longest `query` `keyword_search` / `semantic_search` accept. |
+| `MAX_IMPORT_URL_CHARS` | `8192` | Module constant, not a setting: the longest `url` `import_from_url` accepts (#322). Not the memory bound. |
+| `MCP_BODY_MEMORY_BUDGET_BYTES` | unset | The body-memory budget in bytes (≥ 64 MiB). **Unset means derive, never off**; refused at startup above the safe allocation of a readable cgroup limit. |
+| `MCP_BODY_MEMORY_FRACTION` | `0.5` | Share of the cgroup limit given to request bodies, 0.1–0.5. |
+| `MCP_BODY_MEMORY_MULTIPLIER` | `8` | Peak memory per raw body byte, 8–32; 8 is the measured floor. |
+| `MCP_BODY_BUDGET_WAIT_SECONDS` | `15` | How long a body that does not fit waits before its 429, 0–60. |
+| `MCP_BODY_BUDGET_WAITERS` | `8` | Body waiters across both lanes, 1–256. |
 
 Every nullable one accepts an **empty value**, `null` or `none` as "off". Zero
 is refused at boot. The `MCP_CONCURRENCY_*` settings are not nullable (`off` is
@@ -1171,8 +1178,144 @@ only in isolated environments.
 - **L11** Worst-case replay memory ≈ 62 MiB, derived from uvicorn's
   `HIGH_WATER_LIMIT` and the loop's read size.
 
+## The body-memory budget is always on (#322)
+
+`/mcp` accepts bodies up to `mcp_max_request_body_bytes` — `max(2 ×
+MAX_FILE_WRITE_BYTES, 6 × MAX_NOTE_BYTES) + 1 MiB`, 61 MiB by default — so that
+a supported 25 MB `write_file` reaches the tool. That limit is per request.
+Before #322 nothing bounded the bytes in flight across requests, and every
+near-limit body is copied several times before any tool gate runs: the SDK's
+`RequestBodyLimitMiddleware` accumulates a `bytearray` and copies it to
+`bytes`, `json.loads` builds the string, Pydantic and FastMCP keep their own
+copies, and `_tracked`'s `named_params()` ran `import_from_url`'s logging
+transform (`urlsplit(str(url))`) on the full argument. The ASVS reproduction
+took RSS from 57 MiB to 456 MiB with one 60 MiB envelope (≈ 6.7×), so five
+synchronised requests from one write-capable credential, well inside its
+write burst, crossed the 2 GiB limit and restarted the only worker: every
+tenant down. The concurrency controller does not cover this: it counts
+requests, not bytes, and ships in `shadow`.
+
+`src/services/body_budget.py` is the bound. The requirements are in
+[`mcp-request-routing`](../../openspec/specs/mcp-request-routing/spec.md) and
+the design in the `mcp-body-budget` change (D1–D8, under
+`openspec/changes/archive/` once archived); what must not be undone:
+
+- **A memory-safety bound, not a tuning knob (D1).** Its own module, enforced
+  in every `MCP_CONCURRENCY_MODE` including `off`, with no shadow mode and no
+  off switch. Running it in shadow would leave the bug in place. Owner
+  decision, re-confirmed after the Codex spec review.
+- **Derived from the process's own cgroup limit (D2).**
+  `memory_budget = MCP_BODY_MEMORY_BUDGET_BYTES`, else
+  `floor(MCP_BODY_MEMORY_FRACTION × L)`, else 1 GiB when no limit is readable
+  (WARNING). `capacity = memory_budget // MCP_BODY_MEMORY_MULTIPLIER`, the
+  small lane is `capacity // 8`, the large lane the rest. 2 GiB → 1 GiB → 128
+  MiB → 16 / 112 MiB: one 61 MiB maximum write plus 51 MiB of other large
+  traffic, with 16 MiB always free for small requests. `L` is the minimum
+  finite `memory.max` on the process's own cgroup v2 path (from
+  `/proc/self/cgroup` and `/proc/self/mountinfo`) and its ancestors up to the
+  mount; only when v2 yields nothing, v1's `memory.limit_in_bytes` at the
+  memory controller's mount root.
+- **Overrides move only in the safe direction.** The multiplier's floor is
+  the measured 8 (fraction 0.8 × multiplier 4 on 2 GiB would admit five
+  61 MiB bodies, which is the reproduced OOM); the fraction's ceiling is 0.5;
+  and a budget above the safe allocation
+  `min(0.5 × L, L − (384 MiB + MCP_CONCURRENCY_REPLAY_BUDGET_BYTES))` of a
+  readable limit is refused. There is no setting that re-opens the OOM.
+- **Startup refuses an unusable budget, in the lifespan only.** CRITICAL and
+  exit 1 when the large lane cannot hold one maximum request body, the small
+  lane one 1 MiB envelope, or the budget exceeds the safe allocation. With the
+  defaults that means a container of at least ≈ 1.1 GiB. The check runs in
+  `body_budget.configure()` from the FastAPI lifespan (after the sandbox
+  branch), **never** in `Settings`: the k3s `alembic` initContainer imports
+  `src.config.settings` under its own 1 GiB limit, which derives a 56 MiB
+  large lane, and a check in `Settings` would fail every migration.
+  `tests/test_body_budget_config.py` pins both halves. Owner decision: the
+  refusal stays.
+- **Placement (D4).** In `APIKeyMiddleware`, after authentication (an
+  unauthenticated caller never holds or waits for budget), after the auth
+  permit (a body wait holds no database connection), before the app. uvicorn
+  applies flow control, so a body nobody `receive()`s costs at most
+  `HIGH_WATER_LIMIT` plus one socket read: a gate before the first app
+  `receive` really does bound what the process accepts.
+- **POST only.** The SDK buffers POST bodies alone; GET (the SSE stream),
+  DELETE and every other method bypass. Costing a bodyless GET at the chunked
+  worst case would hold 61 MiB for a stream's lifetime.
+- **Accounting (D3).** The declared `Content-Length` is reserved up front; a
+  declaration above the per-request limit gets the SDK's own 413 at once; 0
+  reserves nothing; an absent or unparseable length is costed at the full
+  limit in the large lane (L5). Never incremental: a request holding part of
+  the budget while it waits for the rest can deadlock with another. A
+  counting `receive` delivers `http.disconnect` in place of any message that
+  would cross the reservation, and for every call after it.
+- **Lanes (D5).** A request declaring ≤ 1 MiB uses the small lane, and
+  borrows large-lane bytes only while no large request waits. Large requests
+  are strict FIFO, no barging: a waiting maximum write is never overtaken.
+  Releases credit the source lane and re-run admission, small first.
+- **Waiting and refusal (D6).** FIFO, up to `MCP_BODY_BUDGET_WAIT_SECONDS`
+  (15) with at most `MCP_BODY_BUDGET_WAITERS` (8) waiters across both lanes,
+  disconnect-aware through a second `ReceiveWatch` over the first one's
+  replay (bytes it reads draw on the shared replay budget, so #188 L8 carries
+  over). Then HTTP **429**,
+  `{"error", "code": "body_memory", "scope": "small"|"large", "limit": <lane capacity>}`,
+  `Retry-After: 2`: the same keys as the concurrency 429. A transport refusal
+  outside `MCP-REFUSAL` (nothing has been parsed — parsing is the memory being
+  protected), consuming no rate token, no quota slot and no usage row.
+  Telemetry is `mcp_concurrency_pressure` with `reason: body:memory`,
+  outcome `refused` or `waited` (> 100 ms), and is **not** fed to
+  `concurrency_counters`: body pressure is not concurrency pressure and must
+  not move the enforce-readiness evidence.
+- **Release on every exit (D7).** The middleware's outer `finally` releases
+  the lease and aborts the body watcher and then the transport watcher, so
+  neither a reservation, replay-budget bytes nor a pending `receive` task
+  outlives the request — normal return, SDK 400/413, a raising app, a
+  disconnect, or a cancellation before or after the handoff. A waiter that
+  exits hands back a grant that raced it.
+- **The `import_from_url` URL cap (D8)** is `MAX_IMPORT_URL_CHARS` (8,192)
+  through the existing L5b screen, and `_url_host` returns `<over-long>`
+  without parsing a longer value. It removes the canonicalisation peak; it is
+  **not** the fix.
+
+**Measured (2026-10-09, `scripts/measure_body_amplification.py`, fresh
+uvicorn worker, envelopes of `mcp_max_request_body_bytes − 4 KiB`):** a
+text-mode `write_file` of six-byte escapes peaks at **3.17×** the body, an
+`import_from_url`-shaped envelope at **4.09×** (6.7× before the URL cap). Six
+simultaneous maximum writes at a 1 GiB budget all succeeded, serialised, with
+peak growth 437 MiB against a bound of 1 GiB + 32 MiB + 128 MiB.
+`tests/integration/test_body_budget_stack_pg.py` re-measures both under
+`make test-integration` (opt-in `BODY_BUDGET_RSS_TESTS=1`, not CI: a peak-RSS
+bound on a shared runner measures the runner). A ratio above the multiplier
+means raising the multiplier's default and floor, never loosening the guard.
+
+### Accepted limitations (#322)
+
+- **L1** The budget bounds body-derived memory by a measured multiplier, not
+  by accounting each allocation; a path that amplifies more is only partly
+  bounded until re-measured.
+- **L2** Released memory may not return to the OS; RSS can stay high after a
+  burst, but the peak stays bounded.
+- **L3** Large requests are strict FIFO: head-of-line blocking among them.
+- **L4** No per-principal share of the large lane; one principal is bounded
+  only by its buckets.
+- **L5** A chunked request is costed at the full per-request limit.
+- **L6** Bytes the transport watcher reads while waiting sit in the replay
+  budget (≤ ≈ 62 MiB), not this one.
+- **L7** The cgroup is read once at startup.
+- **L8** Sandbox mode is exempt (it bypasses the middleware).
+- **L9** Responses are not budgeted (read responses are capped separately).
+- **L10** On cgroup v1 only the controller's mount root is read; a v1 process
+  nested below it is not resolved.
+- **L11** Non-POST methods bypass; a future SDK that buffered another
+  method's body would need this re-checked.
+
 ## Alternatives rejected
 
+- **Lowering the global body limit** (#322). It breaks the documented 25 MB
+  `write_file`.
+- **Folding the body budget into concurrency `enforce`** (#322). Mode-gated
+  and default shadow, so the bug would stay open in the default configuration.
+- **A URL cap alone, or an in-band `MCP-REFUSAL` for the body budget**
+  (#322). Every other near-limit envelope still buffers; and nothing is parsed
+  yet to answer in band.
 - **slowapi on the `/mcp` mount.** Keyed on the remote address — wrong scope:
   shared egress merges tenants, and one tenant with two agents is one bucket.
   It is decorator-shaped for routes, not an ASGI mount, and it produces an HTTP
@@ -1206,8 +1349,8 @@ only in isolated environments.
   contribution only, not every shared pool consumer. The #188 accepted
   limitations L1–L11 are listed under concurrency above.
 - OAuth grants and grandfathered NULL-limit keys have **velocity bounds only**.
-- The transport 429s — L1 and the transfer redemption — sit outside the in-band
-  refusal contract.
+- The transport 429s — L1, the body-memory budget (1c, `code: body_memory`)
+  and the transfer redemption — sit outside the in-band refusal contract.
 - A hard kill loses at most one coalescing interval of refusal counts per key.
 - Past 10,000 principals the shared overflow entries lose per-principal
   attribution but not their counts.

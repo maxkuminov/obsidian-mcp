@@ -43,6 +43,7 @@ from src.services.transport_security import (
     log_embedding_transport,
 )
 from src.services.rate_limits import flush_all
+from src.services import body_budget
 from src.services import concurrency
 from src.services import concurrency_counters
 from src.services import vault_fs
@@ -146,6 +147,23 @@ async def _check_pgvector_version() -> None:
             row[0],
             ".".join(str(p) for p in MIN_PGVECTOR_VERSION),
         )
+        sys.exit(1)
+
+
+def _configure_body_budget() -> None:
+    """Derive, check and install the /mcp body-memory budget (#322 D2).
+
+    Logs the resolved derivation once (WARNING when no cgroup limit was
+    readable). Refuses to start — CRITICAL, exit 1, like the other startup
+    guards — when the large lane cannot hold one maximum request body, the
+    small lane one envelope, or a budget exceeds the safe allocation of the
+    readable limit: a server whose documented write cap silently cannot work
+    is worse than one that does not start.
+    """
+    try:
+        body_budget.configure(settings)
+    except body_budget.BodyBudgetConfigError as exc:
+        logging.getLogger(__name__).critical("%s", exc)
         sys.exit(1)
 
 
@@ -522,6 +540,13 @@ async def lifespan(app: FastAPI):
             async with mcp.session_manager.run():
                 yield
             return
+        # #322: the /mcp body-memory budget, derived from this process's own
+        # cgroup limit and checked here — the web application's startup —
+        # never in `Settings`: the migration init container imports the
+        # settings under a smaller limit and must not be refused for it.
+        # First of the guards: it needs no database and no vault. Sandbox
+        # mode bypasses `APIKeyMiddleware`, so it skips this like the rest.
+        _configure_body_budget()
         _check_openat2_support()
         _check_mount_identity_support()
         # First database contact, deliberately: a strict `DATABASE_SSL_MODE`

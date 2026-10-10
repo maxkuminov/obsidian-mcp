@@ -283,6 +283,11 @@ test-schema:
 # because 55438 was taken has moved this one too. The consequence is that the
 # two targets share a container name and must not be run concurrently —
 # `test-schema` starts by `docker rm -f`ing that name.
+#
+# `BODY_BUDGET_RSS_TESTS=1` opts in to the #322 peak-RSS measurements
+# (`tests/integration/test_body_budget_stack_pg.py`). Set here and **not** in
+# CI, by owner decision: a peak-RSS bound on a shared runner measures the
+# runner, not this server.
 test-integration:
 	@echo "$(GREEN)Integration suite: throwaway $(SCHEMA_TEST_IMAGE) on :$(SCHEMA_TEST_PORT)$(NC)"
 	@docker rm -f $(SCHEMA_TEST_CONTAINER) >/dev/null 2>&1 || true; \
@@ -296,7 +301,7 @@ test-integration:
 		sleep 1; \
 	done; \
 	if [ "$$ready" -eq 1 ]; then \
-		OMCP_REQUIRE_SCHEMA_INTEGRATION=1 \
+		OMCP_REQUIRE_SCHEMA_INTEGRATION=1 BODY_BUDGET_RSS_TESTS=1 \
 		PGVECTOR_TEST_ADMIN_URL=postgresql+asyncpg://postgres:test@127.0.0.1:$(SCHEMA_TEST_PORT)/postgres \
 		$(PYTHON) -m pytest -q -rs tests/integration; \
 		status=$$?; \

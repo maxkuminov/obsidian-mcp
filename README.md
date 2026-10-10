@@ -1058,6 +1058,9 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `MCP_CONCURRENCY_REQUESTS` | `32` | Full MCP request ceiling, including open streams; per bearer fingerprint ceiling defaults to 4. |
 | `MCP_CONCURRENCY_AUTH` | `2` | Authentication database-session ceiling. Released before response delivery or downstream work. |
 | `MCP_CONCURRENCY_WRITERS` | `1` | Usage-log writer ceiling; includes fallback inserts. Defaults: 64 pending writers and a 0.25-second enforce-mode wait. |
+| `MCP_BODY_MEMORY_BUDGET_BYTES` | unset | The `/mcp` body-memory budget (≥ 64 MiB). Unset derives it from the container's memory limit — it never means off. Refused at startup above half the limit (less fixed headroom). |
+| `MCP_BODY_MEMORY_FRACTION` / `MCP_BODY_MEMORY_MULTIPLIER` | `0.5` / `8` | The derivation: limit × fraction ÷ multiplier = raw body bytes in flight. Fraction 0.1–0.5, multiplier 8–32. |
+| `MCP_BODY_BUDGET_WAIT_SECONDS` / `MCP_BODY_BUDGET_WAITERS` | `15` / `8` | How long a body that does not fit waits before its 429, and how many may wait at once. |
 | `DEFAULT_DAILY_REQUEST_LIMIT` | `5000` | Daily quota a **newly created** API key receives when the caller does not say otherwise. Existing keys are untouched; an explicit null (or a blank panel field) still means unlimited. |
 | `MCP_REJECT_UNKNOWN_ARGUMENTS` | `true` | Refuse a tool call carrying an argument the tool does not declare (a tool error naming it), and publish `additionalProperties: false` on every input schema. `false` restores the SDK's silent ignore — a rollback for a client that sends extras; change it and recreate the container. `false` logs a WARNING at each start. |
 | `MCP_SANDBOX_MODE` | `false` | Registry-eval only. Skips DB, indexer, embedding provider, and `/mcp` auth so introspection works without external deps. Do not enable in production. |
@@ -1071,6 +1074,16 @@ the defaults. It has to track the write caps so that every supported
 write is refused by the tool — with an actionable message — rather than
 by the transport with a bare HTTP 413. Raise `MAX_FILE_WRITE_BYTES` and
 the transport limit follows.
+
+That limit is per request. The **sum** of request bodies in flight is
+bounded too, always (#322): each `/mcp` POST reserves its declared size
+against a budget derived from the container's memory limit (half of it,
+÷ 8 for the parsing overhead — 128 MiB of raw body on a 2 GiB container),
+waits up to 15 s if it does not fit, and otherwise gets HTTP 429 with
+`code: body_memory` and `Retry-After: 2`. The server refuses to start in a
+container too small to admit one maximum-size body (about 1.1 GiB with the
+defaults). The `MCP_BODY_*` settings in `.env.example` only allow the safe
+direction.
 
 ### Switching providers or models
 

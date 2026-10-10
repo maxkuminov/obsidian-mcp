@@ -187,6 +187,19 @@ MAX_LIST_PATTERN_CHARS = 1024
 # purpose.
 MAX_SEARCH_QUERY_CHARS = 8192
 
+# Upper bound on `import_from_url`'s `url` argument (#322), through the same
+# declarative `arg_char_caps` screen as the search query: the existing
+# `argument_too_long` refusal, before any DNS resolution, connection or quota
+# statement. Presigned S3/GCS URLs carrying session tokens reach 2–4 KB, so
+# 8 KiB clears every real one while staying ~7,000× below the request-body
+# limit. Its logging transform (`_url_host`) refuses to parse a longer value,
+# which removes the canonicalisation peak the ASVS reproduction measured.
+#
+# **This is not the memory bound.** Every other near-limit envelope still
+# buffers; the process-wide body budget (`src/services/body_budget.py`) is
+# what bounds them all.
+MAX_IMPORT_URL_CHARS = 8192
+
 # Aggregate bound on the preflight of `move_note(rewrite_links=True)`. That
 # preflight holds, for every backlink source, both the original bytes and the
 # rewritten content in memory before a single byte is mutated — the price of
@@ -753,6 +766,35 @@ class Settings(BaseSettings):
     # consumed is ever dropped.
     mcp_concurrency_replay_budget_bytes: int = Field(
         32 * 1024 * 1024, ge=1024 * 1024, le=256 * 1024 * 1024)
+
+    # ── The /mcp body-memory budget (#322) ─────────────────────────────────
+    #
+    # A memory-safety bound, not a tuning knob: always on, in every
+    # `MCP_CONCURRENCY_MODE`, with no shadow mode and no off switch. Every
+    # range below only allows the *safe* direction. The derivation (cgroup
+    # limit × fraction ÷ multiplier) and the boot check live in
+    # `src/services/body_budget.py` and run in the lifespan, never here: the
+    # migration init container imports these settings under its own, smaller
+    # memory limit and must not be refused for it. See
+    # `docs/architecture/rate-limits.md`.
+    #
+    # The memory budget in bytes. **Not a `NullableLimit`:** unset means
+    # "derive from the cgroup limit", never "disabled". Elsewhere in this file
+    # null means off; here there is no off. Startup refuses a value above the
+    # safe allocation of a readable cgroup limit.
+    mcp_body_memory_budget_bytes: int | None = Field(None, ge=64 * 1024 * 1024)
+    # Share of the cgroup limit given to request bodies. Capped at 0.5 so the
+    # fixed non-body headroom stays.
+    mcp_body_memory_fraction: float = Field(0.5, ge=0.1, le=0.5, allow_inf_nan=False)
+    # Peak memory per raw body byte. 6.7× was the import_from_url figure
+    # before its URL cap; after it, measured 3.17× (write_file) and 4.09×
+    # (import_from_url) — see docs/architecture/rate-limits.md. 8 is the
+    # safety floor, with headroom over both.
+    mcp_body_memory_multiplier: int = Field(8, ge=8, le=32)
+    # How long a request that does not fit waits before its transport 429.
+    mcp_body_budget_wait_seconds: float = Field(15, ge=0, le=60, allow_inf_nan=False)
+    # Waiters across both lanes; one more is refused at once.
+    mcp_body_budget_waiters: int = Field(8, ge=1, le=256)
 
     @model_validator(mode="after")
     def _validate_concurrency(self) -> "Settings":

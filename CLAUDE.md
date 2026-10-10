@@ -190,6 +190,18 @@ update it in the same change.** What stays here is the short list:
   The pool budget leaves four shared connections of headroom, not a
   reservation. See [rate limits](docs/architecture/rate-limits.md) before
   changing settings.
+- **The `/mcp` body-memory budget is always on** (#322): no shadow mode, no
+  off switch, every concurrency mode. Each authenticated POST (GET/DELETE
+  bypass) reserves its declared `Content-Length` — the full 61 MiB
+  per-request limit when unknown — after auth and before the app reads a
+  byte, against the process's own cgroup limit × 0.5 ÷ 8 (128 MiB on 2 GiB:
+  a 16 MiB small lane for ≤ 1 MiB requests, a strict-FIFO large lane). It
+  waits up to 15 s, then answers a transport 429 `code: body_memory`
+  outside `MCP-REFUSAL`. Overrides only go the safe way (multiplier ≥ 8,
+  fraction ≤ 0.5, budget ≤ the limit's safe allocation), and the **lifespan**
+  — never `Settings`, which the alembic init container imports — refuses to
+  start when one maximum write cannot fit (≈ 1.1 GiB minimum). See
+  [rate limits](docs/architecture/rate-limits.md).
 - **`TRUSTED_PROXY_IPS` is the single control of forwarded-header trust**
   (#189). It is validated at boot, stored **canonicalised** (`192.168.0.10/24`
   → `192.168.0.0/24`, because uvicorn's middleware silently matches nothing on

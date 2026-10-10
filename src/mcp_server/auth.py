@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import or_, select, text, update
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from src.auth.session import (
@@ -21,7 +21,7 @@ from src.config import settings
 from src.database import async_session
 from src.models.db import APIKey, OAuthClient, OAuthToken, User
 from src.oauth.scope import has_vault_scope, token_has_write
-from src.services import concurrency, rate_limits, security_events
+from src.services import body_budget, concurrency, rate_limits, security_events
 from src.services.vault import apply_user_vault_row
 
 logger = logging.getLogger(__name__)
@@ -436,6 +436,110 @@ async def _admit(admission_coro, watch: ReceiveWatch):
         raise
 
 
+# ── the body-memory budget (#322) ───────────────────────────────────────────
+
+#: The only method whose body the SDK buffers (`RequestBodyLimitMiddleware`
+#: passes every other method through unread). GET (the SSE stream), DELETE and
+#: the rest bypass the budget: costing a bodyless GET at the chunked worst case
+#: would hold ≈ 61 MiB for the lifetime of a stream (Codex spec review, F2).
+BODY_BUDGET_METHODS = frozenset({"POST"})
+
+
+def _declared_content_length(scope: Scope) -> int | None:
+    """The declared `Content-Length`, or None when absent or not a valid
+    non-negative integer (then the request is costed at the per-request
+    limit, like a chunked body)."""
+    values = [v for k, v in scope.get("headers", ()) if k.lower() == b"content-length"]
+    if len(values) != 1:
+        return None
+    raw = values[0].strip()
+    if not raw or not raw.isdigit():
+        return None
+    return int(raw)
+
+
+def _body_too_large_response() -> Response:
+    """The SDK's own 413, so a client sees one shape whichever layer answers."""
+    return Response("Request body too large", status_code=413)
+
+
+def _body_budget_response(admission) -> JSONResponse:
+    """The body-budget transport 429 (#322 D6).
+
+    The same keys and status as `_concurrency_response`, so a client that
+    handles one handles both; `Retry-After: 2` because a large holder releases
+    when its tool finishes. Outside the in-band `MCP-REFUSAL` contract: no tool
+    call has been parsed — parsing is the memory being protected.
+    """
+    return JSONResponse(
+        {"error": "MCP request body memory budget is unavailable", "code": "body_memory",
+         "scope": admission.scope, "limit": admission.limit},
+        status_code=429, headers={"Retry-After": "2"},
+    )
+
+
+def _emit_body_pressure(request, admission) -> None:
+    """`mcp_concurrency_pressure` with `reason="body:memory"`.
+
+    `refused` for a deadline, waiter-bound or unsatisfiable refusal; `waited`
+    for a grant after more than `WAITED_EVENT_THRESHOLD_MS`. A disconnected
+    waiter emits nothing. Deliberately **not** fed to
+    `concurrency.counters()`: body pressure is not concurrency pressure and
+    must not count as `transport_refused` in the enforce-readiness evidence.
+    """
+    if admission.disconnected:
+        return
+    if not admission.admitted:
+        outcome = "refused"
+    elif admission.queue_ms > WAITED_EVENT_THRESHOLD_MS:
+        outcome = "waited"
+    else:
+        return
+    try:
+        security_events.emit(
+            "mcp_concurrency_pressure",
+            subject=security_events.subject_for(user_id=current_user_id.get(),
+                                                request=request),
+            reason="body:memory",
+            outcome=outcome,
+            limit_count=admission.limit, method=request.method,
+            route=request.url.path, client_ip=security_events.client_ip(request),
+            user_id=current_user_id.get(), key_id=current_api_key_id.get(),
+            oauth_token_id=current_oauth_token_id.get(),
+        )
+    except Exception:
+        pass  # telemetry is response-neutral
+
+
+def _counting_receive(receive: Receive, reserved: int) -> Receive:
+    """The app's `receive`, never delivering more body than was reserved.
+
+    Sums delivered `http.request` body bytes. A message that would bring the
+    total above the reservation is replaced by `http.disconnect`, and so is
+    every call after it: the SDK treats the client as gone and stops reading,
+    so nothing beyond the reservation is ever buffered. uvicorn enforces
+    `Content-Length` framing and the SDK 413s an over-limit chunked body, so
+    this is defence in depth (D3).
+    """
+    delivered = 0
+    cut = False
+
+    async def counted():
+        nonlocal delivered, cut
+        if cut:
+            return {"type": "http.disconnect"}
+        message = await receive()
+        if isinstance(message, dict) and message.get("type") == "http.request":
+            size = _message_bytes(message)
+            if delivered + size > reserved:
+                cut = True
+                return {"type": "http.disconnect"}
+            delivered += size
+        return message
+
+    return counted
+
+
 #: This request's measured transport wait (request + auth stages) in ms, read
 #: by `_tracked` as `transport_queue_ms` in queue and enforce (#188). Reset
 #: with the rest of the request's context in the middleware's `finally`.
@@ -570,6 +674,10 @@ class APIKeyMiddleware:
         # A request waiting at either stage holds no database connection.
         transport_deadline = controller.transport_deadline()
         watch = ReceiveWatch(receive)
+        # The body-budget stage's own watcher and admission (#322), created
+        # only for an authenticated POST that reserves bytes.
+        body_watch: ReceiveWatch | None = None
+        body_admission = None
         request_admission = auth_admission = None
         worst = "none"
         transport_ms = 0.0
@@ -623,11 +731,62 @@ class APIKeyMiddleware:
                 finally:
                     auth_admission.lease.release()
             app_receive = watch.downstream()
+            if (response is None and scope["type"] == "http"
+                    and scope.get("method") in BODY_BUDGET_METHODS):
+                # The body-memory budget (#322): after authentication, so an
+                # unauthenticated caller never holds or waits for budget; after
+                # the auth permit, so a body wait holds no DB connection; before
+                # the app, so nothing has read this body except a transport
+                # watcher, whose bytes the replay budget already accounts for.
+                # Always on, whatever the concurrency mode.
+                declared = _declared_content_length(scope)
+                per_request = settings.mcp_max_request_body_bytes
+                if declared is not None and declared > per_request:
+                    response = _body_too_large_response()
+                elif declared == 0:
+                    # A declared-empty body reserves nothing, but it is still
+                    # counted: any byte delivered beyond the declaration is
+                    # over-reservation and is cut off like any other. No lease
+                    # is taken, so there is nothing to release.
+                    app_receive = _counting_receive(app_receive, 0)
+                else:
+                    size = per_request if declared is None else declared
+                    small = (declared is not None
+                             and declared <= body_budget.SMALL_REQUEST_MAX_BYTES)
+                    # A second watcher over the first one's replay: the
+                    # composition keeps the message order, and it starts only
+                    # if the reservation actually waits (the `_admit` pattern).
+                    body_watch = ReceiveWatch(app_receive)
+                    body_admission = await _admit(
+                        body_budget.get_body_budget().reserve(
+                            size, small=small, disconnected=body_watch.disconnected),
+                        body_watch)
+                    await body_watch.stop()
+                    _emit_body_pressure(request, body_admission)
+                    if body_admission.disconnected or body_watch.disconnected.is_set():
+                        # The client left while this request waited: no
+                        # response, and the `finally` returns anything held.
+                        return
+                    if not body_admission.admitted:
+                        response = _body_budget_response(body_admission)
+                        app_receive = body_watch.downstream()
+                    else:
+                        app_receive = _counting_receive(body_watch.downstream(), size)
             if response is not None:
                 await response(scope, app_receive, send)
             else:
                 await self.app(scope, app_receive, send)
         finally:
+            # The body lease first: it is held exactly for the downstream call.
+            if body_admission is not None and body_admission.lease is not None:
+                body_admission.lease.release()
+            # Both watchers, on every exit — a disconnect or a cancellation
+            # before the handoff included (Codex spec review F3). The body
+            # watcher first: its in-flight `receive` is the transport
+            # watcher's `downstream()`. Each returns its replay-budget bytes
+            # and cancels any still-pending `receive` task.
+            if body_watch is not None:
+                body_watch.abort()
             watch.abort()
             if request_admission is not None and request_admission.lease is not None:
                 request_admission.lease.release()

@@ -34,6 +34,19 @@ vault-sync, embedding and transport sections below still apply there.
 > (the `http://ollama:11434` default included) now refuses to start
 > unless `.env` has `EMBEDDING_ALLOW_PLAINTEXT=true`, and a TLS
 > parameter in `DATABASE_URL` or any `PGSSL*` variable is refused.
+>
+> **Minimum container memory (#322).** The `/mcp` body-memory budget is
+> derived from the app container's cgroup memory limit (half of it, ÷ 8,
+> as raw request bytes in flight), and the server **refuses to start**
+> when that cannot hold one maximum request body (61 MiB with the default
+> `MAX_FILE_WRITE_BYTES`). With the defaults the app container needs a
+> memory limit of at least **~1.1 GiB**; the shipped compose file and the
+> Kubernetes manifests set 2 GiB. A smaller container must lower
+> `MAX_FILE_WRITE_BYTES`. A container with no limit uses a 1 GiB budget
+> and logs a WARNING — give it a limit. Importing the settings (the
+> Kubernetes `alembic` init container, 1 GiB) is unaffected: only the web
+> application's startup checks. See `.env.example` and
+> [rate limits](docs/architecture/rate-limits.md).
 
 ## What you need before starting
 
