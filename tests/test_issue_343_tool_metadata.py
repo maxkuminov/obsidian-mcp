@@ -72,6 +72,10 @@ READ_TOOLS = frozenset({
     "get_links", "get_neighborhood", "find_related", "find_orphans", "check_upload",
 })
 RESTRUCTURED_WRITE_TOOLS = ("edit_note", "move_note", "set_frontmatter")
+# The refusal statement is qualified in every description that makes one: the
+# three restructured tools plus `create_note` and `delete_note`, whose
+# pre-existing sentence had the same inaccuracy (truth fix found in review).
+REFUSAL_QUALIFIED_TOOLS = RESTRUCTURED_WRITE_TOOLS + ("create_note", "delete_note")
 
 
 # ── pollution probes ─────────────────────────────────────────────────────────
@@ -316,7 +320,7 @@ _OPTIONAL_CLAUSE = re.compile(
 )
 
 
-@pytest.mark.parametrize("name", RESTRUCTURED_WRITE_TOOLS)
+@pytest.mark.parametrize("name", REFUSAL_QUALIFIED_TOOLS)
 def test_the_refusal_statement_is_qualified(name):
     text = _normalised(description(name))
     assert _REFUSAL_CLAUSE.search(text), f"{name}: no positive refusal clause"

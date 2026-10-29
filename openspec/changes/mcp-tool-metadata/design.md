@@ -252,6 +252,8 @@ The restructure is constrained by these, each already pinned by a test that must
 - `_forbid_unknown_arguments` and its test.
 - The vault guide and its primer.
 
+**Amendment after review (Codex adversarial round 1 → round 2 PASS).** "The other 21 descriptions untouched" became "the other 19 untouched, plus a one-sentence truth fix in `create_note` and in `delete_note`": both carried the pre-existing wording "Every refusal ends with one machine-readable `MCP-REFUSAL` line", which is false for an undeclared or mistyped argument (rejected by protocol validation before `_tracked`, no such line — the same inaccuracy review found in the three restructured descriptions). Each now reads "Every refusal the server raises ends with one machine-readable `MCP-REFUSAL {"code":…}` line (an undeclared or mistyped argument is rejected by protocol validation before the tool runs and carries no such line)". Nothing else in either description changed; both remain under 4,000 and `test_the_refusal_statement_is_qualified` covers all five.
+
 ## Tests (contract for the implementer)
 
 All in `tests/test_issue_343_tool_metadata.py`, following the `test_issue_150_docstrings.py` setup convention (env defaults and `chdir` before importing `src.mcp_server.server`), reading everything from `mcp._tool_manager.list_tools()` / `await mcp.list_tools()` rather than from module functions (#89's reason).

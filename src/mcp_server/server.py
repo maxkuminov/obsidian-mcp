@@ -407,8 +407,9 @@ async def create_note(
     file's** hash, never a hash of the text you received. Two windows, both
     live: `expected_hash` covers your read → this call's read, the server's own
     pre-publication compare covers this call's read → its publication, and a
-    match on the first does not exempt the second. Every refusal ends with one
-    machine-readable `MCP-REFUSAL {"code":…}` line — `stale_precondition` (with
+    match on the first does not exempt the second. Every refusal the server raises ends with one
+    machine-readable `MCP-REFUSAL {"code":…}` line (an undeclared or mistyped argument is rejected by
+    protocol validation before the tool runs and carries no such line) — `stale_precondition` (with
     the file's current hash, ready to resend), `concurrent_write`,
     `no_incumbent`, `malformed_precondition`, `precondition_unavailable`,
     `precondition_required` — and each states what resolves it.
@@ -733,8 +734,9 @@ async def delete_note(
     file's** hash, never a hash of the text you received. `expected_hash`
     covers your read through this call's preflight read. The delete acts through the
     pinned parent directory but does not compare the bytes again: an in-place edit after that
-    comparison can still be deleted. Precondition refusals end with one
-    machine-readable `MCP-REFUSAL {"code":…}` line — `stale_precondition` (with
+    comparison can still be deleted. Every refusal the server raises ends with one
+    machine-readable `MCP-REFUSAL {"code":…}` line (an undeclared or mistyped argument is rejected by
+    protocol validation before the tool runs and carries no such line) — `stale_precondition` (with
     the file's current hash, ready to resend), `concurrent_write`,
     `no_incumbent`, `malformed_precondition`, `precondition_unavailable`,
     `precondition_required` — and each states what resolves it.
