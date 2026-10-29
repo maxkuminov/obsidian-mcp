@@ -1,0 +1,78 @@
+## 0. Pre-flight
+
+- [ ] 0.1 Worktree off `origin/main` at or after `5a391ca`; confirm `alembic/versions/030_note_derived_under.py` exists and `tests/integration/test_schema_check.py` reads `HEAD_REVISION = "030"` before touching it
+- [ ] 0.2 Read `docs/architecture/search.md`, `indexing-and-embeddings.md` (the tsvector writers, the rebuild's certification, the fingerprints), `schema-and-migrations.md` and this change's `design.md`
+
+## 1. Builders and rules (`src/services/fts.py`) — D1, D2, D3
+
+- [ ] 1.1 `index_tsvector_sql(content_bind="content", title_bind="title", aliases_bind="aliases")`: title parts for every config, then aliases parts, then the unchanged content parts; `head_tsvector_sql(title_bind, aliases_bind)`; `rehead_tsvector_sql(title_bind, aliases_bind)` = `head || ts_filter(content_tsvector, '{d}')`; config names stay bound `CAST(:fts_cfg_i AS regconfig)`
+- [ ] 1.2 Constants `RANK_WEIGHTS = "{0.02, 0.2, 0.4, 1.0}"`, `KEYWORD_EXCERPT_CHARS = 20_000`, `FTS_ALIASES_MAX_CHARS = 2048`, `MATCHED_TERMS_MAX_UNITS = 32`, the `ts_headline` option string with the U+0002/U+0003 sentinels; `rank_expression(tsquery)` wrapping `ts_rank_cd(RANK_WEIGHTS, …)`
+- [ ] 1.3 `note_aliases(frontmatter) -> list[str]` per design D1 (keys `aliases` then `alias`; list / scalar string comma-split / other scalar; the title rule's scalar rendering, imported from `vault` without creating a cycle — move `_title_value`'s scalar rendering into a dependency-free spot if needed; NUL/U+0002/U+0003 removed; empties dropped; joined text cut at the cap); `aliases_text(frontmatter) -> str`
+- [ ] 1.4 `excerpt_of(content: str) -> str` (first `KEYWORD_EXCERPT_CHARS` characters, U+0002/U+0003 removed)
+- [ ] 1.5 `parse_conjunction(tsquery_text) -> Conjunction | None` over PostgreSQL's tsquery output grammar (quoted lexemes with doubled quotes/backslashes passed through verbatim, `&`, `|`, `!`, `<->`, `<N>`, parentheses); `None` on any `|`, parenthesis, unknown token, a `!` not followed by exactly one lexeme, or an empty parse; `fallback_tsquery_text(conj) -> str | None` (`(u1 | … | uk) & !n1 … & !nm`, `None` when `k < 2`); `positive_units(conj)` for `matched_terms`
+- [ ] 1.6 Unit tests in `tests/test_fts.py`: the three fragment shapes for one, two and three configs (exact strings), the bind names, no interpolated config name; Postgres-side (in 5.x) `ts_filter(to_tsvector(x),'{d}') = to_tsvector(x)`, `rehead` byte-exact over a D-only vector and relative-position-exact over a headed one; `note_aliases` table (every form in the spec scenario, parsed mapping vs sanitised JSONB parity, the 10,000-alias cap, NUL/sentinel removal, a `title`-less note); `parse_conjunction` table (plain words, a phrase with a stop-word gap `<2>`, `-term`, `OR` → None, `-"a b"` → None, a lexeme containing `''` and `\\`, an empty parse, a single unit → no fallback, 8,192-character inputs are linear)
+
+## 2. Model and migration — D5
+
+- [ ] 2.1 `src/models/db.py`: `NoteMetadata.body_excerpt: Mapped[str | None] = mapped_column(Text, nullable=True, deferred=True, deferred_raiseload=True, comment=_BODY_EXCERPT_COLUMN_MARKER)` with a comment block naming D4 (what it is a prefix of, who writes it, why NULL means "not written by this build")
+- [ ] 2.2 `alembic/versions/031_keyword_head_and_excerpt.py` (revises `030`): pinned and asserted `search_path`, `lock_timeout`/`statement_timeout` set (15 min) and `RESET`; the marked column, reconcile-or-refuse, marked downgrade; `pg_advisory_xact_lock(INDEX_GENERATION_LOCK_KEY)` (literal mirrored from `index_state.py`); configs from the stored `fts_fingerprint` (present / absent → settings / unreadable → refuse naming the key); per-row `rehead` UPDATE in a savepoint over `id, title, frontmatter WHERE content_tsvector IS NOT NULL AND length(ts_filter(content_tsvector, '{a}')) = 0` (the byte-idempotence predicate, design D5), 54000 counted and logged by id, anything else fails; a closing log line with rows re-headed, rows already headed and rows skipped
+- [ ] 2.3 Offline test pinning the migration's lock-key literal equal to `index_state.INDEX_GENERATION_LOCK_KEY` and the marker equal to the model's
+- [ ] 2.4 `tests/integration/test_schema_check.py`: `HEAD_REVISION = "031"`; cases per the schema-integrity delta — fresh upgrade over seeded unweighted rows (head at `A`, body at `D`, equal to the incremental writer's output for the same inputs), stamp-back idempotence (vectors byte-equal across the two runs), stored-fingerprint configs vs environment, absent fingerprint, unreadable fingerprint refuses, a 54000 row survives, impostor refusals, both downgrade directions, `alembic check` clean
+- [ ] 2.5 `make test-schema` green (own `SCHEMA_TEST_CONTAINER` / `SCHEMA_TEST_PORT`, never concurrently with `make test-integration`)
+
+## 3. Writers — D1, D6, D7
+
+- [ ] 3.1 `write_tsvector_bounded`: accept the title and aliases text and bind `title`, `aliases` and `excerpt = excerpt_of(content[:length])` on every attempt; halve `content` only
+- [ ] 3.2 Incremental pass (`_index_vault_attempt`): the UPDATE sets `content_tsvector = <index_tsvector_sql>` and `body_excerpt = :excerpt`; bind the entry's title and `aliases_text(frontmatter)`; the quarantine's floor retry (`_floor`) binds the same
+- [ ] 3.3 `_rebuild_tsvectors_pinned`: the certified UPDATE writes the vector and the excerpt; title recomputed via `_note_title` from the parsed verified bytes, aliases via `aliases_text`; the all-scopes driver and the fingerprint write unchanged; `scripts/rebuild_tsvectors.py` docstring mentions the excerpt and the post-031 run
+- [ ] 3.4 Indexer id-preserving move UPDATE: add `content_tsvector = <rehead_tsvector_sql>` binding the parsed entry's title and aliases; `body_excerpt` untouched
+- [ ] 3.5 `move_note` metadata UPDATE: add `content_tsvector = <rehead>` with the title and `aliases_text` derived from the moved file's frontmatter, falling back to the stored JSONB exactly where the title does
+- [ ] 3.6 Grep every `content_tsvector` writer in `src/` (the three UPDATE sites, both move sites, 031) and confirm each goes through a `fts.py` builder; an AST/grep test pins that no `to_tsvector(` string is composed outside `fts.py` and the migration
+- [ ] 3.7 `tests/test_issue_18_tsvector_concurrent_delete.py` and the #127/#308 tsvector tests updated for the new binds; `tests/integration/test_tsvector_bounded_pg.py` extended: the head stays whole at every retreat step and the excerpt tracks the successful prefix
+
+## 4. Search service — D3, D4, D8
+
+- [ ] 4.1 `full_text_search`: project `id` too; rank with `rank_expression`; after the conjunctive statement with `n < limit`, fetch the per-config `CAST(websearch_to_tsquery(CAST(:cfg AS regconfig), :q) AS text)`, parse, build the fallback per config as `CAST(:fallback_i AS tsquery)` OR'd, run the fallback statement (`AND NOT (content_tsvector @@ <and tsquery>)`, same filters, same ORDER BY, `LIMIT limit - n`); tag rows `match`
+- [ ] 4.2 The snippet statement per non-empty block: `WHERE id = ANY(:ids)`, one `ts_headline` column per config, `matched_title`, `matched_body`, `matched_terms` (positive units as `CAST(:unit_j AS tsquery)`, only when `≤ 32`); pick the first headline carrying the sentinel, else the first config's leading words with `highlighted=False`; rows with NULL excerpt carry `snippet=None`
+- [ ] 4.3 Telemetry: `fallback`, `any_rows`, `snippet_ms` via `timing.record` / `timing.add_ms`; `record_results` over the assembled list
+- [ ] 4.4 `search_notes_impl` renderer per design D4 (header counts always including zero; `match`, `matched_in`, `terms`; `snippet:` with `«»` / `head:`; the no-excerpt footer naming `make rebuild-tsvectors`); the snippet is never cut or marked by the server
+- [ ] 4.5 `keyword_search` docstring per design D9; `tests/test_issue_150_docstrings.py`-style assertion for the AND default, the three operator forms, the five field names, and the symmetric cross-reference with `semantic_search`
+- [ ] 4.6 `tests/test_perf_projection.py`: the keyword statement projects `id, file_path, title, tags, rank` and no `content_tsvector` / `body_excerpt`; `body_excerpt` deferred with raiseload; the snippet statement projects no excerpt column
+
+## 5. Integration tests on real Postgres (`tests/integration/test_keyword_ranking_pg.py`, plus existing suites)
+
+Run with `make test-integration` (own container/port; never concurrently with `make test-schema`).
+
+- [ ] 5.1 The title case: titled note with no body occurrence vs. a ~3,000-word note with thirty adjacent occurrences → titled first; the alias case; body-only order equal under `RANK_WEIGHTS` and the default array
+- [ ] 5.2 The OR fallback: `alpha beta gamma` with no full match → the two-term note in the `any` block; three `all` + seven `any` at `limit=5` → exactly `[all×3, any×2]`; a full page issues no fallback (statement count asserted); `OR`, `-"a b"` and a single term skip it; `alpha "beta gamma" -delta` keeps the phrase and the negation; `fallback`/`any_rows` recorded
+- [ ] 5.3 The superset property: a generated corpus of plain-conjunction queries (words, phrases, negations, quotes/backslashes in lexemes, stop words) — every AND-matching row matches the fallback, every fallback text casts; multi-config (`english,simple`) included
+- [ ] 5.4 Snippets: a highlighted body match; title-only → `head:` and `matched_in: title`; a match past 20,000 characters → `head:` with `matched_in: body`; `matched_terms: 2/3`; a NULL-excerpt row counted in the header and the footer; the snippet statement is issued with exactly the page's ids (statement capture)
+- [ ] 5.5 EXPLAIN: `tests/integration/test_keyword_plan.py` still asserts the GIN plan for the conjunctive statement on its fixture (fixture binds `title`/`aliases` empty so its vectors are unchanged), and gains the same assertion for the disjunctive statement
+- [ ] 5.6 Moves: both move paths on `Alpha.md → Beta.md` → `Beta` found by title, `Alpha` not, body lexemes and excerpt byte-equal before/after (`ts_filter(v,'{d}')` compared)
+- [ ] 5.7 The rebuild after 031 writes the excerpt and the head for every row; `rebuild_tsvectors_all_scopes` records the fingerprint as before
+- [ ] 5.8 `tests/integration/test_search_recall.py` unchanged and green; `test_perf_projection_identity_pg.py` keyword case compares the `all` block with the comparator ignoring the new fields (the oracle's corpus still builds vectors through `index_tsvector_sql`); `test_fts_integration.py` updated for the three binds
+- [ ] 5.9 The startup WARNING: a database with `k` NULL-excerpt rows logs one WARNING naming `k` and the command; zero logs nothing
+
+## 6. Deploy surfaces
+
+- [ ] 6.1 `src/main.py`: the excerpt count WARNING immediately after `_check_fts_fingerprint`, inside the sandbox-mode short-circuit; no refusal, no `/health` change
+- [ ] 6.2 `deploy/kubernetes/base/rebuild-tsvectors-job.example.yaml` matching the manifest in `docs/deployment-kubernetes.md` (same image, env, mounts, security context); the doc references the file and names the post-031 run
+- [ ] 6.3 Makefile `rebuild-tsvectors` help text mentions the excerpt; `make help` output checked
+
+## 7. Docs (last commits of the feature branch)
+
+- [ ] 7.1 `docs/architecture/search.md`: new section "Keyword ranking, the disjunctive fill and the snippet (#344)" — the vector shape and why the body stays `D`, `RANK_WEIGHTS` with the cover arithmetic, the fallback's derivation from PostgreSQL's parse and the superset property, the page-bounded snippet statement and `snippet_ms`, the `head:` rule, L1–L10; update "Search decisions" (the keyword bullet), "Read paths project what they render" (the `id` column, `body_excerpt` deferred, the snippet statement), the identity-oracle paragraph (the `all` block), and the telemetry keys
+- [ ] 7.2 `docs/architecture/indexing-and-embeddings.md`: the keyword-vector bullet (head, excerpt, the aliases rule, the halving retreat touches the body only), the rebuild's certified UPDATE now carrying the excerpt, the move paths' re-head, the fingerprint's unchanged scope and why no version bump
+- [ ] 7.3 `docs/architecture/schema-and-migrations.md`: "031: `notes_metadata.body_excerpt` and the in-SQL re-head" — the generation lock, the stored-fingerprint configs, idempotence via `ts_filter`, the 54000 rule, no excerpt backfill and why, the compose overlap window
+- [ ] 7.4 README: "What's in the box" `keyword_search` line (title/alias weighting, `match: all|any`, snippets); "Full-text search language(s)" (what the vector holds, the rebuild also stores the excerpt); "Upgrading" (031 re-heads vectors on migrate; run `make rebuild-tsvectors` / the k8s Job once for snippets; the startup WARNING); no new setting — grep-check `.env.example` unchanged per the public-docs rule
+- [ ] 7.5 `docs/deployment-kubernetes.md`: the checked-in Job example and the post-031 run
+- [ ] 7.6 CLAUDE.md, Key decisions: one bullet — the keyword vector is `A(title) || A(aliases) || D(body)` ranked under `RANK_WEIGHTS`; conjunction first, disjunction derived from PostgreSQL's parse fills the page tagged `match: any`; the snippet comes from a stored 20,000-character excerpt via a page-bounded statement; 031 re-heads in SQL, the rebuild stores excerpts, moves re-head (#344)
+
+## 8. Gates
+
+- [ ] 8.1 `openspec validate keyword-search-ranking --strict`
+- [ ] 8.2 Codex spec review before implementation (this proposal), findings folded in
+- [ ] 8.3 `openspec-verifier` subagent against this change after implementation; iterate to zero blocking gaps
+- [ ] 8.4 Adversarial Codex pass (mandatory: search path and `move_note`, a write tool) framed on silently wrong results — a false `all` tag, a fallback that drops a negation or re-stems, a highlight presented for a non-matching row, a move that leaves the old title at weight `A`, a migration that mixes stemmers; **two full rounds by default, verification-only from round three**; findings triaged per CLAUDE.md, declined ones listed with the reason in `design.md`'s accepted limitations
+- [ ] 8.5 `make audit`, `make db-check` after deploy ("No new upgrade operations detected"), the startup log shows the 031 re-head summary and the excerpt WARNING, then one `make rebuild-tsvectors` (or the k8s Job) and a restart with no WARNING
+- [ ] 8.6 Post-deploy end-to-end exercise against the live server, named in the report: `keyword_search` with the issue's two-word title, a three-term over-specified query, a quoted phrase with `-term`, a query on a note indexed before 031 (no excerpt, counted) and after the rebuild (snippet); `move_note` of a note then `keyword_search` by its new stem; `semantic_search` unchanged on the same queries
