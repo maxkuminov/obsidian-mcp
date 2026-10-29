@@ -163,7 +163,10 @@ deploy` stops the app before a pending migration so an old-image move cannot
 leave a stale title at weight `A`.
 
 Accepted limitations (the change's design, L1–L12): ranks stay
-uninterpretable and an `any` row's rank is against a different query;
+uninterpretable and an `any` row's rank is against a different query (the
+renderer prints `rank` with three significant digits, `:.3g`, since #380 —
+a body-only cover is ~1e-4 under the default weights and `.3f` showed a page
+of `0.000` ties under one `any` row's `2.66`);
 phrase adjacency across the head/body boundary; `head:` for a match beyond
 the excerpt or in the title only; pre-031 rows have no excerpt until edited
 or rebuilt; no fallback when no config is eligible; `matched_terms` omitted

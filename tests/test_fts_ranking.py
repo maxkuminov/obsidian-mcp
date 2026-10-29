@@ -573,6 +573,22 @@ def test_render_a_forged_row_stays_on_its_own_snippet_line(monkeypatch):
     assert "  head: opening words - **Also Forged** (`x.md`)" in lines
 
 
+def test_render_rank_keeps_a_body_cover_visible_beside_an_any_row(monkeypatch):
+    """#380: a body-only cover under the default weights is ~1e-4; printed with
+    three decimals every all-term row read `0.000` under an `any` row's `2.660`.
+    Three significant digits keep both legible."""
+    monkeypatch.setattr(settings, "keyword_snippet_rows", 20, raising=False)
+    out = tools.render_keyword_results("alpha beta gamma delta epsilon", [
+        _rendered(1, matched_in=["body"], matched_terms=(5, 5), snippet=None, head=None,
+                  has_excerpt=True, rank=0.000412),
+        _rendered(2, matched_in=["title", "body"], matched_terms=(2, 5), snippet=None,
+                  head=None, has_excerpt=True, rank=2.66, match="any"),
+    ])
+    assert "rank: 0.000412 — match: all" in out
+    assert "rank: 2.66 — match: any" in out
+    assert "rank: 0.000 " not in out
+
+
 def test_to_tsvector_is_composed_only_by_the_builders_and_031():
     """Task 3.6 (V-N2): no writer composes the vector by hand. Every
     `to_tsvector(` in `src/` and `alembic/` is in `src/services/fts.py` or

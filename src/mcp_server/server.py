@@ -203,8 +203,10 @@ async def keyword_search(
     `aliases` are indexed above its body, so a query that is a note's title
     ranks that note first.
 
-    Each result carries `rank` (a relative score, not comparable across
-    queries), `match`, `matched_in` (`title` — title or aliases — and/or
+    Each result carries `rank` (a relative score: a body-only match scores in
+    the thousandths, a title match near 1, and an `any` row is scored against
+    the fallback query, so ranks compare only within one block of one page),
+    `match`, `matched_in` (`title` — title or aliases — and/or
     `body`, or `title+body` when the terms are split between them), `terms`
     (`k/n`: how many of the query's terms the note contains), and a second
     line: `snippet:` — the matching body text with the matches in `«»` — or

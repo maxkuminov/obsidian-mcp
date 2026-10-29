@@ -2036,7 +2036,11 @@ def render_keyword_results(query: str, results: list[dict]) -> str:
     note-controlled field: never cut or marked by the server, and rendered on
     one line (whitespace runs, line breaks included, become one space) so a
     note cannot forge a result row. A split match — one term in the title,
-    another in the body — renders `matched_in: title+body`.
+    another in the body — renders `matched_in: title+body`. `rank` is
+    rendered with three significant digits, not three decimals (#380): a
+    body-only cover under the default weights is on the order of 1e-4, which
+    `.3f` printed as `0.000` beside an `any` row's `2.66` — seven apparent
+    ties under one apparent strong hit.
     """
     cap = settings.keyword_snippet_rows
     all_count = sum(1 for r in results if r.get("match") == "all")
@@ -2055,7 +2059,7 @@ def render_keyword_results(query: str, results: list[dict]) -> str:
     for r in results:
         tags_str = f" [{', '.join(r['tags'])}]" if r.get("tags") else ""
         line = (
-            f"- **{r['title']}** (`{r['path']}`){tags_str} — rank: {r['rank']:.3f}"
+            f"- **{r['title']}** (`{r['path']}`){tags_str} — rank: {r['rank']:.3g}"
             f" — match: {r.get('match', 'all')}"
         )
         if r.get("matched_in"):
