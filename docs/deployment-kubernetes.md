@@ -34,6 +34,7 @@ deploy/kubernetes/
     secret.example.yaml         the Secret's shape. NOT applied, placeholders only
     pvc-vault.yaml              the vault volume
     vault-init-job.example.yaml one-shot ownership fix for a NEW empty vault volume
+    rebuild-tsvectors-job.example.yaml  one-off keyword-index rebuild (FTS_CONFIGS change; once after migration 031)
     deployment.yaml             1 replica, Recreate, migration initContainer, probes
     service.yaml                ClusterIP :8000
     networkpolicy.yaml          default deny + the app's allow-list
@@ -262,6 +263,9 @@ List-valued settings: `TRUSTED_PROXY_IPS`, `FTS_CONFIGS` and
 | `INDEXER_DEGRADED_AFTER_FAILURES` | `3` | Consecutive failed index, embedding or re-derive passes before `/health` reports `degraded`. |
 | `INDEXER_QUARANTINE_RETRIES_PER_TICK` | `5` | Re-runs per user per pass while isolating notes whose database writes fail on their own data. |
 | `FTS_CONFIGS` | `english` | Postgres text-search configs for keyword search. A change needs `rebuild-tsvectors`. |
+| `RANK_WEIGHTS` | `{0.02, 0.2, 0.4, 1.0}` | `keyword_search`'s `ts_rank_cd` weights `{D, C, B, A}`; title and aliases are indexed at `A`, the body at `D`. |
+| `KEYWORD_EXCERPT_CHARS` | `20000` | Characters of each note's indexed text stored for snippets (1000–100000). |
+| `KEYWORD_SNIPPET_ROWS` | `20` | Rows per `keyword_search` page that get a snippet (0–100; 0 disables). |
 | `EMBED_CHUNK_BUDGET_PER_USER` | `5000` | Chunks embedded per user per pass (multi-user fairness). |
 | `EMBED_TIME_BUDGET_SECONDS_PER_USER` | `300` | Seconds of embedding per user per pass. |
 | `VAULT_ROOT_OBSERVE_TIMEOUT_SECONDS` | `10` | How long the overlap check waits on one vault root before quarantining that account (multi-user). |
@@ -732,6 +736,18 @@ spec:
 ```
 
 4. When it has completed, `kubectl -n obsidian-mcp scale deploy/obsidian-mcp --replicas=1`.
+
+The rebuild Job above is checked in as
+`deploy/kubernetes/base/rebuild-tsvectors-job.example.yaml` (set the image
+to the Deployment's tag and add your extra mounts), so the whole step is one
+`kubectl apply -f` between the two `scale` commands. **Run it once after
+upgrading across migration 031 (#344):** 031 re-heads every keyword vector in
+the migrate initContainer, so ranking is right at once, but the excerpt
+`keyword_search`'s snippets come from is stored only when a vector is written
+— until the Job has run, notes indexed before 031 show `head:` or no snippet,
+and startup logs how many. There is no old-image overlap to worry about here:
+`strategy: Recreate` ends the old pod before the new pod's `migrate`
+initContainer runs.
 
 Both tasks take the index generation lock. With the app scaled down nothing
 else holds it. If you run one with the app up (possible only for

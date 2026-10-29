@@ -85,7 +85,7 @@ help:
 	@echo "$(YELLOW)Operations:$(NC)"
 	@echo "  make reindex      - Explain how to trigger a reindex (panel only)"
 	@echo "  make reset-embeddings - Drop & recreate embedding column at configured dim"
-	@echo "  make rebuild-tsvectors - Recompute keyword index for FTS_CONFIGS (no embeddings, no API calls)"
+	@echo "  make rebuild-tsvectors - Recompute keyword index for FTS_CONFIGS and store snippet excerpts (no embeddings, no API calls)"
 	@echo "  make concurrency-report TARGET=queue|enforce [DAYS=n] [END=iso] - Concurrency readiness verdict (#188; exit 0 only on PASS)"
 	@echo "  make status       - Show container and health status"
 	@echo "  make clean        - Remove containers and images"
@@ -171,8 +171,20 @@ deploy: image
 		exit 1; \
 	}
 	# Migrate with the newly built image before replacing the live container.
-	# Migrations are backward-compatible, avoiding a window where new code runs
-	# against the old schema (and matching README's documented deploy behavior).
+	# When a migration is PENDING the running (old-image) container is stopped
+	# first (#344, design D5): migration 031 rewrites every keyword vector in
+	# place, and an old-image `move_note` landing between that commit and the
+	# recreate would carry a stale title inside a headed vector for ever — a
+	# false positive nothing later repairs. With nothing pending the old
+	# container keeps serving through the no-op upgrade, as before. The
+	# Kubernetes bundle has no such window (`Recreate` + a migrate
+	# initContainer).
+	@current=$$($(COMPOSE) run --rm --no-deps obsidian-mcp alembic current 2>/dev/null | grep -Eo '^[0-9a-f]+' | head -1); \
+	head=$$($(COMPOSE) run --rm --no-deps obsidian-mcp alembic heads 2>/dev/null | grep -Eo '^[0-9a-f]+' | head -1); \
+	if [ -n "$$head" ] && [ "$$current" != "$$head" ]; then \
+		echo "$(YELLOW)Migration pending ($${current:-none} -> $$head): stopping the app before migrating.$(NC)"; \
+		$(COMPOSE) stop obsidian-mcp; \
+	fi
 	$(COMPOSE) run --rm obsidian-mcp alembic upgrade head
 	$(COMPOSE) up -d --force-recreate
 	@$(MAKE) check-no-backups-mount
@@ -437,9 +449,9 @@ reset-embeddings:
 	@echo "$(GREEN)Done. The next indexer pass will re-embed all notes.$(NC)"
 
 rebuild-tsvectors:
-	@echo "$(YELLOW)Rebuilding keyword (FTS) index for the configured FTS_CONFIGS...$(NC)"
+	@echo "$(YELLOW)Rebuilding keyword (FTS) index for the configured FTS_CONFIGS (and storing snippet excerpts)...$(NC)"
 	$(COMPOSE) run --rm obsidian-mcp python -m scripts.rebuild_tsvectors
-	@echo "$(GREEN)Done. Keyword search now reflects FTS_CONFIGS (embeddings untouched, no API calls).$(NC)"
+	@echo "$(GREEN)Done. Keyword search now reflects FTS_CONFIGS and every note has a snippet excerpt (embeddings untouched, no API calls).$(NC)"
 
 # Invariant: the application container must not be able to see the backups
 # directory (docs/architecture/control-panel.md, "Backup recency"). The mount

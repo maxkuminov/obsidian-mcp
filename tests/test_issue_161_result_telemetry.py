@@ -118,10 +118,10 @@ class _Note:
 def _keyword_row(path):
     from types import SimpleNamespace
 
-    # `keyword_search` projects four columns (#280, D6), so a row is flat.
+    # `keyword_search` projects five columns (#280 D6, #344), so a row is flat.
     note = _Note(1, path)
     return SimpleNamespace(
-        file_path=note.file_path, title=note.title, tags=note.tags, rank=0.5
+        id=1, file_path=note.file_path, title=note.title, tags=note.tags, rank=0.5
     )
 
 

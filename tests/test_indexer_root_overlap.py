@@ -132,6 +132,7 @@ def _install_lifespan_fakes(monkeypatch):
         "_validate_fts_configs",
         "_check_embedding_fingerprint",
         "_check_fts_fingerprint",
+        "_warn_missing_keyword_excerpts",
     ):
         monkeypatch.setattr(main, name, _noop_check)
     monkeypatch.setattr(main, "_check_openat2_support", lambda: None)

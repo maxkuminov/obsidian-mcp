@@ -31,7 +31,14 @@ async def test_full_text_search_clamps_limit(monkeypatch):
 
     await search.full_text_search(session, "needle", limit=10**9)
 
-    statement = session.execute.await_args.args[0]
+    # The conjunctive select is the first non-`SET LOCAL` statement (#344
+    # added the parse-text and snippet statements after it).
+    from sqlalchemy import Select
+
+    statement = next(
+        call.args[0] for call in session.execute.await_args_list
+        if isinstance(call.args[0], Select)
+    )
     assert statement._limit_clause.value == 500
 
 

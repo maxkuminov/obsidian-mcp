@@ -11,6 +11,13 @@ does NOT touch embeddings/vectors and makes NO API calls, so it completes in
 seconds for a few thousand notes (unlike the expensive `make reset-embeddings`
 flow, which it must not be confused with).
 
+Since migration 031 (#344) each vector is `A(title) || A(aliases) || D(body)`
+and the same certified UPDATE stores `body_excerpt`, the prefix of the indexed
+text that `keyword_search`'s snippets come from. 031 re-heads every vector in
+SQL but cannot store an excerpt (nothing in the database holds the body), so
+**run this once after upgrading across 031**: until then notes indexed before
+it show `head:` or no snippet, and startup logs how many.
+
 **It rebuilds every scope that holds rows, not every active user, and it is
 all-or-nothing.** The fingerprint it writes is one stored row asserting
 something about *every* retained row in the database, and that is not a claim

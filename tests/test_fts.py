@@ -86,28 +86,44 @@ def _set_configs(monkeypatch, cfgs):
     return fts
 
 
+def _head(i: int, bind: str) -> str:
+    return f"setweight(to_tsvector(CAST(:fts_cfg_{i} AS regconfig), :{bind}), 'A')"
+
+
+def _body(i: int, bind: str = "content") -> str:
+    return f"to_tsvector(CAST(:fts_cfg_{i} AS regconfig), :{bind})"
+
+
 def test_index_tsvector_sql_single_config(monkeypatch):
+    """`A(title) || A(aliases) || D(body)` (#344, D1): the body part is the
+    pre-031 fragment byte for byte, so a pre-031 vector is exactly the body
+    part of a post-031 one."""
     fts = _set_configs(monkeypatch, ["english"])
     frag, params = fts.index_tsvector_sql("content")
-    assert frag == "to_tsvector(CAST(:fts_cfg_0 AS regconfig), :content)"
+    assert frag == f"{_head(0, 'title')} || {_head(0, 'aliases')} || {_body(0)}"
     assert params == {"fts_cfg_0": "english"}
+    assert fts.body_tsvector_sql("content") == (_body(0), params)
 
 
 def test_index_tsvector_sql_two_configs(monkeypatch):
+    """Title parts for every config, then aliases parts, then content parts —
+    the order the design fixes, so every writer stores one shape."""
     fts = _set_configs(monkeypatch, ["english", "norwegian"])
     frag, params = fts.index_tsvector_sql("content")
-    assert frag == (
-        "to_tsvector(CAST(:fts_cfg_0 AS regconfig), :content)"
-        " || to_tsvector(CAST(:fts_cfg_1 AS regconfig), :content)"
-    )
+    assert frag == " || ".join([
+        _head(0, "title"), _head(1, "title"),
+        _head(0, "aliases"), _head(1, "aliases"),
+        _body(0), _body(1),
+    ])
     assert params == {"fts_cfg_0": "english", "fts_cfg_1": "norwegian"}
 
 
 def test_index_tsvector_sql_three_configs(monkeypatch):
     fts = _set_configs(monkeypatch, ["simple", "english", "norwegian"])
     frag, params = fts.index_tsvector_sql("content")
-    assert frag.count("to_tsvector(") == 3
-    assert frag.count(" || ") == 2
+    assert frag.count("to_tsvector(") == 9
+    assert frag.count("setweight(") == 6
+    assert frag.count(" || ") == 8
     assert params == {
         "fts_cfg_0": "simple",
         "fts_cfg_1": "english",
@@ -115,10 +131,31 @@ def test_index_tsvector_sql_three_configs(monkeypatch):
     }
 
 
-def test_index_tsvector_sql_honors_content_bind(monkeypatch):
+def test_index_tsvector_sql_honors_the_bind_names(monkeypatch):
     fts = _set_configs(monkeypatch, ["english"])
-    frag, _ = fts.index_tsvector_sql("body")
-    assert frag == "to_tsvector(CAST(:fts_cfg_0 AS regconfig), :body)"
+    frag, _ = fts.index_tsvector_sql("body", "t", "al")
+    assert frag == f"{_head(0, 't')} || {_head(0, 'al')} || {_body(0, 'body')}"
+
+
+def test_rehead_tsvector_sql_keeps_the_d_part_only(monkeypatch):
+    """`head || ts_filter(content_tsvector, '{d}')`: the head from stored
+    columns, the body kept, any previous head dropped."""
+    fts = _set_configs(monkeypatch, ["english"])
+    frag, params = fts.rehead_tsvector_sql("head_title", "head_aliases")
+    assert frag == (
+        f"{_head(0, 'head_title')} || {_head(0, 'head_aliases')} "
+        "|| ts_filter(content_tsvector, '{d}')"
+    )
+    assert params == {"fts_cfg_0": "english"}
+
+
+def test_builders_take_explicit_configs_for_the_migration(monkeypatch):
+    """031 builds under the configs the stored fingerprint names, not the
+    environment's — the builders accept them explicitly."""
+    fts = _set_configs(monkeypatch, ["english"])
+    frag, params = fts.rehead_tsvector_sql(configs=["simple", "norwegian"])
+    assert params == {"fts_cfg_0": "simple", "fts_cfg_1": "norwegian"}
+    assert frag.count("setweight(") == 4
 
 
 def test_index_tsvector_sql_never_interpolates_config_name(monkeypatch):
@@ -171,9 +208,11 @@ def test_default_config_reproduces_single_english_behavior(monkeypatch):
 
     fts = _set_configs(monkeypatch, s.fts_configs)
 
-    frag, params = fts.index_tsvector_sql("content")
+    frag, params = fts.body_tsvector_sql("content")
     assert frag == "to_tsvector(CAST(:fts_cfg_0 AS regconfig), :content)"
     assert params == {"fts_cfg_0": "english"}
+    full, _ = fts.index_tsvector_sql("content")
+    assert full.endswith(" || " + frag)
 
     sql = _compile(fts.combined_tsquery("hello"))
     assert sql.count("websearch_to_tsquery(") == 1

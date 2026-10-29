@@ -19,7 +19,10 @@
   plan change would otherwise change *which* tied rows survive the LIMIT.
   Index usage is the expected plan for rare terms on a production-sized
   corpus, not a guarantee; a tiny table or a very common term may legitimately
-  seq-scan.
+  seq-scan. Since #344 the vector is `A(title) || A(aliases) || D(body)`,
+  ranking is `ts_rank_cd(RANK_WEIGHTS, …)`, an under-filled page is filled
+  from a disjunction derived from PostgreSQL's own parse, and each row
+  carries a page-bounded snippet — see the section below.
 - Vector search via a pgvector HNSW **expression** index over
   `(embedding::halfvec(D)) halfvec_cosine_ops` (`m=16, ef_construction=64`,
   *D* = `EMBEDDING_DIMENSIONS`, built only when *D* ≤ 2000; migration 027,
@@ -28,6 +31,120 @@
   below. `semantic_search` sets `hnsw.ef_search=80` per query and dedupes per
   note in Python after a 5x overfetch. See "Filtered vector search" below —
   the `SET LOCAL`s are load-bearing for *correctness*, not just speed.
+
+## Keyword ranking, the disjunctive fill and the snippet (#344)
+
+`keyword_search("<exact two-word title of an existing note>")` returned ten
+rows without that note, live, on 2026-10-28. Three causes, three changes.
+
+**The vector weights the title and aliases above the body.** Every writer
+builds `content_tsvector` through `fts.index_tsvector_sql` as *title parts for
+every config, then aliases parts, then the content parts* — `setweight(…,
+'A')` on the first two, the pre-031 `to_tsvector(cfg, body)` fragment byte for
+byte on the last, so a pre-031 vector is exactly the body part of a post-031
+one. Ranking is `ts_rank_cd(RANK_WEIGHTS, vector, query)` with the array bound
+as `float4[]` (a setting, default `{0.02, 0.2, 0.4, 1.0}` for `D, C, B, A`,
+never interpolated). `calc_rank_cd` scores one term per cover,
+`len(cover) / Σ(1/weight)`: an adjacent two-word title cover is `2/(1+1) =
+1.0`, a body cover `2/(50+50) = 0.02`. Measured: the issue's shape — a title
+`Quarterly Review` against a hub repeating the phrase thirty times — scores
+`1.0` against `3.725` under PostgreSQL's default array (the hub wins) and
+`1.0` against `0.745` under ours (the title wins; the crossover is near forty
+adjacent repetitions, fifty for a one-word title — L8). The array moves only
+title-versus-body competition: body-only order is identical under any uniform
+`D`, which the identity suite pins. Normalisation flags were rejected (flag 1
+still loses the issue's case; flag 2 makes every short note beat every long
+one) and would re-rank body-only matches.
+
+**Conjunction first, disjunction to fill — derived from PostgreSQL's parse.**
+The conjunctive statement is the pre-#344 one plus `id` in the projection and
+the weights in the rank (the GIN plan `test_keyword_plan.py` pins is
+unchanged); its rows are `match: all`. When it returns fewer than `limit`
+rows, the service asks PostgreSQL for `websearch_to_tsquery(cfg, :q)::text`
+per config — a no-table statement — and `fts.parse_conjunction` reads that
+output grammar, **never the caller's string**: a *plain conjunction* has no
+`|` and no parenthesis and splits on `&` into units that are a negated lexeme
+or a `<->`/`<N>` phrase chain. Per config: a plain conjunction with ≥ 2
+positive units is *eligible* and contributes `(u1 | … | uk) & !n1 …` built
+from the verbatim tokens and cast with the `tsquery` input function (which
+does not re-stem — `'running'::tsquery` stays `'running'`, measured); an
+ineligible config (an `OR`, a negated phrase `!( 'a' <-> 'b' )`, a single
+word, stop words only) contributes its **own unchanged AND expression**. The
+OR over configs of those forms is implied by the OR over configs of the AND
+parses, so the fallback is a superset of the conjunction by construction,
+whatever mix of eligible and ineligible configs a query yields — the case
+that forced this (Codex r1 #3) is `english,simple` on `the running`: english
+parses to `'run'`, simple to `'the' & 'running'`, and `runs fast` matches the
+conjunction only through english. The fallback statement is the conjunctive
+one with the fallback tsquery, `AND NOT (v @@ <and query>)` (the conjunctive
+block was not full, so that excludes exactly its rows), the same filters,
+`rank DESC, file_path ASC`, `LIMIT limit − n`; its rows are `match: any`,
+appended after every `all` row and never interleaved (their rank is against
+a different query — L1). The superset property is asserted over a generated
+query corpus under `english` and `english,simple`. Telemetry: `fallback`
+(`ran | skipped | not_needed`) and `any_rows` in `usage_logs.params`.
+
+`matched_terms` is per config: for each config whose parse is a plain
+conjunction of ≤ 32 units, the count of its positive units present in the
+vector over that count; the row renders the pair with the greatest ratio
+(ties: the greater total, then config order) — `1/1` for the `runs fast` row
+above, not `0/2`.
+
+**The snippet comes from a stored excerpt, over the page only.** The body is
+not stored anywhere usable (`chunk_text` is embed-time, masked, capped and
+stale under #200; a per-result file read is what this document already
+declined), so migration 031 adds `notes_metadata.body_excerpt`: the first
+`KEYWORD_EXCERPT_CHARS` (20,000) characters of exactly the prefix the vector's
+successful attempt bound, written in the same UPDATE, preserved by moves,
+sentinel-free, deferred with raiseload, **never projected** — `ts_headline`
+reads it server-side. The snippet statement names the ids of the first
+`KEYWORD_SNIPPET_ROWS` (20) rows of the assembled page, whatever `limit` is,
+and projects one headline per config (`MaxFragments=2, MaxWords=18,
+MinWords=6`, U+0002/U+0003 as `StartSel`/`StopSel`, rendered `«»`),
+`matched_in` from `ts_filter(v, '{a}') @@ q` / `ts_filter(v, '{d}') @@ q`, and
+the per-config `matched_terms` counts; a second statement supplies the
+`head:` text (`MaxFragments=0, MinWords=18, MaxWords=24` — in fragment mode a
+no-cover headline is only `MinWords` words, measured) for the rows whose
+excerpt held no highlight: a title/alias-only match, or a match beyond the
+excerpt (L3). Nothing fabricated: `head:` is text the index holds for that
+note, labelled as not the matching span. Rows beyond the cap carry no
+`snippet`/`head` key and the header says `snippets: first N`; a row with a
+NULL excerpt (indexed before 031) carries neither, the header counts such
+rows always, including zero, and the footer names `make rebuild-tsvectors`.
+Cost is a function of the row cap, the excerpt cap and the config count —
+never of `limit` — recorded as `snippet_ms`; the integration suite gates the
+worst case (twenty distinct 20,000-character excerpts, `english,simple`,
+head rows included) under 300 ms on the throwaway container, after Codex
+measured ≈ 452 ms / 891 ms for a `limit`-bound design.
+
+**What is invariant, and what the oracle checks.** The projection identity
+suite can no longer claim byte identity for `keyword_search` — `rank` is a
+pre-change field and every body-only rank scales, and title-versus-body order
+changes on purpose — so its keyword case asserts what is: conjunctive
+membership equals the oracle's (`@@` and the filters did not change), body-only
+relative order equals the oracle's up to ties, rank values and title-matched
+rows' positions are exempt, and the new contract is asserted by its own
+tests.
+
+**031 and the move paths** are described in [schema and
+migrations](schema-and-migrations.md#031-notes_metadatabody_excerpt-and-the-in-sql-re-head-344)
+and [indexing and embeddings](indexing-and-embeddings.md): the migration
+re-heads every vector in SQL under the generation lock with the stored
+fingerprint's configs and skips rows already headed (`rehead` keeps relative
+positions, not absolute ones); its downgrade strips every `A` lexeme; both
+move paths re-head under the lock with the fingerprint re-read; and `make
+deploy` stops the app before a pending migration so an old-image move cannot
+leave a stale title at weight `A`.
+
+Accepted limitations (the change's design, L1–L12): ranks stay
+uninterpretable and an `any` row's rank is against a different query;
+phrase adjacency across the head/body boundary; `head:` for a match beyond
+the excerpt or in the title only; pre-031 rows have no excerpt until edited
+or rebuilt; no fallback when no config is eligible; `matched_terms` omitted
+past 32 units; U+0002/U+0003 removed from excerpts; the weight array is a
+heuristic (#356 measures it); no hybrid fusion (#354); a 54000 row stays
+unweighted after 031 until written again; repeated re-heads shift body
+positions; snippets for the first `KEYWORD_SNIPPET_ROWS` rows only.
 
 ## Filtered vector search — the SET LOCALs are correctness, not tuning
 
@@ -281,22 +398,23 @@ Six read statements select an explicit column list instead of whole entities:
 | Path | Projected columns |
 | --- | --- |
 | `semantic_search` | `ne.note_id, ne.chunk_index, ne.chunk_text, nm.file_path, nm.title, nm.tags, nm.content_hash, nm.embedded_content_hash, nm.chunks_truncated, distance` (the `find_related_stmt` shape) |
-| `keyword_search` | `nm.file_path, nm.title, nm.tags, rank` |
+| `keyword_search` | `nm.id, nm.file_path, nm.title, nm.tags, rank` (both ranking blocks); the snippet statement projects `id`, one `ts_headline` per config, the two `matched_in` flags, `has_excerpt` and the `matched_terms` counts — `body_excerpt` is read inside `ts_headline` and never projected |
 | `list_notes` | `file_path, file_size, modified_at` |
 | `get_recent` / `find_orphans` | `file_path, title, tags, modified_at` |
 | `get_neighborhood` hydration | `id, file_path, title, tags` |
 
 None of them ships `notes_metadata.content_tsvector` (the largest TOASTed
-column, which the planner does not cost), `note_embeddings.embedding` or
-`notes_metadata.frontmatter`. `ts_rank_cd` and `@@` still read the tsvector
-*server-side*; what is gone is shipping and hydrating it. **No predicate, no
-`SET LOCAL`, no overfetch and no exact-fallback condition changed.** The
-staleness fields (`content_hash`, `embedded_content_hash`) and
+column, which the planner does not cost), `notes_metadata.body_excerpt`,
+`note_embeddings.embedding` or `notes_metadata.frontmatter`. `ts_rank_cd`,
+`@@` and `ts_headline` still read the tsvector and the excerpt *server-side*;
+what is gone is shipping and hydrating them. **No predicate, no `SET LOCAL`,
+no overfetch and no exact-fallback condition of the vector paths changed.**
+The staleness fields (`content_hash`, `embedded_content_hash`) and
 `chunks_truncated` are still selected wherever they are rendered. A new read
 path should follow the same rule: select the columns it renders.
 
-**`content_tsvector` is deferred with raiseload** (D5):
-`mapped_column(TSVECTOR, deferred=True, deferred_raiseload=True)`. A
+**`content_tsvector` and `body_excerpt` are deferred with raiseload** (D5,
+#344): `mapped_column(…, deferred=True, deferred_raiseload=True)`. A
 whole-entity `select(NoteMetadata)` (the path lookups in the graph tools, the
 indexer's per-note loads) no longer carries it, and code that reads
 `.content_tsvector` from a loaded entity raises `InvalidRequestError` instead
@@ -326,11 +444,13 @@ stay last. `semantic_search`'s in-Python re-sort keys on
 on `file_path`. Before this, an exact tie was resolved by whatever row the sort
 saw first.
 
-**What "identical" means for this change.** The results are the same as the
-pre-change implementation: the same result set, the same order, every field
-other than `similarity` byte-equal, and `similarity` within 1e-5. There are
-exactly three permitted exceptions, and all of them are confined to exact ties
-of the sort key (`modified_at`, `rank` or distance):
+**What "identical" means for this change.** For the vector, listing and graph
+paths the results are the same as the pre-change implementation: the same
+result set, the same order, every field other than `similarity` byte-equal,
+and `similarity` within 1e-5. (`keyword_search`'s clause was narrowed by #344
+— see "What is invariant" above.) There are exactly three permitted
+exceptions, and all of them are confined to exact ties of the sort key
+(`modified_at`, `rank` or distance):
 
 1. **membership at a tied cutoff**: when more rows share the boundary key than
    fit under the limit, which of them are returned may differ;
@@ -426,8 +546,9 @@ plan there, so it is recorded, not asserted).
 ## Per-phase search timing
 
 `usage_logs.params` carries `embed_ms` + `db_ms` + `exact_fallback` for
-`semantic_search`, and `db_ms` + `exact_fallback` for `find_related` (it makes
-no embedding call). A single whole-call `duration_ms` could not separate the
+`semantic_search`, `db_ms` + `exact_fallback` for `find_related` (it makes
+no embedding call), and `fallback` + `any_rows` + `snippet_ms` for
+`keyword_search` (#344). A single whole-call `duration_ms` could not separate the
 two independent cold paths — provider eviction and HNSW page cache — so the
 last regression had to be diagnosed with hand-run probes against the live DB.
 

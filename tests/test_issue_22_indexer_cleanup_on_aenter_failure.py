@@ -96,6 +96,8 @@ def _install_fakes(monkeypatch, session_manager):
     # own before the lifecycle behaviour under test is reached.
     monkeypatch.setattr(main, "_check_embedding_fingerprint", _noop_check)
     monkeypatch.setattr(main, "_check_fts_fingerprint", _noop_check)
+    # And the #344 excerpt count, which opens a session for the same reason.
+    monkeypatch.setattr(main, "_warn_missing_keyword_excerpts", _noop_check)
     # Replace the indexer loop with a forever-sleeping coroutine so it never
     # touches a DB/network and is observably cancellable.
     monkeypatch.setattr(main, "run_indexer_loop", _never_returns)

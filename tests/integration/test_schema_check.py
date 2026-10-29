@@ -60,7 +60,7 @@ DIM = 64  # irrelevant here; keeps the migration cheap.
 # The current head. Every case that migrates forward asserts it, so adding a
 # revision without teaching this module about it fails loudly rather than
 # leaving the new migration unexercised.
-HEAD_REVISION = "030"
+HEAD_REVISION = "031"
 
 CONSTRAINT = "ck_oauth_clients_auth_method_secret"
 MARKER = "created by 013_schema_reconciliation"
@@ -6540,7 +6540,7 @@ def refuse_030(url, *, must_mention):
 
 def test_030_adds_one_nullable_marked_column_with_no_default():
     with throwaway_db("schema_030_fresh") as url:
-        assert alembic_version(url) == HEAD_REVISION == "030"
+        assert alembic_version(url) == HEAD_REVISION
         assert column_state_029(url, "notes_metadata", "derived_under") == (
             "character varying(64)",
             False,
@@ -6557,7 +6557,7 @@ def test_030_chains_from_029():
     config = Config()
     config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_current_head() == HEAD_REVISION == "030"
+    assert script.get_current_head() == HEAD_REVISION
     assert script.get_revision("030").down_revision == "029"
 
 
@@ -6646,3 +6646,245 @@ def test_downgrade_030_leaves_a_column_it_did_not_create():
         )
         assert alembic_version(url) == "029"
         assert column_state_029(url, "notes_metadata", "derived_under") is not None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 031 — notes_metadata.body_excerpt, and the in-SQL re-head (#344)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# One nullable `text` column with 031's marker, no default, no backfill — and a
+# data step: every weight-D-only vector gains `A(title) || A(aliases)` from
+# stored columns, under the generation lock, under the configs the stored
+# keyword fingerprint names, skipping rows already headed (byte-idempotent).
+# Downgrade strips every A lexeme before dropping the column.
+
+BODY_EXCERPT_MARKER_031 = "keyword excerpt (031_keyword_head_and_excerpt)"
+
+
+def insert_keyword_note(url, note_id, path, title, frontmatter_json, body, cfg="english"):
+    """A row as a pre-031 build left it: a D-only vector, no head."""
+    sql(
+        url,
+        "INSERT INTO notes_metadata (id, user_id, file_path, title, frontmatter, "
+        " content_hash, content_tsvector) "
+        f"VALUES ($1, NULL, $2, $3, $4::jsonb, 'h', to_tsvector('{cfg}', $5))",
+        note_id, path, title, frontmatter_json, body,
+    )
+
+
+def vector_text(url, note_id):
+    return fetchval(
+        url, "SELECT content_tsvector::text FROM notes_metadata WHERE id = $1", note_id
+    )
+
+
+def expected_headed(url, title, aliases, body, cfg="english"):
+    """What a fresh build writes for the same title, aliases and body."""
+    return fetchval(
+        url,
+        f"SELECT (setweight(to_tsvector('{cfg}', $1), 'A') || "
+        f"        setweight(to_tsvector('{cfg}', $2), 'A') || "
+        f"        to_tsvector('{cfg}', $3))::text",
+        title, aliases, body,
+    )
+
+
+def a_lexemes(url, note_id):
+    return fetchval(
+        url,
+        "SELECT tsvector_to_array(ts_filter(content_tsvector, '{a}')) "
+        "FROM notes_metadata WHERE id = $1",
+        note_id,
+    )
+
+
+def refuse_031(url, *, must_mention):
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    assert result.returncode != 0, "031 should have refused"
+    combined = result.stdout + result.stderr
+    for phrase in must_mention:
+        assert phrase in combined, f"refusal did not mention {phrase!r}:\n{combined}"
+    assert alembic_version(url) == "030", "nothing should have been recorded"
+    return combined
+
+
+def test_031_adds_the_excerpt_column_and_re_heads_every_vector():
+    with throwaway_db("schema_031_fresh", revision="030") as url:
+        insert_keyword_note(
+            url, 1, "q.md", "Quarterly Review", '{"aliases": ["Q3 retro", "retrospective"]}',
+            "plain body text about the period",
+        )
+        insert_keyword_note(url, 2, "t.md", "The", "{}", "stop word title")
+        sql(url, "INSERT INTO notes_metadata (id, user_id, file_path, title, content_hash) "
+                 "VALUES (3, NULL, 'n.md', 'never vectorised', 'h')")
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION == "031"
+        assert column_state_029(url, "notes_metadata", "body_excerpt") == (
+            "text", False, None, BODY_EXCERPT_MARKER_031,
+        )
+        # No backfill: the excerpt needs the file, which the database lacks.
+        assert fetchval(url, "SELECT count(*) FROM notes_metadata WHERE body_excerpt IS NOT NULL") == 0
+        # Byte-exact against a fresh build of the same inputs (first application).
+        assert vector_text(url, 1) == expected_headed(
+            url, "Quarterly Review", "Q3 retro\nretrospective", "plain body text about the period"
+        )
+        assert set(a_lexemes(url, 1)) == {"quarter", "review", "q3", "retro", "retrospect"}
+        # An all-stop-word title has an empty head and an unchanged body.
+        assert a_lexemes(url, 2) == []
+        assert vector_text(url, 2) == fetchval(
+            url, "SELECT to_tsvector('english', 'stop word title')::text"
+        )
+        assert vector_text(url, 3) is None
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_031_chains_from_030():
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config()
+    config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+    assert script.get_current_head() == HEAD_REVISION == "031"
+    assert script.get_revision("031").down_revision == "030"
+
+
+def test_031_stamp_back_rerun_is_byte_idempotent():
+    """`rehead` is not position-idempotent (a second application shifts the
+    body's positions by the head's length), so 031 skips rows already carrying
+    a weight-A lexeme — and a re-run changes no byte."""
+    with throwaway_db("schema_031_rerun", revision="030") as url:
+        insert_keyword_note(url, 1, "q.md", "Quarterly Review", '{"aliases": "Q3"}', "body words")
+        insert_keyword_note(url, 2, "t.md", "The", "{}", "stop word title body")
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        first = {i: vector_text(url, i) for i in (1, 2)}
+        sql(url, "UPDATE notes_metadata SET body_excerpt = 'kept' WHERE id = 1")
+        _harness.run_alembic(url, "stamp", "030", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert {i: vector_text(url, i) for i in (1, 2)} == first
+        assert fetchval(url, "SELECT body_excerpt FROM notes_metadata WHERE id = 1") == "kept"
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_031_builds_the_head_under_the_stored_fingerprints_configs():
+    """The stored keyword fingerprint names the configs the body lexemes were
+    built under; the head follows it, not the environment (english here)."""
+    with throwaway_db("schema_031_configs", revision="030") as url:
+        sql(url, "INSERT INTO indexer_state (key, value, updated_at) "
+                 "VALUES ('fts_fingerprint', '{\"configs\":[\"simple\"],\"v\":1}', now())")
+        insert_keyword_note(url, 1, "r.md", "Running Notes", "{}", "runs fast", cfg="simple")
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert set(a_lexemes(url, 1)) == {"running", "notes"}  # simple, not 'run'/'note'
+        assert vector_text(url, 1) == expected_headed(url, "Running Notes", "", "runs fast", cfg="simple")
+
+
+def test_031_uses_the_environment_when_no_fingerprint_is_stored():
+    with throwaway_db("schema_031_absent", revision="030") as url:
+        insert_keyword_note(url, 1, "r.md", "Running Notes", "{}", "runs fast")
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert set(a_lexemes(url, 1)) == {"run", "note"}  # english stems
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["not json", "[1, 2]", '{"configs": ["english"], "v": 99}', '{"v": 1}', '{"configs": [], "v": 1}'],
+)
+def test_031_refuses_an_unreadable_fingerprint(value):
+    with throwaway_db("schema_031_unreadable", revision="030") as url:
+        sql(url, "INSERT INTO indexer_state (key, value, updated_at) VALUES ('fts_fingerprint', $1, now())", value)
+        insert_keyword_note(url, 1, "r.md", "Running", "{}", "runs")
+        refuse_031(url, must_mention=["fts_fingerprint", "Nothing has been changed"])
+        assert column_state_029(url, "notes_metadata", "body_excerpt") is None
+        assert a_lexemes(url, 1) == []
+
+
+def test_031_leaves_a_row_at_the_size_limit_and_completes():
+    """A synthetic 54000 on one row's re-head (the 1 MiB tsvector limit, for
+    a vector already at the edge): that row keeps its D-only vector, the
+    migration logs it and completes, every other row is re-headed."""
+    with throwaway_db("schema_031_size_limit", revision="030") as url:
+        insert_keyword_note(url, 1, "ok.md", "Fine Note", "{}", "body one")
+        insert_keyword_note(url, 2, "big.md", "Huge Note", "{}", "body two")
+        sql(url, """
+            CREATE OR REPLACE FUNCTION refuse_big() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+              IF NEW.file_path = 'big.md'
+                 AND NEW.content_tsvector IS DISTINCT FROM OLD.content_tsvector THEN
+                RAISE EXCEPTION 'synthetic size failure' USING ERRCODE = '54000';
+              END IF;
+              RETURN NEW;
+            END $$
+        """)
+        sql(url, "CREATE TRIGGER refuse_big BEFORE UPDATE ON notes_metadata "
+                 "FOR EACH ROW EXECUTE FUNCTION refuse_big()")
+        result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert "keeps its unweighted keyword vector" in result.stdout + result.stderr
+        assert set(a_lexemes(url, 1)) == {"fine", "note"}
+        assert a_lexemes(url, 2) == []
+        sql(url, "DROP TRIGGER refuse_big ON notes_metadata")
+        assert_alembic_check_clean(url, DIM)
+
+
+@pytest.mark.parametrize(
+    "label,ddl,fragment",
+    [
+        ("wrong_type", ["ALTER TABLE notes_metadata ADD COLUMN body_excerpt varchar(64)"],
+         "notes_metadata.body_excerpt is character varying(64), not text"),
+        ("not_null", ["ALTER TABLE notes_metadata ADD COLUMN body_excerpt text NOT NULL DEFAULT ''"],
+         "notes_metadata.body_excerpt is NOT NULL"),
+        ("default", ["ALTER TABLE notes_metadata ADD COLUMN body_excerpt text DEFAULT ''"],
+         "has a server default"),
+        ("unmarked", ["ALTER TABLE notes_metadata ADD COLUMN body_excerpt text"],
+         "does not carry 031's comment marker"),
+    ],
+)
+def test_031_refuses_a_pre_existing_column_of_another_shape(label, ddl, fragment):
+    with throwaway_db(f"schema_031_foreign_{label}", revision="030") as url:
+        for statement in ddl:
+            sql(url, statement)
+        refuse_031(url, must_mention=[fragment, "Nothing has been changed"])
+
+
+def test_downgrade_031_strips_every_head_and_drops_the_column():
+    with throwaway_db("schema_031_downgrade", revision="030") as url:
+        insert_keyword_note(url, 1, "q.md", "Quarterly Review", '{"aliases": ["Q3"]}', "plain body text")
+        before = vector_text(url, 1)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert a_lexemes(url, 1)
+        sql(url, "UPDATE notes_metadata SET body_excerpt = 'x' WHERE id = 1")
+
+        _harness.run_alembic(url, "downgrade", "030", dimensions=DIM)
+        assert alembic_version(url) == "030"
+        assert column_state_029(url, "notes_metadata", "body_excerpt") is None
+        assert fetchval(
+            url, "SELECT count(*) FROM notes_metadata "
+                 "WHERE length(ts_filter(content_tsvector, '{a}')) > 0"
+        ) == 0
+        # Every body lexeme survives; the D part equals the pre-031 vector
+        # up to the position shift the head's removal does not undo.
+        assert fetchval(url, "SELECT content_tsvector @@ to_tsquery('english', 'plain & bodi & text') "
+                             "FROM notes_metadata WHERE id = 1") is True
+        assert set(fetchval(url, "SELECT tsvector_to_array(content_tsvector) FROM notes_metadata WHERE id = 1")) == set(
+            fetchval(url, "SELECT tsvector_to_array($1::tsvector)", before)
+        )
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert a_lexemes(url, 1)
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_downgrade_031_leaves_a_column_it_did_not_create():
+    with throwaway_db("schema_031_downgrade_foreign") as url:
+        insert_keyword_note(url, 1, "q.md", "Quarterly Review", "{}", "plain body")
+        _harness.run_alembic(url, "stamp", "030", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        sql(url, "COMMENT ON COLUMN notes_metadata.body_excerpt IS 'somebody else'")
+        result = _harness.run_alembic(url, "downgrade", "030", dimensions=DIM)
+        assert "031 downgrade: leaving notes_metadata.body_excerpt" in (
+            result.stdout + result.stderr
+        )
+        assert alembic_version(url) == "030"
+        assert column_state_029(url, "notes_metadata", "body_excerpt") is not None
+        assert a_lexemes(url, 1) == []

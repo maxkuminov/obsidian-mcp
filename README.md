@@ -240,7 +240,12 @@ and ops layer around them.
 
 ### Search and discovery
 - `keyword_search(query, folder?, tags?, frontmatter?, limit=20)`,
-  full-text via PostgreSQL `tsvector`; the text-search config(s) are
+  full-text via PostgreSQL `tsvector`. A note's title and frontmatter
+  `aliases` rank above its body, so a query that is a note's title finds
+  that note first; bare terms are ANDed, and when the full matches do not
+  fill the page, partial matches follow tagged `match: any`; every row
+  carries a `snippet:` with the matches highlighted (or `head:`, the
+  note's opening words, for a title match). The text-search config(s) are
   configurable via `FTS_CONFIGS` (see
   [Full-text search language(s)](#full-text-search-languages))
 - `semantic_search(query, folder?, tags?, frontmatter?, limit=15)`,
@@ -797,8 +802,24 @@ naming conventions, and YAML schema before it writes anything.
 ## Upgrading
 
 Pull, then `make deploy` (or rebuild your compose stack); migrations
-run on start. Read this first when upgrading across the internal-transport
-and panel-CSP release:
+run on start. Read this first when upgrading across the keyword-ranking
+release (migration 031, #344):
+
+- **Keyword ranking changes at once; snippets need one rebuild.**
+  Migration 031 rewrites every keyword vector in place so titles and
+  aliases rank above bodies — no operator step, and `make deploy` now
+  **stops the app before a pending migration** and recreates it after
+  (on a hand-driven compose stack: stop → `alembic upgrade head` →
+  start; Kubernetes already `Recreate`s). Snippets come from an excerpt
+  that only a write stores, so notes indexed before 031 show no snippet
+  (the header counts them and startup logs the count) until they are
+  edited or you run **`make rebuild-tsvectors` once** (on Kubernetes,
+  `deploy/kubernetes/base/rebuild-tsvectors-job.example.yaml` with the
+  app scaled to zero). No embeddings are touched, no API calls are made.
+- **New optional settings:** `RANK_WEIGHTS`, `KEYWORD_EXCERPT_CHARS`,
+  `KEYWORD_SNIPPET_ROWS`. See [Configuration](#configuration).
+
+And across the internal-transport and panel-CSP release:
 
 - **Breaking: the server refuses to run as a PostgreSQL superuser
   (#324).** A Compose install created from `docker-compose.simple.yml` or
@@ -1049,6 +1070,9 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `MAX_FILE_WRITE_BYTES` | `26214400` | `write_file` cap (25 MB), decoded byte length |
 | `MAX_READ_RESPONSE_CHARS` | `40000` | `read_note` / `read_file` cap on what is returned to the caller (≈10K tokens). See [Response size limits](#response-size-limits). |
 | `FTS_CONFIGS` | `english` | Keyword-search text-search config(s). JSON or CSV. See [Full-text search language(s)](#full-text-search-languages). |
+| `RANK_WEIGHTS` | `{0.02, 0.2, 0.4, 1.0}` | `keyword_search`'s `ts_rank_cd` weight array `{D, C, B, A}`: the title and aliases are indexed at `A`, the body at `D`. At the default one two-word title match outweighs fifty body repetitions; PostgreSQL's own `D=0.1` lets ten tie it. Four numbers in (0, 1]; only title-versus-body order moves. |
+| `KEYWORD_EXCERPT_CHARS` | `20000` | Leading characters of each note's indexed text stored for `keyword_search` snippets (1000–100000). Applies to notes indexed afterwards; `make rebuild-tsvectors` rewrites the rest. |
+| `KEYWORD_SNIPPET_ROWS` | `20` | Rows per `keyword_search` page that get a snippet, whatever `limit` is (0–100; 0 turns snippets off). Bounds the per-call `ts_headline` cost. |
 | `TRANSFER_TOKEN_TTL_SECONDS` | `600` | Default life of a transfer link. Per-call `expires_in` is clamped to 60–3600. |
 | `TRANSFER_MAX_UPLOAD_SECONDS` | `600` | How long one claimed upload may stream before the token is spent |
 | `TRANSFER_MAX_CONCURRENT_UPLOADS` | `4` | Simultaneous upload streams |
@@ -1200,6 +1224,17 @@ resumes).
 configuration* it uses — the stemmer and stop-word dictionary — is
 controlled by `FTS_CONFIGS`. It defaults to `english`, which reproduces
 the historical behavior exactly, so existing deployments need no action.
+
+The vector holds the note's **title and frontmatter `aliases` at weight
+`A`** and its body at weight `D`, per configured config, and ranking
+uses `RANK_WEIGHTS` — so a query that is a note's title ranks that note
+first, where it used to lose to a long note repeating the words. Bare
+terms are ANDed; when the full matches do not fill the page, the same
+terms OR-ed fill the rest, tagged `match: any`. Each row carries a
+`snippet:` built from a stored excerpt of the indexed text
+(`KEYWORD_EXCERPT_CHARS`), computed for the first `KEYWORD_SNIPPET_ROWS`
+rows. The excerpt is written with the vector; `make rebuild-tsvectors`
+also stores it for notes indexed before it existed.
 
 `FTS_CONFIGS` is a **list**, settable as JSON
 (`FTS_CONFIGS=["simple","norwegian"]`) or comma-separated

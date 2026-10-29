@@ -270,7 +270,13 @@ async def corpus(sessionmaker, queries):
         )
         for path, _vecs, _attrs, body in pending:
             if body is not None:
-                await session.execute(tsv, {"id": ids[path], "content": body, **cfg_params})
+                # The title rides in the vector at weight A (#344), so the
+                # corpus has title-matched rows for the oracle to exempt.
+                await session.execute(tsv, {
+                    "id": ids[path], "content": body,
+                    "title": path.rsplit("/", 1)[-1].removesuffix(".md"),
+                    "aliases": "", **cfg_params,
+                })
 
         # Links for `get_neighborhood` and `find_orphans`: a chain over every
         # third `B/` note, and a star around B/note-0003. `N/`, `T/`, `E/` and
@@ -855,6 +861,12 @@ KEYWORD_QUERIES = ["meeting", "roadmap budget", "vault", "sprint planner", "noth
 
 @pytest.mark.parametrize("limit", [5, 20, 200])
 async def test_keyword_search_is_identical(sessionmaker, corpus, limit):
+    """The keyword oracle, re-scoped by #344 (design D8): the ranking change
+    is intended, so what is asserted is what is invariant — the conjunctive
+    membership (`@@` and the filters did not change) and the relative order
+    among body-only matches — while rank *values* and the position of any
+    title-matched row are exempt. The `any` block has no pre-change
+    counterpart and is outside the oracle."""
     bob = corpus["bob"]
     cases = {
         "user_scope": {"user_id": bob},
@@ -863,21 +875,42 @@ async def test_keyword_search_is_identical(sessionmaker, corpus, limit):
         "frontmatter": {"frontmatter": {"status": "open"}, "user_id": bob},
         "ownerless": {},
     }
-    cutoff_tie_seen = False
+    body_only_compared = 0
     for q in KEYWORD_QUERIES:
         for name, kw in cases.items():
             async with sessionmaker() as session:
-                old = await _old_full_text_search(session, q, limit=limit, **kw)
+                old = await _old_full_text_search(session, q, limit=500, **kw)
             async with sessionmaker() as session:
                 new = await full_text_search(session, q, limit=limit, **kw)
-            _assert_identical(
-                old, new, ident=lambda r: r["path"], key=lambda r: r["rank"],
-                limit=limit, same_item=lambda o, n: _fields_equal(o, n),
-            )
-            if len(new) == limit and len(new) > 1 and new[-1]["rank"] == new[-2]["rank"]:
-                cutoff_tie_seen = True
-    if limit < 200:
-        assert cutoff_tie_seen, "the corpus must put a rank tie at the cutoff"
+            new_all = [r for r in new if r["match"] == "all"]
+            # (a) conjunctive membership, where the limit cuts neither list.
+            if len(old) < limit:
+                assert {r["path"] for r in new_all} == {r["path"] for r in old}, (q, name)
+            else:
+                assert {r["path"] for r in new_all} <= {r["path"] for r in old}, (q, name)
+            # Every rendered field but rank is byte-equal per path.
+            by_old = {r["path"]: r for r in old}
+            for r in new_all:
+                _fields_equal(
+                    by_old[r["path"]], r,
+                    except_=("rank", "match", "snippet", "head", "matched_in",
+                             "matched_terms", "has_excerpt"),
+                )
+            # (b) body-only relative order equals the oracle's, up to ties.
+            body_only = [r for r in new_all if r.get("matched_in") == ["body"]]
+            if len(body_only) > 1:
+                old_order = [r["path"] for r in old if r["path"] in {b["path"] for b in body_only}]
+                old_rank = {r["path"]: r["rank"] for r in old}
+                positions = {p: i for i, p in enumerate(old_order)}
+                for earlier, later in zip(body_only, body_only[1:]):
+                    body_only_compared += 1
+                    # Ties are the permitted exception (order among equal
+                    # keys); across distinct oracle ranks the order must hold.
+                    if old_rank[earlier["path"]] != old_rank[later["path"]]:
+                        assert positions[earlier["path"]] < positions[later["path"]], (
+                            q, name, earlier["path"], later["path"]
+                        )
+    assert body_only_compared > 0, "the corpus must have body-only matches to compare"
 
 
 # ── list_notes / get_recent ─────────────────────────────────────────────────

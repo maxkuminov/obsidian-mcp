@@ -477,6 +477,27 @@ class Settings(BaseSettings):
     # validator below so the CSV form doesn't trip pydantic-settings' JSON
     # decode of complex (list) fields.
     fts_configs: Annotated[list[str], NoDecode] = ["english"]
+    # ── Keyword ranking and snippets (#344, migration 031) ─────────────────
+    #
+    # `ts_rank_cd`'s weight array `{D, C, B, A}`, bound as `float4[]` and never
+    # interpolated. The keyword vector holds the title and aliases at `A` and
+    # the body at `D`; at the default one adjacent two-word title cover
+    # (`2/(1+1) = 1.0`) outweighs fifty body covers (`2/(50+50) = 0.02` each),
+    # where PostgreSQL's default `D = 0.1` lets ten body repetitions tie the
+    # title — the #344 failure. Changing it re-ranks title-versus-body
+    # competition only; body-only order is unchanged by any uniform `D`.
+    # Accepts `{0.02, 0.2, 0.4, 1.0}`, a JSON list or a CSV; four numbers in
+    # (0, 1]. See "Keyword ranking" in docs/architecture/search.md.
+    rank_weights: Annotated[list[float], NoDecode] = [0.02, 0.2, 0.4, 1.0]
+    # How many leading characters of the text a keyword vector was built from
+    # are stored in `notes_metadata.body_excerpt` for `ts_headline`. Applies to
+    # rows written afterwards; `make rebuild-tsvectors` rewrites the rest.
+    keyword_excerpt_chars: int = Field(20_000, ge=1_000, le=100_000)
+    # Snippets (`ts_headline`) are computed for the first N rows of a
+    # keyword_search page regardless of `limit` — the parse cost is bounded by
+    # this, by `KEYWORD_EXCERPT_CHARS` and by the config count, never by the
+    # page size. 0 disables snippets.
+    keyword_snippet_rows: int = Field(20, ge=0, le=100)
 
     embedding_provider: Literal["ollama", "openai"] = "ollama"
     openai_api_key: str | None = None
@@ -1121,6 +1142,49 @@ class Settings(BaseSettings):
             out.append(name)
         if not out:
             raise ValueError("FTS_CONFIGS must contain at least one config name")
+        return out
+
+    @field_validator("rank_weights", mode="before")
+    @classmethod
+    def _parse_rank_weights(cls, v):
+        """`{0.02, 0.2, 0.4, 1.0}` (PostgreSQL array spelling), a JSON list, a
+        CSV, or a list: exactly four numbers, each in (0, 1], as `D, C, B, A`."""
+        if isinstance(v, str):
+            s = v.strip()
+            if s.startswith("{") and s.endswith("}"):
+                s = s[1:-1]
+            elif s.startswith("["):
+                import json
+
+                try:
+                    v = json.loads(s)
+                except ValueError as e:
+                    raise ValueError(
+                        f"RANK_WEIGHTS looks like JSON but failed to parse: {e}"
+                    ) from e
+            if isinstance(v, str):
+                v = s.split(",")
+        if not isinstance(v, (list, tuple)):
+            raise ValueError(
+                "RANK_WEIGHTS must be four numbers {D, C, B, A}, e.g. "
+                "{0.02, 0.2, 0.4, 1.0}"
+            )
+        out: list[float] = []
+        for item in v:
+            try:
+                number = float(str(item).strip())
+            except ValueError as e:
+                raise ValueError(f"RANK_WEIGHTS entry {item!r} is not a number") from e
+            if not (0.0 < number <= 1.0) or number != number:
+                raise ValueError(
+                    f"RANK_WEIGHTS entry {item!r} is outside (0, 1]; ts_rank_cd "
+                    "divides by each weight, so zero is not a weight"
+                )
+            out.append(number)
+        if len(out) != 4:
+            raise ValueError(
+                f"RANK_WEIGHTS must have exactly four entries (D, C, B, A), got {len(out)}"
+            )
         return out
 
     @field_validator("oauth_known_redirect_hosts", mode="before")

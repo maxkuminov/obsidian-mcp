@@ -26,6 +26,20 @@ from src.services.indexer import discover_markdown_files
 from src.services.vault import validate_mutable_path
 
 
+@pytest.fixture(autouse=True)
+def _no_keyword_generation(monkeypatch):
+    """The fake sessions here are scripted by statement order. `move_note`'s
+    metadata transaction now opens with the index generation lock and the
+    keyword fingerprint re-read (#344, D6); both are pinned against a real
+    PostgreSQL in `tests/integration/test_keyword_ranking_pg.py`, so stand
+    them down here."""
+
+    async def _noop(_session):
+        return None
+
+    monkeypatch.setattr(tools, "_enter_keyword_generation", _noop)
+
+
 @pytest.fixture
 def vault(monkeypatch, tmp_path):
     monkeypatch.setattr(vault_service.settings, "vault_path", str(tmp_path))

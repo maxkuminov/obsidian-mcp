@@ -103,7 +103,7 @@ def test_the_scan_and_the_re_verifying_readers_agree_on_the_hash(vault):
     (vault / "n.md").write_bytes(b"a\x00b\n")
     result = scan(vault)
     with indexer.pinned_root(vault) as root_fd:
-        body, h = indexer._read_body_and_hash(root_fd, "n.md")
+        _frontmatter, body, h = indexer._read_body_and_hash(root_fd, "n.md")
         rescanned = indexer._rescan_one(root_fd, "n.md")
     assert result.files["n.md"].content_hash == sha("ab\n") == h == rescanned.content_hash
     assert body == "ab\n" and "\x00" not in rescanned.raw

@@ -47,6 +47,20 @@ from src.mcp_server.auth import current_permission  # noqa: E402
 from src.services import refusals  # noqa: E402
 from src.services import vault as vault_service  # noqa: E402
 
+
+@pytest.fixture(autouse=True)
+def _no_keyword_generation(monkeypatch):
+    """The fake sessions here are scripted by statement order. `move_note`'s
+    metadata transaction now opens with the index generation lock and the
+    keyword fingerprint re-read (#344, D6); both are pinned against a real
+    PostgreSQL in `tests/integration/test_keyword_ranking_pg.py`, so stand
+    them down here."""
+
+    async def _noop(_session):
+        return None
+
+    monkeypatch.setattr(tools, "_enter_keyword_generation", _noop)
+
 pytestmark = pytest.mark.asyncio
 
 

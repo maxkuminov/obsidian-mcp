@@ -557,6 +557,71 @@ and `RESET`. The gate's head literal is `030`; its cases cover the fresh
 shape, the chain from 029, no backfill, stamp-back with a recorded marker
 kept, four impostor-column refusals, and both downgrade directions.
 
+## 031: `notes_metadata.body_excerpt`, and the in-SQL re-head (#344)
+
+031 is a column **and** a data step, and the data step is the point.
+
+- **The column**: `body_excerpt text NULL`, no default, 031's comment marker
+  declared in the ORM, deferred with raiseload like `content_tsvector`. The
+  first `KEYWORD_EXCERPT_CHARS` characters of exactly the text a row's keyword
+  vector was built from, written in the same UPDATE as the vector by the
+  incremental pass and the rebuild, preserved by both move paths. **No
+  backfill**: nothing in the database holds the body (`chunk_text` is
+  embed-time, masked, capped and stale under #200), so the excerpt arrives
+  with each note's next write or with one `make rebuild-tsvectors`, and
+  startup logs how many rows still lack one. Reconcile-or-refuse on a re-run
+  (030's shape); a column of another shape is text of unknown origin that
+  `keyword_search` would present as the note's own.
+- **The re-head, with no file access.** Every pre-031 vector is entirely
+  weight `D` (`to_tsvector` emits no other weight), so `head(title, aliases)
+  || ts_filter(content_tsvector, '{d}')` over stored columns equals a fresh
+  build byte for byte on the first application — measured on PostgreSQL 16 —
+  and ranking is right at deploy with no operator step. Three rules make it
+  safe:
+  - **the generation lock first**, under a 10 s `lock_timeout`: with `make
+    deploy` stopping the app before a pending migration and k8s
+    `Recreate`-ing, a holder is a pass someone left running against the
+    deploy order, and the migration fails naming it rather than waiting;
+  - **the stored fingerprint's configs**, not the environment's: the body
+    lexemes were built under those, and a head under another stemmer is the
+    mixed-configuration vector the startup guard exists to refuse. Absent →
+    the environment's (what adoption would bless); unreadable → refuse by
+    name, as the guard does;
+  - **skip a row that already carries a weight-`A` lexeme.** `ts_filter`
+    keeps the body's absolute positions as the previous concatenation
+    assigned them, so a second application shifts them by the previous head's
+    length (`'beta':1A 'bodi':3 'text':4` against a fresh `bodi:2 text:3`);
+    the predicate makes the stamp-back re-run byte-idempotent. Matching,
+    phrases and `ts_rank_cd` are invariant under the shift, which is why the
+    move paths (which do re-head repeatedly) are specified on those and not
+    on bytes.
+
+  Each UPDATE runs in a savepoint; SQLSTATE 54000 leaves that row unchanged
+  and logged by id (its next edit or the rebuild writes it through the
+  halving retreat); any other error fails the migration whole.
+- **`downgrade()` restores the old semantics, not only the schema** (Codex
+  r1 #4): under the lock it sets every vector to `ts_filter(content_tsvector,
+  '{d}')` — no `A` lexeme survives, so the previous image sees no title-only
+  matches and its later D-only writes do not mix with headed rows — and only
+  then drops a marked column.
+- **The deploy order is part of the migration.** An old-image process
+  serving between 031's commit and its own replacement could `move_note` a
+  note 031 had just re-headed: it rewrites `title` and `file_path` but keeps
+  the headed vector, and the new image then serves the old stem at weight
+  `A` for ever (neither the unchanged-hash scan nor 031's skip predicate
+  revisits it). So `make deploy` stops the app before `alembic upgrade head`
+  whenever `alembic current` differs from `alembic heads`, `DEPLOYMENT.md`
+  says stop → migrate → start for a hand-driven stack, and k8s already has
+  no overlap (`Recreate` + the migrate initContainer).
+
+The gate's head literal is `031`; its cases cover the fresh shape and the
+byte-exact re-head, the chain from 030, the stamp-back byte-idempotence, the
+stored-fingerprint configs versus the environment and the absent case, five
+unreadable fingerprints refused, a synthetic 54000 row left behind, four
+impostor-column refusals, the downgrade stripping every head and keeping
+every body lexeme, and the foreign-column downgrade. `alembic check` is clean
+after each.
+
 ## The session TimeZone is UTC
 
 Every DateTime column is `timestamptz` and the application reasons in UTC

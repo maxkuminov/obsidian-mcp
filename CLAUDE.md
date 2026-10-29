@@ -352,6 +352,26 @@ update it in the same change.** What stays here is the short list:
   the stamp records only when an in-transaction re-read finds every surviving
   row current, after re-resolving every link target. A skip (including an
   unlisted directory) withholds only over a row that is not current.
+- **The keyword vector is `A(title) || A(aliases) || D(body)`** (#344,
+  migration 031), built by the one builder in `src/services/fts.py` for every
+  writer, ranked with `ts_rank_cd(RANK_WEIGHTS, …)` (`{0.02,0.2,0.4,1.0}`, a
+  bound `float4[]`) so one title cover outweighs fifty body covers.
+  `keyword_search` runs the conjunction first (`match: all`) and, when it
+  under-fills the page, a disjunction **derived per config from PostgreSQL's
+  own `websearch_to_tsquery` text** (never the caller's string; an ineligible
+  config keeps its AND form, so the union is a superset by construction)
+  tagged `match: any`, never interleaved. Snippets come from
+  `notes_metadata.body_excerpt` (the first `KEYWORD_EXCERPT_CHARS` of exactly
+  the text the vector was built from, same UPDATE) via a statement over the
+  first `KEYWORD_SNIPPET_ROWS` ids only; a row with no highlight shows
+  `head:`, a pre-031 row has no excerpt until edited or
+  `make rebuild-tsvectors`. 031 re-heads in SQL under the generation lock
+  with the **stored fingerprint's** configs and skips rows already headed
+  (`rehead` is not position-idempotent); its downgrade strips every `A`
+  lexeme. **Both move paths re-head under the generation lock with the
+  fingerprint re-read** — the title is inside the vector — and `make deploy`
+  stops the app before a pending migration. See
+  [search](docs/architecture/search.md).
 - **The vector index is a `halfvec` expression index** (#283, migration 027),
   defined once in `src/services/vector_index.py` and excluded from `alembic
   check` by `include_object`; queries cast to match it and re-rank by

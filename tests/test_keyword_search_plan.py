@@ -50,14 +50,24 @@ def _fake_tsquery(monkeypatch):
     monkeypatch.setattr(search, "combined_tsquery", lambda _q: "tsq")
 
 
+def _select(session):
+    """The conjunctive statement: the first non-`SET LOCAL` clause. #344 added
+    the parse-text statement (and, with rows, the snippet statements) after
+    it; the hint and the tie-break are properties of this one."""
+    return session.clauses[1]
+
+
 @pytest.mark.asyncio
 async def test_random_page_cost_is_set_before_the_select():
     session = _RecordingSession()
     await search.full_text_search(session, "needle")
 
     assert session.statements[0].strip() == "SET LOCAL random_page_cost = 1.1"
-    assert len(session.statements) == 2
+    # The conjunctive select, then PostgreSQL's parse of the query (#344) —
+    # which, with no rows and no eligible parse, is where the call ends.
+    assert len(session.statements) == 3
     assert "SET LOCAL" not in session.statements[1]
+    assert "websearch_to_tsquery" in session.statements[2]
 
 
 @pytest.mark.asyncio
@@ -65,7 +75,7 @@ async def test_order_by_carries_the_file_path_tie_break():
     session = _RecordingSession()
     await search.full_text_search(session, "needle")
 
-    order_by = str(session.clauses[-1]).split("ORDER BY", 1)[1]
+    order_by = str(_select(session)).split("ORDER BY", 1)[1]
     assert "rank DESC" in order_by
     assert "notes_metadata.file_path ASC" in order_by
     # The tie-break must come *after* rank, or it becomes the primary sort and
@@ -89,7 +99,7 @@ async def test_hint_and_tie_break_apply_under_every_filter(kwargs):
     await search.full_text_search(session, "needle", **kwargs)
 
     assert session.statements[0].strip() == "SET LOCAL random_page_cost = 1.1"
-    assert "file_path ASC" in str(session.clauses[-1])
+    assert "file_path ASC" in str(_select(session))
 
 
 @pytest.mark.asyncio
@@ -98,6 +108,6 @@ async def test_matching_predicate_is_untouched():
     session = _RecordingSession()
     await search.full_text_search(session, "needle")
 
-    sql = str(session.clauses[-1])
+    sql = str(_select(session))
     assert "content_tsvector @@ " in sql
     assert "ts_rank_cd" in sql

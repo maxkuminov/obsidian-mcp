@@ -743,12 +743,36 @@ deployment; on a compose-file deployment the equivalents are plain
   failing indexer stays invisible (#308: 8.5 days of failed passes
   under a `200 ok`). The body carries counts only; the offending path
   is in the log and on `/admin/health`.
-- **Upgrades.** Check the upgrade note at the top of this guide first,
-  then pull, rebuild, and bring the stack up again; migrations
-  run on start. After a release that carries one, confirm the schema
-  agrees with the models:
+- **Upgrades.** Check the upgrade notes below first, then pull and
+  rebuild. **When the release carries a migration, stop the app before
+  migrating and start it after** —
+  `docker compose -f docker-compose.simple.yml stop obsidian-mcp`, then
+  `docker compose -f docker-compose.simple.yml run --rm obsidian-mcp alembic upgrade head`,
+  then `up -d` (the Makefile's `make deploy` does this by itself when
+  `alembic current` is behind `alembic heads`). A migration that rewrites
+  rows in place — 031 below is one — must not race an old-image process
+  that still writes them. After a release that carries one, confirm the
+  schema agrees with the models:
   `docker compose -f docker-compose.simple.yml exec obsidian-mcp alembic check`
   should print "No new upgrade operations detected."
+
+  **Upgrading across migration 031 (keyword ranking, #344).** 031
+  rewrites every keyword vector so a note's title and frontmatter
+  `aliases` rank above its body; ranking is right the moment the new
+  version serves. Snippets (`keyword_search`'s `snippet:` line) come
+  from an excerpt that is stored only when a note's vector is written,
+  so notes indexed before 031 show `head:` or no second line, the result
+  header counts them, and startup logs the count. Run
+  `make rebuild-tsvectors` (or, on a compose-file deployment,
+  `docker compose -f docker-compose.simple.yml run --rm obsidian-mcp python -m scripts.rebuild_tsvectors`)
+  **once** after the upgrade; it stores an excerpt for every note,
+  touches no embeddings and makes no API calls. On Kubernetes use
+  `deploy/kubernetes/base/rebuild-tsvectors-job.example.yaml` with the
+  Deployment scaled to zero (the RWO vault volume), as the
+  [Kubernetes guide](docs/deployment-kubernetes.md#upgrades-and-migrations)
+  describes. Three optional settings arrived with it — `RANK_WEIGHTS`,
+  `KEYWORD_EXCERPT_CHARS`, `KEYWORD_SNIPPET_ROWS` — documented in the
+  README's Configuration table and `.env.example`.
 - **Backups.** `pg_dump` the database on a schedule; the vault itself is
   covered by whatever sync you chose in Step 4. Note that a soft delete
   moves files into `.trash/` inside the vault, so your sync sees them.

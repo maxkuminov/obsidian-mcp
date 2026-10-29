@@ -65,6 +65,7 @@ from src.services.tool_outcomes import BodyOutcome, body_refusal as _body_refusa
 from src.services.embeddings import semantic_search
 from src.services.filters import apply_note_filters
 from src.services.quotas import admit as _admit_quota, quota_refusal_message
+from src.services.fts import aliases_text, rehead_tsvector_sql
 from src.services.search import full_text_search
 from src.services.usage_params import render_usage_params
 from src.services.usage_stats import OVER_QUOTA_PARAM
@@ -1947,10 +1948,80 @@ async def search_notes_impl(
         )
     if not results:
         return f"No results for '{query}'"
-    lines = [f"Found {len(results)} results for '{query}':\n"]
+    return render_keyword_results(query, results)
+
+
+async def _enter_keyword_generation(session) -> None:
+    """The two statements every keyword-vector writer opens with (#344, D6):
+    the index generation lock — before any row lock, the documented order —
+    and the keyword fingerprint re-read under it, which raises on a mismatch.
+    `move_note`'s metadata transaction calls this first, because the title it
+    rewrites is inside the vector. A module-level seam so the offline move
+    tests, which script a fake session by statement order, can stand it down;
+    the real behaviour is pinned on PostgreSQL in
+    `tests/integration/test_keyword_ranking_pg.py`.
+    """
+    from src.services.index_state import acquire_generation_lock
+    from src.services.indexer import (  # local: avoids a cycle
+        _assert_fts_generation_current,
+    )
+
+    await acquire_generation_lock(session)
+    await _assert_fts_generation_current(session)
+
+
+def render_keyword_results(query: str, results: list[dict]) -> str:
+    """The `keyword_search` text form (#344, design D4).
+
+    The header carries the `all` and `any` counts and the count of rows
+    without a stored excerpt **always, including zero** (#200's rule: an
+    absent token is not evidence of absence), plus `snippets: first N` when
+    the page is longer than the snippet cap. Per row, `match`, `matched_in`
+    and `terms` ride the first line; the second line is `snippet:` (the
+    highlighted fragments, `«»`) or `head:` (the excerpt's leading words, when
+    the excerpt held no highlight — a title/alias match, or a match beyond the
+    stored excerpt). A row with no stored excerpt has no second line and is
+    counted; a row beyond the cap carries neither. The snippet is a
+    note-controlled field: never cut or marked by the server.
+    """
+    cap = settings.keyword_snippet_rows
+    all_count = sum(1 for r in results if r.get("match") == "all")
+    any_count = len(results) - all_count
+    computed = [r for r in results if "has_excerpt" in r]
+    no_excerpt = sum(1 for r in computed if not r["has_excerpt"])
+    header = (
+        f"Found {len(results)} results for '{query}' — all terms: {all_count}, "
+        f"any term: {any_count} — without excerpt: {no_excerpt}"
+    )
+    if cap == 0:
+        header += " — snippets: off"
+    elif len(results) > cap:
+        header += f" — snippets: first {cap}"
+    lines = [header + ":\n"]
     for r in results:
         tags_str = f" [{', '.join(r['tags'])}]" if r.get("tags") else ""
-        lines.append(f"- **{r['title']}** (`{r['path']}`){tags_str} — rank: {r['rank']:.3f}")
+        line = (
+            f"- **{r['title']}** (`{r['path']}`){tags_str} — rank: {r['rank']:.3f}"
+            f" — match: {r.get('match', 'all')}"
+        )
+        if r.get("matched_in"):
+            line += f" — matched_in: {','.join(r['matched_in'])}"
+        terms = r.get("matched_terms")
+        if terms:
+            line += f" — terms: {terms[0]}/{terms[1]}"
+        lines.append(line)
+        if r.get("snippet"):
+            lines.append(f"  snippet: {r['snippet']}")
+        elif r.get("head"):
+            lines.append(f"  head: {r['head']}")
+    if no_excerpt:
+        lines.append(
+            f"\n**{no_excerpt} of these notes {'has' if no_excerpt == 1 else 'have'} "
+            "no stored excerpt yet** (indexed before this version), so no snippet "
+            "is shown for them; ranking is unaffected. One run of "
+            "`make rebuild-tsvectors` (or the Kubernetes rebuild Job) stores one "
+            "for every note."
+        )
     return "\n".join(lines)
 
 
@@ -5336,6 +5407,9 @@ async def _move_note_locked(
 
         dest_name = PurePosixPath(to_rel).name
         moved_title: str | None = None
+        # The parsed frontmatter of the moved file, for the vector's head
+        # (#344, D6): the aliases come from the same parse as the title.
+        moved_frontmatter: dict | None = None
         # The bytes the **rename** published, captured from the same read the
         # title derivation already performs (D9: one read, and the hash it
         # yields describes exactly the bytes that read saw). `None` when the
@@ -5371,6 +5445,20 @@ async def _move_note_locked(
         db_failed = False
         try:
             async with async_session() as session:
+                # **This transaction writes a keyword vector, so it is a
+                # tsvector writer like every other** (#344, D6): the title is
+                # inside the vector at weight A since 031, and a move that
+                # rewrote `title` but kept the vector would serve the old stem
+                # as a false positive and miss the new one for ever (#127 D3's
+                # class, one column over). The generation lock comes first —
+                # before any row lock, the documented order — and the keyword
+                # fingerprint is re-read under it; a wait past the statement
+                # timeout or a mismatch raises into the `except` below, the
+                # move on disk stands, the result reports the partial outcome,
+                # and the next pass's move detection (itself under the lock)
+                # repairs path, title and head. Nothing is written under a
+                # configuration the store does not certify.
+                await _enter_keyword_generation(session)
                 # **A path change invalidates the embedding certification.**
                 # `embedded_content_hash` records that the row's *current
                 # content* has been dealt with, and one of the things that
@@ -5394,16 +5482,33 @@ async def _move_note_locked(
                 # re-embedded only because the hash check selects it, and the
                 # exclusion decision is re-taken against the path it now has.
                 title = moved_title
-                if title is None:
+                head_frontmatter = moved_frontmatter
+                if title is None or head_frontmatter is None:
                     # The fallback needs the row, so it is resolved inside the
-                    # same transaction as the UPDATE.
+                    # same transaction as the UPDATE. Title and aliases fall
+                    # back together: both derive from the same frontmatter.
                     row = (await session.execute(
                         select(NoteMetadata.frontmatter).where(
                             NoteMetadata.file_path == from_rel,
                             _note_owner_predicate(uid),
                         )
                     )).scalar_one_or_none()
-                    title = _note_title(row or {}, dest_name)
+                    head_frontmatter = row or {}
+                    if title is None:
+                        title = _note_title(head_frontmatter, dest_name)
+
+                # The vector's head, from the same title and the shared
+                # aliases rule; the body part and `body_excerpt` are untouched
+                # — the content did not move. Bind names are the head's own so
+                # they cannot collide with the column assignments' binds.
+                rehead_frag, rehead_params = rehead_tsvector_sql(
+                    "head_title", "head_aliases"
+                )
+                rehead_expr = text(rehead_frag).bindparams(
+                    head_title=title,
+                    head_aliases=aliases_text(head_frontmatter),
+                    **rehead_params,
+                )
 
                 nm_update = (
                     update(NoteMetadata)
@@ -5414,6 +5519,7 @@ async def _move_note_locked(
                     .values(
                         file_path=to_rel,
                         title=title,
+                        content_tsvector=rehead_expr,
                         embedded_content_hash=None,
                         # Re-derive progress (#311, D3): a move is not a
                         # re-deriving pass's derivation of this row.

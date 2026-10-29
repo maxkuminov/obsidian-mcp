@@ -642,14 +642,15 @@ async def test_the_retreat_halves_down_to_the_floor(sessionmaker, vault):
     prefixes and never below the floor."""
     frag, params = index_tsvector_sql("content")
     stmt = text(
-        f"UPDATE notes_metadata SET content_tsvector = {frag} "
-        "WHERE file_path = :p"
+        f"UPDATE notes_metadata SET content_tsvector = {frag}, "
+        "body_excerpt = :excerpt WHERE file_path = :p"
     )
     await _seed_many(sessionmaker, vault, 1, bad_index=None)
 
     async with sessionmaker() as session:
         used, rowcount = await indexer.write_tsvector_bounded(
-            session, stmt, OVERSIZED, {"p": "n0000.md", **params},
+            session, stmt, OVERSIZED,
+            {"p": "n0000.md", "title": "n0000", "aliases": "", **params},
             label="n0000.md",
         )
         await session.commit()
@@ -666,3 +667,14 @@ async def test_the_retreat_halves_down_to_the_floor(sessionmaker, vault):
 
     present, _ = await tsvector_state(sessionmaker, "n0000.md")
     assert present is True
+
+    # #344, D4: the excerpt is a prefix of exactly the prefix that succeeded,
+    # cut at the excerpt cap — and the head stayed whole at every retreat.
+    async with sessionmaker() as session:
+        excerpt, headed = (await session.execute(text(
+            "SELECT body_excerpt, ts_filter(content_tsvector, '{a}') @@ "
+            "plainto_tsquery('english', 'n0000') FROM notes_metadata "
+            "WHERE file_path = 'n0000.md'"
+        ))).first()
+    assert excerpt == OVERSIZED[:used][:settings.keyword_excerpt_chars]
+    assert headed is True

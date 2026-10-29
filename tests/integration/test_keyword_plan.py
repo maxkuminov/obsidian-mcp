@@ -48,6 +48,9 @@ TSVECTOR_INDEX = "ix_notes_metadata_tsvector"
 # A term planted in a handful of notes (what the hint is for) and one planted
 # in most of them (where a seq scan is a legitimate plan).
 RARE_TERM = "zygomorphic"
+# A second rare term, for the disjunctive fallback's plan (#344): a fallback
+# of two rare units is the shape the GIN bitmap-OR plan exists for.
+RARE_TERM_2 = "quinquennial"
 COMMON_TERM = "meeting"
 
 _WORDS = [
@@ -63,6 +66,8 @@ def _body(rng: random.Random, index: int) -> str:
     words = [rng.choice(_WORDS) for _ in range(900)]
     if index % 400 == 0:
         words.append(RARE_TERM)
+    if index % 500 == 0:
+        words.append(RARE_TERM_2)
     if index % 3 != 0:
         words.append(COMMON_TERM)
     return " ".join(words)
@@ -84,7 +89,9 @@ async def sessionmaker(migrated_url):
 @pytest_asyncio.fixture(loop_scope="module", scope="module")
 async def corpus(sessionmaker):
     rng = random.Random(SEED)
-    fragment, cfg_params = index_tsvector_sql()
+    # The head's binds get their own names: `:title` also fills the varchar
+    # column, and asyncpg refuses one parameter deduced as two types.
+    fragment, cfg_params = index_tsvector_sql("content", "head_title", "aliases")
 
     async with sessionmaker() as session:
         user = (await session.execute(
@@ -95,6 +102,8 @@ async def corpus(sessionmaker):
             )
         )).scalar_one()
 
+        # The vector's `:title` bind is the row's title, as every writer binds
+        # it (#344); the corpus declares no aliases.
         stmt = text(
             "INSERT INTO notes_metadata "
             "(user_id, file_path, title, tags, frontmatter, content_hash, "
@@ -107,6 +116,8 @@ async def corpus(sessionmaker):
                 "user_id": user if i % 5 == 0 else None,
                 "path": f"{folder}/note-{i:05d}.md",
                 "title": f"note {i}",
+                "head_title": f"note {i}",
+                "aliases": "",
                 "tags": ["work"] if i % 4 == 0 else ["personal"],
                 "fm": '{"status": "open"}' if i % 7 == 0 else '{"status": "done"}',
                 "hash": f"h{i}",
@@ -240,6 +251,48 @@ async def test_rare_term_uses_the_tsvector_index_and_reads_fewer_buffers(
     assert hinted_buffers < seq_buffers, (
         f"index plan read {hinted_buffers} buffers vs {seq_buffers} sequential"
     )
+
+
+async def test_the_disjunctive_fallback_uses_the_tsvector_index(sessionmaker, corpus):
+    """#344: the `any` block's statement — the fallback tsquery derived from
+    PostgreSQL's own parse, `AND NOT` the conjunctive query — still plans as
+    a GIN bitmap scan (a bitmap OR of the two rare units)."""
+    from src.services import fts
+
+    query = f"{RARE_TERM} {RARE_TERM_2}"
+    async with sessionmaker() as session:
+        parsed = (await session.execute(text(
+            "SELECT CAST(websearch_to_tsquery('english', :q) AS text)"
+        ), {"q": query})).scalar_one()
+    plan = fts.fallback_plan([parsed])
+    assert plan.eligible and plan.forms[0] is not None, parsed
+
+    async with sessionmaker() as session:
+        await session.execute(text("SET LOCAL random_page_cost = 1.1"))
+        rows = (await session.execute(text(
+            "EXPLAIN (ANALYZE, BUFFERS) "
+            "SELECT id, file_path, title, tags, "
+            "  ts_rank_cd('{0.02,0.2,0.4,1.0}', content_tsvector, CAST(:fb AS tsquery)) AS rank "
+            "FROM notes_metadata "
+            "WHERE content_tsvector @@ CAST(:fb AS tsquery) "
+            "  AND NOT (content_tsvector @@ websearch_to_tsquery('english', :q)) "
+            "ORDER BY rank DESC, file_path ASC LIMIT 50"
+        ), {"fb": plan.forms[0], "q": query})).fetchall()
+    explained = "\n".join(r[0] for r in rows)
+    print(f"\n[fallback/{query}]\n{explained}")
+    assert TSVECTOR_INDEX in explained, explained
+
+    # And the service's own fallback returns the union the EXPLAIN describes:
+    # the notes holding both rare terms first (`all`), then each note holding
+    # one of them (`any`).
+    both = {i for i in range(N_NOTES) if i % 400 == 0 and i % 500 == 0}
+    either = {i for i in range(N_NOTES) if i % 400 == 0 or i % 500 == 0}
+    # Every multiple of 400 or 500 is a multiple of 5, i.e. owned by the
+    # corpus user — so the search is scoped to that user, not the NULL slice.
+    async with sessionmaker() as session:
+        results = await full_text_search(session, query, limit=50, user_id=corpus)
+    assert [r["match"] for r in results] == ["all"] * len(both) + ["any"] * (len(either) - len(both))
+    assert len(results) == len(either)
 
 
 async def test_common_term_plans_are_recorded_not_asserted(sessionmaker, corpus):

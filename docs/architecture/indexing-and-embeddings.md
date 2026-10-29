@@ -261,6 +261,36 @@ text) alone; the fingerprint names the model.
   bytes through `set_frontmatter`. One shared token helper, `.nan` / `.inf` /
   `-.inf`, keys included — see [the section below](#non-finite-frontmatter-numbers-and-the-one-title-rule-154),
   which also names the one title rule every surface shares.
+- **The keyword vector is `A(title) || A(aliases) || D(body)` and stores its
+  excerpt** (#344, migration 031). One builder, `fts.index_tsvector_sql`,
+  produces the fragment for every writer — title parts for every config, then
+  aliases parts, then the pre-031 content parts byte for byte — and the same
+  UPDATE writes `body_excerpt`, the first `KEYWORD_EXCERPT_CHARS` characters
+  of exactly the prefix the successful attempt bound. The title is the row's
+  (the shared `note_title` rule); the aliases are `fts.note_aliases` over the
+  parsed frontmatter — `aliases` then `alias`, a list's scalars or a scalar
+  string comma-split like a scalar `tags`, rendered as the title rule renders
+  a scalar, NUL and the headline sentinels removed, the joined text cut at
+  2,048 characters so the head stays small against the 1 MiB limit (the
+  halving retreat shrinks the **body** bind only). The same list comes from a
+  freshly parsed mapping and from the stored JSONB, which is what lets the
+  rebuild and `move_note` parse while 031 reads the column. **Both move paths
+  re-head the vector** (`fts.rehead_tsvector_sql`: `head ||
+  ts_filter(content_tsvector, '{d}')`), because the title is derived from the
+  path and both preserve the vector — #127 D3's class, one column over — and
+  both do it as every tsvector writer does, under the generation lock with
+  the fingerprint re-read (the pass at its head; `move_note`'s metadata
+  transaction as its first two statements, a wait past the statement timeout
+  or a mismatch aborting it into the partial-outcome report the next pass's
+  move detection repairs). `rehead` keeps the body's lexemes, weights and
+  relative positions but shifts its absolute positions by the previous head's
+  length on each application; `@@`, phrases and `ts_rank_cd` are invariant,
+  an edit rebuilds the vector, and positions saturate only after thousands of
+  consecutive renames. The rebuild recomputes title and aliases from the
+  bytes it verified and writes the excerpt in its certified UPDATE; the
+  fingerprint it records still certifies configs only (weights are not
+  configuration, and a `FINGERPRINT_VERSION` bump would invalidate the
+  embedding fingerprint too). See [search](search.md#keyword-ranking-the-disjunctive-fill-and-the-snippet-344).
 - **The keyword vector attempts the full note and retreats per note** (#127).
   Both writers bound `content[:100000]`, so every term past that was invisible
   to `keyword_search` on a note the tool still reported. `write_tsvector_bounded`

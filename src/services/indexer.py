@@ -53,7 +53,12 @@ from src.services.embeddings import (
     clean_for_embedding,
     embed_note,
 )
-from src.services.fts import index_tsvector_sql
+from src.services.fts import (
+    aliases_text,
+    excerpt_of,
+    index_tsvector_sql,
+    rehead_tsvector_sql,
+)
 from src.services import empty_prune, indexer_health
 from src.services.rate_limits import flush_expired
 from src.services.index_state import (
@@ -833,8 +838,14 @@ async def write_tsvector_bounded(
     while True:
         try:
             async with session.begin_nested():
+                # The excerpt is a prefix of exactly the text this attempt
+                # binds (#344, D4), so a retreat re-binds it with the body.
+                # The title and aliases binds are the caller's and are never
+                # halved: the head is bounded by construction.
+                attempt = content[:length]
                 result = await session.execute(
-                    statement, {**params, "content": content[:length]}
+                    statement,
+                    {**params, "content": attempt, "excerpt": excerpt_of(attempt)},
                 )
                 rowcount = result.rowcount
         except Exception as exc:
@@ -3491,9 +3502,22 @@ async def _index_vault_attempt(
             # `embedded_content_hash = NULL` stays unconditional and is not the
             # grammar rule: it is the path-change invalidation (#127), which
             # applies to every move whatever the marker says.
+            # The title is **inside the keyword vector** since 031 (#344,
+            # D6), at weight A, so a move that rewrites `title` and keeps the
+            # vector would serve the old stem as a false positive and miss
+            # the new one for ever — #127 D3's class, one column over. The
+            # head is replaced from the same parsed entry; the body part and
+            # `body_excerpt` are untouched (the content did not change). This
+            # statement runs inside the pass transaction, which took the
+            # generation lock at its head and asserted the fingerprint.
+            # Bind names of the head's own: `:title` also assigns the varchar
+            # column below, and asyncpg refuses one parameter deduced as both
+            # `character varying` and `text` (AmbiguousParameterError).
+            rehead_frag, rehead_params = rehead_tsvector_sql("head_title", "head_aliases")
             move_upd_sql = (
                 "UPDATE notes_metadata "
                 "SET file_path = :new, title = :title, tags = :tags, "
+                f"content_tsvector = {rehead_frag}, "
                 "file_size = :size, modified_at = :mtime, indexed_at = now(), "
                 "extraction_version = :xver, "
                 "embedded_content_hash = NULL, "
@@ -3534,6 +3558,8 @@ async def _index_vault_attempt(
                 e = entry_by_path[new]
                 params: dict = {
                     "new": new, "old": old, "title": e["title"],
+                    "head_title": e["title"],
+                    "head_aliases": aliases_text(e["frontmatter"]), **rehead_params,
                     "tags": e["tags"], "xver": CURRENT_EXTRACTION_VERSION,
                     "size": e["file_size"], "mtime": e["modified_at"],
                     "stat_size": e["stat_size"],
@@ -3738,21 +3764,31 @@ async def _index_vault_attempt(
             # mode. The tsvector expression is built from `settings.fts_configs`
             # (see `src/services/fts.py`) so index-time configs match the
             # query-time configs in `search.py`.
-            tsv_frag, tsv_params = index_tsvector_sql("content")
+            # `A(title) || A(aliases) || D(body)` and the excerpt in the same
+            # statement (#344, D1/D4): the title is the entry's (the shared
+            # rule), the aliases text the shared aliases rule over the same
+            # parsed frontmatter the row's JSONB was sanitised from.
+            tsv_frag, tsv_params = index_tsvector_sql("content", "title", "aliases")
             if user_id is None:
                 tsv_sql = f"""
                     UPDATE notes_metadata
-                    SET content_tsvector = {tsv_frag}
+                    SET content_tsvector = {tsv_frag},
+                        body_excerpt = :excerpt
                     WHERE file_path = :path
                       AND user_id IS NULL
                 """
             else:
                 tsv_sql = f"""
                     UPDATE notes_metadata
-                    SET content_tsvector = {tsv_frag}
+                    SET content_tsvector = {tsv_frag},
+                        body_excerpt = :excerpt
                     WHERE file_path = :path
                       AND user_id = :uid
                 """
+            head_by_path = {
+                n["file_path"]: (n["title"], aliases_text(n["frontmatter"]))
+                for n in to_upsert
+            }
             for path in paths:
                 # Reuse the body parsed during the scan loop above instead of
                 # re-reading from disk; a concurrent delete between the passes
@@ -3767,7 +3803,11 @@ async def _index_vault_attempt(
                     underived.add(path)  # never marked (#311, D3)
                     continue
                 content = path_to_content[path]
-                params: dict = {"path": path, **tsv_params}
+                head_title, head_aliases = head_by_path[path]
+                params: dict = {
+                    "path": path, "title": head_title, "aliases": head_aliases,
+                    **tsv_params,
+                }
                 if user_id is not None:
                     params["uid"] = user_id
                 # Full body first, halving retreat per note, floor failure
@@ -3791,11 +3831,13 @@ async def _index_vault_attempt(
                         raise
 
                     async def _floor(content=content, params=params):
+                        floor_content = content[:TSVECTOR_CONTENT_FLOOR_CHARS]
                         await session.execute(
                             text(tsv_sql),
                             {
                                 **params,
-                                "content": content[:TSVECTOR_CONTENT_FLOOR_CHARS],
+                                "content": floor_content,
+                                "excerpt": excerpt_of(floor_content),
                             },
                         )
 
@@ -4584,11 +4626,14 @@ def _read_body_beneath(root_fd: int, rel_path: str) -> str | None:
     return parse_frontmatter(raw)[1]
 
 
-def _read_body_and_hash(root_fd: int, rel_path: str) -> tuple[str, str]:
-    """`(parsed body, content_hash)` of one note, for the keyword-vector
-    rebuild; runs on a worker thread. Raises what `read_note_beneath` raises."""
+def _read_body_and_hash(root_fd: int, rel_path: str) -> tuple[dict, str, str]:
+    """`(parsed frontmatter, parsed body, content_hash)` of one note, for the
+    keyword-vector rebuild; runs on a worker thread. Raises what
+    `read_note_beneath` raises. The frontmatter is what the rebuild derives
+    the title and aliases from — the head of the vector it writes (#344)."""
     raw, _stat = read_note_beneath(root_fd, rel_path)
-    return parse_frontmatter(raw)[1], _content_hash(raw)
+    frontmatter, body = parse_frontmatter(raw)
+    return frontmatter, body, _content_hash(raw)
 
 
 async def _link_backfill_pinned(
@@ -6642,7 +6687,7 @@ async def _rebuild_tsvectors_pinned(
             ),
         )
 
-    tsv_frag, tsv_params = index_tsvector_sql("content")
+    tsv_frag, tsv_params = index_tsvector_sql("content", "title", "aliases")
     # ── The rebuild certifies what it writes ──────────────────────────────
     # It used to address the UPDATE by `id` alone, over a snapshot holding only
     # `(id, file_path)`, and to treat a read failure as a silent `continue`.
@@ -6669,8 +6714,11 @@ async def _rebuild_tsvectors_pinned(
     # four, requiring exactly one row. Anything else is staleness, and staleness
     # is re-read and retried against the fresh row — or aborts the whole
     # transaction. It is never committed around.
+    # The excerpt rides in the same certified UPDATE (#344, D4/D7): it is a
+    # prefix of exactly the bytes verified against the hash below.
     upd_sql = text(
-        f"UPDATE notes_metadata SET content_tsvector = {tsv_frag} "
+        f"UPDATE notes_metadata SET content_tsvector = {tsv_frag}, "
+        "body_excerpt = :excerpt "
         "WHERE id = :id AND user_id IS NOT DISTINCT FROM :uid "
         "  AND file_path = :path AND content_hash = :hash"
     )
@@ -6700,7 +6748,7 @@ async def _rebuild_tsvectors_pinned(
             try:
                 # The read, parse and hash off the loop (#278): the rebuild
                 # walks every row of the scope. The UPDATE stays here.
-                content, got_hash = await asyncio.to_thread(
+                frontmatter, content, got_hash = await asyncio.to_thread(
                     _read_body_and_hash, root_fd, path
                 )
             except (UnicodeDecodeError, OSError) as exc:
@@ -6712,10 +6760,17 @@ async def _rebuild_tsvectors_pinned(
                         "content_hash the rebuild selected"
                     )
                 else:
+                    # Title and aliases from the bytes just verified — the
+                    # shared rules, so the head equals what the scan writes
+                    # for the same file (the hash matched, so the stored title
+                    # already equals this).
                     _used, rowcount = await write_tsvector_bounded(
                         session, upd_sql, content,
                         {"id": snapshot.id, "uid": owner, "path": path,
-                         "hash": chash, **tsv_params},
+                         "hash": chash,
+                         "title": _note_title(frontmatter, path.rsplit("/", 1)[-1]),
+                         "aliases": aliases_text(frontmatter),
+                         **tsv_params},
                         label=path,
                     )
                     if rowcount == 1:

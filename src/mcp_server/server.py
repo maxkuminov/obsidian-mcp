@@ -119,9 +119,30 @@ async def keyword_search(
     frontmatter: dict | None = None,
 ) -> str:
     """Full-text keyword search via PostgreSQL tsvector. Use this for exact identifiers,
-    code symbols, proper nouns, or known phrases — anywhere semantic noise hurts.
+    code symbols, proper nouns, titles, or known phrases — anywhere semantic noise hurts.
 
     For conceptual or paraphrased queries, use semantic_search instead.
+
+    **Bare terms are ANDed**: `budget forecast` matches only notes containing
+    both stems. Notes matching every term come first, tagged `match: all`;
+    when they do not fill the page, notes matching some of the terms follow,
+    tagged `match: any`, in their own rank order. The operators:
+    `"exact phrase"` (adjacent words), `budget OR forecast` (either), `-draft`
+    (exclude; honoured in the `any` block too). A note's title and frontmatter
+    `aliases` are indexed above its body, so a query that is a note's title
+    ranks that note first.
+
+    Each result carries `rank` (a relative score, not comparable across
+    queries), `match`, `matched_in` (`title` — title or aliases — and/or
+    `body`), `terms` (`k/n`: how many of the query's terms the note contains),
+    and a second line: `snippet:` — the matching text with the matches in
+    `«»` — or `head:` — the note's opening words when the match is in the
+    title/aliases or beyond the stored excerpt. Snippets are computed for the
+    first rows of the page (the header says `snippets: first N` when the page
+    is longer). The header always carries the `all`/`any` counts and how many
+    rows have no stored excerpt yet (notes indexed before this version; the
+    footer names the one-time rebuild). Call `read_note` on a result's path
+    for the full note.
 
     Args:
         query: Keywords or phrase to match (websearch tsquery syntax: "foo bar", "foo OR bar", "-bar").

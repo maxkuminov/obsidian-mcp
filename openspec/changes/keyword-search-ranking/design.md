@@ -289,7 +289,15 @@ distinct 20,000-character excerpts with repeated matches, under
 `english,simple`, with head-fallback rows included, completes the snippet
 statement in **under 300 ms** (asserted in the integration suite, the
 measurement recorded here); if it does not, `KEYWORD_EXCERPT_CHARS`'s
-default is lowered until it does and the reason recorded. A match beyond
+default is lowered until it does and the reason recorded. **Measured
+2026-10-29** on the throwaway `pgvector/pgvector:pg16` container
+(`test_keyword_ranking_pg.py::test_the_worst_case_snippet_latency_is_under_the_gate`):
+**112 ms best of three (147, 130, 112 ms)** for the headline statement plus
+the head statement over 20 rows × 20,000 characters, `english,simple`, 5
+head rows — so the 20,000 default stands. Codex's ≈ 452 / 891 ms were for a
+`limit`-bound design with a fragment-mode headline on every row; the row
+cap and the two-statement split (no second parse for highlighted rows) are
+what changed. A match beyond
 the excerpt, or a match only in the head (title/aliases are not in the
 excerpt), yields no highlight and the row shows the excerpt's leading
 words as `head:` with `matched_in` saying where it matched (L3). Nothing

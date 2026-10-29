@@ -403,6 +403,40 @@ async def _check_fts_fingerprint() -> None:
     )
 
 
+async def _warn_missing_keyword_excerpts() -> None:
+    """One WARNING naming how many keyword vectors have no stored excerpt
+    (#344, design D5): every row written before migration 031, until its note
+    is edited or `make rebuild-tsvectors` runs. Ranking is right regardless
+    (031 re-headed every vector in SQL); only `keyword_search`'s snippet is
+    missing for those rows, and the tool says so per call. Never a refusal,
+    never `/health`: an absent snippet is an ergonomic gap, not a wrong answer.
+    """
+    from sqlalchemy import text as _text
+
+    log = logging.getLogger(__name__)
+    async with async_session() as session:
+        if (await session.execute(
+            _text("SELECT to_regclass('notes_metadata')")
+        )).scalar() is None:
+            return
+        try:
+            count = (await session.execute(_text(
+                "SELECT count(*) FROM notes_metadata "
+                "WHERE content_tsvector IS NOT NULL AND body_excerpt IS NULL"
+            ))).scalar() or 0
+        except Exception as exc:  # the column is 031's; defer to alembic
+            log.debug("keyword excerpt count skipped: %s", exc)
+            return
+    if count:
+        log.warning(
+            "%d note(s) have a keyword vector but no stored excerpt (indexed before "
+            "migration 031): keyword_search shows no snippet for them until they are "
+            "edited or `make rebuild-tsvectors` (the Kubernetes rebuild Job) runs once. "
+            "Ranking is unaffected.",
+            count,
+        )
+
+
 async def _warm_embedding_model() -> None:
     """Pre-load the embedding model so the first semantic_search after startup
     isn't a cold reload. Combined with OLLAMA_KEEP_ALIVE the model then stays
@@ -574,6 +608,8 @@ async def lifespan(app: FastAPI):
         # database to read a fingerprint from and nothing it could verify.
         await _check_embedding_fingerprint()
         await _check_fts_fingerprint()
+        # #344: a count, a WARNING, nothing else — see the function.
+        await _warn_missing_keyword_excerpts()
         # E1 — **synchronously, before the app serves, and before the indexer
         # task exists.** An asynchronously-published snapshot is not startup
         # enforcement: a tool call between the first accepted connection and the

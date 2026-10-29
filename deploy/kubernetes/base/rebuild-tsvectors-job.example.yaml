@@ -1,0 +1,76 @@
+# EXAMPLE ONLY. The one-off keyword-index rebuild (`make rebuild-tsvectors` on
+# compose). Run it after changing FTS_CONFIGS in the ConfigMap, and once after
+# upgrading across migration 031 (#344) so every note stores the excerpt
+# `keyword_search` snippets come from — ranking is right without it; snippets
+# read `head:` or are absent until it has run, and startup logs the count.
+#
+# It must run in a FRESH container that reads the NEW settings, never through
+# `kubectl exec` into the running pod (its environment was fixed at start), and
+# it re-reads every note, so it needs every vault volume the app mounts at the
+# same paths. With a ReadWriteOnce vault volume the app has to be scaled to
+# zero first; that also releases the index generation lock the task takes.
+#
+#   kubectl -n obsidian-mcp scale deploy/obsidian-mcp --replicas=0
+#   kubectl -n obsidian-mcp apply -f deploy/kubernetes/base/rebuild-tsvectors-job.example.yaml
+#   kubectl -n obsidian-mcp wait --for=condition=complete --timeout=30m job/obsidian-mcp-rebuild-tsvectors
+#   kubectl -n obsidian-mcp logs job/obsidian-mcp-rebuild-tsvectors
+#   kubectl -n obsidian-mcp delete job obsidian-mcp-rebuild-tsvectors
+#   kubectl -n obsidian-mcp scale deploy/obsidian-mcp --replicas=1
+#
+# Set the image to the SAME tag/digest the Deployment runs. Add every
+# `/vaults/<name>` mount and any TLS file mount the Deployment has.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: obsidian-mcp-rebuild-tsvectors
+  namespace: obsidian-mcp
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:  # reuses the app's NetworkPolicy (DNS, Postgres, 443)
+        app.kubernetes.io/name: obsidian-mcp
+        app.kubernetes.io/component: server
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:           # same uid/gid as the Deployment, no fsGroup
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: task
+          image: registry.example.com/obsidian-mcp:CHANGE_ME   # the Deployment's tag
+          command: ["python", "-m", "scripts.rebuild_tsvectors"]
+          envFrom:
+            - configMapRef:
+                name: obsidian-mcp-config
+            - secretRef:
+                name: obsidian-mcp-secrets
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+          volumeMounts:
+            - name: vault
+              mountPath: /obsidian
+            - name: tmp
+              mountPath: /tmp
+            # + every /vaults/<name> and TLS mount the Deployment has
+      volumes:
+        - name: vault
+          persistentVolumeClaim:
+            claimName: obsidian-mcp-vault
+        - name: tmp
+          emptyDir: {}

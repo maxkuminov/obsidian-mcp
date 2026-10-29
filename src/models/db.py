@@ -340,6 +340,8 @@ _NOTE_STAT_COLUMN_MARKER = (
 # Migration 030's marker on `notes_metadata.derived_under`, byte identical to
 # its `MARKER`; declared as the column comment so `alembic check` compares it.
 _DERIVED_UNDER_COLUMN_MARKER = "re-derive progress digest (030_note_derived_under)"
+# Byte identical to `MARKER` in `alembic/versions/031_keyword_head_and_excerpt.py`.
+_BODY_EXCERPT_COLUMN_MARKER = "keyword excerpt (031_keyword_head_and_excerpt)"
 # The all-or-none CHECK over those four columns. The predicate is the
 # migration's `STAT_PREDICATE`, byte for byte.
 _NOTE_STAT_CHECK_NAME = "ck_notes_metadata_stat_all_or_none"
@@ -500,6 +502,23 @@ class NoteMetadata(Base):
     # that genuinely needs it selects the column explicitly.
     content_tsvector: Mapped[str | None] = mapped_column(
         TSVECTOR, nullable=True, deferred=True, deferred_raiseload=True
+    )
+    # The first `KEYWORD_EXCERPT_CHARS` characters of exactly the body text the
+    # row's keyword vector was built from (#344, migration 031, design D4):
+    # the same prefix the vector's successful attempt bound under the halving
+    # retreat, sentinel-free (U+0000/U+0002/U+0003 removed). Written in the
+    # same UPDATE as `content_tsvector` by the incremental pass and the
+    # rebuild; preserved by both move paths. `ts_headline` reads it
+    # server-side for `keyword_search`'s snippet; no read path ships it, hence
+    # deferred with raiseload like the vector. NULL means "the vector was last
+    # written by a build that stored no excerpt" (every pre-031 row until it is
+    # edited or `make rebuild-tsvectors` runs) and the tool says so.
+    body_excerpt: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        deferred=True,
+        deferred_raiseload=True,
+        comment=_BODY_EXCERPT_COLUMN_MARKER,
     )
     file_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
     modified_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

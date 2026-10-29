@@ -90,7 +90,10 @@ async def _matches(conn, configs, body, query):
     finally:
         fts.settings.fts_configs = orig
     sql = f"SELECT ({tsv_frag}) @@ ({_query_frag(configs)})"
-    row = await conn.execute(text(sql), {"content": body, "q": query, **params})
+    # An empty head (#344): these cases are about the body's stemming.
+    row = await conn.execute(
+        text(sql), {"content": body, "title": "", "aliases": "", "q": query, **params}
+    )
     return bool(row.scalar())
 
 
