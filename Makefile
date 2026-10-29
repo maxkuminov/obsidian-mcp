@@ -165,8 +165,10 @@ deploy: image
 	@echo "$(GREEN)Deploying Obsidian MCP...$(NC)"
 	# A deploy runs `alembic upgrade head` against the live database, so the
 	# backup is the only way back from a bad migration. If it cannot be taken,
-	# stop here rather than migrate unprotected.
-	@$(MAKE) db-backup || { \
+	# stop here rather than migrate unprotected. It is always a FULL dump
+	# (derived index tables included, #348): the point of this dump is an
+	# instant rollback, and a rollback that costs a full re-embed is not one.
+	@BACKUP_FULL=1 $(MAKE) db-backup || { \
 		echo "$(RED)Deploy ABORTED: database backup failed — refusing to migrate without one.$(NC)"; \
 		exit 1; \
 	}

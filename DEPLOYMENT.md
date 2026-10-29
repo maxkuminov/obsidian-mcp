@@ -783,7 +783,9 @@ deployment; on a compose-file deployment the equivalents are plain
   derivable from anything and are always dumped. `BACKUP_FULL=1 make
   db-backup` dumps everything; a weekly line of that beside the daily
   default is worth it when restore *time* matters more than dump size, since
-  a full dump restores a warm index instead of rebuilding one. `make
+  a full dump restores a warm index instead of rebuilding one. The
+  pre-migration dump that `make deploy` takes is always full for the same
+  reason: it exists for an instant rollback. `make
   db-restore` accepts either kind.
 
   **Restore runbook.** `make db-restore FILE=<dump.sql.gz>` loads a dump
