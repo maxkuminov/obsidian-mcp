@@ -1597,6 +1597,10 @@ batching and retry behavior, config validation, and the
 dimension-mismatch startup check. Network-bound tests use `respx` to
 mock httpx, so no real network access is required.
 
+Dependencies are exact pins (`==`) in `requirements*.txt`, bumped by
+Renovate; `renovate.json` holds `mcp` below 2.x (the 2.x migration is
+issue #365, not a routine bump) and digest-pins the Docker base image.
+
 To run the server outside Docker:
 
 ```bash

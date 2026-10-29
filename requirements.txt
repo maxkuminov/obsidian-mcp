@@ -18,6 +18,10 @@ pgvector==0.5.0
 # pip-audit gate, 2026-10-23). 1.29.0 added a streamable-HTTP request
 # body limit (4 MiB by default) which we size explicitly from the write caps —
 # see `Settings.mcp_max_request_body_bytes`.
+# Stay on 1.x: 1.30.0 is the last 1.x release, and since 2.0.0 (2026-07-28)
+# the 1.x line receives security fixes only. The 2.x migration is issue #365
+# and must not arrive as a routine bump; `renovate.json` holds mcp `<2` so
+# Renovate never proposes it here.
 mcp[cli]==1.30.0
 
 # Embeddings & search

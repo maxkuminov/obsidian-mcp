@@ -1,6 +1,14 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "config:recommended"
+    "config:recommended",
+    "docker:pinDigests"
+  ],
+  "packageRules": [
+    {
+      "description": "mcp 2.x is a migration (issue #365), not a routine bump; 1.x is security-fixes-only since 2.0.0 (2026-07-28).",
+      "matchPackageNames": ["mcp"],
+      "allowedVersions": "<2"
+    }
   ]
 }
