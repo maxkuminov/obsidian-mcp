@@ -462,8 +462,8 @@ get the app's own metadata cache for free; none of them work on a
 headless box, and none give claude.ai or a phone a way in without you
 exposing your desktop.
 
-**Headless and remote.** The server owns a copy of the files and runs
-anywhere. This server is one. [Vault Cortex][vc] (aliasunder,
+**Headless and remote.** The server works on the vault files directly,
+wherever they are mounted, with no Obsidian process. This server is one. [Vault Cortex][vc] (aliasunder,
 September 2026) is a single container with OAuth 2.1, SQLite FTS5 plus
 sqlite-vec fused by RRF and a local reranker, tasks and daily-note
 helpers, and a bundled Obsidian Headless Sync client; one vault per
