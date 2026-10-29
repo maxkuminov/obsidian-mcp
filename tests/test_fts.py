@@ -124,10 +124,13 @@ def test_index_tsvector_sql_three_configs(monkeypatch):
     assert frag.count("to_tsvector(") == 9
     assert frag.count("setweight(") == 6
     assert frag.count(" || ") == 8
+    # The builders sort the configs (#344, V-N4): 031 builds under the
+    # fingerprint's sorted list, so the writers must too, whatever order
+    # `FTS_CONFIGS` names them in.
     assert params == {
-        "fts_cfg_0": "simple",
-        "fts_cfg_1": "english",
-        "fts_cfg_2": "norwegian",
+        "fts_cfg_0": "english",
+        "fts_cfg_1": "norwegian",
+        "fts_cfg_2": "simple",
     }
 
 
@@ -154,8 +157,18 @@ def test_builders_take_explicit_configs_for_the_migration(monkeypatch):
     environment's — the builders accept them explicitly."""
     fts = _set_configs(monkeypatch, ["english"])
     frag, params = fts.rehead_tsvector_sql(configs=["simple", "norwegian"])
-    assert params == {"fts_cfg_0": "simple", "fts_cfg_1": "norwegian"}
+    assert params == {"fts_cfg_0": "norwegian", "fts_cfg_1": "simple"}  # sorted
     assert frag.count("setweight(") == 4
+
+
+def test_builders_produce_one_sql_whatever_the_config_order(monkeypatch):
+    """V-N4: the writers (settings order) and 031 (the fingerprint's sorted
+    list) must build byte-equal vectors, so the builders sort."""
+    fts = _set_configs(monkeypatch, ["simple", "english"])
+    from_settings = (fts.index_tsvector_sql(), fts.rehead_tsvector_sql())
+    _set_configs(monkeypatch, ["english", "simple"])
+    assert (fts.index_tsvector_sql(), fts.rehead_tsvector_sql()) == from_settings
+    assert fts.rehead_tsvector_sql(configs=["simple", "english"]) == from_settings[1]
 
 
 def test_index_tsvector_sql_never_interpolates_config_name(monkeypatch):
@@ -304,8 +317,9 @@ async def test_rebuild_tsvectors_updates_every_note(monkeypatch, tmp_path):
     assert ids == {1, 2}
     for text_sql, p in session.updates:
         # Both configs present as bound params; names never interpolated.
-        assert p["fts_cfg_0"] == "simple"
-        assert p["fts_cfg_1"] == "norwegian"
+        # Sorted by the builders (V-N4), not in `FTS_CONFIGS` order.
+        assert p["fts_cfg_0"] == "norwegian"
+        assert p["fts_cfg_1"] == "simple"
         assert "CAST(:fts_cfg_0 AS regconfig)" in text_sql
         assert "CAST(:fts_cfg_1 AS regconfig)" in text_sql
         assert "body" in p["content"]

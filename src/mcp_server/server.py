@@ -134,10 +134,11 @@ async def keyword_search(
 
     Each result carries `rank` (a relative score, not comparable across
     queries), `match`, `matched_in` (`title` — title or aliases — and/or
-    `body`), `terms` (`k/n`: how many of the query's terms the note contains),
-    and a second line: `snippet:` — the matching text with the matches in
-    `«»` — or `head:` — the note's opening words when the match is in the
-    title/aliases or beyond the stored excerpt. Snippets are computed for the
+    `body`, or `title+body` when the terms are split between them), `terms`
+    (`k/n`: how many of the query's terms the note contains), and a second
+    line: `snippet:` — the matching body text with the matches in `«»` — or
+    `head:` — the note's opening words when the body alone does not match
+    or the match is beyond the stored excerpt. Snippets are computed for the
     first rows of the page (the header says `snippets: first N` when the page
     is longer). The header always carries the `all`/`any` counts and how many
     rows have no stored excerpt yet (notes indexed before this version; the

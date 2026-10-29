@@ -63,7 +63,7 @@ class _Session:
         self._batches = list(batches)
 
     async def execute(self, clause, *_a, **_k):
-        if str(clause).lstrip().upper().startswith("SET LOCAL"):
+        if str(clause).lstrip().upper().startswith(("SET LOCAL", "SET TRANSACTION")):
             return _Result()
         return _Result(self._batches.pop(0) if self._batches else [])
 
@@ -83,7 +83,7 @@ class _FindRelatedSession(_Session):
         self._preamble = [[source] if source else [], chunks]
 
     async def execute(self, clause, *_a, **_k):
-        if not str(clause).lstrip().upper().startswith("SET LOCAL") and self._preamble:
+        if not str(clause).lstrip().upper().startswith(("SET LOCAL", "SET TRANSACTION")) and self._preamble:
             return _Result(self._preamble.pop(0))
         return await super().execute(clause, *_a, **_k)
 

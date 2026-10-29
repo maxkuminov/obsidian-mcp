@@ -50,11 +50,28 @@ def _fake_tsquery(monkeypatch):
     monkeypatch.setattr(search, "combined_tsquery", lambda _q: "tsq")
 
 
+SET_TRANSACTION = "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+
+
 def _select(session):
-    """The conjunctive statement: the first non-`SET LOCAL` clause. #344 added
-    the parse-text statement (and, with rows, the snippet statements) after
-    it; the hint and the tie-break are properties of this one."""
-    return session.clauses[1]
+    """The conjunctive statement: the first clause after `SET TRANSACTION`
+    and `SET LOCAL`. #344 added the parse-text statement (and, with rows, the
+    snippet statements) after it; the hint and the tie-break are properties
+    of this one."""
+    return session.clauses[2]
+
+
+@pytest.mark.asyncio
+async def test_the_call_opens_one_read_only_snapshot_before_any_query():
+    """Codex C-1: every statement of one call reads one snapshot, so the
+    disjunctive statement's `NOT (v @@ <and query>)` excludes exactly the
+    conjunctive block. `SET TRANSACTION` is legal only before the first
+    snapshot-taking statement, so it is the call's first statement."""
+    session = _RecordingSession()
+    await search.full_text_search(session, "needle")
+
+    assert session.statements[0].strip() == SET_TRANSACTION
+    assert session.statements[1].strip().startswith("SET LOCAL")
 
 
 @pytest.mark.asyncio
@@ -62,12 +79,12 @@ async def test_random_page_cost_is_set_before_the_select():
     session = _RecordingSession()
     await search.full_text_search(session, "needle")
 
-    assert session.statements[0].strip() == "SET LOCAL random_page_cost = 1.1"
+    assert session.statements[1].strip() == "SET LOCAL random_page_cost = 1.1"
     # The conjunctive select, then PostgreSQL's parse of the query (#344) —
     # which, with no rows and no eligible parse, is where the call ends.
-    assert len(session.statements) == 3
-    assert "SET LOCAL" not in session.statements[1]
-    assert "websearch_to_tsquery" in session.statements[2]
+    assert len(session.statements) == 4
+    assert "SET " not in session.statements[2]
+    assert "websearch_to_tsquery" in session.statements[3]
 
 
 @pytest.mark.asyncio
@@ -98,7 +115,8 @@ async def test_hint_and_tie_break_apply_under_every_filter(kwargs):
     session = _RecordingSession()
     await search.full_text_search(session, "needle", **kwargs)
 
-    assert session.statements[0].strip() == "SET LOCAL random_page_cost = 1.1"
+    assert session.statements[0].strip() == SET_TRANSACTION
+    assert session.statements[1].strip() == "SET LOCAL random_page_cost = 1.1"
     assert "file_path ASC" in str(_select(session))
 
 

@@ -179,21 +179,27 @@ async def test_body_only_order_is_unchanged_by_the_weight_array(sessionmaker, va
     assert ours == default and len(ours) == 4
 
 
-async def test_every_writer_produces_the_same_shape(sessionmaker, vault):
+@pytest.mark.parametrize("configs", [["english"], ["simple", "english"]])
+async def test_every_writer_produces_the_same_shape(sessionmaker, vault, monkeypatch, configs):
     """The pass's vector equals migration 031's re-head of its own D part, and
     the rebuild's rewrite — byte for byte (the first application over a
-    D-only vector is exact)."""
-    body = "a body with words\n"
+    D-only vector is exact). Under `simple,english` too (V-N4): the writers
+    run in `FTS_CONFIGS` order, 031 under the fingerprint's sorted list, and
+    the builders sort, so the bytes agree."""
+    monkeypatch.setattr(settings, "fts_configs", configs, raising=False)
+    body = "a body with words running\n"
     write(vault, {"Shape.md": ({"aliases": "one, two"}, body)})
     await index(vault)
     # A row as a pre-031 build left it (a D-only vector), re-headed the way
-    # 031 does it from stored columns, equals the pass's vector byte for byte.
-    frag, params = fts.rehead_tsvector_sql("head_title", "head_aliases")
+    # 031 does it from stored columns — under the fingerprint's configs,
+    # which are stored sorted — equals the pass's vector byte for byte.
+    body_frag, body_params = fts.body_tsvector_sql("body")
+    frag, params = fts.rehead_tsvector_sql("head_title", "head_aliases", sorted(configs))
     async with sessionmaker() as session:
         await session.execute(text(
             "INSERT INTO notes_metadata (user_id, file_path, title, frontmatter, content_hash, content_tsvector) "
-            "VALUES (NULL, 'Raw.md', 'Shape', CAST(:fm AS jsonb), 'h', to_tsvector('english', :body))"
-        ), {"fm": json.dumps({"aliases": "one, two"}), "body": body})
+            f"VALUES (NULL, 'Raw.md', 'Shape', CAST(:fm AS jsonb), 'h', {body_frag})"
+        ), {"fm": json.dumps({"aliases": "one, two"}), "body": body, **body_params})
         await session.execute(text(
             f"UPDATE notes_metadata SET content_tsvector = {frag} WHERE file_path = 'Raw.md'"
         ), {"head_title": "Shape", "head_aliases": "one\ntwo", **params})
@@ -382,6 +388,50 @@ async def test_a_row_without_an_excerpt_is_counted_not_guessed(sessionmaker, vau
     rows = await search(sessionmaker, "xylograph")
     old = next(r for r in rows if r["path"] == "old.md")
     assert old["snippet"] is None and old["head"] is None and old["has_excerpt"] is False
+
+
+async def test_a_title_only_or_split_match_shows_a_clean_head(sessionmaker, vault):
+    """V-B1: the body holding one of the two query words is not a body match,
+    so no highlight is shown even though `ts_headline` would mark the word.
+    V-B2: the head carries no marker of any kind, including PostgreSQL's
+    default `<b>`, for a query word inside the head's leading words. V-N5: a
+    match split across title and body renders `title+body`."""
+    write(vault, {
+        "Quarterly Review.md": "Quarterly numbers were up this period, as expected.\n",
+        "Zephyr Quill.md": "one two three four five six seven eight nine zephyr eleven twelve\n",
+        "Zephyr Notes.md": "a quill is kept here\n",
+    })
+    await index(vault)
+    by_path = {r["path"]: r for r in await search(sessionmaker, "quarterly review", limit=10)}
+    qr = by_path["Quarterly Review.md"]
+    assert qr["matched_in"] == ["title"] and qr["snippet"] is None
+    assert qr["head"].startswith("Quarterly numbers were up")
+    for marker in ("«", "»", "<b>", "\x02", "\x03"):
+        assert marker not in qr["head"], marker
+
+    by_path = {r["path"]: r for r in await search(sessionmaker, "zephyr quill", limit=10)}
+    zq = by_path["Zephyr Quill.md"]
+    assert zq["matched_in"] == ["title"] and zq["snippet"] is None
+    assert "nine zephyr eleven" in zq["head"]
+    split = by_path["Zephyr Notes.md"]
+    assert split["match"] == "all" and split["matched_in"] == ["title+body"]
+    assert split["snippet"] is None and split["head"].startswith("a quill is kept")
+    out = await tools.search_notes_impl("zephyr quill")
+    assert "— matched_in: title+body" in out and "«" not in out and "<b>" not in out
+
+
+async def test_the_call_reads_one_repeatable_read_snapshot(sessionmaker, vault):
+    """Codex C-1: the conjunctive, disjunctive and snippet statements share one
+    snapshot. Still inside the call's transaction, the session reports
+    REPEATABLE READ, read-only."""
+    write(vault, {"s.md": "snapshot alpha only\n", "t.md": "snapshot alpha beta\n"})
+    await index(vault)
+    async with sessionmaker() as session:
+        rows = await full_text_search(session, "alpha beta gamma", limit=10)
+        isolation = (await session.execute(text("SHOW transaction_isolation"))).scalar()
+        read_only = (await session.execute(text("SHOW transaction_read_only"))).scalar()
+    assert {r["path"] for r in rows} == {"s.md", "t.md"}
+    assert isolation == "repeatable read" and read_only == "on"
 
 
 async def test_the_snippet_cost_is_bounded_by_the_row_cap_not_the_limit(sessionmaker, vault, monkeypatch):

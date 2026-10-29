@@ -109,11 +109,18 @@ HEADLINE_OPTIONS = (
     'FragmentDelimiter=" … "'
 )
 
-#: Head mode: the excerpt's leading words for a row whose excerpt holds no
-#: highlight (a title/alias-only match, or a match beyond the stored excerpt).
-#: `MaxFragments=0` with no cover returns the document's first `MinWords`
-#: words (measured: eighteen).
-HEAD_OPTIONS = "MaxFragments=0, MinWords=18, MaxWords=24"
+#: Head mode: the excerpt's leading words for a row whose body part did not
+#: match (a title/alias-only or split match) or whose excerpt held no
+#: highlight (a match beyond the stored excerpt). `MaxFragments=0` with no
+#: cover returns the document's first `MinWords` words (measured: eighteen).
+#: PostgreSQL still marks single query words inside those words, so the head
+#: carries the same sentinels as the fragment mode and the service strips
+#: them (`strip_sentinels`) — never PostgreSQL's default `<b>…</b>`, which a
+#: note may contain literally (#344, V-B2).
+HEAD_OPTIONS = (
+    "MaxFragments=0, MinWords=18, MaxWords=24, "
+    f"StartSel={HEADLINE_START}, StopSel={HEADLINE_STOP}"
+)
 
 _SENTINEL_RE = re.compile("[\x00\x02\x03]")
 
@@ -134,8 +141,12 @@ def strip_sentinels(value: str) -> str:
 
 def _configs(configs: list[str] | None) -> list[str]:
     """`configs` when given (migration 031 builds under the configs the stored
-    fingerprint names, not the environment's), else the running setting."""
-    return list(configs) if configs is not None else list(settings.fts_configs)
+    fingerprint names, not the environment's), else the running setting —
+    **sorted** either way. The fingerprint stores its configs sorted, so 031
+    and the writers build the same bytes whatever order `FTS_CONFIGS` lists
+    them in (#344, V-N4). The query side keeps the setting's order: a tsquery
+    OR is order-free, and `fts_configs[0]` there is the head's config."""
+    return sorted(configs if configs is not None else settings.fts_configs)
 
 
 def _cfg_params(configs: list[str] | None = None) -> dict:
@@ -171,7 +182,9 @@ def head_tsvector_sql(
 def body_tsvector_sql(
     content_bind: str = "content", configs: list[str] | None = None
 ) -> tuple[str, dict]:
-    """The weight-`D` body — the pre-031 fragment, byte for byte.
+    """The weight-`D` body — the pre-031 fragment, byte for byte, for one
+    config (or configs listed in sorted order; the builders sort, see
+    :func:`_configs`).
 
     Example (two configs)::
 

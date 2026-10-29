@@ -1,5 +1,6 @@
 import ipaddress
 import logging
+import math
 import resource
 import sys
 from typing import Annotated, Any, Literal
@@ -186,6 +187,11 @@ MAX_LIST_PATTERN_CHARS = 1024
 # opposite sides of the body/no-body line and carry different usage markers on
 # purpose.
 MAX_SEARCH_QUERY_CHARS = 8192
+
+#: The smallest accepted `RANK_WEIGHTS` entry (#344, Codex C-3). The array is
+#: bound as `float4[]`, where a positive Python float below float4's smallest
+#: subnormal (~1.4e-45) encodes as 0 and silently zeroes that weight's covers.
+RANK_WEIGHT_MIN = 1e-6
 
 # Upper bound on `import_from_url`'s `url` argument (#322), through the same
 # declarative `arg_char_caps` screen as the search query: the existing
@@ -486,8 +492,8 @@ class Settings(BaseSettings):
     # where PostgreSQL's default `D = 0.1` lets ten body repetitions tie the
     # title — the #344 failure. Changing it re-ranks title-versus-body
     # competition only; body-only order is unchanged by any uniform `D`.
-    # Accepts `{0.02, 0.2, 0.4, 1.0}`, a JSON list or a CSV; four numbers in
-    # (0, 1]. See "Keyword ranking" in docs/architecture/search.md.
+    # Accepts `{0.02, 0.2, 0.4, 1.0}`, a JSON list or a CSV; four finite
+    # numbers in [1e-6, 1] (`RANK_WEIGHT_MIN`: float4 must not round one to 0). See "Keyword ranking" in docs/architecture/search.md.
     rank_weights: Annotated[list[float], NoDecode] = [0.02, 0.2, 0.4, 1.0]
     # How many leading characters of the text a keyword vector was built from
     # are stored in `notes_metadata.body_excerpt` for `ts_headline`. Applies to
@@ -1148,7 +1154,8 @@ class Settings(BaseSettings):
     @classmethod
     def _parse_rank_weights(cls, v):
         """`{0.02, 0.2, 0.4, 1.0}` (PostgreSQL array spelling), a JSON list, a
-        CSV, or a list: exactly four numbers, each in (0, 1], as `D, C, B, A`."""
+        CSV, or a list: exactly four finite numbers, each in [1e-6, 1], as
+        `D, C, B, A`."""
         if isinstance(v, str):
             s = v.strip()
             if s.startswith("{") and s.endswith("}"):
@@ -1175,10 +1182,15 @@ class Settings(BaseSettings):
                 number = float(str(item).strip())
             except ValueError as e:
                 raise ValueError(f"RANK_WEIGHTS entry {item!r} is not a number") from e
-            if not (0.0 < number <= 1.0) or number != number:
+            # Finite and in [1e-6, 1]: ts_rank_cd divides by each weight (zero
+            # is not a weight) and PostgreSQL refuses one above 1 ("weight out
+            # of range"); the array binds as float4, where a positive value
+            # below ~1.4e-45 encodes as 0 — so the floor sits far above that.
+            if not math.isfinite(number) or not (RANK_WEIGHT_MIN <= number <= 1.0):
                 raise ValueError(
-                    f"RANK_WEIGHTS entry {item!r} is outside (0, 1]; ts_rank_cd "
-                    "divides by each weight, so zero is not a weight"
+                    f"RANK_WEIGHTS entry {item!r} is outside [{RANK_WEIGHT_MIN:g}, 1]; "
+                    "ts_rank_cd divides by each weight, PostgreSQL refuses one above 1, "
+                    "and a smaller value would bind as float4 zero"
                 )
             out.append(number)
         if len(out) != 4:

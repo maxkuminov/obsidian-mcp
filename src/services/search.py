@@ -1,8 +1,11 @@
 """`keyword_search`'s service: the conjunctive block, the disjunctive fill and
 the page-bounded snippet (#344; design D2–D4, D8).
 
-Three kinds of statement, all in the one transaction that issued
-`SET LOCAL random_page_cost = 1.1`:
+Three kinds of statement, all in the one transaction that opens with
+`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY` and issued
+`SET LOCAL random_page_cost = 1.1` — one snapshot for every statement, so a
+concurrent index commit between the conjunctive and the disjunctive statement
+cannot drop a note from both blocks (Codex C-1):
 
 1. **The conjunctive statement** — `websearch_to_tsquery` per config OR'd,
    `@@`, the shared filters, `rank DESC, file_path ASC`, `LIMIT limit`. Its
@@ -19,7 +22,8 @@ Three kinds of statement, all in the one transaction that issued
    `KEYWORD_SNIPPET_ROWS` rows of the assembled page and nothing else: one per
    block for the highlighted headline per config, `matched_in` and the
    per-config `matched_terms` counts; then one more per block for the `head:`
-   text of the rows whose excerpt held no highlight. Their cost is a function
+   text of the rows whose body part did not match or whose excerpt held no
+   highlight. Their cost is a function
    of the row cap, the excerpt cap and the config count — never of `limit` —
    and is recorded as `snippet_ms`.
 """
@@ -40,6 +44,7 @@ from src.services.fts import (
     HEADLINE_START,
     HEADLINE_STOP,
     FallbackPlan,
+    strip_sentinels,
     best_matched_terms,
     combined_tsquery,
     fallback_plan,
@@ -155,18 +160,28 @@ async def _snippets(session, ids: list[int], tsquery, plan: FallbackPlan | None)
     for row in rows:
         m = row._mapping
         snippet = None
-        for i in range(len(settings.fts_configs)):
-            hl = m.get(f"hl_{i}")
-            if hl and HEADLINE_START in hl:
-                snippet = hl.replace(HEADLINE_START, RENDER_START).replace(
-                    HEADLINE_STOP, RENDER_STOP
-                )
-                break
+        # A headline is the matching span only when the body part itself
+        # matched the block's query: with no full cover `ts_headline` still
+        # marks single query words, so a title-only or split match would
+        # otherwise render a body "highlight" that is not the match (V-B1).
+        if m.get("matched_body"):
+            for i in range(len(settings.fts_configs)):
+                hl = m.get(f"hl_{i}")
+                if hl and HEADLINE_START in hl:
+                    snippet = hl.replace(HEADLINE_START, RENDER_START).replace(
+                        HEADLINE_STOP, RENDER_STOP
+                    )
+                    break
         matched_in = []
         if m.get("matched_title"):
             matched_in.append("title")
         if m.get("matched_body"):
             matched_in.append("body")
+        if not matched_in:
+            # Every id here matched the block's query over the whole vector,
+            # so neither part alone matching means the match needs both —
+            # one term in the title, another in the body (V-N5).
+            matched_in.append("title+body")
         pairs = [
             (int(m.get(f"mt_{i}") or 0), len(units)) for i, units in units_by_config
         ]
@@ -195,7 +210,10 @@ async def _snippets(session, ids: list[int], tsquery, plan: FallbackPlan | None)
         for row in (await session.execute(head_stmt)).all():
             m = row._mapping
             if m["id"] in out:
-                out[m["id"]]["head"] = m["head"]
+                # Same sentinels as the fragment mode (`HEAD_OPTIONS`); the
+                # head is never highlighted, so they are removed, not rendered.
+                head = m["head"]
+                out[m["id"]]["head"] = strip_sentinels(head) if head else head
     return out
 
 
@@ -240,6 +258,19 @@ async def full_text_search(
     # SET LOCAL scopes to this transaction only — the database is shared with
     # other tenants, so no global setting is touched. Every statement of this
     # call runs on this session, inside this transaction.
+    #
+    # And under one snapshot (Codex C-1): the disjunctive statement excludes
+    # `v @@ <and query>` on the premise that every such row is already in the
+    # conjunctive block, which holds only if both statements see the same
+    # data. At READ COMMITTED an index commit between them can drop a note
+    # from both blocks. `SET TRANSACTION` must precede the first statement that
+    # takes a snapshot; `SET LOCAL` takes none, and the caller hands over a
+    # session with no statement run (`search_notes_impl`). READ ONLY: this
+    # path never writes, and a read-only REPEATABLE READ transaction cannot
+    # raise a serialization failure.
+    await session.execute(
+        text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+    )
     await session.execute(text("SET LOCAL random_page_cost = 1.1"))
 
     filters = dict(folder=folder, tags=tags, frontmatter=frontmatter, user_id=user_id)

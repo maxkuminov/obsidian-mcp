@@ -70,7 +70,7 @@ class _RecordingSession:
         self.statements: list = []
 
     async def execute(self, clause, *_a, **_k):
-        if str(clause).lstrip().upper().startswith("SET LOCAL"):
+        if str(clause).lstrip().upper().startswith(("SET LOCAL", "SET TRANSACTION")):
             return _Result()
         self.statements.append(clause)
         return _Result(self._batches.pop(0) if self._batches else [])
@@ -155,6 +155,23 @@ def test_content_tsvector_is_deferred_with_raiseload():
     assert dict(prop.strategy_key).get("raiseload") is True
 
 
+def test_body_excerpt_is_deferred_with_raiseload():
+    """#344 (V-N1): the stored excerpt is read only inside `ts_headline`
+    server-side; an entity reader must fail loudly, never lazy-load it."""
+    prop = inspect(NoteMetadata).attrs.body_excerpt
+    assert prop.deferred is True
+    assert dict(prop.strategy_key).get("raiseload") is True
+
+
+def test_touching_body_excerpt_on_a_loaded_entity_raises():
+    note = NoteMetadata(id=1, file_path="a.md", title="a", content_hash="h")
+    make_transient_to_detached(note)
+    session = Session()
+    session.add(note)
+    with pytest.raises(InvalidRequestError, match="raiseload"):
+        _ = note.body_excerpt
+
+
 def test_frontmatter_stays_eager():
     """D5 assessed `frontmatter` and left it alone: deferring it would turn any
     future entity reader on a write path into a runtime error."""
@@ -176,6 +193,7 @@ def test_a_whole_entity_select_no_longer_carries_content_tsvector():
 
     sql = str(select(NoteMetadata).compile(dialect=postgresql.dialect()))
     assert "content_tsvector" not in sql
+    assert "body_excerpt" not in sql
     assert "frontmatter" in sql  # still eager
 
 

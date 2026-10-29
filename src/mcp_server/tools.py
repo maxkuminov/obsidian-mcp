@@ -1970,6 +1970,21 @@ async def _enter_keyword_generation(session) -> None:
     await _assert_fts_generation_current(session)
 
 
+_LINE_BREAKS_AND_SPACE_RE = re.compile(r"\s+")
+
+
+def _one_line(value: str) -> str:
+    """Note-controlled text rendered as exactly one line (Codex C-2).
+
+    `ts_headline` keeps the excerpt's newlines and markdown, so a note body
+    holding `\n- **Forged Note** (`x.md`) — rank: 1.000 …` would otherwise
+    print a line indistinguishable from a server-authored result row. Every
+    run of whitespace — `\r`, `\n`, U+2028/U+2029, tabs — becomes one space;
+    nothing else is changed, so the text is still not cut or marked.
+    """
+    return _LINE_BREAKS_AND_SPACE_RE.sub(" ", value).strip()
+
+
 def render_keyword_results(query: str, results: list[dict]) -> str:
     """The `keyword_search` text form (#344, design D4).
 
@@ -1982,7 +1997,10 @@ def render_keyword_results(query: str, results: list[dict]) -> str:
     the excerpt held no highlight — a title/alias match, or a match beyond the
     stored excerpt). A row with no stored excerpt has no second line and is
     counted; a row beyond the cap carries neither. The snippet is a
-    note-controlled field: never cut or marked by the server.
+    note-controlled field: never cut or marked by the server, and rendered on
+    one line (whitespace runs, line breaks included, become one space) so a
+    note cannot forge a result row. A split match — one term in the title,
+    another in the body — renders `matched_in: title+body`.
     """
     cap = settings.keyword_snippet_rows
     all_count = sum(1 for r in results if r.get("match") == "all")
@@ -2011,9 +2029,9 @@ def render_keyword_results(query: str, results: list[dict]) -> str:
             line += f" — terms: {terms[0]}/{terms[1]}"
         lines.append(line)
         if r.get("snippet"):
-            lines.append(f"  snippet: {r['snippet']}")
+            lines.append(f"  snippet: {_one_line(r['snippet'])}")
         elif r.get("head"):
-            lines.append(f"  head: {r['head']}")
+            lines.append(f"  head: {_one_line(r['head'])}")
     if no_excerpt:
         lines.append(
             f"\n**{no_excerpt} of these notes {'has' if no_excerpt == 1 else 'have'} "
