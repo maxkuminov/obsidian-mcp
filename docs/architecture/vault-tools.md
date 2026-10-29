@@ -116,6 +116,16 @@ an earlier change pinned in those docstrings — #128, #140, #149, #150, #205 �
 is still there; their tests ran unmodified. The `tools.py` implementation
 docstrings are not on the wire and were not shortened.
 
+Two statements were corrected in review rather than merely shortened, and the
+test asserts them as clauses, not tokens: "every refusal ends with one
+`MCP-REFUSAL` line" is true only of refusals the server raises — an
+undeclared or mistyped argument is rejected by protocol validation before
+`_tracked` and carries no such line (#295) — so the five descriptions that make
+the statement (`edit_note`, `move_note`, `set_frontmatter`, and the otherwise
+untouched `create_note` and `delete_note`) now say so; and "`expected_hash` is
+optional" is a default, because `WRITE_PRECONDITION_REQUIRED=true` refuses an
+omitted hash with `precondition_required`.
+
 ## Write tools
 Returned body refusals carry a pure `BodyOutcome` and an authoritative final
 `MCP-REFUSAL` line (#263). `_tracked` classifies only the terminal typed value;
