@@ -238,6 +238,23 @@ looks the way it does.
 The server exposes 25 MCP tools across five families, plus the auth
 and ops layer around them.
 
+Every tool is published with a `title` and MCP `ToolAnnotations`, all
+four hints set explicitly: `readOnlyHint` on the fifteen tools that only
+read (search, read, list, graph, `check_upload`), `destructiveHint` on
+the eight that can replace or remove something (`edit_note`,
+`move_note`, `delete_note`, `set_frontmatter`, `write_file`,
+`delete_file`, `import_from_url`, and `request_upload`, whose link can
+overwrite on redemption), `openWorldHint` on `import_from_url` only.
+`create_note` and `request_download` are additive. Clients that honour
+annotations run read-only tools without a per-call confirmation (Claude
+Code also runs them in parallel) and keep prompting on destructive ones.
+They are hints: the server enforces read-only credentials itself,
+regardless of what a client does with them. The `initialize` result also
+carries a short `instructions` paragraph — what the vault is, which tool
+to reach for, and the write-safety rules — for clients that load only
+tool names at session start. No description exceeds 4,000 characters on
+the wire, so none is cut off by a client's description limit.
+
 ### Search and discovery
 - `keyword_search(query, folder?, tags?, frontmatter?, limit=20)`,
   full-text via PostgreSQL `tsvector`; the text-search config(s) are
@@ -880,9 +897,11 @@ authoritative about its own rules.
 
 `get_vault_guide()` does exactly this. It returns a generic Obsidian
 primer (wikilink syntax, embed syntax, tag conventions, common plugin
-literals) plus the vault's `CLAUDE.md` live. The hint to call it first
-is baked into the write-tool descriptions so the agent gets pulled
-into the right behavior even without prompting.
+literals) plus the vault's `CLAUDE.md` live. The write-tool
+descriptions and the server's `instructions` both point at it — as a
+description of where the vault's conventions live, not as an order —
+so the agent gets pulled into the right behavior even without
+prompting.
 
 ## Multi-user mode
 

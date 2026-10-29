@@ -96,7 +96,7 @@ Adding titles, annotations and instructions, and shortening descriptions, SHALL 
 #### Scenario: Every schema is identical to the fixture
 - **WHEN** each tool's `inputSchema` and `outputSchema` are compared with the fixture entry of the same name
 - **THEN** each SHALL be equal as a JSON value
-- **AND** `read_note` SHALL remain the only tool with an `outputSchema`
+- **AND** the set of tools carrying an `outputSchema` SHALL be unchanged — on 5a391ca every tool but `read_file` carries one (the SDK wraps a `str` return as `{"result": string}`; `read_note` publishes its model's schema; `read_file` returns content blocks and has none)
 
 #### Scenario: Unknown-argument refusal is unaffected
 - **WHEN** `tests/test_issue_295_unknown_arguments.py` runs unmodified

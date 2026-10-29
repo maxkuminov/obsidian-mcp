@@ -2,6 +2,7 @@ from urllib.parse import urlparse
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ToolAnnotations
 from pydantic import ConfigDict
 
 from src.config import settings
@@ -89,8 +90,78 @@ def _origin_patterns(origins) -> list[str]:
     return out
 
 
+# ── Tool metadata (#343) ────────────────────────────────────────────────────
+#
+# Every registration below carries a `title` and one of these four
+# `ToolAnnotations` shapes, with all four hints set explicitly — an absent hint
+# is read by clients as the protocol's worst case (not read-only, destructive,
+# open-world). The hints are a *client-side* signal (auto-approve read-only
+# calls, prompt on destructive ones, run read-only tools in parallel); nothing
+# server-side consults them. Enforcement is unchanged: `_tracked` resolves the
+# vault root and runs the admission gates before any body, and `_require_write`
+# refuses a read-only credential inside every write body.
+#
+# The classification, pinned by `tests/test_issue_343_tool_metadata.py`
+# against the code rather than a list:
+#   read-only   = the fifteen tools that neither change vault bytes nor mint a
+#                 capability (idempotent, closed-world)
+#   destructive = the write-bucket set (`_tracked(write_class=True)`) minus
+#                 `create_note` (no-clobber, additive) plus `request_upload`
+#                 (its `overwrite=True` capability overwrites on redemption)
+#   open-world  = `import_from_url` only
+# A `.trash/` undo path does not make a delete non-destructive, and the hints
+# are per tool, not per call: `edit_note(dry_run=True)` is still "destructive".
+# See docs/architecture/vault-tools.md, "Tool metadata".
+_READ_ONLY = ToolAnnotations(
+    readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
+)
+_ADDITIVE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False
+)
+_DESTRUCTIVE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False
+)
+_DESTRUCTIVE_OPEN_WORLD = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True
+)
+
+# Published in the `initialize` result. Some clients load only tool names and
+# this text at session start, so the first paragraph (≤ 512 characters) is the
+# whole contract; the total stays ≤ 2,000. Every sentence must be true of the
+# server (#131) — the round trip is stated with its conditions and
+# `expected_hash` as optional, because an unqualified "pass `content` back"
+# after a truncated read replaces the note with the fragment. Nothing may
+# depend on a client having read this (claude.ai is reported to drop it).
+SERVER_INSTRUCTIONS = (
+    "Agent memory in a markdown Obsidian vault. Search with `keyword_search` "
+    "(exact names) or `semantic_search` (concepts); read with `read_note`; "
+    "write with `create_note` (new notes only) or `edit_note` (`dry_run=true` "
+    "first). `get_vault_guide` describes this vault's conventions; one call "
+    "per session is enough. `create_note` never overwrites. Editing tools take "
+    "an optional `expected_hash` (a read's `content_hash`) and refuse, writing "
+    "nothing, if the file changed meanwhile; without it a stale edit "
+    "overwrites."
+    "\n\n"
+    "Round trips: only `content` from a complete whole-note `read_note` "
+    "(`offset=0`, `truncated=false`) may go back as a full replacement; a "
+    "section's `content` goes back only with the same `section=` selector; "
+    "finish a truncated read before writing, or the rest of the note is lost. "
+    "Server refusals end with one machine-readable line, "
+    '`MCP-REFUSAL {"code":…}`; act on the code, not the prose '
+    "(protocol-layer argument errors do not carry it). Non-markdown files use "
+    "`read_file`, `write_file`, `list_files` and `delete_file`. "
+    "`request_upload` and `request_download` mint short-lived links for a "
+    "person; `import_from_url` fetches a public https URL into the vault. The "
+    "link graph is `get_backlinks`, `get_links`, `get_neighborhood`, "
+    "`find_related` and `find_orphans`. Deletes are soft (`.trash/`) unless "
+    "`permanent=true`. Calls are rate-limited per credential; a rate refusal "
+    "says when to retry and spends no daily quota."
+)
+
+
 mcp = FastMCP(
     "obsidian-vault",
+    instructions=SERVER_INSTRUCTIONS,
     stateless_http=True,
     streamable_http_path="/",
     # Derived from the write caps rather than the SDK's 4 MiB default, which
@@ -110,7 +181,7 @@ mcp = FastMCP(
 )
 
 
-@mcp.tool()
+@mcp.tool(title="Keyword search", annotations=_READ_ONLY)
 async def keyword_search(
     query: str,
     folder: str | None = None,
@@ -138,7 +209,7 @@ async def keyword_search(
     )
 
 
-@mcp.tool()
+@mcp.tool(title="Read note", annotations=_READ_ONLY)
 async def read_note(
     path: str,
     section: str | None = None,
@@ -147,91 +218,54 @@ async def read_note(
 ) -> ReadNoteResult:
     """Read a note from the Obsidian vault by its relative path.
 
-    Returns a **structured result**, not a rendered document. Metadata and note
-    content sit in separate fields, so there is no envelope to parse and no
-    textual procedure to get wrong — read the fields:
+    Arguments: `path`, an optional `section` (an ATX heading), and `offset` / `limit` for paging. Returns a
+    **structured result**, not a rendered document — read the fields:
 
-    - `content` — the selected note text. Whole-note reads: the body with a
-      valid YAML frontmatter block stripped, which is exactly what
-      `edit_note(path, content)` full replacement accepts. Section reads: the
-      section's **body only**, which is exactly what
-      `edit_note(path, content, section=...)` accepts. Pass it straight back;
-      do not add, strip or split anything.
-    - `heading` — section reads only: the matched heading line, with no line
-      terminator. It is *not* part of `content`, and a section write must not
-      be sent it — the heading line is never rewritten.
+    - `content` — the selected note text. Whole-note reads: the body with a valid YAML frontmatter block
+      stripped, which is byte-exact input for `edit_note(path, content)` full replacement only when the read is
+      complete and unwindowed (`offset=0` and `truncated` false). Section reads: the section's **body only**,
+      byte-exact input for `edit_note(path, content, section=...)` under the same condition. Pass it straight
+      back; do not add, strip or split anything. Page a truncated read to the end before writing it back, or
+      full replacement replaces the whole body with the fragment.
+    - `heading` — section reads only: the matched heading line, with no line terminator. It is *not* part of
+      `content`; a section write never rewrites the heading line.
+    - `error` — set when the read failed (missing note, bad `offset`/`limit`, unknown section). A normal
+      result, not a transport error; the content-bearing fields are absent beside it.
+    - `content_hash` — the **whole file's** digest, `sha256:<64 lowercase hex>`, in every mode (a section or
+      truncated read returns the value a whole-note read would), and the token the write tools take as
+      `expected_hash`. It is not a hash of `content`: never compute it yourself, hand it back verbatim.
     - `path`, `title`, `tags` — metadata as data.
-    - `frontmatter_yaml` — the frontmatter block's YAML source, fence lines
-      excluded, LF-normalized (a CRLF or lone-CR block comes back with LF
-      terminators — the same declared residual `content` carries, because this
-      tool normalises and the write tools work on raw bytes; `edit_note` still
-      reattaches the original block byte-identically). This is the
-      authoritative copy. `frontmatter` is a best-effort JSON view of the same
-      block for convenience and may be absent — dates, non-string keys,
-      recursive aliases and unpaired-surrogate escapes have no faithful JSON
-      form, and `metadata_omissions` then says which and why. To change
-      frontmatter use `set_frontmatter`, or edit the raw block with
-      `edit_note(find=...)`; never write back a round trip of the JSON view.
-    - `truncated`, `offset`, `next_offset`, `total_chars` — truncation as data.
-      `outline` (whole-note reads that were truncated) lists every section with
-      its `#N` ordinal so you can fetch the one you want directly, and `notice`
-      carries the guidance in prose.
-    - `metadata_omissions` — any metadata field this response had to drop, and
-      why. Nothing is ever signalled by a marker inside a field.
-    - `content_hash` — this note's file digest, `sha256:<64 lowercase hex>`,
-      and the token the write tools accept as `expected_hash` to bind a write
-      to the bytes you actually read. Three things about it:
-      it is the **whole file's** hash in every mode — a section read and a
-      truncated read return the same value a whole-note read of the unchanged
-      file returns, so a section write guarded with it is refused when
-      *anything* in the file changed (that is the trade, and it is why the
-      argument is optional: bind when you reasoned about what you read, omit
-      when you are appending to a log); it comes from the same read that built
-      this response, never a second one; and it is **not** a hash of `content`
-      — a note with frontmatter, or with CRLF terminators, has a digest the
-      returned text cannot reproduce, so never compute it yourself, hand this
-      value back verbatim. `read_file` on the same path is the byte-exact
-      route to the file itself, `frontmatter_yaml` here being authoritative
-      but LF-normalized.
-    - `error` — set when the read failed (missing note, bad `offset`/`limit`,
-      unknown section). It is a normal result, not a transport error, and the
-      content-bearing fields are absent beside it.
+    - `frontmatter_yaml` — the frontmatter block's YAML source, fence lines excluded, LF-normalized (a CRLF
+      block comes back with LF terminators — the same declared residual `content` carries, because this tool
+      normalises and the write tools work on raw bytes; `edit_note` still reattaches the original block
+      byte-identically). This is the authoritative copy. `frontmatter` is a best-effort JSON view of the same
+      block and may be absent; `metadata_omissions` then says which fields were dropped and why. To change
+      frontmatter use `set_frontmatter`, or edit the raw block with `edit_note(find=...)`; never write back a
+      round trip of the JSON view.
+    - `truncated`, `offset`, `next_offset`, `total_chars` — truncation as data. `outline` (truncated whole-note
+      reads) lists every section with its `#N` ordinal so you can fetch the one you want directly, and `notice`
+      carries the guidance in prose. Read the one section you need with `section=` rather than paging a large
+      note; `content`, the outline and the metadata fields each have their own budget.
+    - `metadata_omissions` — any metadata field this response had to drop, and why. Nothing is ever signalled
+      by a marker inside a field.
 
-    Budgets are per field, not per response: `content` is bounded by the
-    server's response cap, the outline by its own equal budget, and the
-    metadata fields by a third — so a truncated whole-note read can carry
-    several capped components. Read the one section you need with `section=`
-    rather than paging a large note.
-
-    **Round trips.** A whole-note `content` is byte-exact input for
-    `edit_note(path, content)` only when the read is complete and unwindowed
-    (`offset=0` and `truncated` false); a truncated read must be paged to the
-    end first, or full replacement replaces the whole body with the fragment.
-    A section `content` is byte-exact input for `edit_note(section=...)` under
-    the same completeness condition. Byte-identity holds for notes whose body
-    newlines are LF: terminators inside the selected content come back as LF,
-    because this tool normalises and the write tools rewrite raw bytes.
+    Byte-identity holds for notes whose body newlines are LF: terminators inside the selected content come back
+    as LF. `read_file` on the same path is the byte-exact route to the file itself.
 
     Args:
         path: Vault-relative path to the note (e.g. "Cards/My Note.md")
-        section: Optional ATX heading to read instead of the whole note. Plain
-            text ("Balance Sheet"), a path-style chain ("Parent/Child") when the
-            heading appears under different parents, or a "#N" ordinal ("#7",
-            1-based document order) — the ordinal is the only form that can
-            address duplicate headings sharing the same parent. The outline
-            returned with a truncated note carries the ordinal for every
-            section. A bare "#N" always selects by position and is never
-            shadowed by a heading whose text happens to be "#N"; use
-            "Parent/#N" to reach such a heading by title.
-        offset: Character offset to start reading from (default 0). Use the
-            `next_offset` the response reports to continue.
-        limit: Maximum characters of `content` to return. Only lowers the
-            server cap; it cannot raise it.
+        section: Optional ATX heading to read instead of the whole note. Plain text ("Balance Sheet"), a
+            path-style chain ("Parent/Child") when the heading appears under different parents, or a "#N"
+            ordinal ("#7", 1-based document order) — the only form that can address duplicate headings
+            sharing the same parent; the outline of a truncated note carries the ordinal for every section.
+            A bare "#N" always selects by position; use "Parent/#N" to reach a heading titled "#N".
+        offset: Character offset to start reading from (default 0); continue from the reported `next_offset`.
+        limit: Maximum characters of `content` to return. Only lowers the server cap; it cannot raise it.
     """
     return await read_note_impl(path, section=section, offset=offset, limit=limit)
 
 
-@mcp.tool()
+@mcp.tool(title="List notes", annotations=_READ_ONLY)
 async def list_notes(
     folder: str = "",
     limit: int = 50,
@@ -255,7 +289,7 @@ async def list_notes(
     return await list_notes_impl(folder, limit=limit, tags=tags, frontmatter=frontmatter)
 
 
-@mcp.tool()
+@mcp.tool(title="List tags", annotations=_READ_ONLY)
 async def get_tags(limit: int = 50) -> str:
     """List all tags used across the vault with note counts.
 
@@ -265,7 +299,7 @@ async def get_tags(limit: int = 50) -> str:
     return await get_tags_impl(limit=limit)
 
 
-@mcp.tool()
+@mcp.tool(title="Recent notes", annotations=_READ_ONLY)
 async def get_recent(
     limit: int = 20,
     folder: str | None = None,
@@ -290,7 +324,7 @@ async def get_recent(
     )
 
 
-@mcp.tool()
+@mcp.tool(title="Semantic search", annotations=_READ_ONLY)
 async def semantic_search(
     query: str,
     limit: int = 15,
@@ -345,7 +379,7 @@ async def semantic_search(
     )
 
 
-@mcp.tool()
+@mcp.tool(title="Create note", annotations=_ADDITIVE)
 async def create_note(
     path: str, content: str, expected_hash: str | None = None
 ) -> str:
@@ -394,7 +428,7 @@ async def create_note(
     return await create_note_impl(path, content, expected_hash=expected_hash)
 
 
-@mcp.tool()
+@mcp.tool(title="Edit note", annotations=_DESTRUCTIVE)
 async def edit_note(
     path: str,
     content: str,
@@ -410,166 +444,51 @@ async def edit_note(
     """Edit an existing note in the Obsidian vault. Requires write permission — a `readwrite` API key, or an OAuth token
     carrying the `readwrite` scope.
 
-    See `get_vault_guide` for Obsidian syntax and any vault-specific conventions
-    (naming, folder placement, frontmatter, tags).
+    Arguments: `path`, `content`, at most one mode flag — `append`, `find` or `section` (`operation` is the
+    legacy selector, "append" or "replace") — plus `replace_all`, `dry_run`, `replace_frontmatter`, and the
+    optional `expected_hash` precondition. Every refusal ends with one machine-readable `MCP-REFUSAL {"code":…}`
+    line. See `get_vault_guide` for vault conventions.
 
-    Four mutually exclusive modes (set at most one of append/find/section):
-    1. **Full replace** (default): provide only `content`. `content` becomes the
-       note's **body**; an existing valid line-1 YAML frontmatter block is
-       **preserved byte-identically** ahead of it. Pass
-       `replace_frontmatter=True` to overwrite the entire file, frontmatter
-       included.
-    2. **Append**: `append=True`; `content` is added at the end (preceded by a single newline).
-    3. **Find & replace**: `find=<exact text>`; replaced with `content`. Must match
-       exactly once unless `replace_all=True`. This mode operates on the raw
-       file, so it is the one mode that can edit frontmatter text in place.
-    4. **Section**: `section=<heading>`; replaces the **whole body** under the
-       named ATX heading — see "Section mode: what `content` replaces" below.
-       Use the path-style form `Parent/Child` to disambiguate when the same heading
-       appears more than once, or the `#N` ordinal form ("#7", 1-based document
-       order) — the ordinal is the only form that can address duplicate headings
-       sharing one parent, and it is the selector the outline of a truncated
-       `read_note` advertises. A bare "#N" always selects by position and is
-       never shadowed by a heading whose text happens to be "#N"; reach such a
-       heading by title with "Parent/#N". A selector resolves to the same
-       section in `read_note` as in this tool **on any write this tool
-       admits** — that parity is about resolution, not about admission: see
-       the two section-mode refusals below, where a section that reads fine is
-       deliberately not writable. Setext (`====`/`----`) headings are not
-       matched.
+    Four mutually exclusive modes:
+    1. **Full replace** (default): `content` becomes the note's **body**; an existing valid line-1 YAML
+       frontmatter block is **preserved byte-identically** ahead of it. `replace_frontmatter=True` overwrites
+       the entire file, frontmatter included (with another mode it is an error and nothing is written). A note
+       with no valid block is replaced wholesale by default. The round-trip guarantee covers a complete,
+       unwindowed whole-note read only — no `section`, `offset=0`, `truncated` false; page a truncated read to
+       the end first, or full replacement replaces the whole body with the fragment. A section response
+       belongs to section mode.
+    2. **Append**: `append=True`; `content` is added at the end after a single newline.
+    3. **Find & replace**: `find=<exact text>` is replaced with `content`; it must match exactly once unless
+       `replace_all=True`. The one mode that edits frontmatter text in place.
+    4. **Section**: `section=<heading>` replaces the **whole body** under the named ATX heading. `Parent/Child`
+       disambiguates repeated headings; a `#N` ordinal ("#7", 1-based document order) is the only form that
+       addresses duplicate siblings; a bare "#N" selects by position. A
+       selector resolves to the same section here as in `read_note` on any write this tool admits — parity is
+       about resolution, not admission.
 
-    **Frontmatter and the round trip.** Read a note, edit the `content` field
-    of the response, pass it straight back to full replacement: the frontmatter
-    survives. No property of `content`'s shape changes that — a body whose
-    first line is a thematic break `---`, or which itself begins with a
-    complete mapping-shaped fenced block, is body. A note with no valid block
-    (no line-1 fence, or a malformed one) is replaced wholesale by default,
-    which is the repair path and needs no flag. To change the frontmatter
-    itself use `set_frontmatter`, or edit the raw block through `find=`; a
-    `read_note` response's `frontmatter` JSON view is a lossy convenience and
-    must never be written back.
+    `dry_run=True` returns a unified diff and writes nothing, in every mode.
 
-    **The round-trip guarantee covers a complete, unwindowed whole-note read
-    only** — `read_note(path)` with no `section`, `offset=0` and `truncated`
-    false in the response. A truncated read must be paged to the end before it
-    is written back, or full replacement will replace the whole body with the
-    fragment.
+    **`expected_hash`**: pass the `content_hash` a read returned, verbatim (`sha256:<64 lowercase hex>`), and the
+    call is refused with nothing written if the file changed since — in all four modes, `dry_run` included. It
+    is the **whole file's** hash, never a hash of the text you received. Omit it and a stale edit overwrites. Codes: `stale_precondition` (with the
+    current hash), `concurrent_write`, `no_incumbent`, `malformed_precondition`, `precondition_unavailable`,
+    `precondition_required`. Every publishing mode reports the
+    `content_hash` of the bytes **this call wrote**, not what is on disk when you read the message; `dry_run`
+    reports none.
 
-    **Section mode: what `content` replaces.**
-    - In section mode `content` is the section's **body**: the text beginning
-      on the line immediately after the matched heading line, running to the
-      next heading of equal-or-shallower depth or to end of note. The heading
-      line itself is never removed or rewritten.
-    - A section write replaces that body **whole**. Anything `content` does not
-      resend is **deleted** — a blank line, a list, and a **fenced code block
-      sitting directly under the heading** included. There is no third region
-      between the heading line and the body that survives a write.
-    - So a blank line you want between the heading and its content belongs in
-      `content` (send `"\\ntext"`, not `"text"`).
-    - `read_note(path, section=...)` is the matching read: its response carries
-      the heading line in the `heading` field and the body in the `content`
-      field, and this tool takes exactly that `content`. Pass the field
-      through unchanged — there is nothing to split off and nothing to strip.
-    - Byte-identity holds for notes whose body newlines are LF. Every non-LF
-      terminator inside the **selected body** (CRLF, or a lone CR) comes back
-      as LF — the read path normalises and this tool writes raw bytes — whether
-      the note uses one dialect throughout or mixes them. Terminators outside
-      the selected body are untouched, so a round trip can leave a note with
-      more mixed endings than it started with.
+    **Section mode.** `content` is the section's **body**: the text beginning on the line immediately after the
+    matched heading line; the heading line is never rewritten. The body is replaced **whole** — anything
+    `content` does not resend, a fenced code block directly under the heading included, is deleted — so a blank
+    line you want after the heading belongs in `content`. `read_note(path, section=...)` is the matching read:
+    its `heading` field carries the heading line and its `content` field the body, and this tool takes exactly
+    that `content`, unchanged. Byte-identity holds for notes whose body newlines are LF: non-LF terminators
+    inside the selected body come back as LF.
 
-    Section mode resolves headings over the frontmatter-stripped body, exactly
-    as `read_note` does, so `#N` ordinals agree between the two and a YAML `#`
-    comment inside the block is never selectable. A heading inside a fenced
-    code block is not a heading: fences count with up to three spaces of
-    indentation and a closer at least as long as the opener, and an unclosed
-    column-zero fence hides everything below it.
-
-    **Two shapes refuse a section write outright, naming the problem and
-    writing nothing:**
-    - a malformed frontmatter block (unclosed fence, YAML error, non-mapping)
-      — the refusal names the defect and the `replace_frontmatter=True`
-      repair;
-    - a fence opener indented by one to three spaces that nothing below it
-      closes — such an opener may sit inside a list item, whose code block
-      ends where the item does, and this server does not parse container
-      blocks, so it will not guess whether the text below is code or content.
-      Close the fence or unindent it to column zero, then reissue.
-
-    Both refusals are asymmetric with reads on purpose: `read_note(section=…)`
-    and the truncation outline keep working on such notes, because a read
-    destroys nothing.
-
-    Flags:
-    - `operation="append"`: legacy alias for `append=True`. This is accepted to
-      prevent older clients from silently falling through to full replacement.
-      `operation="replace"` explicitly selects full replacement.
-    - `replace_all=True`: with `find`, replace every occurrence rather than failing on
-      multiple matches. Ignored when `find` is unset.
-    - `replace_frontmatter=True`: full replacement overwrites the entire file
-      including the frontmatter block. Combined with append/find/section it is
-      an error and nothing is written.
-    - `dry_run=True`: compute the would-be result and return a unified diff without
-      writing. Works for all four modes, and diffs the composed result.
-
-    Writes are atomic: the composed result is staged in the note's own directory,
-    flushed to disk, and published with a single same-directory rename, so a
-    crash mid-write cannot truncate the destination. The publish is guarded,
-    but only against a change landing inside **this call**: the file is read
-    here and re-compared immediately before the rename, so a writer racing this
-    tool's own read-modify-write fails with `File changed while editing:
-    <name>` and nothing is written. **That is not a guard on your read** — it
-    is the second of the two windows below, and `expected_hash` is the first.
-    Structured frontmatter mutation is better done via `set_frontmatter` —
-    PyYAML serialization there discards YAML comments. A
-    path whose final component is a symlink is refused in every mode
-    (`dry_run` included), naming the link's target; symlinked folders inside
-    the vault work normally.
-
-    **`expected_hash` — binding a write to the bytes you read.** Optional; omit
-    it and nothing changes, including today's silent overwrite of whatever
-    landed since your `read_note`. Pass the `content_hash` a read returned,
-    verbatim and canonical (`sha256:<64 lowercase hex>`), and the call is
-    refused with nothing written if the file changed in between. It is always
-    the **whole file's** hash, never a hash of the text you received. Two
-    windows, both live: `expected_hash` covers your read → this call's read,
-    the server's own pre-publication compare covers this call's read → its
-    publication, and a match on the first does not exempt the second. Every
-    refusal ends with one machine-readable `MCP-REFUSAL {"code":…}` line —
-    `stale_precondition` (with the file's current hash, ready to resend),
-    `concurrent_write`, `no_incumbent`, `malformed_precondition`,
-    `precondition_unavailable`, `precondition_required` — and each states what
-    resolves it.
-
-    It applies in **all four modes**, `dry_run` included, and is checked before
-    mode dispatch, the size cap, the diff and every no-op branch, so a stale
-    base never yields a diff or a "no changes" answer. A `section=` write binds
-    the **whole file** as well: `#N` ordinals are positional, so a body-only
-    digest could certify an unchanged body while an insertion above it changed
-    which section the selector names. That makes the narrowest mode the most
-    conflict-prone — an unrelated edit elsewhere refuses it — which is exactly
-    why the argument is optional: bind when you reasoned about what you read,
-    omit when you are appending to a log. Every mode that publishes reports the
-    `content_hash` of the bytes **this call wrote** (not of whatever is on disk
-    when you read the message), so an edit→edit chain needs no intervening
-    read; `dry_run` publishes nothing and reports none.
-
-    Args:
-        path: Vault-relative path to the note.
-        content: New body (full replace), replacement text, text to append, or
-            section body.
-        append: If True, append content to the end of the note.
-        operation: Legacy mode selector; accepts "append" or "replace".
-        find: Exact text to find and replace.
-        section: ATX heading text identifying the section whose body to replace.
-            Use `Parent/Child` to disambiguate repeated headings, or a "#N"
-            ordinal ("#7", 1-based document order) for duplicate siblings.
-        replace_all: With `find`, replace every match instead of requiring uniqueness.
-        dry_run: Return a unified diff and do not write.
-        replace_frontmatter: Full-replace only. If True, `content` replaces the
-            entire file including any frontmatter block. Default False
-            preserves an existing valid block.
-        expected_hash: The note's `content_hash` as you last read it. Refuses
-            the write, changing nothing, if the file has changed since.
+    **Two shapes refuse a section write outright, naming the problem and writing nothing:** a malformed
+    frontmatter block (unclosed fence, YAML error, non-mapping), whose refusal names the
+    `replace_frontmatter=True` repair; and a fence opener indented by one to three spaces that nothing below it
+    closes. Both are asymmetric with reads on purpose: `read_note` keeps
+    working on such notes. A symlinked final component is refused.
     """
     return await edit_note_impl(
         path,
@@ -585,7 +504,7 @@ async def edit_note(
     )
 
 
-@mcp.tool()
+@mcp.tool(title="Vault guide", annotations=_READ_ONLY)
 async def get_vault_guide() -> str:
     """Returns a two-part guide for working with this Obsidian vault:
 
@@ -600,7 +519,7 @@ async def get_vault_guide() -> str:
     return await get_vault_guide_impl()
 
 
-@mcp.tool()
+@mcp.tool(title="Backlinks", annotations=_READ_ONLY)
 async def get_backlinks(path: str, limit: int = 50) -> str:
     """Notes that link TO `path`. Use this to discover what references a given
     note — projects citing a card, daily notes mentioning a person, etc.
@@ -614,7 +533,7 @@ async def get_backlinks(path: str, limit: int = 50) -> str:
     return await get_backlinks_impl(path, limit=limit)
 
 
-@mcp.tool()
+@mcp.tool(title="Outgoing links", annotations=_READ_ONLY)
 async def get_links(path: str, limit: int = 100) -> str:
     """Outgoing links from `path` — both resolved and dangling.
 
@@ -641,7 +560,7 @@ async def get_links(path: str, limit: int = 100) -> str:
     return await get_links_impl(path, limit=limit)
 
 
-@mcp.tool()
+@mcp.tool(title="Link neighborhood", annotations=_READ_ONLY)
 async def get_neighborhood(path: str, depth: int = 1, limit: int = 50) -> str:
     """The connected subgraph reachable from `path` via links or backlinks,
     up to `depth` hops (treated as undirected).
@@ -659,7 +578,7 @@ async def get_neighborhood(path: str, depth: int = 1, limit: int = 50) -> str:
     return await get_neighborhood_impl(path, depth=depth, limit=limit)
 
 
-@mcp.tool()
+@mcp.tool(title="Related notes", annotations=_READ_ONLY)
 async def find_related(path: str, limit: int = 10) -> str:
     """Semantically similar notes based on the source note's chunk embeddings,
     averaged then queried via pgvector.
@@ -695,7 +614,7 @@ async def find_related(path: str, limit: int = 10) -> str:
     return await find_related_impl(path, limit=limit)
 
 
-@mcp.tool()
+@mcp.tool(title="Orphan notes", annotations=_READ_ONLY)
 async def find_orphans(folder: str | None = None, limit: int = 50) -> str:
     """Notes with zero incoming AND zero outgoing resolved links — useful for
     vault hygiene ("what's disconnected?") and cleanup decisions.
@@ -708,7 +627,7 @@ async def find_orphans(folder: str | None = None, limit: int = 50) -> str:
     return await find_orphans_impl(folder=folder, limit=limit)
 
 
-@mcp.tool()
+@mcp.tool(title="Move note", annotations=_DESTRUCTIVE)
 async def move_note(
     from_path: str,
     to_path: str,
@@ -718,86 +637,53 @@ async def move_note(
     """Move or rename a note inside the vault. Requires write permission — a `readwrite` API key, or an OAuth token
     carrying the `readwrite` scope.
 
-    Updates `notes_metadata.file_path` for the moved note and `note_links.target_path`
-    rows whose stored target matched the old path. Backlinks via `target_note_id`
-    keep working without rewriting source notes (the moved note's id is unchanged).
+    Arguments: `from_path`, `to_path` (must not exist; parent directories are created), `rewrite_links`
+    (default False) and the optional `expected_hash` precondition. The index follows the move, so backlinks
+    keep working without rewriting source notes. Every precondition refusal ends with one machine-readable
+    `MCP-REFUSAL {"code":…}` line.
 
-    With `rewrite_links=True`, also opens every source note that linked to this
-    note and rewrites the link in place: `[[Old]]` → `[[New]]`,
-    `[[Old|alias]]` → `[[New|alias]]`, `[[Old#anchor]]` → `[[New#anchor]]`,
-    `![[Old]]` → `![[New]]`, path-style `[[folder/Old]]` → `[[new/folder/New]]`,
-    and markdown links `[text](Old.md)` → `[text](<new path>)`, whose href is
-    written relative to the linking note's own folder (anchors preserved).
-    Aliases and anchors survive; only the target portion is rewritten.
-    **The moved note's own body is rewritten as well**, so a self-reference
-    does not end up pointing at the old path.
+    **`expected_hash`** binds **`from_path`'s own bytes and nothing else**: pass the `content_hash` a read
+    returned, verbatim (`sha256:<64 lowercase hex>`), and the move is refused with nothing written if that note
+    changed since. It is compared at preflight, before the rename and before any rewrite; the rename then pins
+    inode identity but does not compare the bytes again, so an in-place edit landing after that comparison is
+    still moved. The backlink sources a `rewrite_links=True` move rewrites are *not* bound, because you never
+    read them. Codes: `stale_precondition` (with the current hash), `concurrent_write`, `no_incumbent`,
+    `malformed_precondition`, `precondition_unavailable`, `precondition_required`; each states what resolves it.
 
-    The rewrites are planned before anything changes: if one would push a
-    source note past the 10 MiB note limit the whole move is refused, naming
-    that source, before any file is touched. That preflight is also bounded in
-    aggregate: if the originals plus rewrites for all backlink sources would
-    exceed 256 MiB in memory the move is refused before anything changes,
-    naming the note count and the limit.
+    With `rewrite_links=True`, every source note that links to this note is rewritten in place — wikilinks,
+    embeds, path-style and markdown links; aliases and anchors survive — **and the moved note's own body is
+    rewritten as well**, so a self-reference does not end up pointing at the old path. The rewrites are planned
+    before anything changes: if one would push a source past the note size limit, or the planning would exceed
+    the aggregate memory bound, the whole move is refused before any file is touched, naming the source or the
+    count.
 
-    **The same preflight refuses the whole move, before the rename, when any
-    source it would rewrite — the moved note's own body included — contains a
-    fence opener indented by one to three spaces that nothing below it
-    closes.** The refusal names each such source and where its opener sits. A
-    link under such an opener may be inside a list item's code block, which
-    this server does not parse, and a rewrite would mutate text whose
-    code-or-content status had to be guessed. Move with `rewrite_links=False`
-    (unaffected by this refusal) and fix the links yourself, or close the
-    fences first.
+    **The same preflight refuses the whole move, before the rename, when any source it would rewrite — the
+    moved note's own body included — contains a fence opener indented by one to three spaces that nothing below
+    it closes.** The refusal names each such source and where its opener sits. Move with `rewrite_links=False`
+    (unaffected by this refusal) and fix the links yourself, or close the fences first.
 
-    **A rewrite can still fail after the move has committed.** The move is one
-    rename and the rewrites follow it, so an I/O failure, a vault reassignment,
-    or a database that cannot be reached to confirm the assignment stops the
-    remaining rewrites — and the result then reads `partial success: …`, naming
-    the sources that still link to the old path. The move is **not** rolled back
-    and the index rows describe where the note now is. Treat the link graph as
-    agreeing with the vault bytes only when the result reports plain success;
-    on a partial outcome, fix the named sources with `edit_note`.
+    **A rewrite can still fail after the move has committed.** The move is one rename and the rewrites follow
+    it, so an I/O failure or a lost vault assignment stops the remaining rewrites and the result reads `partial
+    success: …`, naming the sources that still link to the old path. The move is **not** rolled back; treat the
+    link graph as agreeing with the vault bytes only on plain success, and fix the named sources with
+    `edit_note`.
 
-    Writes are atomic. Either path is refused, naming the link's target, when
-    its final component is a symlink; symlinked folders inside the vault work
-    normally and the recorded paths are the real ones behind them. See
-    `get_vault_guide` for vault folder conventions.
+    Success reports the `content_hash` of the bytes actually published at `to_path` — the moved bytes for a
+    plain move, the post-rewrite bytes when the moved note's own body was rewritten — and that value binds a
+    following `edit_note(to_path, …, expected_hash=…)`. A failed rewrite stays a partial success and never
+    claims nothing was written; if another writer changed `to_path` in between, **no hash is reported** and the
+    result says to re-read `to_path` first.
 
-    **`expected_hash` — binding a write to the bytes you read.** Optional; omit
-    it and nothing changes. Pass the `content_hash` a read returned, verbatim
-    and canonical (`sha256:<64 lowercase hex>`), and the call is refused with
-    nothing written if the file changed in between. It is always the **whole
-    file's** hash, never a hash of the text you received. `expected_hash`
-    covers your read through this call's preflight read. The rename pins inode
-    identity but does not compare the bytes again: an in-place edit after that
-    comparison can still be moved. Each optional link rewrite retains its own
-    pre-publication byte comparison. Precondition refusals end with one
-    machine-readable `MCP-REFUSAL {"code":…}` line — `stale_precondition` (with
-    the file's current hash, ready to resend), `concurrent_write`,
-    `no_incumbent`, `malformed_precondition`, `precondition_unavailable`,
-    `precondition_required` — and each states what resolves it.
-
-    Here it binds **`from_path`'s own bytes and nothing else**, compared before
-    the rename and before any rewrite; the backlink sources a
-    `rewrite_links=True` move would rewrite are *not* bound, because you never
-    read them. Success reports the `content_hash` of the bytes actually
-    published at `to_path` — the moved bytes for a plain move, the post-rewrite
-    bytes when the moved note's own body was rewritten — and that value binds a
-    following `edit_note(to_path, …, expected_hash=…)`. A rewrite that fails
-    after the rename stays a **partial success** and never claims nothing was
-    written; if it failed because another writer changed `to_path` in between,
-    **no hash is reported at all** and the result says to re-read `to_path`
-    before writing to it.
+    Writes are atomic. Either path is refused, naming the link's target, when its final component is a symlink.
+    See `get_vault_guide` for vault folder conventions.
 
     Args:
         from_path: Vault-relative path of the existing note.
-        to_path: Vault-relative path of the destination. Must not exist. Parent
-            directories are created automatically.
-        rewrite_links: If True, also rewrite incoming wikilinks and embeds in
-            source notes. Off by default — opting in is destructive (it modifies
-            other notes' bodies).
-        expected_hash: `from_path`'s `content_hash` as you last read it.
-            Refuses the move, changing nothing, if that note has changed since.
+        to_path: Vault-relative path of the destination. Must not exist; parent directories are created.
+        rewrite_links: Also rewrite incoming links in source notes. Off by default — opting in modifies other
+            notes' bodies.
+        expected_hash: `from_path`'s `content_hash` as you last read it. Refuses the move, changing nothing, if
+            that note has changed since.
     """
     return await move_note_impl(
         from_path,
@@ -807,7 +693,7 @@ async def move_note(
     )
 
 
-@mcp.tool()
+@mcp.tool(title="Delete note", annotations=_DESTRUCTIVE)
 async def delete_note(
     path: str, permanent: bool = False, expected_hash: str | None = None
 ) -> str:
@@ -867,7 +753,7 @@ async def delete_note(
     )
 
 
-@mcp.tool()
+@mcp.tool(title="Set frontmatter", annotations=_DESTRUCTIVE)
 async def set_frontmatter(
     path: str,
     updates: dict | None = None,
@@ -877,72 +763,53 @@ async def set_frontmatter(
     """Mutate a note's YAML frontmatter without touching its body. Requires write permission — a `readwrite` API key, or an OAuth token
     carrying the `readwrite` scope.
 
-    Parses the existing frontmatter, merges in `updates` (overwriting matching
-    keys, adding any new ones), then drops keys listed in `remove`. The note
-    body is preserved byte-for-byte. If the note has no frontmatter (no `---`
-    fence on line 1), a fresh block is prepended ahead of the unchanged body.
+    Arguments: `path`, `updates` (keys to set), `remove` (keys to drop) and the optional `expected_hash`
+    precondition. Parses the existing frontmatter, merges in `updates` (overwriting matching keys, adding new
+    ones), then drops the keys in `remove`; the body is preserved byte-for-byte. A note with no frontmatter
+    (no `---` fence on line 1) gets a fresh block prepended ahead of the unchanged body.
 
-    **A malformed block is refused, never worked around.** An unclosed line-1
-    fence, YAML that fails to parse, and YAML that is not a mapping (`null`,
-    `~`, comments only, a list, a scalar) each return an error naming the
-    defect and pointing at `edit_note(path, content, replace_frontmatter=True)`
-    as the repair. Nothing is written — in particular no second block is
-    prepended above the broken one — and `remove=` refuses identically rather
-    than silently doing nothing. This is reported even for a call with no
-    `updates` and no `remove`. An empty fenced block (`---` immediately
-    followed by `---`) is *valid*: it is a valid empty mapping and is updated
-    in place.
+    **`expected_hash`**: pass the `content_hash` a read returned, verbatim (`sha256:<64 lowercase hex>`), and
+    the call is refused with nothing written if the file changed since. It is the **whole file's** hash, never
+    a hash of the text you received; omit it and a stale edit overwrites. The comparison runs ahead of the
+    malformed-block diagnosis and ahead of the no-op check, so a stale base never yields "no changes" or a
+    defect report about bytes you have not seen. Every refusal ends with one machine-readable
+    `MCP-REFUSAL {"code":…}` line — `stale_precondition` (with the current hash), `concurrent_write`,
+    `no_incumbent`, `malformed_precondition`, `precondition_unavailable`, `precondition_required` — each
+    stating what resolves it. The server also re-compares the file immediately before publishing. A write
+    reports the `content_hash` of the bytes **this call published**; a no-op publishes nothing and reports none.
 
-    **Only an effective change writes.** `updates` that set every named key to
-    the value it already holds (compared type-sensitively, so `true` is not
-    `1`) together with `remove` naming only absent keys report no changes and
-    leave the file byte-identical. Removing the last key removes the block
-    entirely — no fences, no separator, exactly the prior body.
+    **A malformed block is refused, never worked around.** An unclosed line-1 fence, YAML that fails to parse,
+    and YAML that is not a mapping (`null`, `~`, comments only, a list, a scalar) each return an error naming
+    the defect and pointing at `edit_note(path, content, replace_frontmatter=True)` as the repair. Nothing is
+    written — in particular no second block is prepended above the broken one — and `remove=` refuses
+    identically rather than silently doing nothing, even for a call with no `updates` and no `remove`. An
+    empty fenced block (`---` immediately followed by `---`) is *valid*: it is a valid empty mapping and is
+    updated in place.
 
-    Re-serialization uses `yaml.safe_dump(default_flow_style=False,
-    sort_keys=False, allow_unicode=True)`. **Caveat:** PyYAML does NOT preserve
-    YAML comments — any `# comment` in the original frontmatter will be lost on
-    the first `set_frontmatter` call.
+    **Only an effective change writes.** `updates` that set every named key to the value it already holds
+    (compared type-sensitively, so `true` is not `1`) together with `remove` naming only absent keys report no
+    changes and leave the file byte-identical. Removing the last key removes the block entirely — no fences, no
+    separator, exactly the prior body.
 
-    A path whose final component is a symlink is refused, naming its target, so
-    the frontmatter of an unnamed note is never rewritten; symlinked folders
-    inside the vault work normally.
-
-    See `get_vault_guide` for vault frontmatter conventions.
-
-    **`expected_hash` — binding a write to the bytes you read.** Optional; omit
-    it and nothing changes. Pass the `content_hash` a read returned, verbatim
-    and canonical (`sha256:<64 lowercase hex>`), and the call is refused with
-    nothing written if the file changed in between. It is always the **whole
-    file's** hash, never a hash of the text you received. Two windows, both
-    live: `expected_hash` covers your read → this call's read, the server's own
-    pre-publication compare covers this call's read → its publication, and a
-    match on the first does not exempt the second. Every refusal ends with one
-    machine-readable `MCP-REFUSAL {"code":…}` line — `stale_precondition` (with
-    the file's current hash, ready to resend), `concurrent_write`,
-    `no_incumbent`, `malformed_precondition`, `precondition_unavailable`,
-    `precondition_required` — and each states what resolves it.
-
-    The comparison runs ahead of the malformed-block diagnosis and ahead of the
-    no-op check, so a stale base never yields "no changes" or a defect report
-    about bytes you have not seen. A write reports the `content_hash` of the
-    bytes **this call published**; a no-op publishes nothing and reports none.
+    Re-serialization goes through PyYAML, which does NOT preserve YAML comments — any `# comment` in the
+    original frontmatter is lost on the first `set_frontmatter` call. A path whose final component is a symlink
+    is refused, naming its target; symlinked folders inside the vault work normally. See `get_vault_guide` for
+    vault frontmatter conventions.
 
     Args:
         path: Vault-relative path to the note.
         updates: Mapping of keys to set. Use the empty dict (or omit) to skip.
-        remove: List of keys to delete from the frontmatter. Missing keys are
-            ignored (and, on their own, make the call a no-op rather than a
-            write).
-        expected_hash: The note's `content_hash` as you last read it. Refuses
-            the write, changing nothing, if the note has changed since.
+        remove: List of keys to delete from the frontmatter. Missing keys are ignored (and, on their own, make
+            the call a no-op rather than a write).
+        expected_hash: The note's `content_hash` as you last read it. Refuses the write, changing nothing, if
+            the note has changed since.
     """
     return await set_frontmatter_impl(
         path, updates=updates, remove=remove, expected_hash=expected_hash
     )
 
 
-@mcp.tool()
+@mcp.tool(title="Read file", annotations=_READ_ONLY)
 async def read_file(
     path: str,
     encoding: str = "auto",
@@ -1001,7 +868,7 @@ async def read_file(
     )
 
 
-@mcp.tool()
+@mcp.tool(title="Write file", annotations=_DESTRUCTIVE)
 async def write_file(
     path: str,
     content: str,
@@ -1065,7 +932,7 @@ async def write_file(
     )
 
 
-@mcp.tool()
+@mcp.tool(title="List files", annotations=_READ_ONLY)
 async def list_files(
     folder: str = ".",
     pattern: str = "*",
@@ -1099,7 +966,7 @@ async def list_files(
     )
 
 
-@mcp.tool()
+@mcp.tool(title="Request upload link", annotations=_DESTRUCTIVE)
 async def request_upload(
     path: str,
     overwrite: bool = False,
@@ -1144,7 +1011,7 @@ async def request_upload(
     return await request_upload_impl(path, overwrite=overwrite, expires_in=expires_in)
 
 
-@mcp.tool()
+@mcp.tool(title="Check upload", annotations=_READ_ONLY)
 async def check_upload(upload_id: str) -> str:
     """Ask what happened to an upload link you minted with `request_upload`.
 
@@ -1179,7 +1046,7 @@ async def check_upload(upload_id: str) -> str:
     return await check_upload_impl(upload_id)
 
 
-@mcp.tool()
+@mcp.tool(title="Request download link", annotations=_ADDITIVE)
 async def request_download(path: str, expires_in: int | None = None) -> str:
     """Get a short-lived link a person can use to save a vault file. Peer to
     `read_file`, which returns the bytes to you — use this one when the file is
@@ -1210,7 +1077,7 @@ async def request_download(path: str, expires_in: int | None = None) -> str:
     return await request_download_impl(path, expires_in=expires_in)
 
 
-@mcp.tool()
+@mcp.tool(title="Import from URL", annotations=_DESTRUCTIVE_OPEN_WORLD)
 async def import_from_url(url: str, path: str, overwrite: bool = False) -> str:
     """Fetch a file from a public https URL straight into the vault. Requires write permission — a `readwrite` API key, or an OAuth token
     carrying the `readwrite` scope.
@@ -1249,7 +1116,7 @@ async def import_from_url(url: str, path: str, overwrite: bool = False) -> str:
     return await import_from_url_impl(url, path, overwrite=overwrite)
 
 
-@mcp.tool()
+@mcp.tool(title="Delete file", annotations=_DESTRUCTIVE)
 async def delete_file(
     path: str, permanent: bool = False, expected_hash: str | None = None
 ) -> str:

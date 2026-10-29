@@ -13,6 +13,7 @@ import os
 import posixpath
 import re
 import stat
+import sys
 import time
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
@@ -1912,8 +1913,41 @@ def _tracked(
         # than asserted.
         wrapper.__tracked_tool__ = tool_name
         wrapper.__concurrency_class__ = resource_class or concurrency.TOOL_CLASSES.get(tool_name)
+        # Read by `production_write_bucket_tools()` (#343): the write-bucket
+        # membership, stamped on the wrapper rather than collected into a
+        # module-level set, because test modules decorate probes with
+        # `_tracked(write_class=True)` at import and a shared set would then
+        # depend on collection order.
+        wrapper.__write_class__ = write_class
         return wrapper
     return decorator
+
+
+def production_write_bucket_tools() -> frozenset[str]:
+    """The names of the tools this module registers with ``write_class=True``.
+
+    This is the write-bucket set as the code defines it, derived for
+    `tests/test_issue_343_tool_metadata.py`, which reconciles the published
+    `destructiveHint` annotations against it rather than against a list kept
+    in the test. Only callables that are attributes of *this* module and whose
+    `__module__` is this module count — `functools.wraps` copies the
+    implementation's module onto the wrapper — so a probe a test module
+    decorates with `_tracked(write_class=True)` (``write_probe`` in
+    `tests/test_concurrency_provenance.py`, ``rate_probe_write`` in
+    `tests/test_mcp_rate_limits.py`), or one it decorates under a production
+    tool's name, is never enumerated. It consults nothing registered on the MCP
+    server; the test cross-checks the result against the registry and against
+    `concurrency.TOOL_CLASSES`.
+    """
+    module = sys.modules[__name__]
+    names: set[str] = set()
+    for value in vars(module).values():
+        if getattr(value, "__module__", None) != __name__:
+            continue
+        tool_name = getattr(value, "__tracked_tool__", None)
+        if tool_name and getattr(value, "__write_class__", False):
+            names.add(tool_name)
+    return frozenset(names)
 
 
 # The tool this impl backs is registered as `keyword_search` (server.py takes

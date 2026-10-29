@@ -369,6 +369,18 @@ update it in the same change.** What stays here is the short list:
   The provenance discard is the stated exception. A wrong but non-empty
   mount is not detected (L1) — see
   [indexing and embeddings](docs/architecture/indexing-and-embeddings.md).
+- **Every tool publishes a `title` and all four `ToolAnnotations` hints
+  explicitly** (#343). Fifteen read tools are read-only/idempotent/closed;
+  the destructive set is the write-bucket set minus `create_note` plus
+  `request_upload` (its `overwrite=True` link overwrites on redemption);
+  `import_from_url` alone is open-world. **Hints, not enforcement** — nothing
+  server-side reads them; `_tracked` and `_require_write` enforce as before.
+  `FastMCP(instructions=SERVER_INSTRUCTIONS)` is ≤ 2,000 characters with a
+  ≤ 512-character lead that states the round trip *with its conditions* and
+  `expected_hash` as optional. No description exceeds 4,000 characters on the
+  wire (the raw docstring is what ships); the four long ones lead with their
+  contract and the reasoning moved to the vault-tools note. See
+  [vault tools](docs/architecture/vault-tools.md), "Tool metadata".
 - Wikilink graph extracted from note bodies into `note_links`; resolved at index time with same-folder-first preference
 - `MCP_SANDBOX_MODE=true` is a registry-eval-only switch: lifespan skips `_check_embedding_dim` and the indexer, and `APIKeyMiddleware` bypasses auth on `/mcp/*`. Lets Glama's sandbox build the image and validate MCP introspection without external deps. Never enable in production — tools register but cannot run.
 
@@ -378,6 +390,10 @@ update it in the same change.** What stays here is the short list:
 `_tracked`, which resolves the caller's vault root *before* the tool body runs
 — that decorator is the whole enforcement of "this user has no vault"
 ([vault roots and tenancy](docs/architecture/vault-roots-and-tenancy.md)).
+Every registration carries `title=` and `annotations=` (one of four shared
+`ToolAnnotations` shapes); `tests/test_issue_343_tool_metadata.py` fails on a
+registration without them, on a description over 4,000 characters, and on a
+destructive set that drifts from the write bucket.
 
 **Search and read** — `keyword_search`, `semantic_search`, `read_note`,
 `list_notes`, `get_tags`, `get_recent`, `get_vault_guide`.

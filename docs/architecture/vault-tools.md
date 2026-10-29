@@ -26,6 +26,92 @@ internals (`_tool_manager`, `Tool.fn_metadata.arg_model`, `Tool.parameters`);
 `tests/test_issue_295_unknown_arguments.py` pins them, so an SDK upgrade that
 moves them fails the suite instead of silently reverting to ignore.
 
+## Tool metadata: titles, annotations and server instructions (#343)
+
+Every `@mcp.tool()` in `src/mcp_server/server.py` carries `title=` and
+`annotations=`, one of four shared `ToolAnnotations` constants with **all four
+hints set explicitly** — an absent hint is read by clients as the protocol's
+worst case (not read-only, destructive, open-world), which is how a
+`keyword_search` came to prompt like a `delete_note`.
+
+| shape | readOnly | destructive | idempotent | openWorld | tools |
+| --- | --- | --- | --- | --- | --- |
+| `_READ_ONLY` | true | false | true | false | `keyword_search`, `semantic_search`, `read_note`, `list_notes`, `get_tags`, `get_recent`, `get_vault_guide`, `read_file`, `list_files`, `get_backlinks`, `get_links`, `get_neighborhood`, `find_related`, `find_orphans`, `check_upload` |
+| `_ADDITIVE` | false | false | false | false | `create_note` (no-clobber), `request_download` (mints a capability, destroys nothing) |
+| `_DESTRUCTIVE` | false | true | false | false | `edit_note`, `move_note`, `delete_note`, `set_frontmatter`, `write_file`, `delete_file`, `request_upload` |
+| `_DESTRUCTIVE_OPEN_WORLD` | false | true | false | true | `import_from_url` |
+
+**Annotations are hints; `_tracked` enforces.** Nothing server-side reads them.
+`_tracked` resolves the vault root and runs every admission gate before a body
+runs, and `_require_write` refuses a read-only credential inside every write
+body, exactly as before. A client that ignores the hints loses convenience
+(read-only tools auto-approved and, in Claude Code, run in parallel;
+destructive ones prompting) and nothing else. The MCP spec tells clients to
+treat annotations as untrusted unless the server is trusted.
+
+**The classification is derived, not listed.** With `W` the write-bucket set
+(`_tracked(write_class=True)`, eight tools, equal to the `write` class of
+`concurrency.TOOL_CLASSES`):
+
+- destructive = `(W − {create_note}) ∪ {request_upload}` — `create_note` only
+  ever adds a file; `request_upload(overwrite=True)` mints a capability that
+  overwrites an existing file when a person redeems it, and the tool call is
+  what authorises that (owner decision, 2026-10-28);
+- not read-only = `W ∪ {request_upload, request_download}`;
+- open-world = `{import_from_url}`, the only tool whose arguments name
+  something outside the vault that the server then goes and fetches;
+- idempotent = read-only. `delete_*` and `set_frontmatter` arguably qualify,
+  but a wrong `true` lets a client re-run a write silently while a wrong
+  `false` costs one confirmation, so the hint is set in the safe direction.
+
+`tests/test_issue_343_tool_metadata.py` asserts all four equalities against
+`tools.production_write_bucket_tools()`, which enumerates the `_tracked`
+wrappers that are attributes of `src.mcp_server.tools` with that module as
+their `__module__`. It is deliberately **not** a set the decorator appends to:
+`tests/test_concurrency_provenance.py` and `tests/test_mcp_rate_limits.py`
+decorate probes with `_tracked(write_class=True)` at import, so such a set
+would depend on collection order. The test decorates both kinds of probe
+itself and asserts the derived set does not move.
+
+Hints are per tool, not per call: `edit_note(dry_run=True)` and
+`write_file(overwrite=False)` are "destructive" because the tool is. A
+`.trash/` undo path does not make a delete non-destructive.
+
+**Server instructions.** `FastMCP(instructions=SERVER_INSTRUCTIONS)`, one
+constant in `server.py`, ≤ 2,000 characters, its first paragraph ≤ 512 because
+some clients load only tool names and this text at session start. Every
+sentence must be true of the server (#131): the read→write round trip is
+stated with its conditions (whole-note `content` only from a complete read
+with `offset=0` and `truncated=false`; a section's `content` only back to the
+same `section=`; finish a truncated read first) and `expected_hash` as
+*optional* stale-read protection — an unqualified "pass `content` back" after
+a truncated read replaces the note with the fragment, and nothing refuses that
+unless the caller supplied a hash. `get_vault_guide` is described, not ordered
+(the vault-guide spec's neutral-framing rule covers the instructions too).
+Nothing may depend on a client having read them: claude.ai is reported to drop
+server instructions.
+
+**Descriptions are capped at 4,000 characters on the wire, and the wire
+string is the raw docstring.** `Tool.from_function` publishes
+`description or fn.__doc__ or ""` — no `inspect.cleandoc` — so indentation
+counts, and every length in the test is measured on `tool.description` from
+the registry. Claude Code cuts an upfront description at 4,096; before #343
+`edit_note` was 10,458 raw and its `expected_hash` / `MCP-REFUSAL` contract was
+beyond the cut. `edit_note`, `read_note`, `move_note` and `set_frontmatter`
+were restructured so the first 1,500 characters carry the contract (every
+argument, the `readwrite` precondition, `expected_hash`, the `MCP-REFUSAL`
+line; for `move_note` also the residual that it is compared at preflight and
+the rename pins inode identity without re-comparing bytes), and the reasoning
+they used to carry lives in this note: the frontmatter round-trip examples
+("Frontmatter is preserved unless the caller says otherwise"), the fence
+grammar ("The fence grammar every consumer shares"), the positional-ordinal
+argument for why a `section=` write binds the whole file ("Write
+preconditions"), `move_note`'s link forms and preflight bounds ("Write tools"),
+and the per-field response budgets ("Three kinds of size cap"). Every sentence
+an earlier change pinned in those docstrings — #128, #140, #149, #150, #205 —
+is still there; their tests ran unmodified. The `tools.py` implementation
+docstrings are not on the wire and were not shortened.
+
 ## Write tools
 Returned body refusals carry a pure `BodyOutcome` and an authoritative final
 `MCP-REFUSAL` line (#263). `_tracked` classifies only the terminal typed value;
@@ -41,7 +127,7 @@ See [usage attribution](usage-attribution.md) for the post-body register.
 
 - `create_note(path, content, expected_hash=None)` — create a new note (atomic write). `expected_hash` is accepted and always refused as `no_incumbent` — see "Write preconditions" below.
 - `edit_note(path, content, append=False, operation=None, find=None, section=None, replace_all=False, dry_run=False, replace_frontmatter=False, expected_hash=None)` — four mutually exclusive modes (full-replace, append, find/replace, section). `dry_run` returns a unified diff without writing; `replace_all` lifts the single-match guard for `find`. Section mode matches ATX headings only and supports `Parent/Child` path-style and `#N` ordinal disambiguation (see "Section addressing" below). Full-replace **preserves an existing valid frontmatter block** and section mode never touches one — see "Frontmatter is preserved unless the caller says otherwise" below.
-- `move_note(from_path, to_path, rewrite_links=False, expected_hash=None)` — rename or relocate a note. Updates `notes_metadata.file_path` and `note_links.target_path` rows for the moved note. With `rewrite_links=True`, also rewrites `[[Old]]` / `[[Old|alias]]` / `[[Old#anchor]]` / `![[Old]]` / `[[folder/Old]]` **and markdown `[text](Old.md)`** forms (the markdown href is regenerated relative to the *linking* note's folder), in every backlink source **and in the moved note's own body** — `rewrite_sources` starts as `[from_rel]`. The rewrites run *after* the `renameat2` commits, so one that fails leaves a **partial success** naming the unrewritten sources (`_rewrite_failure_warning`); the move is not rolled back. The docstring must say so — "the link graph never disagrees with the vault bytes" is only true of the preflight refusal, not of the whole call.
+- `move_note(from_path, to_path, rewrite_links=False, expected_hash=None)` — rename or relocate a note. Updates `notes_metadata.file_path` and `note_links.target_path` rows for the moved note. With `rewrite_links=True`, also rewrites `[[Old]]` / `[[Old|alias]]` / `[[Old#anchor]]` / `![[Old]]` / `[[folder/Old]]` **and markdown `[text](Old.md)`** forms (the markdown href is regenerated relative to the *linking* note's folder), in every backlink source **and in the moved note's own body** — `rewrite_sources` starts as `[from_rel]`. The rewrites run *after* the `renameat2` commits, so one that fails leaves a **partial success** naming the unrewritten sources (`_rewrite_failure_warning`); the move is not rolled back. The docstring must say so — "the link graph never disagrees with the vault bytes" is only true of the preflight refusal, not of the whole call. The rewrites are planned before anything changes and the plan is bounded twice: a rewrite that would push one source past the 10 MiB note limit refuses the whole move naming that source, and a plan whose originals plus rewrites across all backlink sources would exceed 256 MiB in memory refuses it naming the note count and the limit — both before any file is touched.
 - `delete_note(path, permanent=False, expected_hash=None)` — soft-delete to `.trash/<YYYYMMDD-HHMMSS>-<basename>-<8 hex>` by default (the same non-replacing `renameat2` `delete_file` uses; the hex suffix is what makes two same-second deletes distinct); `permanent=True` unlinks through the parent descriptor. The indexer skips dot-dirs, so search/embedding cleanup happens on the next reindex pass.
 - `set_frontmatter(path, updates, remove=[], expected_hash=None)` — structured YAML frontmatter mutation. Round-trips via `yaml.safe_dump` (does not preserve YAML comments). Leaves the body byte-identical. **Refuses a malformed block by name** rather than prepending a second one; only an effective mutation writes.
 
@@ -371,7 +457,7 @@ Every refusal is the shared shape from `src/services/refusals.py`: the tool's pr
 
 | # | limitation | why it is accepted |
 | --- | --- | --- |
-| L1 | The precondition is optimistic, not linearizable. A writer landing between the compare and the rename is still overwritten; a delete or a move has no `expected=` analogue, so its window is compare → `renameat2`. | No syscall offers compare-and-swap on a rename. The #59 residual, narrowed rather than widened. |
+| L1 | The precondition is optimistic, not linearizable. A writer landing between the compare and the rename is still overwritten; a delete or a move has no `expected=` analogue, so its window is compare → `renameat2`. For `move_note` concretely: `expected_hash` is compared at preflight, the rename pins inode identity but does not compare the bytes again, so an in-place edit after that comparison is still moved — and the `move_note` description says so in its lead (#343), because it limits what the precondition buys at call time. | No syscall offers compare-and-swap on a rename. The #59 residual, narrowed rather than widened. |
 | L3 | `move_note(rewrite_links=True)` binds only the moved note; the backlink sources it rewrites are unbound, and the refusal prose says so. | The caller never read them. Each source's own rewrite still goes through `expected=`, so a concurrent edit yields the existing partial-success report naming it. |
 | L6 | `notes_metadata.content_hash` and the wire `content_hash` stay two different digests of one note. | Redefining the column would mark every CRLF note changed and re-embed the vault. Canonical-only input makes handing one where the other belongs a `malformed_precondition` rather than a confusing mismatch. |
 | L10 | "Nothing was written" excludes the call's own `usage_logs` row, written for a refusal exactly as for any other call. `expected_hash` is in the logged parameter list of every tool that accepts it. | That row is the audit trail; suppressing it would hide precisely the calls an operator investigating a lost update needs. The guarantee is about the vault and the derived index. |
@@ -454,7 +540,7 @@ exactly as an oversized file does.
 There are **byte** caps, a **character** cap, a **transport** cap and a process-wide **body budget**, and they protect different things:
 
 - `MAX_FILE_READ_BYTES` / `MAX_FILE_WRITE_BYTES` bound what the **server** reads into or writes out of memory. They refuse the operation.
-- `MAX_READ_RESPONSE_CHARS` (default 40,000 ≈ 10K tokens) bounds what `read_note` / `read_file` **return to the caller**, whose context the result consumes. It truncates rather than refusing.
+- `MAX_READ_RESPONSE_CHARS` (default 40,000 ≈ 10K tokens) bounds what `read_note` / `read_file` **return to the caller**, whose context the result consumes. It truncates rather than refusing. For `read_note` the budget is **per field, not per response**: `content` gets the cap, the heading `outline` gets its own equal budget, and the metadata fields share a third — so a truncated whole-note read can carry several capped components, which is why the description tells the agent to read one section with `section=` rather than page a large note.
 - The MCP streamable-HTTP **request body limit** bounds what the transport accepts at all, before any tool runs. It is derived, not configured: `max(2 × MAX_FILE_WRITE_BYTES, 6 × MAX_NOTE_BYTES) + 1 MiB` (61 MiB with the defaults), passed to `FastMCP(max_request_body_size=)` from `Settings.mcp_max_request_body_bytes`. The SDK's own default is 4 MiB, which would silently reject writes far below our documented 25 MB cap. The formula guarantees — for a *canonical* envelope, i.e. JSON-RPC framing plus non-content arguments under 1 MiB — that a base64 `write_file` at the cap (base64 is `4·⌈n/3⌉ ≤ 2n + 2`) and any note write up to `MAX_NOTE_BYTES` (JSON escaping expands a byte at most 6×) always reach the tool, which then decides. Unsupported shapes are bounded by the transport with a bare HTTP 413 and no tool error: text-mode `write_file` whose escaping exceeds the limit (send base64 — always safe), an envelope over 1 MiB, and arguments that are large but discarded.
 - The **body-memory budget** (#322) is the process-wide counterpart of that per-request limit: it bounds the *sum* of request bodies in flight across all `/mcp` requests, before the app reads a byte. Each authenticated POST reserves its declared `Content-Length` (the full per-request limit when unknown) against a budget derived from the container's memory (cgroup limit × 0.5 ÷ 8: 128 MiB of raw body on 2 GiB, one maximum write plus everything else), waits up to 15 s if it does not fit, and is otherwise answered with a transport 429 `code: body_memory`. It does not change the per-request limit, and startup refuses a container too small to admit one maximum body. See [rate limits](rate-limits.md).
 
