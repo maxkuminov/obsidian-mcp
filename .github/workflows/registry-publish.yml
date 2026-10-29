@@ -239,11 +239,16 @@ jobs:
           set -euo pipefail
           jq -e '(.packages | length) == 1 and .packages[0].registryType == "oci"' server.json >/dev/null \
             || { echo "::error::server.json: expected exactly one oci package"; exit 1; }
-          # The live registry refuses an OCI package that carries registryBaseUrl
-          # (the canonical reference in `identifier` is the registry); the schema
-          # validator accepts it, so strip it here too, in case it creeps back.
+          # The tree here is the release tag's, so rules the registry added or
+          # that we learned after the tag was cut are applied to the file, not
+          # to history. The live registry refuses an OCI package that carries
+          # registryBaseUrl (the canonical reference in `identifier` is the
+          # registry) and keys every `remotes[].url` for uniqueness as a literal
+          # string, so a templated URL collides with whoever registered the
+          # same template first (v0.9.3 hit both). There is no public instance
+          # to list; the OCI package is the distribution.
           jq --arg v "$VERSION" --arg img "${IMAGE}:${TAG}" \
-             '.version = $v | .packages[0].identifier = $img | del(.packages[0].registryBaseUrl)' server.json > server.json.tmp
+             '.version = $v | .packages[0].identifier = $img | del(.packages[0].registryBaseUrl) | del(.remotes)' server.json > server.json.tmp
           mv server.json.tmp server.json
           mcp-publisher validate
           cat server.json
