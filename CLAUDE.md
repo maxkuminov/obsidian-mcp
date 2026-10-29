@@ -40,6 +40,11 @@ Self-hosted MCP server exposing an Obsidian vault (~2,577 markdown files) via se
   (maxkuminov/infra `docs/homelab-image-automation.md`). Until the app is cut
   over there, a digest-bump PR in maxkuminov/infra. Docs-only merges build
   nothing.
+- Release tag (`v*`, cut at a PR's merge commit) → `registry-publish`
+  workflow: retags the `sha-` image CI proved as `ghcr.io/maxkuminov/obsidian-mcp:<tag>`
+  (no rebuild) and publishes `server.json` to the official MCP Registry via
+  GitHub OIDC. Not a deploy; the GHCR package must be public for the
+  registry's OCI validation (owner setting).
 - `make deploy` (build → scan → push → backup → migrate → recreate) is the
   compose path, not production.
 

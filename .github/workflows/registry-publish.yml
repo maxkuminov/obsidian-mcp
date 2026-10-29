@@ -1,0 +1,247 @@
+# Publish a release to the official MCP Registry (registry.modelcontextprotocol.io).
+#
+# Runs ONLY for a version tag (`v*`), never for an ordinary merge to main:
+# image.yml publishes an image for every main commit, this workflow publishes a
+# registry *listing* for a release, and the two are deliberately separate so a
+# merge cannot create a registry version by accident.
+#
+# What it does, in order:
+#   1. Resolve the tag to its commit and refuse unless that commit is on main
+#      (a tag on a side branch is not a release).
+#   2. Find the image CI already proved for that commit: `sha-<short>` pushed
+#      by image.yml. A docs-only tag (no image input changed since the image
+#      `:main` was built from) reuses the `:main` image, exactly as image.yml
+#      would have skipped the build. Otherwise wait for image.yml, which runs
+#      after CI and may still be in flight when the tag is pushed right after
+#      the merge.
+#   3. Check the image carries the `io.modelcontextprotocol.server.name` label
+#      the registry's OCI ownership validation requires (set in the Dockerfile).
+#   4. Retag that exact image as `<tag>` on GHCR — a retag, not a rebuild: the
+#      registry listing points at the bytes CI scanned. An existing `<tag>`
+#      built from the same commit is left alone; one built from a different
+#      commit fails the job (a release tag is immutable).
+#   5. Confirm the package is PUBLIC (anonymous pull of the manifest): the
+#      registry validates the image anonymously, and a private package fails
+#      there with an opaque error. Making the package public is an owner
+#      action on GitHub (package settings -> Change visibility), not this
+#      workflow's.
+#   6. Set `version` and the OCI identifier in server.json from the tag, log
+#      in with GitHub OIDC (no secret: the repository owner's io.github.<owner>/*
+#      namespace is granted to this repository's token) and publish.
+#
+# Re-run: workflow_dispatch with the tag name, e.g. after making the package
+# public, or after a failed first attempt. Nothing here is a deploy: the
+# cluster follows image.yml's Flux tags, not this one.
+name: registry-publish
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to (re)publish, e.g. v0.9.3 (must exist and be on main)"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: registry-publish
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/maxkuminov/obsidian-mcp
+  # mcp-publisher release (github.com/modelcontextprotocol/registry), pinned
+  # with the sha256 from that release's registry_<version>_checksums.txt.
+  MCP_PUBLISHER_VERSION: "1.8.6"
+  MCP_PUBLISHER_SHA256: 1fbe93fc0783c2394d8012c8d6e50a59e98cb2cc2d216264cc69f405d0e21340
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write   # retag the proven sha-<short> image as <tag>
+      id-token: write   # mcp-publisher login github-oidc
+    steps:
+      - name: Resolve tag
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            push)              tag="${REF#refs/tags/}" ;;
+            workflow_dispatch) tag="$INPUT_TAG" ;;
+            *) echo "::error::unexpected event $EVENT"; exit 1 ;;
+          esac
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.+-]*)?$ ]] \
+            || { echo "::error::'$tag' is not a release tag (vMAJOR.MINOR.PATCH)"; exit 1; }
+          {
+            echo "TAG=$tag"
+            echo "VERSION=${tag#v}"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+          fetch-depth: 0   # ancestry checks against main and the image's revision
+
+      - name: Resolve commit and require it on main
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse "refs/tags/${TAG}^{commit}")
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::bad sha '$sha'"; exit 1; }
+          if ! git merge-base --is-ancestor "$sha" origin/main; then
+            echo "::error::${TAG} (${sha}) is not on main — not a release, refusing to publish"; exit 1
+          fi
+          {
+            echo "BUILD_SHA=$sha"
+            echo "SHORT_SHA=${sha::7}"
+          } >> "$GITHUB_ENV"
+
+      # The image to list is the one image.yml built and scanned for this
+      # commit. Same input filter as image.yml's "Image-relevant change?" step:
+      # when nothing in it changed since the commit `:main` was built from, no
+      # image was (or will be) built for this commit and `:main` is the right
+      # image. Otherwise the build is in flight (image.yml runs after CI) or
+      # failed; wait, then fail with the reason.
+      - name: Find the image CI proved for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          relevant='^(src/|alembic/|scripts/|docker/)|^(alembic\.ini|Dockerfile|\.dockerignore|\.trivyignore|requirements[^/]*\.txt|\.github/workflows/image\.yml)$'
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          revision_of() {
+            docker buildx imagetools inspect "$1" \
+              --format '{{ index .Image.Config.Labels "org.opencontainers.image.revision" }}' 2>/dev/null || true
+          }
+          digest_of() {
+            docker buildx imagetools inspect "$1" --format '{{ .Manifest.Digest }}'
+          }
+          source=""
+          deadline=$(( $(date +%s) + 30*60 ))
+          while :; do
+            if [ "$(revision_of "${IMAGE}:sha-${SHORT_SHA}")" = "$BUILD_SHA" ]; then
+              source="${IMAGE}:sha-${SHORT_SHA}"; break
+            fi
+            base=$(revision_of "${IMAGE}:main")
+            if [[ "$base" =~ ^[0-9a-f]{40}$ ]] && git merge-base --is-ancestor "$base" "$BUILD_SHA"; then
+              hits=$(git diff --name-only "$base" "$BUILD_SHA" | grep -E "$relevant" || true)
+              if [ -z "$hits" ]; then
+                echo "no image input changed between ${base} (${IMAGE}:main) and ${BUILD_SHA}: reusing it"
+                source="${IMAGE}:main"; break
+              fi
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::no image for ${BUILD_SHA} after 30 min: ${IMAGE}:sha-${SHORT_SHA} is absent and ${IMAGE}:main (revision '${base}') does not cover it. Check the image workflow for that commit, then re-run this workflow (workflow_dispatch, tag=${TAG})."
+              exit 1
+            fi
+            echo "waiting for ${IMAGE}:sha-${SHORT_SHA} (image.yml runs after CI)..."
+            sleep 60
+          done
+          digest=$(digest_of "$source")
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::bad digest '$digest' for $source"; exit 1; }
+          echo "source image: ${source} = ${digest}"
+          {
+            echo "SOURCE_REF=${IMAGE}@${digest}"
+            echo "SOURCE_DIGEST=${digest}"
+          } >> "$GITHUB_ENV"
+
+      - name: Require the registry ownership label
+        run: |
+          set -euo pipefail
+          want=$(jq -er .name server.json)
+          have=$(docker buildx imagetools inspect "$SOURCE_REF" \
+                   --format '{{ index .Image.Config.Labels "io.modelcontextprotocol.server.name" }}')
+          if [ "$have" != "$want" ]; then
+            echo "::error::${SOURCE_REF} carries io.modelcontextprotocol.server.name='${have}', server.json names '${want}'. The registry's OCI validation would refuse it; the label is set in the Dockerfile."
+            exit 1
+          fi
+          echo "label ok: ${have}"
+
+      - name: Tag the image as ${{ env.TAG }} on GHCR
+        run: |
+          set -euo pipefail
+          existing=$(docker buildx imagetools inspect "${IMAGE}:${TAG}" --format '{{ .Manifest.Digest }}' 2>/dev/null || true)
+          if [ -n "$existing" ]; then
+            if [ "$existing" = "$SOURCE_DIGEST" ]; then
+              echo "::notice::${IMAGE}:${TAG} already is ${SOURCE_DIGEST}: not re-pushed"
+            else
+              echo "::error::${IMAGE}:${TAG} already exists as ${existing}, not ${SOURCE_DIGEST}. A release tag is immutable; this job will not move it."
+              exit 1
+            fi
+          else
+            docker buildx imagetools create -t "${IMAGE}:${TAG}" "$SOURCE_REF"
+            echo "${IMAGE}:${TAG} -> ${SOURCE_DIGEST}"
+          fi
+          docker logout ghcr.io
+
+      # The registry pulls the manifest anonymously to read the label above, so
+      # a private package fails validation there. Say so here instead.
+      - name: Require the package to be public
+        run: |
+          set -euo pipefail
+          repo="${IMAGE#ghcr.io/}"
+          token=$(curl -fsS "https://ghcr.io/token?scope=repository:${repo}:pull" | jq -er .token) || token=""
+          if [ -z "$token" ] || ! curl -fsS -o /dev/null \
+               -H "Authorization: Bearer ${token}" \
+               -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json" \
+               "https://ghcr.io/v2/${repo}/manifests/${TAG}"; then
+            echo "::error::${IMAGE}:${TAG} is not pullable anonymously. The GHCR package must be PUBLIC for the MCP Registry's OCI validation: an owner changes it under the package's settings (Danger zone -> Change visibility), then re-runs this workflow (workflow_dispatch, tag=${TAG})."
+            exit 1
+          fi
+          echo "${IMAGE}:${TAG} is public"
+
+      - name: Install mcp-publisher ${{ env.MCP_PUBLISHER_VERSION }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mcp-publisher"
+          cd "$RUNNER_TEMP/mcp-publisher"
+          curl -fsSL -o mcp-publisher.tar.gz \
+            "https://github.com/modelcontextprotocol/registry/releases/download/v${MCP_PUBLISHER_VERSION}/mcp-publisher_linux_amd64.tar.gz"
+          echo "${MCP_PUBLISHER_SHA256}  mcp-publisher.tar.gz" | sha256sum -c -
+          tar xzf mcp-publisher.tar.gz mcp-publisher
+          ./mcp-publisher --help >/dev/null
+          echo "$RUNNER_TEMP/mcp-publisher" >> "$GITHUB_PATH"
+
+      # server.json in the tree is the template; the version and the image tag
+      # come from the release tag, so the committed file never has to be bumped
+      # in lockstep with a tag. The name is checked, never rewritten.
+      - name: Set version and image tag in server.json
+        run: |
+          set -euo pipefail
+          jq -e '(.packages | length) == 1 and .packages[0].registryType == "oci"' server.json >/dev/null \
+            || { echo "::error::server.json: expected exactly one oci package"; exit 1; }
+          jq --arg v "$VERSION" --arg img "${IMAGE}:${TAG}" \
+             '.version = $v | .packages[0].identifier = $img' server.json > server.json.tmp
+          mv server.json.tmp server.json
+          mcp-publisher validate
+          cat server.json
+
+      - name: Authenticate to MCP Registry (GitHub OIDC)
+        run: mcp-publisher login github-oidc
+
+      - name: Publish server to MCP Registry
+        run: |
+          set -euo pipefail
+          mcp-publisher publish
+          name=$(jq -r .name server.json)
+          {
+            echo "### MCP Registry"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| server | \`${name}\` |"
+            echo "| version | \`${VERSION}\` |"
+            echo "| image | \`${IMAGE}:${TAG}\` (\`${SOURCE_DIGEST}\`) |"
+            echo "| commit | \`${BUILD_SHA}\` |"
+            echo
+            echo "https://registry.modelcontextprotocol.io/v0/servers?search=${name}"
+          } >> "$GITHUB_STEP_SUMMARY"

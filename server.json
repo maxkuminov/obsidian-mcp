@@ -1,0 +1,92 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.maxkuminov/obsidian-mcp",
+  "title": "Obsidian MCP Server",
+  "description": "Self-hosted agent memory as a markdown vault: semantic and keyword search, wikilink graph, OAuth",
+  "version": "0.9.2",
+  "websiteUrl": "https://github.com/maxkuminov/obsidian-mcp#readme",
+  "repository": {
+    "url": "https://github.com/maxkuminov/obsidian-mcp",
+    "source": "github",
+    "id": "1184745561"
+  },
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://{host}/mcp",
+      "variables": {
+        "host": {
+          "description": "Hostname of your own deployment (MCP_HOSTNAME). There is no public instance: you host this server yourself.",
+          "isRequired": true,
+          "placeholder": "obsidian-mcp.example.com"
+        }
+      },
+      "headers": [
+        {
+          "name": "Authorization",
+          "description": "Bearer <API key> minted in the control panel (omcp_...). Omit it to connect via OAuth instead.",
+          "isSecret": true,
+          "isRequired": false,
+          "placeholder": "Bearer omcp_..."
+        }
+      ]
+    }
+  ],
+  "packages": [
+    {
+      "registryType": "oci",
+      "registryBaseUrl": "https://ghcr.io",
+      "identifier": "ghcr.io/maxkuminov/obsidian-mcp:v0.9.2",
+      "transport": {
+        "type": "streamable-http",
+        "url": "http://localhost:8000/mcp"
+      },
+      "environmentVariables": [
+        {
+          "name": "DATABASE_URL",
+          "description": "PostgreSQL 16 + pgvector (0.8.0+) connection URL for the app's NON-superuser role, e.g. postgresql+asyncpg://obsidian_mcp:<password>@postgres:5432/obsidian_mcp. A superuser role or a CHANGE_ME password is refused at startup.",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "VAULT_PATH",
+          "description": "Path of the Obsidian vault inside the container (mount your vault read-write there).",
+          "isRequired": true,
+          "default": "/obsidian",
+          "format": "filepath"
+        },
+        {
+          "name": "SECRET_KEY",
+          "description": "itsdangerous signer for cookies/sessions. Generate with `openssl rand -hex 32`; the app refuses to start on a placeholder.",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "MCP_HOSTNAME",
+          "description": "Public hostname your reverse proxy routes to. Also derives BASE_URL, ALLOWED_ORIGINS and ALLOWED_HOSTS as https://<MCP_HOSTNAME> unless those are set explicitly.",
+          "isRequired": true,
+          "placeholder": "obsidian-mcp.example.com"
+        },
+        {
+          "name": "EMBEDDING_PROVIDER",
+          "description": "Embedding provider: `ollama` (self-hosted, default) or `openai` (bring your own key). Switching after deploy requires `make reset-embeddings`.",
+          "isRequired": false,
+          "default": "ollama",
+          "choices": ["ollama", "openai"]
+        },
+        {
+          "name": "OLLAMA_URL",
+          "description": "Ollama endpoint serving bge-m3 (used when EMBEDDING_PROVIDER=ollama). Must be https or loopback unless EMBEDDING_ALLOW_PLAINTEXT is set.",
+          "isRequired": false,
+          "default": "http://ollama:11434"
+        },
+        {
+          "name": "OPENAI_API_KEY",
+          "description": "OpenAI (or OpenAI-compatible) API key for text-embedding-3-* (required when EMBEDDING_PROVIDER=openai; the server refuses to start without it).",
+          "isRequired": false,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}

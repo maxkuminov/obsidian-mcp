@@ -760,6 +760,12 @@ The first deploy backfills the index, the wikilink graph, and the
 embeddings. For a 2 to 3k-note vault on Ollama with a GPU this takes
 a few minutes. On `text-embedding-3-small` it's seconds.
 
+Prebuilt images are published at `ghcr.io/maxkuminov/obsidian-mcp`
+(`:v<release>` per release tag, `:main` for the tip), built and scanned
+by CI. The package has to be public for the MCP Registry's OCI
+validation to see it; until the owner flips that package setting, pull
+with a GitHub token or build locally as above.
+
 ### 4. Connect a client
 
 Mint an API key in the control panel, then point your MCP client at:
@@ -1700,6 +1706,13 @@ Single-author, in active use as the maintainer's personal exocortex
 (2,500+ notes, multiple connecting agents). Public for anyone who
 wants to fork it. Issues and PRs welcome but expect opinionated review.
 This is a working system, not a generic platform.
+
+Listed in the official [MCP Registry](https://registry.modelcontextprotocol.io)
+as `io.github.maxkuminov/obsidian-mcp`, published from
+[`server.json`](./server.json) on every release tag, and on
+[Glama](https://glama.ai/mcp/servers). Both listings carry the tagline
+at the top of this README: a memory system for your AI agents, stored
+as plain markdown you can open in Obsidian.
 
 ## License
 

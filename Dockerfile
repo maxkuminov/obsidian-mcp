@@ -20,6 +20,13 @@ COPY alembic/ alembic/
 COPY src/ src/
 COPY scripts/ scripts/
 
+# Ownership proof for the official MCP Registry: its OCI validation reads this
+# label from the published image and requires it to equal `name` in
+# server.json (.github/workflows/registry-publish.yml checks the same thing
+# before it publishes). The org.opencontainers.* labels stay `--label` build
+# arguments in image.yml because they vary per build; this one never does.
+LABEL io.modelcontextprotocol.server.name="io.github.maxkuminov/obsidian-mcp"
+
 USER appuser
 
 EXPOSE 8000
