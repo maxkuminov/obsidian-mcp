@@ -830,3 +830,32 @@ Encryption at rest for the dumps is not implemented; if it is added, keep a
 restore-tested copy with separately managed keys before switching it on, or
 the backup stops being a backup.
 
+### Derived vs durable tables (#348)
+
+Seventeen tables, two kinds. **Five are a cache of the vault plus
+settings** and are dumped schema-only by `make db-backup` and the Kubernetes
+backup Job (`pg_dump --exclude-table-data=<table>` for each; `BACKUP_FULL=1`
+dumps their rows too):
+
+| Table | Rebuilt by |
+| --- | --- |
+| `notes_metadata` | the index pass (full-hash at startup; keyword vectors included) |
+| `note_links` | the index pass per note, and the one-shot backfill when empty |
+| `note_embeddings` | the embed pass, which embeds every note without a current vector |
+| `indexer_runs` | nothing — display history the panel lists, read for no decision |
+| `indexer_state` | startup *adopts* the current fingerprints when absent; the rotation cursor restarts at the first tenant |
+
+The schema (DDL, the `halfvec` expression index, `alembic_version`) is still
+in the dump, so a restore followed by `alembic check` is clean, and an empty
+index over a non-empty vault is the ordinary first-start case — the #309
+guard refuses the *inverse* (an empty root over a populated index). The
+other **twelve are durable and are why backups and alembic cannot go away**:
+`users` (including the index-provenance columns, which survive a restore and
+let the first pass classify the root), `api_keys`, `oauth_clients`,
+`oauth_codes`, `oauth_tokens`, `transfer_tokens`, `user_sessions`,
+`usage_logs`, `quota_counters`, `backups_log` (the panel's backup-age
+source), `concurrency_counters` and `concurrency_runs` (the #188 readiness
+evidence `make concurrency-report` reads, together with `usage_logs` — it
+never reads `indexer_runs`, which is why the pass history can be derived). `tests/test_backup_derived_tables.py` pins both lists against
+`src/models/db.py`; a new table fails it until classified. The restore
+runbook is in `DEPLOYMENT.md` (compose) and `docs/deployment-kubernetes.md`.

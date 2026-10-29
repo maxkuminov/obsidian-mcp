@@ -771,6 +771,66 @@ deployment; on a compose-file deployment the equivalents are plain
   container — `make deploy` and `make status` fail if a mount at
   `/app/backups` exists — and `.env` should be `0600` (`make init` sets it).
 
+  **What a dump contains.** Of the seventeen tables, five are a cache of the
+  vault plus settings — `notes_metadata`, `note_embeddings`, `note_links`,
+  `indexer_runs`, `indexer_state` — and their rows are the bulk of every
+  dump (one 1024-dimension vector per chunk). `make db-backup` dumps their
+  *schema only* (`pg_dump --exclude-table-data=<table>` for each), so a
+  restore followed by `alembic check` is clean and the first indexer pass
+  rebuilds the rows from the vault. The other twelve — users, API keys,
+  OAuth clients, codes and tokens, transfer tokens, panel sessions, usage,
+  quotas, `backups_log`, the concurrency counters and runs — are not
+  derivable from anything and are always dumped. `BACKUP_FULL=1 make
+  db-backup` dumps everything; a weekly line of that beside the daily
+  default is worth it when restore *time* matters more than dump size, since
+  a full dump restores a warm index instead of rebuilding one. `make
+  db-restore` accepts either kind.
+
+  **Restore runbook.** `make db-restore FILE=<dump.sql.gz>` loads a dump
+  into an *empty* `obsidian_mcp` database: it verifies the whole file first
+  (`gzip -t`, pg_dump's end-of-dump marker) and loads it in one transaction
+  with `ON_ERROR_STOP`, so the database is fully restored or untouched.
+
+  1. Stop the app container so nothing writes during the load (`make down`,
+     or `docker compose -f <your compose file> stop obsidian-mcp`). Leave
+     PostgreSQL running.
+  2. Give the restore an empty database. On a fresh volume `make db-init`
+     creates it with the `vector` extension; on an existing one, as the
+     superuser: `DROP DATABASE obsidian_mcp; CREATE DATABASE obsidian_mcp
+     OWNER obsidian_mcp;` then `\c obsidian_mcp` and `CREATE EXTENSION
+     vector;` (the app role cannot create the extension itself).
+  3. `make db-restore FILE=<path>/backup_YYYYMMDD_HHMMSS.sql.gz`.
+  4. Start the app (`make up`). Migrations run on start and bring an older
+     dump up to the image's schema; `make db-check` must then print "No new
+     upgrade operations detected." — it does for a schema-only dump too,
+     because `--exclude-table-data` keeps every table's DDL, the `halfvec`
+     index and `alembic_version`.
+  5. **If the dump was taken without `BACKUP_FULL`, the index is empty and
+     the indexer rebuilds it; there is nothing to run by hand.** An empty
+     index over a non-empty vault is the ordinary first-start case, not the
+     refused one (the "empty root over an existing index" guard is the
+     inverse: a vault that *vanished* under a populated index). The startup
+     pass is a full-hash pass over every note — metadata, keyword vectors,
+     links — and the embed pass that follows it in the same tick sends every
+     chunk to the embedding provider. Both take time proportional to vault
+     size: the scan is minutes for a few thousand notes, the embed stage is
+     chunks × provider latency (minutes on a local Ollama, longer on a
+     metered API). With more than one active user the embed stage is also
+     budgeted per user per pass (`EMBED_CHUNK_BUDGET_PER_USER`,
+     `EMBED_TIME_BUDGET_SECONDS_PER_USER`), so a large multi-user rebuild
+     spans several `INDEX_INTERVAL_SECONDS` ticks. `indexer_state` is empty
+     too, so startup *adopts* the current embedding and keyword
+     configuration instead of refusing on a mismatch; `make
+     reset-embeddings` is only needed if you also changed
+     `EMBEDDING_DIMENSIONS` or the model at the same time. Meanwhile
+     `/health` reports the indexer (`status: "degraded"` only if a pass
+     actually fails) and the panel dashboard shows the pending count;
+     semantic search returns partial results until the embed pass finishes,
+     keyword search is complete after the first pass.
+  6. Take a `make db-backup` once the index is back, so `backups_log` has a
+     post-restore row and the Health page stops dating the last backup from
+     the dump you restored.
+
   **On the deploy that first ships this** (migration 021): `make deploy`
   takes its backup *before* it migrates — deliberately, because the backup
   is the only way back from a bad migration — so that one dump runs against

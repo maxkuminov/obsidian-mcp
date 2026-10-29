@@ -65,6 +65,11 @@ spec:
                   value: "30"
                 - name: BACKUP_RETAIN_MIN
                   value: "7"
+                # "1" dumps the derived index tables' rows too (a full dump);
+                # the default dumps their schema only and the indexer
+                # rebuilds them after a restore (#348).
+                - name: BACKUP_FULL
+                  value: "0"
               securityContext:
                 allowPrivilegeEscalation: false
                 readOnlyRootFilesystem: true

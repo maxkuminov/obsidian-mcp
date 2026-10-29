@@ -753,13 +753,33 @@ Two things hold state: the **vault** and the **database**.
   clients and grants, users, usage history and quotas. A dump contains every
   note's text and every credential hash, so treat it as sensitive.
 
+  The index is five tables — `notes_metadata`, `note_embeddings`,
+  `note_links`, `indexer_runs`, `indexer_state` — and their rows are the bulk
+  of every dump. The backup Job dumps them **schema-only** by default
+  (`--exclude-table-data=<table>` for each; the DDL, the `halfvec` index and
+  `alembic_version` stay in the dump, so a restore followed by `alembic
+  check` is clean) and the indexer rebuilds the rows after a restore.
+  `BACKUP_FULL=1` in the Job's env dumps everything; run a second, weekly
+  CronJob with it if restore time matters more than dump size. The other
+  twelve tables are always dumped.
+
 [`components/db-backup`](../deploy/kubernetes/components/db-backup/) is a
 nightly CronJob that follows `make db-backup`'s contract. It writes a
 `pg_dump` under `umask 077`, gzips and verifies it, prunes past 30 days while
 keeping the newest 7, and records the dump in `backups_log`. A dump is
 accepted only if the archive verifies *and* the SQL ends with pg_dump's
 end-of-dump trailer, because an empty or truncated dump still gzips to a valid
-file. That table is
+file. **If your CronJob lives elsewhere** (an infra repository, a CNPG
+`ScheduledBackup` plus your own `pg_dump`), mirror the flags:
+
+```
+pg_dump --no-owner \
+  --exclude-table-data=notes_metadata --exclude-table-data=note_embeddings \
+  --exclude-table-data=note_links --exclude-table-data=indexer_runs \
+  --exclude-table-data=indexer_state --dbname="$url"
+```
+
+and drop the five flags for the weekly full dump. That table is
 where the panel's Health page reads the last backup's age, so a dump taken by
 any other means leaves the page warning. The backup volume is mounted only by
 the backup Job, never by the app container. The Job uses only
@@ -826,8 +846,31 @@ unverified archive.
    ```
 
 6. Scale the app back to 1. Its migration initContainer brings an older dump
-   up to the image's schema. Resume the CronJob. Drop
-   `obsidian_mcp_before_restore` once the restored deployment checks out.
+   up to the image's schema; `alembic check` from the app pod must then print
+   "No new upgrade operations detected." (it does for a schema-only dump too).
+   Resume the CronJob. Drop `obsidian_mcp_before_restore` once the restored
+   deployment checks out.
+7. **If the dump was taken without `BACKUP_FULL`, the index is empty and the
+   indexer rebuilds it; there is nothing to run by hand.** An empty index over
+   a non-empty vault is the ordinary first-start case, not the refused one
+   (the "empty root over an existing index" guard is the inverse: a vault that
+   vanished under a populated index). The startup pass is a full-hash pass
+   over every note — metadata, keyword vectors, links — and the embed pass in
+   the same tick sends every chunk to the embedding provider. Both take time
+   proportional to vault size: the scan is minutes for a few thousand notes,
+   the embed stage is chunks × provider latency. With more than one active
+   user the embed stage is budgeted per user per pass
+   (`EMBED_CHUNK_BUDGET_PER_USER`, `EMBED_TIME_BUDGET_SECONDS_PER_USER`), so
+   a large multi-user rebuild spans several `INDEX_INTERVAL_SECONDS` ticks.
+   `indexer_state` is empty too, so startup *adopts* the current embedding and
+   keyword configuration instead of refusing; the reset-embeddings workflow is
+   only needed if you also changed `EMBEDDING_DIMENSIONS` or the model.
+   Meanwhile `/health` reports the indexer (`status: "degraded"` only if a
+   pass actually fails) and the panel dashboard shows the pending count;
+   semantic search returns partial results until the embed pass finishes,
+   keyword search is complete after the first pass. Then trigger the backup
+   Job once (`kubectl create job --from=cronjob/obsidian-mcp-db-backup …`) so
+   `backups_log` has a post-restore row.
 
 ## Troubleshooting
 

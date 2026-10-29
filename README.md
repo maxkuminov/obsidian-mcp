@@ -1618,7 +1618,7 @@ make db-init          Create database, user, and pgvector extension
 make db-migrate       Run alembic migrations
 make db-check         alembic check — schema vs. ORM models (must be clean)
 make test-schema      Schema gate: migrations vs. models on a throwaway pgvector container
-make db-backup        Dump database to backups dir
+make db-backup        Dump database to backups dir (derived index tables schema-only; BACKUP_FULL=1 dumps their rows too)
 make db-restore FILE=<path>   Restore from a backup
 make reindex          Explain how to trigger a reindex (panel only; there is no headless trigger)
 make reset-embeddings Drop and recreate embedding column at configured dim

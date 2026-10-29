@@ -79,7 +79,7 @@ help:
 	@echo "  make db-vacuum-notes - VACUUM (ANALYZE) notes_metadata now (027's fallback; autovacuum normally does it)"
 	@echo "  make test-schema  - Schema gate: migrations vs. models on a throwaway pgvector"
 	@echo "  make test-integration - Run tests/integration against a throwaway pgvector (they skip without one)"
-	@echo "  make db-backup    - Backup database"
+	@echo "  make db-backup    - Backup database (derived index tables schema-only; BACKUP_FULL=1 dumps their rows too)"
 	@echo "  make db-restore FILE=<path> - Restore from backup"
 	@echo ""
 	@echo "$(YELLOW)Operations:$(NC)"
@@ -356,6 +356,25 @@ test-integration:
 # a long gap between deploys cannot leave the directory empty (#181).
 BACKUP_RETAIN_DAYS ?= 30
 BACKUP_RETAIN_MIN ?= 7
+#
+# Five tables are a cache of the vault plus settings and are rebuilt by the
+# indexer after a restore (#348): the index pass rewrites `notes_metadata` and
+# `note_links`, the embed pass refills `note_embeddings`, `indexer_runs` is
+# display history nothing reads for a decision, and `indexer_state`'s
+# fingerprints are re-adopted at startup when absent. Their rows are the bulk
+# of every dump (one 1024-dim vector per chunk), so the default dump carries
+# their *schema only*: `--exclude-table-data` keeps the DDL, the halfvec index
+# and `alembic_version`, so a restore followed by `alembic check` is clean and
+# the first pass after it rebuilds the rows from the vault. `BACKUP_FULL=1`
+# dumps everything (a weekly cron line, if restore time matters more than
+# dump size). The other twelve tables are durable — users, credentials, OAuth
+# grants, transfer tokens, sessions, usage, quotas, backups_log, the
+# concurrency evidence — and are always dumped. The same list is written out
+# in deploy/kubernetes/components/db-backup/configmap.yaml, and
+# tests/test_backup_derived_tables.py pins both against src/models/db.py.
+BACKUP_DERIVED_TABLES := notes_metadata note_embeddings note_links indexer_runs indexer_state
+BACKUP_EXCLUDE_DATA = $(if $(filter-out 0,$(BACKUP_FULL)),,$(foreach t,$(BACKUP_DERIVED_TABLES),--exclude-table-data=$(t)))
+BACKUP_MODE_NOTE = $(if $(filter-out 0,$(BACKUP_FULL)),$(YELLOW)Full dump (BACKUP_FULL set): derived index tables included$(NC),Derived index tables ($(BACKUP_DERIVED_TABLES)) dumped schema-only; the indexer rebuilds them after a restore. BACKUP_FULL=1 dumps their rows too.)
 
 db-backup:
 	@mkdir -p $(DATA_DIR)/backups
@@ -363,7 +382,7 @@ db-backup:
 	@umask 077; TIMESTAMP=$$(date +%Y%m%d_%H%M%S); \
 	BACKUP_FILE="$(DATA_DIR)/backups/backup_$$TIMESTAMP.sql"; \
 	: "the database named here is mirrored as DB_NAME's default in docker/record-backup.sh; keep the two in step"; \
-	if ! $(DB_EXEC) pg_dump -U postgres obsidian_mcp > $$BACKUP_FILE; then \
+	if ! $(DB_EXEC) pg_dump -U postgres $(BACKUP_EXCLUDE_DATA) obsidian_mcp > $$BACKUP_FILE; then \
 		rm -f $$BACKUP_FILE; \
 		echo "$(RED)Backup FAILED: pg_dump through DB_BACKEND=$(DB_BACKEND) returned non-zero$(NC)"; \
 		echo "$(YELLOW)Set DB_BACKEND / DB_CONTAINER (docker) or CNPG_NAMESPACE / CNPG_CLUSTER (cnpg) in Makefile.local to match the deployment.$(NC)"; \
@@ -386,6 +405,7 @@ db-backup:
 	fi; \
 	chmod 600 $$BACKUP_FILE.gz; \
 	echo "$(GREEN)Backup: $$BACKUP_FILE.gz$(NC)"; \
+	echo "$(BACKUP_MODE_NOTE)"; \
 	: "prune BEFORE recording: the new dump is already verified above, and the recording must stay the recipe's last command so its exit status is the target's"; \
 	PRUNED=0; \
 	for OLD in $$(ls -1t $(DATA_DIR)/backups/backup_*.sql.gz 2>/dev/null | tail -n +$$(( $(BACKUP_RETAIN_MIN) + 1 ))); do \
