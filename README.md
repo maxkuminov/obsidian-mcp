@@ -5,28 +5,36 @@
 [![MCP](https://img.shields.io/badge/MCP-compatible-7C3AED)](https://modelcontextprotocol.io)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16%20%2B%20pgvector-336791?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 
-**A memory system for your AI agents — stored as plain markdown you
-can open in Obsidian.**
+**Your agents' memory, in the vault you already have, reachable from
+claude.ai, ChatGPT, Claude Code and your phone.**
 
 A self-hosted [Model Context Protocol](https://modelcontextprotocol.io)
-server that gives every agent you connect a durable, shared place to
-remember things. The storage isn't a vector database you can't see
-into: it's a folder of markdown files in your Obsidian vault, backed
-by full-text and semantic search and by your own wikilink graph.
-Obsidian is the human window onto it — open a note, read exactly what
-an agent wrote about you, correct it, delete it, or take the whole
-folder somewhere else. Self-describing, too —
-agents read what you read, link what you link, and pick up your folder
-layout, frontmatter schema, and tag conventions on the first call
-instead of being briefed from scratch every session.
+server over an Obsidian vault. Three things it does that the
+alternatives mostly don't:
 
-To be precise about the scope: what the server supplies is
-MCP-accessible storage, keyword and semantic search, and graph
-operations over markdown notes, for whatever MCP clients you connect.
-The agents direct their own reads and writes. There is no automatic
-extraction, consolidation, or decay pipeline running behind them — an
-agent remembers something because it wrote a note, and forgets it
-because someone deleted one.
+- **Your existing vault, served in place.** No imposed note format, no
+  sidecar syntax, no "memory" folder you have to adopt. Agents read what
+  you read, follow your wikilinks, and pick up your folder layout,
+  frontmatter schema and tag conventions from the vault itself.
+- **Remote and multi-user.** OAuth 2.0 PKCE and API keys, so claude.ai,
+  Claude Desktop, Claude mobile, ChatGPT, Claude Code and n8n all read
+  and write the same files, each user confined to their own vault root.
+- **Writes cannot clobber.** `expected_hash` preconditions refuse an
+  edit made from a stale read, every publish is atomic and
+  no-clobber by default, deletes go to `.trash/`, and `dry_run` returns
+  the diff before anything lands.
+
+Connect from Claude Code:
+
+```bash
+claude mcp add obsidian --transport http \
+  --url "https://obsidian-mcp.<your-domain>/mcp" \
+  --header "Authorization: Bearer omcp_..."
+```
+
+In claude.ai, Claude Desktop or ChatGPT, add a custom connector at
+`https://obsidian-mcp.<your-domain>/mcp` and sign in through the OAuth
+consent page. [Connect a client](#4-connect-a-client) has the rest.
 
 Stack: Python 3.12, FastAPI, PostgreSQL with pgvector. Pluggable
 embeddings (Ollama bge-m3, or OpenAI `text-embedding-3-{small,large}`).
@@ -89,6 +97,22 @@ some chat history I can't search.
 The semantic search and wikilink graph still work over that material,
 so retrieval is fast and conceptual. But the substrate is files you
 own, not a black box.
+
+To be precise about the scope: what the server supplies is
+MCP-accessible storage, keyword and semantic search, and graph
+operations over markdown notes, for whatever MCP clients you connect.
+The agents direct their own reads and writes. There is no extraction
+or decay pipeline running behind them, and nothing rewrites a note
+because a model judged it stale: an agent remembers something because
+it wrote a note, and forgets it because someone deleted one. By late
+2026 that is less of a contrarian position than it sounds. Every
+vendor's consolidation step (the "dreaming" or "sleep-time" job) has
+turned into a separate process you can inspect, rather than silent
+extraction inside the write path. This server keeps the agent as the
+author. The consolidation help it will grow is a hygiene report that
+proposes merges and flags duplicates, and never writes
+([#359](https://github.com/maxkuminov/obsidian-mcp/issues/359)), not
+a pipeline that edits your notes while you are not looking.
 
 <a id="1-a-shared-memory-layer-between-you-and-your-agents"></a>
 
@@ -423,36 +447,63 @@ See [System requirements](#system-requirements).
 
 ## vs. other Obsidian MCP servers
 
-There are several existing MCP servers for Obsidian, and most of them
-solve a different problem than this one. The lightweight ones are
-glue over Obsidian's Local REST API plugin or the filesystem: they
-let an agent reach the files, but don't build any infrastructure of
-their own. They're great if "I just want Claude to read my notes"
-is the goal and you keep Obsidian running locally.
+The field has sorted itself into two shapes since this README was
+first written, and the axis that matters is not "lightweight versus
+heavy" but **where the agent runs relative to the Obsidian app**.
 
-This server is on the other end of the spectrum: a real backend with
-a persistent index, semantic retrieval, a wikilink graph, OAuth, and
-an admin UI. The cost is Postgres and Docker. The benefit is
-everything you can build on top of that.
+**Desktop-local.** The tool talks to a running Obsidian. The [Local
+REST API plugin][rest] has shipped its own Streamable HTTP MCP server
+since 4.0.0 (2026-05-15), and 5.5.0 (2026-10-17) added `If-Match`
+conditional writes and result caps, so it is no longer "glue" but a
+real local MCP endpoint. The official [Obsidian CLI][cli] (1.12)
+reads, writes, searches and walks backlinks, and requires the app to
+be running. In-app agent plugins sit in the same group. All of these
+get the app's own metadata cache for free; none of them work on a
+headless box, and none give claude.ai or a phone a way in without you
+exposing your desktop.
 
-|  | This server | [MarkusPfundstein/mcp-obsidian][mp] | [StevenStavrakis/obsidian-mcp][sg] | [jacksteamdev/obsidian-mcp-tools][js] |
-| --- | --- | --- | --- | --- |
-| Persistent index (Postgres) | ✅ | — | — | — |
-| Semantic search (vectors) | ✅ | — | — | — |
-| Wikilink graph queries | ✅ | — | — | partial |
-| Runs without Obsidian open | ✅ | — | ✅ | — |
-| OAuth 2.0 client flow | ✅ | — | — | — |
-| Multi-user / per-user vaults | ✅ | — | — | — |
-| Admin UI + usage logs | ✅ | — | — | — |
-| Atomic writes + dry-run diffs | ✅ | — | — | — |
-| Setup tax | Postgres + Docker | Obsidian + REST plugin | Python only | Obsidian plugin |
+**Headless and remote.** The server owns a copy of the files and runs
+anywhere. This server is one. [Vault Cortex][vc] (aliasunder,
+September 2026) is a single container with OAuth 2.1, SQLite FTS5 plus
+sqlite-vec fused by RRF and a local reranker, tasks and daily-note
+helpers, and a bundled Obsidian Headless Sync client; one vault per
+container, no multi-user. [StevenStavrakis/obsidian-mcp v2][sg]
+(2026-08) is a stdio server with journaled atomic writes,
+etag/`if_match` preconditions and 30-day recovery snapshots, and no
+semantic search. [jacksteamdev/obsidian-mcp-tools][js] was archived on
+2026-05-13 and is dropped from the table.
 
-[mp]: https://github.com/MarkusPfundstein/mcp-obsidian
+If Obsidian is open on the machine the agent runs on and you need no
+remote access, the official CLI or the REST plugin is the lighter
+choice. This server is for the headless, remote, multi-client and
+semantic case: nothing on the box but a container and Postgres, and
+every client you own hitting the same vault.
+
+As of 2026-10-28:
+
+|  | This server | [REST plugin MCP][rest] | [Obsidian CLI][cli] | [Vault Cortex][vc] | [StevenStavrakis v2][sg] |
+| --- | --- | --- | --- | --- | --- |
+| Runs without Obsidian | ✅ | — | — | ✅ | ✅ |
+| Semantic search | ✅ pgvector | — | — | ✅ sqlite-vec + RRF + reranker | — |
+| Wikilink graph | ✅ backlinks, neighborhood, orphans, related | backlinks | backlinks, orphans, dead ends | backlinks, outgoing, orphans | — |
+| Atomic / journaled writes | ✅ staged, fsync, no-clobber publish | ? | ? | ✅ temp + rename | ✅ journaled, rollback, snapshots |
+| Write preconditions (hash / etag) | ✅ `expected_hash` | ✅ `If-Match` (5.5.0) | — | — | ✅ `if_match` |
+| Dry-run diff | ✅ | — | — | — | — |
+| Soft-delete to trash | ✅ `.trash/` | ? | ✅ | ✅ | ✅ 30-day snapshots |
+| Multi-user vault roots | ✅ | — | — | — | — (multi-vault, one user) |
+| OAuth for claude.ai / ChatGPT | ✅ 2.0 PKCE + API keys | — (API key) | n/a | ✅ 2.1 PKCE + DCR | n/a (stdio) |
+| Audit log | ✅ per call, in the panel | ? | — | server logs | transaction journal |
+| Setup tax | Postgres + Docker | Obsidian + plugin | Obsidian 1.12 | one container (Sync subscription for the remote image) | Node 22 |
+
+[rest]: https://github.com/coddingtonbear/obsidian-local-rest-api
+[cli]: https://obsidian.md/help/cli
+[vc]: https://github.com/aliasunder/vault-cortex
 [sg]: https://github.com/StevenStavrakis/obsidian-mcp
 [js]: https://github.com/jacksteamdev/obsidian-mcp-tools
 
-Comparison reflects each project's documented features at time of
-writing; verify the specifics before betting on them.
+The table reflects each project's documented features on that date,
+read from their READMEs and release notes; a `?` means I could not
+confirm it either way. Verify the specifics before betting on them.
 
 ### vs. hosted memory systems
 
@@ -464,7 +515,32 @@ people usually reach for. What follows is about that architecture —
 memory behind a service boundary — not about any one product's current
 feature list, which moves faster than a README can track.
 
-The difference is where the memory lives and who can open it.
+One thing has changed since that paragraph was first true: files
+plus search is now the mainstream substrate, not the odd one out.
+Letta's MemFS is git-backed markdown; Claude Code's auto-memory is a
+`MEMORY.md` index plus topic files; Anthropic's memory tool is a file
+directory; OpenClaw and Hermes keep markdown workspaces. "Readable
+markdown memory" on its own no longer sets this server apart. The
+closest comparables are [Basic Memory][bm] (markdown plus a SQLite or
+Postgres index, hybrid search, an optional reranker, structured
+frontmatter filters; its own folder and note format, AGPL, with a paid
+cloud) and [doobidoo/mcp-memory-service][dm] (self-hosted, remote MCP
+over OAuth, opaque memory records rather than files). Against those,
+the differences are five, and plain:
+
+1. The existing vault, served in place, with no imposed folder or
+   note format.
+2. Remote and multi-user over OAuth, one vault root per user.
+3. Destructive-write guards: `expected_hash`, atomic no-clobber
+   publish, `.trash/`, dry-run diffs.
+4. MIT.
+5. No hosted tier, and none planned.
+
+[bm]: https://github.com/basicmachines-co/basic-memory
+[dm]: https://github.com/doobidoo/mcp-memory-service
+
+The difference from memory-as-a-service is where the memory lives and
+who can open it.
 
 - **Readability.** When memory sits behind a service API, reading it
   means whatever endpoint or console the service exposes, in whatever
@@ -498,6 +574,8 @@ reconciling ones that contradict each other, and scoring relevance or
 decaying old memories so they stop crowding out new ones. Here an
 agent remembers something because it decided to write a note, and the
 judgment about what's worth keeping is the agent's, not the server's.
+The consolidation help planned here is a report that proposes and
+never writes ([#359](https://github.com/maxkuminov/obsidian-mcp/issues/359)).
 If you want memory that curates itself, that's a fair reason to pick
 the other shape.
 
@@ -562,8 +640,11 @@ vault was in git at all.
 ### Who this isn't for
 
 - "I just want Claude to read my notes" with the lightest possible
-  setup. Use one of the filesystem-glue projects above; you don't
-  need this.
+  setup. Use one of the desktop-local tools above; you don't need
+  this.
+- Obsidian is open on the machine the agent runs on and you need no
+  remote access. The official CLI or the Local REST API plugin's MCP
+  server is the lighter choice.
 - Anyone unwilling to run a database. There is no SQLite fallback;
   pgvector is doing real work, and a managed Postgres with
   pgvector support is part of the stack.
