@@ -649,8 +649,9 @@ async def move_note(
     changed since. It is compared at preflight, before the rename and before any rewrite; the rename then pins
     inode identity but does not compare the bytes again, so an in-place edit landing after that comparison is
     still moved. The backlink sources a `rewrite_links=True` move rewrites are *not* bound, because you never
-    read them. Codes: `stale_precondition` (with the current hash), `concurrent_write`, `no_incumbent`,
-    `malformed_precondition`, `precondition_unavailable`, `precondition_required`.
+    read them. Optional by default — omitted, the move proceeds — unless the deployment requires it, when
+    an omitted hash is refused `precondition_required`. Codes: `stale_precondition`, `concurrent_write`,
+    `no_incumbent`, `malformed_precondition`, `precondition_unavailable`, `precondition_required`.
 
     With `rewrite_links=True`, every source note that links to this note is rewritten in place — wikilinks,
     embeds, path-style links, and bare-href markdown links `[text](Old.md)`, whose new href is written
@@ -678,14 +679,13 @@ async def move_note(
     claims nothing was written; if another writer changed `to_path` in between, **no hash is reported** and the
     result says to re-read `to_path` first.
 
-    Writes are atomic. Either path is refused, naming the link's target, when its final component is a symlink.
-    See `get_vault_guide` for vault folder conventions.
+    Writes are atomic; a symlinked final component on either path is refused. See `get_vault_guide` for
+    vault folder conventions.
 
     Args:
         from_path: Vault-relative path of the existing note.
-        to_path: Vault-relative path of the destination. Must not exist; parent directories are created.
-        rewrite_links: Also rewrite incoming links in source notes. Off by default — opting in modifies other
-            notes' bodies.
+        to_path: Vault-relative path of the destination.
+        rewrite_links: Also rewrite incoming links in source notes (off by default).
         expected_hash: `from_path`'s `content_hash` as you last read it.
     """
     return await move_note_impl(
@@ -727,8 +727,9 @@ async def delete_note(
     Dangling backlinks left behind by a delete are surfaced via
     `get_backlinks` and `find_orphans`. See `get_vault_guide` for context.
 
-    **`expected_hash` — binding a write to the bytes you read.** Optional; omit
-    it and nothing changes. Pass the `content_hash` a read returned, verbatim
+    **`expected_hash` — binding a write to the bytes you read.** Optional by default — omitted, the
+    delete proceeds against whatever is on disk — unless the deployment requires it, when an omitted hash
+    is refused `precondition_required`. Pass the `content_hash` a read returned, verbatim
     and canonical (`sha256:<64 lowercase hex>`), and the call is refused with
     nothing written if the file changed in between. It is always the **whole
     file's** hash, never a hash of the text you received. `expected_hash`
@@ -913,8 +914,9 @@ async def write_file(
     bound is rejected by the transport with a bare HTTP 413 before this tool
     runs — send such content as base64 instead.
 
-    Optional `expected_hash` binds an existing whole file on `overwrite=True`.
-    Obtain its canonical `sha256:<64 lowercase hex>` value from `read_file`'s
+    `expected_hash` binds an existing whole file on `overwrite=True`; optional by default — omitted, the
+    overwrite replaces whatever is on disk — unless the deployment requires it, when an omitted hash on
+    an overwrite is refused `precondition_required`. Obtain its canonical `sha256:<64 lowercase hex>` value from `read_file`'s
     base64 header, `read_file(hash_only=True)`, or a prior write's success.
     Syntax is checked before path work; a hash with no-clobber or a missing
     destination is `no_incumbent`. An over-cap incumbent cannot be guarded.
@@ -1143,11 +1145,12 @@ async def delete_file(
     backlinks), directories, and symlinks. Non-markdown files are not indexed,
     so search and embeddings are unaffected either way.
 
-    Optional `expected_hash` binds the whole raw file in either mode. Use the
-    canonical `sha256:<64 lowercase hex>` from `read_file`'s base64 header,
+    `expected_hash` binds the whole raw file in either mode; optional by default — omitted, the delete
+    proceeds — unless the deployment requires it, when an omitted hash is refused `precondition_required`.
+    Use the canonical `sha256:<64 lowercase hex>` from `read_file`'s base64 header,
     `read_file(hash_only=True)`, or a write success. Malformed hashes refuse
     before path checks; unavailable, required and stale preconditions refuse
-    before any trash entry or unlink. The deployment may require a hash.
+    before any trash entry or unlink.
     This checks the caller-read-to-call window; a later concurrent replacement
     remains possible, so it is not an atomic filesystem compare-and-delete.
     A successful delete reports no content hash.

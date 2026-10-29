@@ -312,11 +312,21 @@ _REFUSAL_EXCEPTION = re.compile(
     r"tool runs and carries no such line"
 )
 _REFUSAL_NEGATED = re.compile(r"mcp-refusal[^.]*\bnot (emitted|appended|returned)")
-# `expected_hash` is schema-optional and unguarded writes overwrite *by default*,
-# but WRITE_PRECONDITION_REQUIRED=true turns an omitted hash into a refusal.
+# `expected_hash` is schema-optional and unguarded writes proceed *by default*,
+# but WRITE_PRECONDITION_REQUIRED=true turns an omitted hash into a refusal. Every
+# description that accepts the argument on a guardable write says so in one
+# clause; `create_note` is the exception — it accepts the argument only to
+# refuse it `no_incumbent`, and creation is exempt from the setting.
 _OPTIONAL_CLAUSE = re.compile(
-    r"optional by default[^.]*stale edit overwrites[^.]*deployment requires it"
-    r"[^.]*`precondition_required`"
+    r"optional by default[^.]*unless the deployment requires it[^.]*`precondition_required`"
+)
+_UNQUALIFIED_OPTIONAL = (
+    "without it a stale edit overwrites",
+    "optional; omit it and nothing changes",
+    "the deployment may require a hash",
+)
+GUARDABLE_WRITE_TOOLS = (
+    "edit_note", "set_frontmatter", "move_note", "delete_note", "write_file", "delete_file",
 )
 
 
@@ -328,11 +338,27 @@ def test_the_refusal_statement_is_qualified(name):
     assert not _REFUSAL_NEGATED.search(text), f"{name}: refusal statement is negated"
 
 
-@pytest.mark.parametrize("name", ("edit_note", "set_frontmatter"))
+def test_the_guardable_set_is_every_expected_hash_tool_but_create_note():
+    """Guard the parametrisation: a tool that gains `expected_hash` later must
+    join the list (or be argued out of it here), not slip past unqualified."""
+    accepting = {
+        t.name for t in listed() if "expected_hash" in t.parameters["properties"]
+    }
+    assert accepting == set(GUARDABLE_WRITE_TOOLS) | {"create_note"}
+
+
+@pytest.mark.parametrize("name", GUARDABLE_WRITE_TOOLS)
 def test_expected_hash_is_described_as_optional_by_default_only(name):
     text = _normalised(description(name))
     assert _OPTIONAL_CLAUSE.search(text), f"{name}: optional-by-default clause missing or unqualified"
-    assert "without it a stale edit overwrites" not in text, name
+    for phrase in _UNQUALIFIED_OPTIONAL:
+        assert phrase not in text, f"{name}: still says {phrase!r}"
+
+
+def test_create_note_describes_its_hash_as_always_refused():
+    text = _normalised(description("create_note"))
+    assert "no_incumbent" in text
+    assert not _OPTIONAL_CLAUSE.search(text)
 
 
 def test_the_instructions_qualify_both_statements():
