@@ -188,25 +188,52 @@ constant-time statement with no table access), and
   phrase, `-"a b"`), an unknown token — means **no fallback**: the AND rows
   stand alone and telemetry records `fallback: "skipped"`.
 
-With a plain conjunction holding `k ≥ 2` positive units, the fallback text
-for that config is `(u1 | u2 | … | uk) & !n1 & … & !nm` built from the
-verbatim unit tokens, and the fallback tsquery is `CAST(:fallback_i AS
-tsquery)` per config, OR'd with `||` like `combined_tsquery`. The
-`tsquery` input function takes quoted lexemes **verbatim** — no stemming,
-no stop-word pass — so the fallback's stems are exactly the AND parse's,
-including stop-word gaps (`<2>`) inside a quoted phrase. Nothing from the
-caller's string reaches `to_tsquery`; the only caller-derived input is the
-same `:q` bind the AND statement already uses. `k = 1` means the OR equals
-the AND and the fallback is skipped (`fallback: "not_needed"` when `n =
-limit`).
+**Per config, because the parses differ per config** (Codex r1 #3: under
+`english,simple`, `the running` parses to `'run'` and to `'the' &
+'running'`). For each configured config `i`:
+
+- its parse is a plain conjunction with `k_i ≥ 2` positive units →
+  *eligible*: the per-config fallback form is `(u1 | … | uk) & !n1 & … &
+  !nm` built from the verbatim unit tokens and cast `CAST(:fallback_i AS
+  tsquery)`;
+- otherwise (an `OR`, a parenthesised negation, a single unit, an empty
+  parse) → *ineligible*: the per-config form is that config's **own AND
+  query**, `websearch_to_tsquery(CAST(:cfg_i AS regconfig), :q)`, retained
+  unchanged.
+
+The combined fallback is the OR (`||`) over configs of those per-config
+forms — the same shape `combined_tsquery` has. Because each per-config form
+is implied by that config's AND parse (`(a & b & !n) ⇒ ((a | b) & !n)`, and
+an ineligible config's form *is* its AND parse), the combined fallback is a
+superset of the combined AND query **by construction**, whatever mix of
+eligible and ineligible configs a query produces. A `runs fast` document
+under `english,simple` matches the combined AND through `english`'s `'run'`
+and matches the combined fallback through the retained `english` form. The
+fallback runs only when at least one config is eligible; when none is, the
+fallback is skipped (`fallback: "skipped"`). The `tsquery` input function
+takes quoted lexemes **verbatim** — no stemming, no stop-word pass — so an
+eligible form's stems are exactly that config's AND parse, including
+stop-word gaps (`<2>`) inside a quoted phrase. Nothing from the caller's
+string reaches `to_tsquery`; the only caller-derived input is the same `:q`
+bind the AND statement already uses.
 
 The fallback statement is the AND statement with the fallback tsquery in
 both `@@` and `ts_rank_cd`, `AND NOT (content_tsvector @@ <and tsquery>)`,
 the same filters, the same ORDER BY, `LIMIT :limit - n`. Because the AND
 block was not full, every AND-matching row is in it, so the predicate
-excludes exactly those rows. `(a & b & !n) ⇒ ((a | b) & !n)` for every
-vector, so the union is a superset of the AND set — asserted on Postgres
-over a generated query corpus as the safety property of the parser.
+excludes exactly those rows. The superset property is asserted on Postgres
+over a generated query corpus under `english` and under `english,simple`,
+with the `the running` / `runs fast` case pinned by name.
+
+**`matched_terms` is per config, rendered as one pair.** For each config
+whose parse is a plain conjunction (any `k_i ≥ 1`, at most
+`MATCHED_TERMS_MAX_UNITS` = 32 units), the statement counts the config's
+positive units present in the row's vector, `m_i`, and the row renders the
+pair `m/k` of the config with the greatest `m_i / k_i`, ties broken by the
+greater `k_i`, then by config order. Under `english,simple` the `runs
+fast` row for `the running` therefore renders `1/1` (english: `'run'`
+present), not `0/2`. A row whose configs all have a non-conjunctive parse
+carries no `matched_terms`.
 
 Both statements and D4's run in one transaction after `SET LOCAL
 random_page_cost = 1.1`; rows are assembled `all` block then `any` block,
@@ -250,13 +277,31 @@ amplification: one more TOAST value per changed note per pass, the same
 cardinality as the vector.
 
 Why 20,000: it covers the median note many times over and most long notes
-whole, and it bounds `ts_headline`'s parse to `limit × 20 KB` per search
-(default page: ≤ 400 KB; `limit=500`: ≤ 10 MB, the caller's own cost,
-timed separately). A match beyond the excerpt, or a match only in the
-head (title/aliases are not in the excerpt), yields no highlight and the
-row shows the excerpt's leading words as `head:` with `matched_in` saying
-where it matched (L3). Nothing fabricated: `head:` is text the index holds
-for that note, labelled as not the matching span.
+whole. It does **not** bound the cost by itself (Codex r1 #5: twenty
+distinct 20,000-character excerpts cost ≈ 452 ms under one config and ≈
+891 ms under `english,simple` on PG16, and `limit` may be 500), so the
+cost is bounded by rows, not by `limit`: snippets are computed for the
+first **`KEYWORD_SNIPPET_ROWS`** (default 20) rows of the assembled page
+regardless of `limit`; rows beyond it carry no `snippet`/`head` field and
+the header says `snippets: first N`. The implementation ships only if the
+measured gate passes: on the throwaway PG16 container, a page of twenty
+distinct 20,000-character excerpts with repeated matches, under
+`english,simple`, with head-fallback rows included, completes the snippet
+statement in **under 300 ms** (asserted in the integration suite, the
+measurement recorded here); if it does not, `KEYWORD_EXCERPT_CHARS`'s
+default is lowered until it does and the reason recorded. A match beyond
+the excerpt, or a match only in the head (title/aliases are not in the
+excerpt), yields no highlight and the row shows the excerpt's leading
+words as `head:` with `matched_in` saying where it matched (L3). Nothing
+fabricated: `head:` is text the index holds for that note, labelled as
+not the matching span.
+
+`RANK_WEIGHTS`, `KEYWORD_EXCERPT_CHARS` and `KEYWORD_SNIPPET_ROWS` are
+**settings** (`src/config.py`, validated at boot: four floats in `(0, 1]`
+rendered as a bound `float4[]`, never interpolated; `1_000 ≤ excerpt ≤
+100_000`; `0 ≤ rows ≤ 100`), documented in README's Configuration table and
+`.env.example` per the public-docs rule. Changing `KEYWORD_EXCERPT_CHARS`
+takes effect for rows written afterwards; the rebuild rewrites the rest.
 
 **The snippet statement** is a third statement, over the page only:
 `WHERE id = ANY(:ids)` for the block's ids, projecting per row
@@ -349,10 +394,30 @@ because it changes the indexer's skip rules (C1–C8) in the most delicate
 module for a one-time upgrade step; recorded as a follow-up if the
 operator step proves annoying.
 
-**The compose overlap window.** 031 commits before `--force-recreate`; the
-old container's next tick may write an unweighted vector for a note
-changed in that window. The next edit, or the rebuild, repairs it (L4).
-k8s has no such window.
+**Downgrade restores the old semantics, not only the schema** (Codex r1
+#4). `downgrade()` takes the generation lock, sets `content_tsvector =
+ts_filter(content_tsvector, '{d}')` on every row holding a vector (strips
+every weight-`A` lexeme, so the previous image sees no title-only matches
+and later D-only writes do not mix with headed rows), and only then drops
+a marked `body_excerpt`. The schema gate asserts a downgraded database has
+no A-weighted lexeme.
+
+**The old-image overlap is closed, not accepted** (Codex r1 #1). The
+failing input was: 031 re-heads `Alpha.md`; before `--force-recreate` the
+old container serves `move_note(Alpha.md → Beta.md)`, which rewrites
+`title` and `file_path` but preserves the headed vector — so the new
+image serves `alpha` as an A-weighted false positive and misses `beta`,
+and neither the unchanged-hash scan nor 031's skip predicate ever repairs
+it. The control: **the compose `make deploy` stops the application
+container before migrating whenever a migration is pending** (`alembic
+current` ≠ `heads`), then migrates, then recreates; with no pending
+migration it keeps today's order. `DEPLOYMENT.md`'s upgrade notes state
+the same order (stop app → migrate → start) for anyone driving compose by
+hand. k8s already has no overlap: `strategy: Recreate` terminates the old
+pod before the new pod's `migrate` initContainer runs. The scenario stays
+in the spec as an accepted-and-closed limitation whose control is the
+ordering rule (L4), and a rebuild-versus-move race test covers the other
+writer pairing (D6).
 
 ## D6 — Both move paths re-head the vector
 
@@ -365,6 +430,27 @@ best-effort fallback to the stored JSONB when that read or parse failed.
 `body_excerpt` is untouched by both — the body did not move. A
 `set_frontmatter` or `edit_note` that changes aliases changes the hash and
 the pass rewrites the whole vector; no third writer is needed.
+
+**Both move paths are tsvector writers, so both hold the generation lock
+and revalidate the fingerprint** (Codex r1 #1). The indexer's move UPDATE
+already runs inside the pass transaction, which takes
+`acquire_generation_lock_unbounded` at its head and calls
+`_assert_fts_generation_current` before any row lock. `move_note`'s
+metadata transaction gains the same two steps as its **first** statements
+— `acquire_generation_lock(session)` (the 60 s bounded form: a request
+must not sit on a lock for minutes), then `_assert_fts_generation_current`
+— before its `UPDATE notes_metadata` takes a row lock, keeping the
+documented order *generation lock → row locks*. A lock wait past the
+statement timeout, or a fingerprint mismatch (a rebuild recorded a
+different `FTS_CONFIGS` since this process started), aborts the metadata
+transaction: the move on disk stands, the result reports the partial
+outcome exactly as a database failure does today, and the next pass's
+id-preserving move detection — itself under the lock and the fingerprint
+check — rewrites path, title and head. Nothing is written under a
+configuration the store does not certify. The rebuild holds the lock for
+its whole transaction, so a `move_note` racing it waits and re-heads
+afterwards, and a move that commits first makes the rebuild's certified
+UPDATE miss and re-read (the race test in tasks §5).
 
 The move paths are specified on what matters — the new title matches at
 `A`, the old one does not, the body's lexemes, weights and relative
@@ -389,10 +475,27 @@ write are unchanged: the fingerprint still certifies configs only.
 (`"ran" | "skipped" | "not_needed"`) and `snippet_ms`; JSONB, no migration.
 `timing.record_results` runs over the final assembled list.
 
-`test_perf_projection_identity_pg.py`'s keyword case compares the oracle
-against the rows tagged `match: "all"`, with the comparator ignoring the
-new fields — the identity requirement's keyword clause is re-scoped to the
-`all` block, since the `any` block has no pre-change counterpart.
+`test_perf_projection_identity_pg.py`'s keyword case can no longer claim
+byte identity: `rank` is a pre-change field and D2 scales every body-only
+rank, and title-versus-body order changes on purpose (Codex r1 #2). The
+identity requirement's keyword clause is therefore rewritten to what is
+actually invariant, and the new contract is asserted separately:
+
+- **conjunctive membership**: the set of paths tagged `match: "all"`
+  equals the oracle's set (the `@@` predicate and the filters are
+  unchanged), for every query, filter and limit, where the limit cuts
+  neither list;
+- **body-only relative order**: among rows whose `matched_in` is `body`
+  alone, the relative order equals the oracle's (same tie rules as before,
+  `file_path` tie-break);
+- **exempt**: rank values, and the position of any row whose `matched_in`
+  includes `title` (the intended change);
+- **asserted separately** (`test_keyword_ranking_pg.py`): the title case,
+  the alias case, body-only order equal under `RANK_WEIGHTS` and under the
+  default array.
+
+The oracle's corpus still builds its vectors through `index_tsvector_sql`
+(with the corpus titles, so title rows exist to be exempted).
 
 ## D9 — The docstring, symmetric with `semantic_search`
 
@@ -425,14 +528,22 @@ describes `snippet`/`head`, `matched_in`, `matched_terms`; keeps the
   cross-config case pre-exists.
 - **L3** A match beyond the 20,000-character excerpt, or only in the
   title/aliases, shows `head:` (leading words) instead of a highlight.
-- **L4** Rows indexed before 031 carry no excerpt until edited or rebuilt;
-  on compose, notes changed in the migrate-to-recreate window may keep an
-  unweighted vector until their next edit or a rebuild. A startup WARNING
-  counts the former; nothing counts the latter.
-- **L5** No fallback for a query with `OR`, a negated phrase, or a single
-  positive unit; a `-term` is honoured in the fallback.
-- **L6** `matched_terms` omitted above 32 positive units or when the
-  parse is not a plain conjunction.
+- **L4** Rows indexed before 031 carry no excerpt until edited or rebuilt
+  (a startup WARNING counts them). The old-image overlap on compose — an
+  old container moving a note after 031 re-headed it, leaving the old
+  title at weight `A` for ever — is **closed** by the ordering rule: `make
+  deploy` stops the app before a pending migration, `DEPLOYMENT.md` says
+  so for hand-driven compose, and k8s `Recreate`s. An operator who
+  migrates a live compose stack by hand against that note reopens it and
+  repairs it with `make rebuild-tsvectors`.
+- **L5** No fallback when no config's parse is a plain conjunction of at
+  least two positive units (`OR`, a negated phrase, a single word); an
+  ineligible config keeps its AND form inside a fallback another config
+  made eligible; a `-term` is honoured in the fallback.
+- **L6** `matched_terms` omitted when no config's parse is a plain
+  conjunction of at most 32 positive units; rendered per the best config.
+- **L12** Snippets are computed for the first `KEYWORD_SNIPPET_ROWS` (20)
+  rows of the page; rows beyond carry no `snippet`/`head` field.
 - **L7** U+0002 and U+0003 are removed from the stored excerpt and from
   alias text.
 - **L8** The weight array is a heuristic: a note with about forty adjacent
@@ -482,15 +593,31 @@ Probed while writing this design; the implementation's tests pin each.
   yield two fragments joined by the delimiter; U+0002/U+0003 pass through
   as `StartSel`/`StopSel` bytes.
 
-## Open owner decisions
+## Owner decisions (taken 2026-10-29, after Codex round 1)
 
 1. **`RANK_WEIGHTS = {0.02, 0.2, 0.4, 1.0}`** (one title cover ≈ fifty
-   body covers) versus PostgreSQL's default (≈ ten). The scenario in the
-   spec uses thirty adjacent body occurrences; the default fails it.
-2. **`KEYWORD_EXCERPT_CHARS = 20,000`** and the storage it implies (~12 MB
-   on the reference vault, ≤ 20 KB per note).
+   body covers), a setting with that default.
+2. **`KEYWORD_EXCERPT_CHARS = 20,000`** (a setting) and the storage it
+   implies (~12 MB on the reference vault, ≤ 20 KB per note), with
+   **`KEYWORD_SNIPPET_ROWS = 20`** bounding the per-call parse cost and a
+   measured 300 ms gate.
 3. **Excerpt backfill is an operator step** (`make rebuild-tsvectors` /
    the k8s Job) rather than self-healing in the full-hash pass.
 4. **A checked-in k8s Job example** under `deploy/kubernetes/base/`.
 5. **`alias` (singular) read beside `aliases`**, and a scalar alias string
    comma-split like a scalar `tags` string.
+
+## Codex spec review, round 1 (FAIL, six findings, all folded)
+
+1. BLOCKER — old-image overlap + unlocked move writer → D5 (stop before a
+   pending migration; k8s `Recreate` stated), D6 (both move paths under the
+   generation lock with the fingerprint re-read; rebuild race test), L4.
+2. MAJOR — identity oracle contradicted the ranking change → D8 rewritten.
+3. MAJOR — multi-config fallback and `matched_terms` undefined → D3
+   per-config construction, superset by construction, the `the running` /
+   `runs fast` case pinned.
+4. MAJOR — downgrade left headed vectors → D5 downgrade re-filters under
+   the lock.
+5. MAJOR — snippet cost was a row-count assertion → D4
+   `KEYWORD_SNIPPET_ROWS` and the measured 300 ms gate.
+6. MINOR — settings and `DEPLOYMENT.md` omitted → D4 settings, tasks §7.

@@ -28,7 +28,7 @@
 
 ### Requirement: Keyword search runs the conjunction first and fills the page from a disjunction derived from PostgreSQL's parse
 
-`full_text_search` SHALL first run the conjunctive statement — `websearch_to_tsquery` per configured config, OR'd across configs, exactly as before — and SHALL return its rows tagged `match: "all"`. When that statement returns fewer rows than `limit`, the service SHALL obtain the text form of each config's `websearch_to_tsquery` parse from PostgreSQL and SHALL parse that text, never the caller's string: a parse that contains no `|` and no parenthesis and splits on `&` into units each of which is a single negated lexeme or a phrase chain of lexemes joined by `<->`/`<N>` is a plain conjunction. For a plain conjunction with at least two positive units the service SHALL run a second statement whose tsquery is, per config, the positive units OR'd and every negated unit retained as an AND NOT, built from the verbatim lexeme tokens and cast with the `tsquery` input function (no re-stemming), OR'd across configs as the first statement's is; that statement SHALL exclude every row matching the conjunctive tsquery, SHALL apply the identical `folder`, `tags`, `frontmatter` and owner predicates, SHALL order by `rank DESC, file_path ASC` under the same `RANK_WEIGHTS`, SHALL be limited to `limit` minus the conjunctive row count, and its rows SHALL be appended after every conjunctive row tagged `match: "any"`. A parse that is not a plain conjunction, or has fewer than two positive units, SHALL produce no second statement. Every statement of one call SHALL run in the one transaction that issued `SET LOCAL random_page_cost = 1.1`. The service SHALL record `fallback` (`ran`, `skipped` or `not_needed`) and `any_rows` in the call's telemetry.
+`full_text_search` SHALL first run the conjunctive statement — `websearch_to_tsquery` per configured config, OR'd across configs, exactly as before — and SHALL return its rows tagged `match: "all"`. When that statement returns fewer rows than `limit`, the service SHALL obtain the text form of **each** config's `websearch_to_tsquery` parse from PostgreSQL and SHALL parse that text, never the caller's string: a parse that contains no `|` and no parenthesis and splits on `&` into units each of which is a single negated lexeme or a phrase chain of lexemes joined by `<->`/`<N>` is a plain conjunction. A config is *eligible* when its parse is a plain conjunction with at least two positive units. The fallback tsquery SHALL be built **per config** and OR'd across configs as the first statement's is: an eligible config contributes its positive units OR'd with every negated unit retained as an AND NOT, built from the verbatim lexeme tokens and cast with the `tsquery` input function (no re-stemming); an ineligible config contributes its own unchanged `websearch_to_tsquery` expression — so the combined fallback is implied by the combined conjunctive tsquery for every vector, by construction. When at least one config is eligible the service SHALL run the second statement: it SHALL exclude every row matching the conjunctive tsquery, SHALL apply the identical `folder`, `tags`, `frontmatter` and owner predicates, SHALL order by `rank DESC, file_path ASC` under the same `RANK_WEIGHTS`, SHALL be limited to `limit` minus the conjunctive row count, and its rows SHALL be appended after every conjunctive row tagged `match: "any"`. When no config is eligible there SHALL be no second statement. Every statement of one call SHALL run in the one transaction that issued `SET LOCAL random_page_cost = 1.1`. The service SHALL record `fallback` (`ran`, `skipped` or `not_needed`) and `any_rows` in the call's telemetry.
 
 #### Scenario: A three-term query that over-specifies still finds the target
 
@@ -57,8 +57,13 @@
 
 #### Scenario: The disjunction is a superset of the conjunction
 
-- **WHEN** a generated corpus of plain-conjunction queries is run against a seeded database
-- **THEN** for every query every row matching the conjunctive tsquery SHALL match the derived disjunctive tsquery, and the derived text SHALL cast as a `tsquery` without error
+- **WHEN** a generated corpus of queries (plain words, phrases, negations, stop words, quotes and backslashes in lexemes) is run against a seeded database under `FTS_CONFIGS=english` and under `FTS_CONFIGS=english,simple`
+- **THEN** for every query every row matching the combined conjunctive tsquery SHALL match the combined fallback tsquery, and every eligible config's derived text SHALL cast as a `tsquery` without error
+
+#### Scenario: Configs whose parses differ are combined per config
+
+- **WHEN** `FTS_CONFIGS=english,simple`, a note's body is `runs fast`, and `keyword_search("the running", limit=10)` runs — `english` parses to the single unit `'run'` (ineligible) and `simple` to `'the' & 'running'` (eligible)
+- **THEN** the note SHALL be returned tagged `match: "all"` (it matches `english`'s conjunctive parse), the fallback SHALL retain `english`'s unchanged query beside `simple`'s `('the' | 'running')`, and the row SHALL carry `matched_terms: 1/1`
 
 #### Scenario: No caller text reaches a tsquery constructor
 
@@ -72,7 +77,7 @@
 
 ### Requirement: Each keyword result carries a snippet computed over the page only
 
-Each row of `keyword_search` SHALL carry `snippet`: `ts_headline(cfg, body_excerpt, q, opts)` where `body_excerpt` is the stored excerpt (see `index-integrity`), `q` is the tsquery that matched the row's block, and `opts` is `MaxFragments=2, MaxWords=18, MinWords=6` with U+0002/U+0003 as `StartSel`/`StopSel` rendered as `«`/`»`. The headline SHALL be computed by a statement whose predicate is the page's row ids (`id = ANY(:ids)`), never over the candidate set, so its cost is a function of `limit` alone, and that statement's time SHALL be recorded as `snippet_ms`. The same statement SHALL project `matched_in` from `ts_filter(content_tsvector, '{a}') @@ q` (title or aliases) and `ts_filter(content_tsvector, '{d}') @@ q` (body), and `matched_terms` — the count of the plain conjunction's positive units present in the row's vector, over its unit count — when the parse was a plain conjunction of at most 32 positive units. A row whose headline contains no highlight SHALL instead render the excerpt's leading words labelled `head:`, taken from `ts_headline(cfg, body_excerpt, q, 'MaxFragments=0, MinWords=18, MaxWords=24')` evaluated only for such rows; a row whose excerpt is NULL SHALL render neither, and the header SHALL carry the count of such rows always, including zero, with a footer naming the rebuild command when the count is positive. The server SHALL NOT cut or mark inside a snippet, and the header SHALL carry the `all` and `any` counts always, including zero.
+Each of the first `KEYWORD_SNIPPET_ROWS` (default 20, a setting in `0..100`) rows of a `keyword_search` page SHALL carry `snippet`: `ts_headline(cfg, body_excerpt, q, opts)` where `body_excerpt` is the stored excerpt (see `index-integrity`), `q` is the tsquery that matched the row's block, and `opts` is `MaxFragments=2, MaxWords=18, MinWords=6` with U+0002/U+0003 as `StartSel`/`StopSel` rendered as `«`/`»`; rows beyond that count SHALL carry neither `snippet` nor `head`, and the header SHALL say so. The headline SHALL be computed by a statement whose predicate is those rows' ids (`id = ANY(:ids)`), never over the candidate set, so its cost is a function of `KEYWORD_SNIPPET_ROWS`, `KEYWORD_EXCERPT_CHARS` and the config count alone — never of `limit` — and that statement's time SHALL be recorded as `snippet_ms`. The integration suite SHALL measure the worst case on the throwaway PostgreSQL 16 container — twenty distinct 20,000-character excerpts with repeated matches, `FTS_CONFIGS=english,simple`, head-fallback rows included — and SHALL assert the snippet statement completes in under 300 ms; the measurement is recorded in the change's design. The same statement SHALL project `matched_in` from `ts_filter(content_tsvector, '{a}') @@ q` (title or aliases) and `ts_filter(content_tsvector, '{d}') @@ q` (body), and `matched_terms` — for each config whose parse is a plain conjunction of at most 32 positive units, the count of that config's positive units present in the row's vector over that count, rendered as the single pair with the greatest ratio (ties: the greater denominator, then config order). A row whose headline contains no highlight SHALL instead render the excerpt's leading words labelled `head:`, taken from `ts_headline(cfg, body_excerpt, q, 'MaxFragments=0, MinWords=18, MaxWords=24')` evaluated only for such rows; a row whose excerpt is NULL SHALL render neither, and the header SHALL carry the count of such rows always, including zero, with a footer naming the rebuild command when the count is positive. The server SHALL NOT cut or mark inside a snippet, and the header SHALL carry the `all` and `any` counts always, including zero.
 
 #### Scenario: A body match is shown highlighted
 
@@ -89,10 +94,15 @@ Each row of `keyword_search` SHALL carry `snippet`: `ts_headline(cfg, body_excer
 - **WHEN** a note's only occurrence of the query term lies past the first 20,000 characters of its indexed text
 - **THEN** the row SHALL render `head:` and `matched_in` SHALL include `body`
 
-#### Scenario: The snippet cost is bounded by the page
+#### Scenario: The snippet cost is bounded by the row cap, not by the limit
 
-- **WHEN** a query matches 2,000 notes and `limit` is 20
-- **THEN** the snippet statement SHALL be issued with exactly the 20 returned ids and SHALL compute at most 20 headlines per configured config
+- **WHEN** a query matches 2,000 notes and `limit` is 500 with `KEYWORD_SNIPPET_ROWS` at its default
+- **THEN** the snippet statement SHALL be issued with exactly the first 20 returned ids, rows 21–500 SHALL carry no `snippet` or `head`, and the header SHALL say `snippets: first 20`
+
+#### Scenario: The worst-case snippet latency is measured and gated
+
+- **WHEN** the integration suite seeds twenty notes with distinct 20,000-character excerpts containing repeated matches, some matching only through their title, under `FTS_CONFIGS=english,simple`, and runs the snippet statement for that page on the throwaway PostgreSQL 16 container
+- **THEN** the statement SHALL complete in under 300 ms, or the change SHALL lower the default `KEYWORD_EXCERPT_CHARS` until it does and record why
 
 #### Scenario: A row indexed before migration 031 is counted, not guessed
 
@@ -146,7 +156,7 @@ The change SHALL NOT alter any predicate, `SET LOCAL`, overfetch, or exact-fallb
 
 `list_notes` and `get_recent` SHALL order by `modified_at DESC, file_path ASC`. `find_orphans` SHALL keep its existing `modified_at DESC NULLS LAST` and add `file_path ASC` after it. Rows with exactly equal `modified_at` therefore have a deterministic order.
 
-Results SHALL be identical to the pre-change implementation (the same result set, the same order, and every non-similarity field byte-equal) with exactly three permitted exceptions, all confined to exact ties — where for `keyword_search` "results" means the rows tagged `match: "all"` compared on the pre-change fields, the `any` block having no pre-change counterpart:
+For the vector, listing and graph paths, results SHALL be identical to the pre-change implementation (the same result set, the same order, and every non-similarity field byte-equal) with exactly three permitted exceptions, all confined to exact ties. For `keyword_search` the identity claim is narrower, because the ranking change is intended: against the pre-change implementation on the same corpus, filters and limit, (a) the set of paths tagged `match: "all"` SHALL equal the pre-change result set whenever the limit cuts neither list, (b) among rows whose `matched_in` is `body` alone the relative order SHALL equal the pre-change order up to the same tie rules, and (c) `rank` values and the position of any row whose `matched_in` includes `title` are exempt — the new ranking contract is asserted by its own requirement above, not by the oracle. The `any` block has no pre-change counterpart and is outside the oracle. The three tie exceptions:
 - **membership at a tied cutoff**: when more rows share the boundary sort key (`modified_at`, `rank` or distance) than fit under the limit, which of them are returned MAY differ;
 - **the representative chunk among exact distance ties**: when two chunks of one note have exactly equal distance, the kept `chunk_index` and its preview MAY differ.
 - **order among exact ties**: rows whose sort key (`modified_at`, `rank` or distance) is exactly equal MAY appear in a different relative order, even when all of them fit under the limit (the previous order among such rows was unspecified; the new `file_path ASC` tie-break makes it deterministic).
@@ -162,8 +172,9 @@ No other difference is permitted.
 - **THEN** the access SHALL raise rather than issue a load
 
 #### Scenario: Results match the previous implementation
-- **WHEN** the same fixed corpus and query set are run through the previous and the new implementation, covering stale, truncated, filtered, unfiltered and exact-fallback cases, with the keyword oracle compared against the `all` block
-- **THEN** the result sets SHALL be equal, the order SHALL be equal, and every field other than `similarity` SHALL be byte-equal, except for the three permitted tie cases
+- **WHEN** the same fixed corpus and query set are run through the previous and the new implementation, covering stale, truncated, filtered, unfiltered and exact-fallback cases
+- **THEN** for the vector, listing and graph paths the result sets SHALL be equal, the order SHALL be equal, and every field other than `similarity` SHALL be byte-equal, except for the three permitted tie cases
+- **AND** for `keyword_search` the `all` paths SHALL equal the pre-change set and the body-only rows SHALL keep their pre-change relative order, with rank values and title-matched rows' positions exempt
 
 #### Scenario: The permitted tie differences are exercised
 - **WHEN** the corpus contains more notes with an identical `modified_at` than the requested limit, two notes with an identical `modified_at` that both fit under the limit, and one note with two chunks at exactly equal distance
