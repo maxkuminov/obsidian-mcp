@@ -134,13 +134,13 @@ _DESTRUCTIVE_OPEN_WORLD = ToolAnnotations(
 # depend on a client having read this (claude.ai is reported to drop it).
 SERVER_INSTRUCTIONS = (
     "Agent memory in a markdown Obsidian vault. Search with `keyword_search` "
-    "(exact names) or `semantic_search` (concepts); read with `read_note`; "
-    "write with `create_note` (new notes only) or `edit_note` (`dry_run=true` "
-    "first). `get_vault_guide` describes this vault's conventions; one call "
-    "per session is enough. `create_note` never overwrites. Editing tools take "
-    "an optional `expected_hash` (a read's `content_hash`) and refuse, writing "
-    "nothing, if the file changed meanwhile; without it a stale edit "
-    "overwrites."
+    "or `semantic_search`; read with `read_note`; write with `create_note` or "
+    "`edit_note` (`dry_run=true` first). `get_vault_guide` describes this "
+    "vault's conventions (one call per session). `create_note` never "
+    "overwrites. Editing tools take `expected_hash` (a read's `content_hash`) "
+    "and refuse, writing nothing, if it changed; optional by default (an "
+    "unguarded stale edit overwrites) unless the deployment requires it "
+    "(`precondition_required`)."
     "\n\n"
     "Round trips: only `content` from a complete whole-note `read_note` "
     "(`offset=0`, `truncated=false`) may go back as a full replacement; a "
@@ -441,54 +441,54 @@ async def edit_note(
     replace_frontmatter: bool = False,
     expected_hash: str | None = None,
 ) -> str:
-    """Edit an existing note in the Obsidian vault. Requires write permission — a `readwrite` API key, or an OAuth token
-    carrying the `readwrite` scope.
+    """Edit an existing note in the Obsidian vault. Requires write permission (a `readwrite` API key or OAuth scope).
 
-    Arguments: `path`, `content`, at most one mode flag — `append`, `find` or `section` (`operation` is the
-    legacy selector, "append" or "replace") — plus `replace_all`, `dry_run`, `replace_frontmatter`, and the
-    optional `expected_hash` precondition. Every refusal ends with one machine-readable `MCP-REFUSAL {"code":…}`
-    line. See `get_vault_guide` for vault conventions.
+    Arguments: `path`, `content`, at most one mode flag — `append`, `find` or `section` (`operation` is a
+    legacy alias) — plus `replace_all`, `dry_run`, `replace_frontmatter`, and the `expected_hash`
+    precondition. Every refusal the server raises ends with one machine-readable `MCP-REFUSAL {"code":…}`
+    line; an undeclared or mistyped argument is rejected by protocol validation before the tool runs and
+    carries no such line. See `get_vault_guide` for vault conventions.
 
-    Four mutually exclusive modes:
+    Modes (mutually exclusive):
     1. **Full replace** (default): `content` becomes the note's **body**; an existing valid line-1 YAML
        frontmatter block is **preserved byte-identically** ahead of it. `replace_frontmatter=True` overwrites
-       the entire file, frontmatter included (with another mode it is an error and nothing is written). A note
-       with no valid block is replaced wholesale by default. The round-trip guarantee covers a complete,
-       unwindowed whole-note read only — no `section`, `offset=0`, `truncated` false; page a truncated read to
-       the end first, or full replacement replaces the whole body with the fragment. A section response
-       belongs to section mode.
-    2. **Append**: `append=True`; `content` is added at the end after a single newline.
+       the entire file, frontmatter included. A note with no valid block is replaced wholesale.
+       Change frontmatter with `set_frontmatter` or `find=`; never write back `read_note`'s `frontmatter` JSON
+       view. The round-trip guarantee covers a complete, unwindowed whole-note read only — no `section`,
+       `offset=0`, `truncated` false; page a truncated read to the end first, or full replacement replaces the
+       whole body with the fragment. A section response belongs to section mode.
+    2. **Append**: `append=True`; `content` is added at the end, after one newline.
     3. **Find & replace**: `find=<exact text>` is replaced with `content`; it must match exactly once unless
-       `replace_all=True`. The one mode that edits frontmatter text in place.
+       `replace_all=True`.
     4. **Section**: `section=<heading>` replaces the **whole body** under the named ATX heading. `Parent/Child`
        disambiguates repeated headings; a `#N` ordinal ("#7", 1-based document order) is the only form that
-       addresses duplicate siblings; a bare "#N" selects by position. A
-       selector resolves to the same section here as in `read_note` on any write this tool admits — parity is
-       about resolution, not admission.
+       addresses duplicate siblings. A selector resolves to the same section here as in `read_note` on any
+       write this tool admits — parity is about resolution, not admission.
 
-    `dry_run=True` returns a unified diff and writes nothing, in every mode.
+    `dry_run=True` returns a unified diff and writes nothing.
 
-    **`expected_hash`**: pass the `content_hash` a read returned, verbatim (`sha256:<64 lowercase hex>`), and the
-    call is refused with nothing written if the file changed since — in all four modes, `dry_run` included. It
-    is the **whole file's** hash, never a hash of the text you received. Omit it and a stale edit overwrites. Codes: `stale_precondition` (with the
-    current hash), `concurrent_write`, `no_incumbent`, `malformed_precondition`, `precondition_unavailable`,
-    `precondition_required`. Every publishing mode reports the
-    `content_hash` of the bytes **this call wrote**, not what is on disk when you read the message; `dry_run`
-    reports none.
+    **`expected_hash`**: pass the `content_hash` a read returned, verbatim, and the call is refused with
+    nothing written if the file changed since — in every mode, `dry_run` included. It is the **whole file's**
+    hash, never a hash of the text you received. Optional by default — omitted, a stale edit overwrites —
+    unless the deployment requires it, when an omitted hash is refused `precondition_required`. Codes:
+    `stale_precondition`, `concurrent_write`, `no_incumbent`, `malformed_precondition`,
+    `precondition_unavailable`, `precondition_required`. Success reports the `content_hash` of the bytes
+    **this call wrote**, not what is on disk when you read it; `dry_run` reports none.
 
     **Section mode.** `content` is the section's **body**: the text beginning on the line immediately after the
     matched heading line; the heading line is never rewritten. The body is replaced **whole** — anything
-    `content` does not resend, a fenced code block directly under the heading included, is deleted — so a blank
+    `content` does not resend, a fenced code block under the heading included, is deleted — so a blank
     line you want after the heading belongs in `content`. `read_note(path, section=...)` is the matching read:
     its `heading` field carries the heading line and its `content` field the body, and this tool takes exactly
-    that `content`, unchanged. Byte-identity holds for notes whose body newlines are LF: non-LF terminators
-    inside the selected body come back as LF.
+    that `content`. Byte-identity holds for notes whose body newlines are LF: non-LF terminators inside the
+    selected body come back as LF. `#N` ordinals agree with `read_note`; a heading inside a fenced code block is
+    not a heading.
 
     **Two shapes refuse a section write outright, naming the problem and writing nothing:** a malformed
-    frontmatter block (unclosed fence, YAML error, non-mapping), whose refusal names the
-    `replace_frontmatter=True` repair; and a fence opener indented by one to three spaces that nothing below it
-    closes. Both are asymmetric with reads on purpose: `read_note` keeps
-    working on such notes. A symlinked final component is refused.
+    frontmatter block, whose refusal names the `replace_frontmatter=True` repair; and a fence opener indented by
+    one to three spaces that nothing below it closes — close the fence or unindent it to column zero, then
+    reissue. Both are asymmetric with reads: `read_note` keeps working on such notes. A symlinked
+    final component is refused.
     """
     return await edit_note_impl(
         path,
@@ -639,20 +639,23 @@ async def move_note(
 
     Arguments: `from_path`, `to_path` (must not exist; parent directories are created), `rewrite_links`
     (default False) and the optional `expected_hash` precondition. The index follows the move, so backlinks
-    keep working without rewriting source notes. Every precondition refusal ends with one machine-readable
-    `MCP-REFUSAL {"code":…}` line.
+    keep working without rewriting source notes. Every refusal the server raises ends with one
+    machine-readable `MCP-REFUSAL {"code":…}` line; an undeclared or mistyped argument is rejected by
+    protocol validation before the tool runs and carries no such line.
 
     **`expected_hash`** binds **`from_path`'s own bytes and nothing else**: pass the `content_hash` a read
-    returned, verbatim (`sha256:<64 lowercase hex>`), and the move is refused with nothing written if that note
+    returned, verbatim, and the move is refused with nothing written if that note
     changed since. It is compared at preflight, before the rename and before any rewrite; the rename then pins
     inode identity but does not compare the bytes again, so an in-place edit landing after that comparison is
     still moved. The backlink sources a `rewrite_links=True` move rewrites are *not* bound, because you never
     read them. Codes: `stale_precondition` (with the current hash), `concurrent_write`, `no_incumbent`,
-    `malformed_precondition`, `precondition_unavailable`, `precondition_required`; each states what resolves it.
+    `malformed_precondition`, `precondition_unavailable`, `precondition_required`.
 
     With `rewrite_links=True`, every source note that links to this note is rewritten in place — wikilinks,
-    embeds, path-style and markdown links; aliases and anchors survive — **and the moved note's own body is
-    rewritten as well**, so a self-reference does not end up pointing at the old path. The rewrites are planned
+    embeds, path-style links, and bare-href markdown links `[text](Old.md)`, whose new href is written
+    relative to the linking note's own folder; angle-bracket hrefs `[text](<Old.md>)` are **not** rewritten.
+    Aliases and anchors survive. **The moved note's own body is rewritten as well**, so a self-reference
+    does not end up pointing at the old path. The rewrites are planned
     before anything changes: if one would push a source past the note size limit, or the planning would exceed
     the aggregate memory bound, the whole move is refused before any file is touched, naming the source or the
     count.
@@ -682,8 +685,7 @@ async def move_note(
         to_path: Vault-relative path of the destination. Must not exist; parent directories are created.
         rewrite_links: Also rewrite incoming links in source notes. Off by default — opting in modifies other
             notes' bodies.
-        expected_hash: `from_path`'s `content_hash` as you last read it. Refuses the move, changing nothing, if
-            that note has changed since.
+        expected_hash: `from_path`'s `content_hash` as you last read it.
     """
     return await move_note_impl(
         from_path,
@@ -770,12 +772,15 @@ async def set_frontmatter(
 
     **`expected_hash`**: pass the `content_hash` a read returned, verbatim (`sha256:<64 lowercase hex>`), and
     the call is refused with nothing written if the file changed since. It is the **whole file's** hash, never
-    a hash of the text you received; omit it and a stale edit overwrites. The comparison runs ahead of the
-    malformed-block diagnosis and ahead of the no-op check, so a stale base never yields "no changes" or a
-    defect report about bytes you have not seen. Every refusal ends with one machine-readable
-    `MCP-REFUSAL {"code":…}` line — `stale_precondition` (with the current hash), `concurrent_write`,
-    `no_incumbent`, `malformed_precondition`, `precondition_unavailable`, `precondition_required` — each
-    stating what resolves it. The server also re-compares the file immediately before publishing. A write
+    a hash of the text you received. Optional by default — omitted, a stale edit overwrites — unless the
+    deployment requires it, when an omitted hash is refused `precondition_required`. The comparison runs ahead
+    of the malformed-block diagnosis and ahead of the no-op check, so a stale base never yields "no changes"
+    or a defect report about bytes you have not seen. Every refusal the server raises ends with one
+    machine-readable `MCP-REFUSAL {"code":…}` line (an undeclared or mistyped argument is rejected by protocol
+    validation before the tool runs and carries no such line) — `stale_precondition` (with the current hash),
+    `concurrent_write`, `no_incumbent`, `malformed_precondition`, `precondition_unavailable`,
+    `precondition_required` — each stating what resolves it. The server also re-compares the file immediately
+    before publishing. A write
     reports the `content_hash` of the bytes **this call published**; a no-op publishes nothing and reports none.
 
     **A malformed block is refused, never worked around.** An unclosed line-1 fence, YAML that fails to parse,

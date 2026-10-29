@@ -290,6 +290,74 @@ def test_the_write_tools_lead_with_their_contract(name):
         assert token in lead, f"{name}: {token!r} is not in the first {LEAD_CHARS} chars"
 
 
+def _normalised(text: str) -> str:
+    """Lowercased, whitespace-collapsed: wrapping is not part of the contract."""
+    return re.sub(r"\s+", " ", text).lower()
+
+
+# The refusal statement, asserted as a clause rather than a token: the sentence
+# must say refusals END WITH the line (not "is not emitted"), and the same
+# description must carry the protocol-validation exception — an undeclared or
+# mistyped argument is rejected before `_tracked` and carries no such line.
+_REFUSAL_CLAUSE = re.compile(
+    r"refusal the server raises ends with one machine-readable "
+    r"`mcp-refusal \{\"code\":…\}` line"
+)
+_REFUSAL_EXCEPTION = re.compile(
+    r"undeclared or mistyped argument is rejected by protocol validation before the "
+    r"tool runs and carries no such line"
+)
+_REFUSAL_NEGATED = re.compile(r"mcp-refusal[^.]*\bnot (emitted|appended|returned)")
+# `expected_hash` is schema-optional and unguarded writes overwrite *by default*,
+# but WRITE_PRECONDITION_REQUIRED=true turns an omitted hash into a refusal.
+_OPTIONAL_CLAUSE = re.compile(
+    r"optional by default[^.]*stale edit overwrites[^.]*deployment requires it"
+    r"[^.]*`precondition_required`"
+)
+
+
+@pytest.mark.parametrize("name", RESTRUCTURED_WRITE_TOOLS)
+def test_the_refusal_statement_is_qualified(name):
+    text = _normalised(description(name))
+    assert _REFUSAL_CLAUSE.search(text), f"{name}: no positive refusal clause"
+    assert _REFUSAL_EXCEPTION.search(text), f"{name}: protocol-validation exception missing"
+    assert not _REFUSAL_NEGATED.search(text), f"{name}: refusal statement is negated"
+
+
+@pytest.mark.parametrize("name", ("edit_note", "set_frontmatter"))
+def test_expected_hash_is_described_as_optional_by_default_only(name):
+    text = _normalised(description(name))
+    assert _OPTIONAL_CLAUSE.search(text), f"{name}: optional-by-default clause missing or unqualified"
+    assert "without it a stale edit overwrites" not in text, name
+
+
+def test_the_instructions_qualify_both_statements():
+    text = _normalised(server.SERVER_INSTRUCTIONS)
+    assert re.search(
+        r"server refusals end with one machine-readable line, `mcp-refusal \{\"code\":…\}`", text
+    )
+    assert "protocol-layer argument errors do not carry it" in text
+    assert re.search(
+        r"optional by default \(an unguarded stale edit overwrites\) unless the deployment "
+        r"requires it \(`precondition_required`\)",
+        text,
+    )
+    assert "without it a stale edit overwrites" not in text
+
+
+def test_move_note_states_the_markdown_link_restriction():
+    """`MDLINK_REWRITE_FLAGS` sets `angle=False`: `[x](<Old.md>)` is indexed but
+    not rewritten, and the move still reports plain success — so the description
+    must not promise "markdown links" generally (Codex adversarial round 1)."""
+    text = _normalised(description("move_note"))
+    assert "bare-href markdown links `[text](old.md)`" in text
+    assert re.search(
+        r"angle-bracket hrefs `\[text\]\(<old\.md>\)` are \*\*not\*\* rewritten", text
+    ), text
+    assert not re.search(r"path-style and markdown links", text)
+    assert tools.MDLINK_REWRITE_FLAGS["angle"] is False  # the fact the sentence states
+
+
 def test_move_note_keeps_the_residual_race_in_its_lead():
     """The precondition is compared at preflight; the rename pins inode identity
     and does not compare bytes again. That limits what `expected_hash` buys at

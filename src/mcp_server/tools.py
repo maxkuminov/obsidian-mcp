@@ -1915,9 +1915,11 @@ def _tracked(
         wrapper.__concurrency_class__ = resource_class or concurrency.TOOL_CLASSES.get(tool_name)
         # Read by `production_write_bucket_tools()` (#343): the write-bucket
         # membership, stamped on the wrapper rather than collected into a
-        # module-level set, because test modules decorate probes with
-        # `_tracked(write_class=True)` at import and a shared set would then
-        # depend on collection order.
+        # module-level set. The first design had the decorator append to a
+        # global `WRITE_BUCKET_TOOLS`; Codex's spec review (round 1, MAJOR)
+        # pointed out that test modules decorate probes with
+        # `_tracked(write_class=True)` at import, so that set would carry
+        # `write_probe` / `rate_probe_write` and depend on collection order.
         wrapper.__write_class__ = write_class
         return wrapper
     return decorator
