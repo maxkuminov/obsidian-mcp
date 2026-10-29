@@ -39,12 +39,14 @@ rows without that note, live, on 2026-10-28. Three causes, three changes.
 
 **The vector weights the title and aliases above the body.** Every writer
 builds `content_tsvector` through `fts.index_tsvector_sql` as *title parts for
-every config, then aliases parts, then the content parts* — `setweight(…,
+every config, then aliases parts, then the content parts* (configs in sorted
+order — the fingerprint's order, so 031 and the writers agree byte for byte) — `setweight(…,
 'A')` on the first two, the pre-031 `to_tsvector(cfg, body)` fragment byte for
 byte on the last, so a pre-031 vector is exactly the body part of a post-031
 one. Ranking is `ts_rank_cd(RANK_WEIGHTS, vector, query)` with the array bound
 as `float4[]` (a setting, default `{0.02, 0.2, 0.4, 1.0}` for `D, C, B, A`,
-never interpolated). `calc_rank_cd` scores one term per cover,
+never interpolated; each entry finite and in `[1e-6, 1]` — a smaller positive
+value binds as float4 zero, and PostgreSQL refuses one above 1). `calc_rank_cd` scores one term per cover,
 `len(cover) / Σ(1/weight)`: an adjacent two-word title cover is `2/(1+1) =
 1.0`, a body cover `2/(50+50) = 0.02`. Measured: the issue's shape — a title
 `Quarterly Review` against a hub repeating the phrase thirty times — scores
@@ -80,7 +82,16 @@ one with the fallback tsquery, `AND NOT (v @@ <and query>)` (the conjunctive
 block was not full, so that excludes exactly its rows), the same filters,
 `rank DESC, file_path ASC`, `LIMIT limit − n`; its rows are `match: any`,
 appended after every `all` row and never interleaved (their rank is against
-a different query — L1). The superset property is asserted over a generated
+a different query — L1). **Every statement of the call reads one
+snapshot**: the transaction opens with `SET TRANSACTION ISOLATION LEVEL
+REPEATABLE READ, READ ONLY` before the `SET LOCAL`, because the fallback's
+`NOT (v @@ <and query>)` excludes exactly the conjunctive block only when
+both statements see the same rows — at READ COMMITTED an index commit
+between them could drop a note from both blocks for that call (Codex C-1).
+`SET TRANSACTION` is legal only before the first snapshot-taking statement;
+`SET LOCAL` takes none, and `search_notes_impl` hands over a session with
+nothing run. Read-only REPEATABLE READ raises no serialization failure. The
+superset property is asserted over a generated
 query corpus under `english` and `english,simple`. Telemetry: `fallback`
 (`ran | skipped | not_needed`) and `any_rows` in `usage_logs.params`.
 
@@ -102,20 +113,35 @@ reads it server-side. The snippet statement names the ids of the first
 and projects one headline per config (`MaxFragments=2, MaxWords=18,
 MinWords=6`, U+0002/U+0003 as `StartSel`/`StopSel`, rendered `«»`),
 `matched_in` from `ts_filter(v, '{a}') @@ q` / `ts_filter(v, '{d}') @@ q`, and
-the per-config `matched_terms` counts; a second statement supplies the
-`head:` text (`MaxFragments=0, MinWords=18, MaxWords=24` — in fragment mode a
-no-cover headline is only `MinWords` words, measured) for the rows whose
-excerpt held no highlight: a title/alias-only match, or a match beyond the
-excerpt (L3). Nothing fabricated: `head:` is text the index holds for that
+the per-config `matched_terms` counts (the parse statement therefore runs
+whenever snippets are on, even on a full page). A headline counts as the
+row's snippet **only when the body part itself matched** — with no full
+cover `ts_headline` still marks single query words, so a title-only match
+whose body holds one of the words would otherwise show a highlight that is
+not the match. A second statement supplies the `head:` text
+(`ts_headline(fts_configs[0], …, 'MaxFragments=0, MinWords=18,
+MaxWords=24')` with the same sentinels, stripped from the result — never
+PostgreSQL's default `<b>`, which a note may contain literally; in fragment
+mode a no-cover headline is only `MinWords` words, measured) for every other
+row with an excerpt: a title/alias-only match, a split match (rendered
+`matched_in: title+body`), or a match beyond the excerpt (L3). Nothing fabricated: `head:` is text the index holds for that
 note, labelled as not the matching span. Rows beyond the cap carry no
 `snippet`/`head` key and the header says `snippets: first N`; a row with a
 NULL excerpt (indexed before 031) carries neither, the header counts such
 rows always, including zero, and the footer names `make rebuild-tsvectors`.
+`snippet:` and `head:` are **rendered on one line** — every whitespace run,
+line breaks included, becomes one space — because `ts_headline` keeps the
+excerpt's newlines and markdown, and a note body could otherwise print a
+line that reads as another server-authored result row (Codex C-2). A
+literal `«`/`»` in a note still collides with the rendered markers
+(accepted: the stored markers are U+0002/U+0003, stripped from excerpts).
 Cost is a function of the row cap, the excerpt cap and the config count —
 never of `limit` — recorded as `snippet_ms`; the integration suite gates the
 worst case (twenty distinct 20,000-character excerpts, `english,simple`,
 head rows included) under 300 ms on the throwaway container, after Codex
-measured ≈ 452 ms / 891 ms for a `limit`-bound design.
+measured ≈ 452 ms / 891 ms for a `limit`-bound design. That gate is at the
+defaults; the cost grows roughly linearly with both settings, whose maxima
+are about 25× the measured work.
 
 **What is invariant, and what the oracle checks.** The projection identity
 suite can no longer claim byte identity for `keyword_search` — `rank` is a

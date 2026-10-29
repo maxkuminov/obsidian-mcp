@@ -28,8 +28,9 @@ Three causes, all in code:
   indexed title (`notes_metadata.title`, the shared `note_title` rule) and
   the frontmatter `aliases` (a new shared `note_aliases` rule, list or
   scalar) at weight `A`, the existing full-content build at weight `D`.
-  Ranking uses an explicit weight array (`{0.02, 0.2, 0.4, 1.0}`) so one
-  title cover outweighs fifty body covers (design D2).
+  Ranking uses an explicit weight array, the `RANK_WEIGHTS` setting
+  (default `{0.02, 0.2, 0.4, 1.0}`), so one title cover outweighs fifty
+  body covers (design D2).
 - **Conjunction first, disjunction to fill.** The existing AND query runs
   unchanged. When it returns fewer than `limit` rows and the parsed query is
   a plain conjunction, the same stems OR-ed (derived from PostgreSQL's own
@@ -44,7 +45,7 @@ Three causes, all in code:
   vector. Each returned row carries `snippet` from `ts_headline` over that
   excerpt with the tsquery that matched the row, computed by a third
   statement over the page's ids only, plus `matched_in` (title/body) and
-  `matched_terms`. A row whose excerpt holds no highlight shows the
+  the term count (rendered `terms:`). A row whose excerpt holds no highlight shows the
   excerpt's leading words as `head:` instead; a row with no stored excerpt
   yet (indexed before 031) carries none, and the header counts them.
 - **Migration 031 re-heads every stored vector in SQL** — no file access:
@@ -60,10 +61,12 @@ Three causes, all in code:
   a title in the vector would otherwise reopen).
 - **Docstring**: bare terms are ANDed; the `OR`, `"phrase"` and `-term`
   forms are shown; `match`, `snippet`, `head`, `matched_in` and
-  `matched_terms` are described. `keyword_search` and `semantic_search`
+  `terms` are described. `keyword_search` and `semantic_search`
   remain symmetric peers.
 
-No new setting. `FINGERPRINT_VERSION` unchanged. Not in scope: hybrid
+Three new optional settings — `RANK_WEIGHTS`, `KEYWORD_EXCERPT_CHARS`,
+`KEYWORD_SNIPPET_ROWS` (design D4) — documented in README, `.env.example`
+and `DEPLOYMENT.md`. `FINGERPRINT_VERSION` unchanged. Not in scope: hybrid
 fusion (#354), a title-only mode, `ts_rank_cd` normalisation.
 
 ## Capabilities
@@ -90,9 +93,10 @@ fusion (#354), a title-only mode, `ts_rank_cd` normalisation.
 
 - `src/services/fts.py`: `index_tsvector_sql(content_bind, title_bind,
   aliases_bind)`, `head_tsvector_sql`, `rehead_tsvector_sql`,
-  `RANK_WEIGHTS`, `KEYWORD_EXCERPT_CHARS`, `FTS_ALIASES_MAX_CHARS`,
-  `note_aliases`, the tsquery-text conjunction parser and the fallback
-  builder.
+  `rank_expression`, `FTS_ALIASES_MAX_CHARS`, `note_aliases`, the
+  tsquery-text conjunction parser and the fallback builder.
+- `src/config.py`: the `RANK_WEIGHTS`, `KEYWORD_EXCERPT_CHARS` and
+  `KEYWORD_SNIPPET_ROWS` settings and their validators.
 - `src/services/search.py`: the two ranking statements, the snippet
   statement, the `all`/`any` assembly, telemetry keys.
 - `src/services/indexer.py`: the incremental writer, the rebuild writer,
@@ -113,6 +117,6 @@ fusion (#354), a title-only mode, `ts_rank_cd` normalisation.
 - Docs: `docs/architecture/search.md`, `indexing-and-embeddings.md`,
   `schema-and-migrations.md`, README (What's in the box, Full-text search,
   Upgrading), `docs/deployment-kubernetes.md`, CLAUDE.md key decisions.
-  `.env.example` untouched (no setting).
+  `.env.example` gains the three settings.
 - Not touched: `semantic_search`'s statements, the HNSW path, the
   fingerprints, rate limits, OAuth, transfer, the panel.

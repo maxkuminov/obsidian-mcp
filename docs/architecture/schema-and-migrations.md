@@ -596,6 +596,12 @@ kept, four impostor-column refusals, and both downgrade directions.
     move paths (which do re-head repeatedly) are specified on those and not
     on bytes.
 
+  **031 imports the live builders** (`fts.rehead_tsvector_sql`,
+  `fts.aliases_text`) rather than freezing a copy, so a later builder change
+  changes what 031 does on a fresh database. That is intended: the
+  migration and the writers must build the same bytes (the builders sort
+  the configs for the same reason — the fingerprint stores them sorted).
+
   Each UPDATE runs in a savepoint; SQLSTATE 54000 leaves that row unchanged
   and logged by id (its next edit or the rebuild writes it through the
   halving retreat); any other error fails the migration whole.

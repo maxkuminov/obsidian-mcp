@@ -139,8 +139,9 @@ vector is the only consumer; the JSONB already holds the data).
 ## D2 — Rank: `ts_rank_cd` with an explicit weight array
 
 `ts_rank_cd(RANK_WEIGHTS, content_tsvector, query)` with
-`RANK_WEIGHTS = '{0.02, 0.2, 0.4, 1.0}'` (`D, C, B, A`), one constant in
-`fts.py`, used by both blocks of D3.
+`RANK_WEIGHTS = '{0.02, 0.2, 0.4, 1.0}'` (`D, C, B, A`) — the default of
+the `RANK_WEIGHTS` setting (D4's settings paragraph), bound by
+`fts.rank_expression` and used by both blocks of D3.
 
 Why not PostgreSQL's default `{0.1, 0.2, 0.4, 1.0}`: `calc_rank_cd` sums
 one term per cover, `len(cover) / Σ(1/weight)`, so an adjacent two-word
@@ -236,7 +237,15 @@ present), not `0/2`. A row whose configs all have a non-conjunctive parse
 carries no `matched_terms`.
 
 Both statements and D4's run in one transaction after `SET LOCAL
-random_page_cost = 1.1`; rows are assembled `all` block then `any` block,
+random_page_cost = 1.1`, and that transaction opens with `SET TRANSACTION
+ISOLATION LEVEL REPEATABLE READ, READ ONLY` (Codex implementation round 1,
+C-1): the fallback's `NOT (v @@ <and query>)` excludes exactly the
+conjunctive block only when both statements read the same snapshot — at
+READ COMMITTED an index commit between them could drop a note from both
+blocks for that call. `SET TRANSACTION` is legal before the first
+snapshot-taking statement; `SET LOCAL` takes none, and `search_notes_impl`
+hands the service a session with nothing run. A read-only REPEATABLE READ
+transaction raises no serialization failure. Rows are assembled `all` block then `any` block,
 each in its own `rank DESC, file_path ASC`, never interleaved — an `any`
 row's rank is against a different query and is not comparable (L1).
 
@@ -305,11 +314,18 @@ fabricated: `head:` is text the index holds for that note, labelled as
 not the matching span.
 
 `RANK_WEIGHTS`, `KEYWORD_EXCERPT_CHARS` and `KEYWORD_SNIPPET_ROWS` are
-**settings** (`src/config.py`, validated at boot: four floats in `(0, 1]`
-rendered as a bound `float4[]`, never interpolated; `1_000 ≤ excerpt ≤
+**settings** (`src/config.py`, validated at boot: four finite floats in
+`[1e-6, 1]` rendered as a bound `float4[]`, never interpolated — the floor
+because a positive value below float4's range binds as zero and silently
+zeroes that weight's covers, the ceiling because PostgreSQL refuses a
+weight above 1 (Codex implementation round 1, C-3); `1_000 ≤ excerpt ≤
 100_000`; `0 ≤ rows ≤ 100`), documented in README's Configuration table and
 `.env.example` per the public-docs rule. Changing `KEYWORD_EXCERPT_CHARS`
 takes effect for rows written afterwards; the rebuild rewrites the rest.
+**The 300 ms gate is measured at the defaults** (20,000 × 20); the snippet
+cost scales roughly linearly with both settings, so their maxima (100,000 ×
+100) are about 25× the measured work. The bounds are kept as an operator's
+choice and the README rows say so (verifier V-N3).
 
 **The snippet statement** is a third statement, over the page only:
 `WHERE id = ANY(:ids)` for the block's ids, projecting per row
@@ -320,25 +336,51 @@ sentinel wins), `ts_filter(v, '{a}') @@ q` as `matched_title`,
 @@ CAST(:unit_j AS tsquery))::int` over the plain conjunction's positive
 units when D3 parsed one and `k ≤ 32`, else omitted (L6). `:opts` is
 `MaxFragments=2, MaxWords=18, MinWords=6, StartSel=\x02, StopSel=\x03,
-FragmentDelimiter=" … "`. When no config's headline carries the sentinel,
-the row's `head:` text is a second call, `ts_headline(cfg_0, body_excerpt,
-q, 'MaxFragments=0, MinWords=18, MaxWords=24')` — in fragment mode a
+FragmentDelimiter=" … "`. A headline is accepted as the row's `snippet`
+only when `matched_body` is true: with no full cover `ts_headline` still
+marks single query words, so a title-only or split match would otherwise
+show a body "highlight" that is not the match (verifier V-B1). For every
+row without a snippet and with an excerpt, the `head:` text comes from a
+**second statement** over those ids only — not a `CASE` inside the first —
+`ts_headline(fts_configs[0], body_excerpt, q, 'MaxFragments=0,
+MinWords=18, MaxWords=24, StartSel=\x02, StopSel=\x03')`, with the
+sentinels stripped from the result (PostgreSQL still marks query words in
+the leading words, and its default `<b>…</b>` would be indistinguishable
+from a note that contains `<b>` literally, V-B2). In fragment mode a
 no-cover headline is only `MinWords` (six) words, measured, while
 `MaxFragments=0` with no cover returns the document's first eighteen
-words — evaluated behind a `CASE` so a highlighted row pays for one parse
-per config and a `head:` row for one more. One statement per non-empty
-block (the query differs). Its cost is a function of the page, never of
-the candidate set, and it is timed as `snippet_ms` in `usage_logs.params`
+words. A highlighted row pays one parse per config and a `head:` row one
+more. One statement pair per non-empty block (the query differs). The
+parse-text statement of D3 runs whenever `KEYWORD_SNIPPET_ROWS > 0`, even
+on a full conjunctive page, because `matched_terms` is computed from it.
+The pair's cost is a function of the page, never of the candidate set, and it is timed as `snippet_ms` in `usage_logs.params`
 beside `db_ms`.
 
 Rendering (`search_notes_impl`): header `Found N results for 'q' — all
 terms: a, any term: b — without excerpt: e` (counts always, including
-zero, #200's rule); per row `- **title** (`path`) [tags] — rank: r —
-match: all|any — matched_in: title,body — terms: k/n` and a second line
-`snippet: …` (sentinels rendered `«` `»`) or `head: …`; a row with NULL
+zero, #200's rule), followed by `— snippets: first N` when the page is
+longer than `KEYWORD_SNIPPET_ROWS`, or `— snippets: off` when it is 0; per
+row `- **title** (`path`) [tags] — rank: r — match: all|any — matched_in:
+title,body — terms: k/n` and a second line `snippet: …` (sentinels
+rendered `«` `»`) or `head: …`. `matched_in` is `title+body` for a split
+match — neither part alone matches the block's query, the whole vector
+does (one term in the title, another in the body; V-N5). A row with NULL
 excerpt has no second line, and a footer names `make rebuild-tsvectors`
 when `e > 0`. The snippet is a note-controlled field: never cut by the
-server (ts_headline bounds it), never marked inside.
+server (ts_headline bounds it), never marked inside, and **rendered as one
+line** — every whitespace run, line breaks included, becomes one space —
+because `ts_headline` keeps the excerpt's newlines and markdown and a note
+could otherwise print a line that reads as another result row (Codex
+implementation round 1, C-2). The service dict carries `snippet`, `head`,
+`matched_in`, `matched_terms` and `has_excerpt` (whether the row has a
+stored excerpt; the header's `without excerpt` count reads it). The field
+is rendered `terms:`; the service key stays `matched_terms`.
+
+`move_note` enters the keyword-vector writer's two opening statements
+(generation lock, fingerprint re-read; D6) through one module-level seam,
+`tools._enter_keyword_generation`, so the offline move tests that script a
+fake session by statement order can stand it down; the real behaviour is
+pinned on PostgreSQL.
 
 ## D5 — Migration 031: the column, and an in-SQL re-head of every row
 
@@ -504,12 +546,16 @@ actually invariant, and the new contract is asserted separately:
 
 The oracle's corpus still builds its vectors through `index_tsvector_sql`
 (with the corpus titles, so title rows exist to be exempted).
+Membership is checked on every `all` row; body-only order only within the
+first `KEYWORD_SNIPPET_ROWS` rows, because `matched_in` exists only there
+(V-N9, accepted).
 
 ## D9 — The docstring, symmetric with `semantic_search`
 
 States that bare terms are ANDed and partial matches come after the full
 ones marked `match: any`; shows `"exact phrase"`, `a OR b`, `-excluded`;
-describes `snippet`/`head`, `matched_in`, `matched_terms`; keeps the
+describes `snippet`/`head`, `matched_in`, `terms` (the rendered name of
+the service's `matched_terms`); keeps the
 "use the other tool for…" cross-reference in the same shape
 `semantic_search` uses, with neither ranked above the other.
 
@@ -564,6 +610,17 @@ describes `snippet`/`head`, `matched_in`, `matched_terms`; keeps the
   by the previous head's length; matching, phrases and `ts_rank_cd` are
   unaffected, and an edit rebuilds the vector. Positions saturate at
   16383 only after thousands of consecutive renames with no edit between.
+- **L13** `make deploy`'s stop-before-a-pending-migration step has no
+  automated test; it fails safe — an empty or failing `alembic current`
+  differs from `alembic heads`, so the app is stopped (V-N8).
+- **L14** A literal `«` or `»` in a note collides with the rendered
+  highlight markers. The stored markers are the unforgeable U+0002/U+0003
+  (stripped from excerpts at index time); the visible rendering is a
+  convenience the agent verifies with `read_note` (C-2).
+- **L15** The builders sort the configs (V-N4), so under an `FTS_CONFIGS`
+  not in sorted order a vector written by a pre-#344 build has its body
+  parts in the old order until the note is rewritten or rebuilt; matching
+  and rank are unaffected, only byte equality with a fresh write is.
 
 ## Measured on PostgreSQL 16 (pgvector/pgvector:pg16, 2026-10-28)
 
@@ -629,3 +686,17 @@ Probed while writing this design; the implementation's tests pin each.
 5. MAJOR — snippet cost was a row-count assertion → D4
    `KEYWORD_SNIPPET_ROWS` and the measured 300 ms gate.
 6. MINOR — settings and `DEPLOYMENT.md` omitted → D4 settings, tasks §7.
+
+## Implementation review, round 1 (verifier + Codex), folded
+
+Verifier: V-B1 (headline accepted only for a body match), V-B2 (head
+sentinels), V-N1 (raiseload test), V-N2 (the `to_tsvector(` guard), V-N4
+(sorted builders), V-N5 (`title+body`) fixed; V-N3, V-N6–V-N9 accepted
+above and in the deltas. Codex: C-1 fixed by the REPEATABLE READ READ ONLY
+transaction (D3) — the service's session has no statement run before it,
+so the isolation can be set; C-2 fixed by one-line rendering, its
+guillemet half accepted (L14); C-3 fixed by the `[1e-6, 1]` finite bound
+(D4) — the triage's `[1e-6, 1e6]` ceiling was not taken because
+PostgreSQL refuses any weight above 1 ("weight out of range"), so the
+existing `≤ 1` stays, and zero stays refused because `ts_rank_cd`
+divides by each weight.

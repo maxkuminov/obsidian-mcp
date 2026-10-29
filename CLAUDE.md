@@ -363,8 +363,10 @@ update it in the same change.** What stays here is the short list:
   tagged `match: any`, never interleaved. Snippets come from
   `notes_metadata.body_excerpt` (the first `KEYWORD_EXCERPT_CHARS` of exactly
   the text the vector was built from, same UPDATE) via a statement over the
-  first `KEYWORD_SNIPPET_ROWS` ids only; a row with no highlight shows
-  `head:`, a pre-031 row has no excerpt until edited or
+  first `KEYWORD_SNIPPET_ROWS` ids only, every statement of the call in one
+  `REPEATABLE READ, READ ONLY` snapshot; a row whose body part did not match
+  (or held no highlight) shows `head:`, both rendered on one line so a note
+  cannot forge a result row; a pre-031 row has no excerpt until edited or
   `make rebuild-tsvectors`. 031 re-heads in SQL under the generation lock
   with the **stored fingerprint's** configs and skips rows already headed
   (`rehead` is not position-idempotent); its downgrade strips every `A`
