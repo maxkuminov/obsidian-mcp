@@ -200,6 +200,11 @@
           "title": "Query",
           "type": "string"
         },
+        "rerank": {
+          "default": false,
+          "title": "Rerank",
+          "type": "boolean"
+        },
         "tags": {
           "anyOf": [
             {
