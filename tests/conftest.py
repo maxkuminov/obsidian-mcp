@@ -70,6 +70,11 @@ SETTINGS_ENV_KEYS = (
     # Embedding transport (#185).
     "EMBEDDING_ALLOW_PLAINTEXT",
     "EMBEDDING_CA_FILE",
+    # The optional reranker (#367).
+    "RERANK_URL",
+    "RERANK_MODEL",
+    "RERANK_TIMEOUT_MS",
+    "RERANK_ALLOW_PLAINTEXT",
     "MAX_FILE_READ_BYTES",
     "MAX_FILE_WRITE_BYTES",
     "MAX_READ_RESPONSE_CHARS",
