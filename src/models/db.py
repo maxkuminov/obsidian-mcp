@@ -354,6 +354,30 @@ _CONTENT_CHANGED_AT_COLUMN_MARKER = "content-change stamp (033_content_changed_a
 _NOTE_EVENTS_TABLE_MARKER = "change-feed events (033_content_changed_at)"
 _NOTE_EVENT_SCOPES_TABLE_MARKER = "change-feed scope counters (033_content_changed_at)"
 _NOTE_EVENT_GAPS_TABLE_MARKER = "change-feed write gaps (033_content_changed_at)"
+# Migration 034 (#355, heading-aware chunks; design D4/D5). Byte identical to
+# the migration's literals, so `alembic check` compares them.
+_HEADING_META_COLUMN_MARKER = "chunk section locator (034_heading_chunks)"
+_EMBED_PREFIX_COLUMN_MARKER = "embedded context prefix (034_heading_chunks)"
+_EMBEDDED_CHUNKING_VERSION_COLUMN_MARKER = (
+    "chunking version of the stored vectors (034_heading_chunks)"
+)
+_EMBEDDED_INPUT_DIGEST_COLUMN_MARKER = (
+    "digest of the embedded provider inputs (034_heading_chunks)"
+)
+# The two CHECKs 034 adds. Alembic does not compare CHECK predicates; the
+# schema gate asserts both through `pg_constraint`. Byte identical to the
+# migration's `HEADING_META_PREDICATE` / `CHUNKING_VERSION_PREDICATE`.
+_HEADING_META_CHECK_NAME = "ck_note_embeddings_heading_meta"
+_HEADING_META_PREDICATE = (
+    "(heading_path IS NULL AND section_ordinal IS NULL AND embed_prefix IS NULL) OR "
+    "(heading_path IS NOT NULL AND section_ordinal IS NOT NULL "
+    "AND embed_prefix IS NOT NULL AND section_ordinal >= 0 "
+    "AND (section_ordinal = 0) = (cardinality(heading_path) = 0))"
+)
+_CHUNKING_VERSION_CHECK_NAME = "ck_notes_metadata_embedded_chunking_version"
+_CHUNKING_VERSION_PREDICATE = (
+    "embedded_chunking_version IS NULL OR embedded_chunking_version >= 1"
+)
 # The all-or-none CHECK over those four columns. The predicate is the
 # migration's `STAT_PREDICATE`, byte for byte.
 _NOTE_STAT_CHECK_NAME = "ck_notes_metadata_stat_all_or_none"
@@ -451,6 +475,25 @@ class NoteMetadata(Base):
     frontmatter: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     embedded_content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Heading-aware chunks (#355, migration 034, design D3a/D4). Stamped by
+    # `certify_embedded` in the same conditional UPDATE as
+    # `embedded_content_hash`, on every certifying branch (embedded,
+    # certified-empty, excluded). `embedded_chunking_version` is the
+    # `src.services.embeddings.CHUNKING_VERSION` the stored vectors were built
+    # under; NULL means "pre-034 chunking". It is deliberately **not** part of
+    # the stored embedding fingerprint: a note on another version is re-selected
+    # by the embed backlog (`IS DISTINCT FROM`, never `<`), not refused at
+    # startup. `embedded_input_digest` is the SHA-256 hex of the canonical JSON
+    # of the ordered provider inputs the certification covers (`[]` for an
+    # empty or excluded note); the full-hash pass recomputes it as a backstop.
+    embedded_chunking_version: Mapped[int | None] = mapped_column(
+        SmallInteger,
+        nullable=True,
+        comment=_EMBEDDED_CHUNKING_VERSION_COLUMN_MARKER,
+    )
+    embedded_input_digest: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, comment=_EMBEDDED_INPUT_DIGEST_COLUMN_MARKER
+    )
     # Which fence grammar derived this row's links, tags and vectors.
     # `content_hash` cannot see a grammar change — the bytes are unchanged — so
     # without a separate marker the derivation gate would certify stale link
@@ -649,6 +692,10 @@ class NoteMetadata(Base):
         # Migration 026. Alembic does not compare CHECK predicates; the schema
         # gate asserts this one through `pg_constraint`.
         CheckConstraint(_NOTE_STAT_PREDICATE, name=_NOTE_STAT_CHECK_NAME),
+        # Migration 034, asserted by the schema gate like the one above.
+        CheckConstraint(
+            _CHUNKING_VERSION_PREDICATE, name=_CHUNKING_VERSION_CHECK_NAME
+        ),
     )
 
 
@@ -660,6 +707,22 @@ class NoteEmbedding(Base):
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     chunk_text: Mapped[str] = mapped_column(Text, nullable=False)
     embedding: Mapped[list[float]] = mapped_column(Vector(settings.embedding_dimensions), nullable=False)
+    # The chunk's section (#355, migration 034, design D1/D5/D6): the heading
+    # path outermost first (`{}` for the text before the first heading) and
+    # the `read_note(section="#N")` ordinal (0 for that preamble), plus the
+    # context prefix the provider input was built from (`embed_prefix +
+    # "\n\n" + chunk_text`). All three NULL on a pre-034 row, all three set on
+    # a row written since (the CHECK below). `chunk_text` stays un-prefixed.
+    # The reuse key is `(embed_prefix, chunk_text)`; the locator is not in it.
+    heading_path: Mapped[list[str] | None] = mapped_column(
+        ARRAY(Text), nullable=True, comment=_HEADING_META_COLUMN_MARKER
+    )
+    section_ordinal: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment=_HEADING_META_COLUMN_MARKER
+    )
+    embed_prefix: Mapped[str | None] = mapped_column(
+        Text, nullable=True, comment=_EMBED_PREFIX_COLUMN_MARKER
+    )
 
     note: Mapped["NoteMetadata"] = relationship(back_populates="embeddings")
 
@@ -673,6 +736,7 @@ class NoteEmbedding(Base):
     # used to be declared here is dropped by 027.
     __table_args__ = (
         Index("ix_note_embeddings_note_id", "note_id"),
+        CheckConstraint(_HEADING_META_PREDICATE, name=_HEADING_META_CHECK_NAME),
     )
 
 

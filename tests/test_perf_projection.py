@@ -42,6 +42,8 @@ FORBIDDEN = {
     ("notes_metadata", "content_tsvector"),
     ("notes_metadata", "frontmatter"),
     ("note_embeddings", "embedding"),
+    # #355 (D6): the prefix is embedded input, never rendered.
+    ("note_embeddings", "embed_prefix"),
 }
 
 
@@ -61,6 +63,9 @@ class _Result:
     def scalar_one_or_none(self):
         return self._rows[0] if self._rows else None
 
+    def scalar(self):
+        # The transition count (#355): an empty batch is zero.
+        return self._rows[0] if self._rows else 0
 
 class _RecordingSession:
     """Serves one batch per non-`SET LOCAL` statement and records each one."""
@@ -92,7 +97,7 @@ def _quiet_usage(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _fake_embedding(monkeypatch):
-    async def _fake(_text):
+    async def _fake(_text, **_kw):
         return [1.0, 0.0, 0.0]
 
     monkeypatch.setattr("src.services.embeddings.get_embedding", _fake)
@@ -215,7 +220,8 @@ async def test_semantic_search_projects_the_find_related_shape():
     await semantic_search(session, "q", limit=5)
     (stmt,) = session.statements
     _assert_projected(stmt, [
-        "note_id", "chunk_index", "chunk_text", "file_path", "title", "tags",
+        "note_id", "chunk_index", "chunk_text", "heading_path", "section_ordinal",
+        "file_path", "title", "tags",
         "content_hash", "embedded_content_hash", "chunks_truncated", "distance",
     ])
 

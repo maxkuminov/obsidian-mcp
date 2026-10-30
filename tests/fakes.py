@@ -25,8 +25,8 @@ class FakeProvider:
             out.append((b - 128) / 128.0)
         return out
 
-    async def embed_one(self, text: str) -> list[float]:
+    async def embed_one(self, text: str, **_kw) -> list[float]:
         return self._vector_for(text)
 
-    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+    async def embed_batch(self, texts: list[str], **_kw) -> list[list[float]]:
         return [self._vector_for(t) for t in texts]

@@ -209,12 +209,139 @@ numeric noise, so a note mixing reused and fresh vectors is not bit-identical
 to a from-scratch embed. The vector is assumed to be a function of (model,
 text) alone; the fingerprint names the model.
 
+**Since #355 the key is the exact embedded input.** Reuse requires, in
+addition to the three gates above, that the note's `embedded_chunking_version`
+equal `CHUNKING_VERSION` and that the row's `(embed_prefix, chunk_text)` pair
+equal the new chunk's; a row with a NULL prefix (pre-034) is never a
+candidate, and the under-lock check compares the pair, not the text alone.
+The locator (`heading_path`, `section_ordinal`) is not in the key: a reused
+vector is re-inserted with the new chunk's locator, so a heading inserted above
+a section re-embeds nothing and still records the shifted ordinals. See
+"Heading-aware chunks (#355)" below.
+
+## Heading-aware chunks (#355)
+
+**Sectioning.** `chunk_note_bounded` (`src/services/embeddings.py`) splits the
+frontmatter-stripped body `read_note` scans, with `vault._scan_headings`
+itself (imported, never copied: a heading inside fenced or inline code is not
+a boundary). Section *k* is heading *k*'s **own** text — one terminator past
+its `line_end` (the `_section_body_span` step) up to the next heading of **any**
+depth — and section 0 is the text before the first heading. `read_note(section=
+"#k")` returns a superset (the subsections too), so the guarantee is
+*containment*: every chunk with ordinal *k* is a substring of that section's
+body with the whole-body fence spans removed. Cleaning uses the spans of one
+`scan_fences(body, BODY)` call per note; windowing is `chunk_text_bounded` per
+section with **one cap counter across sections**, stopping one past
+`MAX_CHUNKS_PER_NOTE` so `chunks_truncated` keeps its meaning. Heading lines
+are not chunk text. The heading path is the enclosing chain (each step to a
+strictly shallower heading, `_path_chain_match`'s rule), components cut at 200
+characters with `…`. A change to the heading scan is now also a
+`CHUNKING_VERSION` bump.
+
+**The zero-chunk invariant.** A note with no headings chunks byte-identically
+to `chunk_text_bounded(clean_for_embedding(body))`. A note whose sections are
+all empty but whose cleaned body is not (headings only) falls back to that
+whole-body chunking as section 0, so a note has zero chunks exactly when the
+pre-034 chunker gave it zero: `CERTIFIED_EMPTY`, #127's convergence exceptions
+and the exclusion sweep's probe (which now calls `chunk_note_bounded`) keep
+their meaning.
+
+**The prefix.** The provider input is `embedding_input(prefix, chunk)` =
+`prefix + "\n\n" + chunk`; `prefix` is `build_embed_prefix(title, path,
+tags)`: `Title > H1 > … > Hk`, each component whitespace-collapsed and cut at
+80, outer headings replaced by one `…` until the breadcrumb fits
+`EMBED_PREFIX_MAX_CHARS` (300; the title and innermost heading always fit),
+then a `tags: a, b` line only if the whole prefix still fits. The row stores
+the prefix (`embed_prefix`) and the un-prefixed `chunk_text`.
+
+**The certification covers the input (D3a).** `certify_embedded` stamps, in
+its one conditional UPDATE, `embedded_chunking_version = CHUNKING_VERSION` and
+`embedded_input_digest` (SHA-256 of the canonical JSON of the ordered provider
+inputs, `[]` for an empty or excluded note) on every certifying branch. The
+index upsert clears `embedded_content_hash` in the same statement when the
+stored `title` or `tags` are `IS DISTINCT FROM` the new ones (a re-derive, an
+extraction-version re-upsert, a frontmatter edit); both move paths already
+clear it unconditionally. As a backstop, every full-hash pass (which keeps
+every body for this) recomputes the digest of what the current code would send
+for each note certified under the current version — CPU only, no provider call
+— and clears certification on a NULL or differing digest, in the pass
+transaction under the generation lock.
+
+**The re-embed is a per-note backlog, outside the stored fingerprint.** A
+fingerprint change refuses startup and its reset empties semantic search, and
+clearing every `embedded_content_hash` would mark every result stale. So the
+chunking format is a per-note stamp instead. The embed backlog, the
+dashboard pending count and the progress endpoint share
+`embedded_chunking_version IS DISTINCT FROM CHUNKING_VERSION` (never `<` or
+`>`, so a rollback to a lower version re-selects notes stamped higher;
+`vectors_not_current_sql` / `_expr`). The `index_transition:` marker and
+`/health` use the narrower `legacy_vectors_sql` / `_expr`: the same version
+test **and** the note holds vector rows — a generation mix, not a note that
+simply has not been embedded yet (the harness's `legacy_chunked_notes` is the
+same definition). Each is paired SQL text and expression; a test checks they
+agree and greps `src/` for an ordered comparison. Staleness is unchanged (`embedded_content_hash IS DISTINCT FROM
+content_hash`), so a version-only note is fresh and keeps its preview. The
+model, and the space, are unchanged and stay in the refusing fingerprint; the
+mix still changes ranking (L1), so the vector tools declare it.
+
+**Ordering and the budget in every mode.** The backlog SELECT sorts
+content-stale notes first, then version-only ones (`version_only`), each
+`modified_at DESC`. `EmbedBudget.enter_version_only()` applies the budget to
+the version-only segment **whatever `_active_scope_count`**: in a single-scope
+pass it starts enforcement there with a fresh allowance (at-least-one-note and
+note-boundary rules unchanged) and `leave_version_only()` restores the
+unbudgeted state for the sweep; a multi-scope pass is budgeted across both
+segments as before. A stop is not a failure.
+
+**`/health` stays non-volumetric.** Each embed stage counts its scope's
+notes holding vectors of another generation at its end and stores the count
+in `indexer_health` (process memory). `/health` exposes only
+`indexer.rechunk: "in_progress" | "complete"`, process-wide — beside the
+"counts only, no path/error/user id" rule, this field carries **no number at
+all**, because the endpoint is unauthenticated and a count would be
+tenant-derived. It never affects `status` or the HTTP code, and no counter
+keys on backlog size or pass length. Exact per-owner counts live on the panel
+and in the owner-scoped `index_transition:` line.
+
+**No build overlap in the supported deployments (L2).** The repository's
+Kubernetes bundle is one replica with `strategy: Recreate`, migrating in an
+init container; compose `make deploy` stops the app first. Only a deployment
+modified outside the repository (rolling update, second replica) can have a
+033 build write after 034: such a note keeps legacy rows (NULL locator, never
+reused) until its next edit or the next full-hash backstop.
+
+**Accepted limitations (#355).**
+- **L1** — during the transition, legacy and heading-era vectors coexist, so
+  which notes fit a bounded page depends on re-embed progress; declared on
+  every vector response by `index_transition:` until the scope drains.
+- **L2** — see above.
+- **L3** — an edit not yet scanned leaves a fresh-looking row whose `#N` may
+  name another section; `read_note` returns the `heading` to check.
+- **L4** — a tag edit, or a title change, re-embeds the whole note (every
+  prefix changes), undoing #281's reuse for metadata edits.
+- **L5** — the `§` path quotes note-controlled heading text; it cannot forge
+  the ordinal, but its words are the author's.
+- **L6** — only ATX headings are boundaries, as in section addressing.
+- **L7** — `alembic downgrade 033` deletes heading-era vectors; those notes
+  are absent from semantic search until the old build re-embeds them.
+- **L8** — `EMBEDDING_QUERY_INSTRUCTION` is not checked against the model.
+- **L9** — searches during the re-embed may wait up to one batch on a shared
+  Ollama.
+- **L10** — heading components and the prefix are cut at fixed lengths,
+  marked `…`.
+- **L11** — the full-hash backstop holds every note body for the pass, once
+  per interval and at startup, the memory profile of a re-derive.
+
 ## Indexing decisions
 
 - Embeddings: pluggable provider, `EmbeddingProvider` Protocol with two
   implementations (Ollama, OpenAI). Single `EMBEDDING_PROVIDER` env var
   picks the backend; `get_provider()` is a cached singleton. Default is
-  Ollama bge-m3 at 1024 dim, 512 token chunks, no overlap.
+  Ollama bge-m3 at 1024 dim, 512 token windows inside heading-aware
+  sections (#355), no overlap, each chunk embedded under a
+  `Title > Heading` context prefix. Every call declares `kind="query"` or
+  `kind="document"`; `EMBEDDING_QUERY_INSTRUCTION` is applied to queries
+  only, in `get_embedding` / `get_embeddings_batch`.
 - **Each embed pass ends with an exclusion reconciliation sweep** (#127). The
   backlog selects on `embedded_content_hash IS NULL OR != content_hash`, so it
   is driven entirely by *content* changes and an `EMBEDDING_EXCLUDE_PATTERNS`
@@ -1831,6 +1958,19 @@ fts_fingerprint()       -> {"configs":["english"],"v":1}
 - **`v` (`FINGERPRINT_VERSION`) makes adding a field a deliberate act.** It
   changes every fingerprint, so the change that adds one must ship either a
   rewrite of the stored value or an instruction to reset.
+
+**What is deliberately not in the embedding fingerprint (#355, #367).**
+`EMBEDDING_QUERY_INSTRUCTION` — every stored vector is a document vector
+embedded without it, so changing it invalidates nothing and must not refuse or
+re-embed — and `CHUNKING_VERSION`, which is per note (see "Heading-aware
+chunks"). Both are in the **retrieval fingerprint**, `retrieval_fingerprint()`:
+the embedding fingerprint's fields plus `chunking_version` and
+`query_instruction_sha256` (16 hex digits, null when empty). It is never
+stored and never compared; startup logs it once (`Embedding retrieval: …`,
+the digest, never the text) and the search-evaluation harness records it per
+semantic arm, so two deployments that differ only in the instruction share a
+stored fingerprint and are labelled apart. A model switch still changes the
+stored fingerprint and takes the refuse-then-reset runbook.
 
 ### Comparison at startup: both fail closed
 

@@ -73,10 +73,10 @@ async def vault(sessionmaker, monkeypatch, tmp_path):
     monkeypatch.setattr(embeddings_service, "async_session", sessionmaker, raising=False)
     monkeypatch.setattr(indexer, "_is_paused", lambda: False)
 
-    async def fake_batch(chunks):
+    async def fake_batch(chunks, **_kw):
         return [list(VECTOR) for _ in chunks]
 
-    async def fake_one(_text):
+    async def fake_one(_text, **_kw):
         return list(VECTOR)
 
     monkeypatch.setattr(embeddings_service, "get_embeddings_batch", fake_batch)

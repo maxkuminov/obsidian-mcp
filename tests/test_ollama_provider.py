@@ -44,7 +44,7 @@ async def test_embed_one_pins_model_with_int_keep_alive(ollama_settings, monkeyp
         route = mock.post("/api/embed").mock(
             return_value=Response(200, json={"embeddings": [[0.1, 0.2, 0.3]]})
         )
-        out = await provider.embed_one("hello")
+        out = await provider.embed_one("hello", kind="query")
 
     assert out == [0.1, 0.2, 0.3]
     body = json.loads(route.calls[0].request.read())
@@ -66,7 +66,7 @@ async def test_embed_one_passes_duration_string_through(ollama_settings, monkeyp
         route = mock.post("/api/embed").mock(
             return_value=Response(200, json={"embeddings": [[1.0]]})
         )
-        await provider.embed_one("hi")
+        await provider.embed_one("hi", kind="query")
 
     body = json.loads(route.calls[0].request.read())
     assert body["keep_alive"] == "30m"

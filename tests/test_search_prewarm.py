@@ -86,7 +86,7 @@ def _install(monkeypatch, session, embed=None):
     monkeypatch.setattr(indexer, "async_session", lambda: session)
     calls = {"embed": 0}
 
-    async def _embed(_text):
+    async def _embed(_text, **_kw):
         calls["embed"] += 1
         if embed is not None:
             return await embed(_text)
@@ -338,7 +338,7 @@ async def test_prewarm_does_not_touch_the_failure_counter(monkeypatch, caplog):
         async def execute(self, clause, *_a, **_k):
             raise RuntimeError("connection reset")
 
-    async def _broken_embed(_text):
+    async def _broken_embed(_text, **_kw):
         raise RuntimeError("ollama is down")
 
     monkeypatch.setattr(indexer, "async_session", lambda: _BrokenSession())

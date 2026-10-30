@@ -437,6 +437,16 @@ async def _warn_missing_keyword_excerpts() -> None:
         )
 
 
+def _log_retrieval_fingerprint() -> None:
+    """One INFO line naming the non-stored retrieval fingerprint (heading-chunks
+    D7): the embedding fingerprint's fields, the chunking version and the
+    query instruction's digest — never the instruction text. Never compared,
+    so it can never refuse startup."""
+    from src.services.index_state import retrieval_fingerprint
+
+    logging.getLogger(__name__).info("Embedding retrieval: %s", retrieval_fingerprint())
+
+
 async def _warm_embedding_model() -> None:
     """Pre-load the embedding model so the first semantic_search after startup
     isn't a cold reload. Combined with OLLAMA_KEEP_ALIVE the model then stays
@@ -446,9 +456,11 @@ async def _warm_embedding_model() -> None:
     if settings.embedding_provider != "ollama":
         return
     try:
-        from src.services.embeddings import get_provider
+        from src.services.embeddings import get_embedding
 
-        await get_provider().embed_one("warmup")
+        # Through the shared layer, as a query: it warms the path a search
+        # takes, query instruction included (heading-chunks D7).
+        await get_embedding("warmup", kind="query")
         logging.getLogger(__name__).info(
             "Embedding model warm-up complete (keep_alive=%s)",
             settings.ollama_keep_alive,
@@ -598,6 +610,7 @@ async def lifespan(app: FastAPI):
         # itself) and below the sandbox short-circuit.
         await check_database_role()
         log_embedding_transport()
+        _log_retrieval_fingerprint()
         await _check_embedding_dim()
         await _check_pgvector_version()
         await _validate_fts_configs()

@@ -43,6 +43,9 @@ class _Result:
     def fetchall(self):
         return self._rows
 
+    def scalar(self):
+        # The transition count (#355): an empty batch is zero.
+        return self._rows[0] if self._rows else 0
 
 class _Session:
     """Replays one scripted batch per non-`SET LOCAL` statement."""
@@ -54,7 +57,7 @@ class _Session:
     async def execute(self, clause, *_a, **_k):
         sql = str(clause)
         self.statements.append(sql)
-        if sql.lstrip().upper().startswith("SET LOCAL"):
+        if sql.lstrip().upper().startswith(("SET LOCAL", "SET TRANSACTION")):
             return _Result([])
         return _Result(self._batches.pop(0) if self._batches else [])
 
@@ -92,7 +95,7 @@ def _row(note, *, text="the note's stored chunk text", distance=0.1):
 
 @pytest.fixture(autouse=True)
 def _no_provider(monkeypatch):
-    async def fake_get_embedding(_text):
+    async def fake_get_embedding(_text, **_kw):
         return [1.0, 0.0, 0.0]
 
     monkeypatch.setattr(embeddings, "get_embedding", fake_get_embedding)
@@ -147,7 +150,7 @@ async def test_a_null_embedded_hash_is_stale(holder):
 
 
 @pytest.mark.asyncio
-async def test_a_fresh_row_keeps_its_five_hundred_character_preview(holder):
+async def test_a_fresh_row_keeps_its_whole_chunk_for_the_renderer(holder):
     note = _Note(3, "Fresh.md", content_hash="h2", embedded_content_hash="h2")
     long_text = "z" * 900
     session = _Session([[_row(note, text=long_text)]])
@@ -155,7 +158,8 @@ async def test_a_fresh_row_keeps_its_five_hundred_character_preview(holder):
     results = await semantic_search(session, "q", limit=10)
 
     assert results[0]["stale"] is False
-    assert results[0]["chunk"] == "z" * 500
+    # Uncut since #355 (D6): the renderer normalises, then cuts at 200.
+    assert results[0]["chunk"] == "z" * 900
 
 
 @pytest.mark.asyncio
@@ -326,6 +330,10 @@ async def test_no_predicate_or_set_local_changed(holder):
 
     await semantic_search(session, "q", limit=5)
 
+    # #355 (D4): one REPEATABLE READ, READ ONLY snapshot, opened first.
+    assert session.statements[0] == (
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+    )
     set_locals = [
         s for s in session.statements if s.lstrip().upper().startswith("SET LOCAL")
     ]
@@ -335,7 +343,7 @@ async def test_no_predicate_or_set_local_changed(holder):
         "SET LOCAL hnsw.iterative_scan = 'relaxed_order'",
     ]
     selects = [
-        s for s in session.statements if not s.lstrip().upper().startswith("SET LOCAL")
+        s for s in session.statements if not s.lstrip().upper().startswith(("SET LOCAL", "SET TRANSACTION"))
     ]
     assert len(selects) == 1
     sql = selects[0]
@@ -355,7 +363,7 @@ async def test_every_row_carries_both_annotations(holder):
     for r in results:
         assert set(r) == {
             "path", "title", "tags", "chunk", "chunk_index", "similarity",
-            "stale", "embedding_truncated",
+            "stale", "embedding_truncated", "section",
         }
         assert r["stale"] is False
         assert r["embedding_truncated"] is False

@@ -106,7 +106,7 @@ async def vault(sessionmaker, monkeypatch, tmp_path):
     monkeypatch.setattr(src.database, "async_session", sessionmaker)
     monkeypatch.setattr(indexer, "_is_paused", lambda: False)
 
-    async def fake_batch(chunks):
+    async def fake_batch(chunks, **_kw):
         # One deterministic non-zero unit vector per chunk. The values do not
         # matter here; that a vector *exists* is the whole assertion.
         return [[1.0] + [0.0] * (DIM - 1) for _ in chunks]

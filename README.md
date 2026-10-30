@@ -290,7 +290,14 @@ the wire, so none is cut off by a client's description limit.
   configurable via `FTS_CONFIGS` (see
   [Full-text search language(s)](#full-text-search-languages))
 - `semantic_search(query, folder?, tags?, frontmatter?, limit=15)`,
-  vector similarity via pgvector, one preview chunk per note
+  vector similarity via pgvector, one one-line preview chunk per note.
+  Notes are chunked at their headings, and each chunk is embedded under a
+  `Title > Heading > Subheading` context prefix. A fresh row names the
+  section it matched: `§ "Plan/Risks" (#7)` or `§ (top of note)`, and
+  `read_note(path, section="#7")` reads exactly that section. Stale rows,
+  and rows not yet re-embedded since the upgrade to heading-aware chunks,
+  carry no locator. While any of your notes is still on the old chunking,
+  each response says so on an `index_transition:` line under its header
 - `hybrid_search(query, limit=10, folder?, tags?, frontmatter?)`, both
   of the above fused by reciprocal rank fusion over each arm's top 50, one
   line per note with its fused score, each arm's rank and the `1/(k+rank)`
@@ -457,7 +464,8 @@ origin the mint tools refuse rather than emit a localhost link.
 - `get_neighborhood(path, depth=1, limit=50)`, undirected BFS over the
   resolved-link graph, capped at depth ≤ 5 and limit ≤ 200
 - `find_related(path, limit=10)`, semantic neighbors via averaged
-  chunk embeddings and pgvector cosine distance, deduped per note
+  chunk embeddings and pgvector cosine distance, deduped per note, with
+  the same section locator and `index_transition:` line as `semantic_search`
 - `find_orphans(folder?, limit=50)`, notes with zero in or out
   resolved links
 
@@ -1294,6 +1302,7 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `EMBEDDING_DIMENSIONS` | `1024` | pgvector column width |
 | `OLLAMA_URL` | `http://ollama:11434` | Used when provider is Ollama. Must be `https`, loopback `http`, or covered by `EMBEDDING_ALLOW_PLAINTEXT`. |
 | `EMBEDDING_MODEL` | `bge-m3` | Ollama model name. Changing it post-deploy requires `make reset-embeddings`; the server refuses to start until the stored vectors match. See [Switching providers or models](#switching-providers-or-models). |
+| `EMBEDDING_QUERY_INSTRUCTION` | empty | Prepended verbatim, with no separator, to every **search query** sent to the embedding provider, and never to a note. For instruction-tuned embedders such as Qwen3-Embedding, e.g. `"Instruct: Given a question, retrieve the notes that answer it\nQuery: "` (double quotes, so `.env` turns `\n` into a newline). Up to 1,000 characters; NUL and control characters other than newline and tab are refused. It is **not** in the stored embedding fingerprint, so changing it needs no reset and re-embeds nothing; changing the model still does. The default model is unchanged (bge-m3, which wants no instruction). |
 | `OLLAMA_KEEP_ALIVE` | `-1` | How long Ollama keeps the model resident. `-1` pins it; a Go duration (`30m`) frees VRAM when idle. Ollama only. |
 | `OPENAI_API_KEY` | — | Required when provider is OpenAI |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Override for Azure or proxies. Same transport rule as `OLLAMA_URL` when this provider is active. |
@@ -1362,6 +1371,12 @@ provider switch. That is every one of:
   the dimension guard cannot see
 - `EMBEDDING_DIMENSIONS`
 - `CHUNK_SIZE` and `CHUNK_OVERLAP`
+
+Two things are deliberately **not** on that list. `EMBEDDING_QUERY_INSTRUCTION`
+touches only queries, so no stored vector depends on it. And the chunking
+format itself (heading-aware sections and the context prefix) is versioned
+per note: when it changes, the indexer re-embeds notes in the background over
+several passes, without a refused startup or a reset.
 
 The server stores a fingerprint of that configuration and compares it at
 startup. On a mismatch it logs both fingerprints and the fields that

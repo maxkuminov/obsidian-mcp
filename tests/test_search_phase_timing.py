@@ -46,6 +46,9 @@ class _Result:
     def scalar_one_or_none(self):
         return self._rows[0] if self._rows else None
 
+    def scalar(self):
+        # The transition count (#355): an empty batch is zero.
+        return self._rows[0] if self._rows else 0
 
 class _Session:
     def __init__(self, batches=(), delay=0.0):
@@ -54,7 +57,7 @@ class _Session:
 
     async def execute(self, clause, *_a, **_k):
         sql = str(clause)
-        if sql.lstrip().upper().startswith("SET LOCAL"):
+        if sql.lstrip().upper().startswith(("SET LOCAL", "SET TRANSACTION")):
             return _Result()
         if self._delay:
             await asyncio.sleep(self._delay)
@@ -119,7 +122,7 @@ def captured(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _fake_embedding(monkeypatch):
-    async def _fake(_text):
+    async def _fake(_text, **_kw):
         await asyncio.sleep(0.01)
         return [1.0, 0.0, 0.0]
 
@@ -187,7 +190,7 @@ class _FindRelatedSession(_Session):
 
     async def execute(self, clause, *_a, **_k):
         sql = str(clause)
-        if not sql.lstrip().upper().startswith("SET LOCAL") and self._preamble:
+        if not sql.lstrip().upper().startswith(("SET LOCAL", "SET TRANSACTION")) and self._preamble:
             await asyncio.sleep(0.005)
             return _Result(self._preamble.pop(0))
         return await super().execute(clause, *_a, **_k)

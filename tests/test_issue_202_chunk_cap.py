@@ -61,6 +61,10 @@ class _NoRows:
     def all(self):
         return []
 
+    def scalar_one_or_none(self):
+        # The note's chunking version (#355): none, so reuse is disabled.
+        return None
+
 
 class _RowcountResult:
     def __init__(self, rowcount):
@@ -230,7 +234,7 @@ async def test_a_capped_note_is_embedded_to_the_cap_and_certified(
     session, note = _Session(), _Note()
     body = "".join(f"{i:04d}" for i in range(9))
 
-    async def ok(chunks):
+    async def ok(chunks, **_kw):
         return [[float(i), 1.0] for i in range(len(chunks))]
 
     monkeypatch.setattr(embeddings, "get_embeddings_batch", ok)
@@ -259,7 +263,7 @@ async def test_a_note_at_the_cap_exactly_is_not_marked(monkeypatch, tiny_chunks)
     monkeypatch.setattr(embeddings, "MAX_CHUNKS_PER_NOTE", 5)
     session, note = _Session(), _Note()
 
-    async def ok(chunks):
+    async def ok(chunks, **_kw):
         return [[0.0, 1.0] for _ in chunks]
 
     monkeypatch.setattr(embeddings, "get_embeddings_batch", ok)
@@ -283,7 +287,7 @@ async def test_a_note_edited_back_under_the_cap_reports_untruncated(
     a later embed of that note fits."""
     monkeypatch.setattr(embeddings, "MAX_CHUNKS_PER_NOTE", 5)
 
-    async def ok(chunks):
+    async def ok(chunks, **_kw):
         return [[0.0, 1.0] for _ in chunks]
 
     monkeypatch.setattr(embeddings, "get_embeddings_batch", ok)
@@ -309,7 +313,7 @@ async def test_cardinality_is_exact_over_the_capped_list(monkeypatch, tiny_chunk
     monkeypatch.setattr(embeddings, "MAX_CHUNKS_PER_NOTE", 5)
     session, note = _Session(), _Note()
 
-    async def one_short(chunks):
+    async def one_short(chunks, **_kw):
         return [[0.0, 1.0]] * (len(chunks) - 1)
 
     monkeypatch.setattr(embeddings, "get_embeddings_batch", one_short)
@@ -334,7 +338,7 @@ async def test_a_full_capped_batch_is_accepted(monkeypatch, tiny_chunks):
     monkeypatch.setattr(embeddings, "MAX_CHUNKS_PER_NOTE", 5)
     session, note = _Session(), _Note()
 
-    async def exact(chunks):
+    async def exact(chunks, **_kw):
         return [[0.0, 1.0] for _ in chunks]
 
     monkeypatch.setattr(embeddings, "get_embeddings_batch", exact)
@@ -358,7 +362,7 @@ async def test_the_cap_logs_nothing_here(monkeypatch, tiny_chunks, caplog):
     that way."""
     monkeypatch.setattr(embeddings, "MAX_CHUNKS_PER_NOTE", 3)
 
-    async def ok(chunks):
+    async def ok(chunks, **_kw):
         return [[0.0, 1.0] for _ in chunks]
 
     monkeypatch.setattr(embeddings, "get_embeddings_batch", ok)

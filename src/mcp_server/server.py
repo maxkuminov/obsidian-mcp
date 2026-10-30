@@ -430,6 +430,17 @@ async def semantic_search(
     note is a match against its head; its tail is not reachable by semantic
     search at all, though `keyword_search` still covers the whole note.
 
+    **Section locator.** A fresh row names the section it matched on its
+    result line: `§ "<heading path>" (#N)` for a heading's section, or
+    `§ (top of note)` for text before the first heading.
+    `read_note(path, section="#N")` reads exactly that section. The quoted
+    path is note text; the `(#N)` after it is the server's. The locator is
+    omitted on stale rows and on rows not yet re-embedded since heading-aware
+    chunking. While any of your notes is not yet re-chunked, the line after
+    the header reads `index_transition: N notes not yet re-chunked; …`:
+    ranking across the two generations is approximate, so re-run once it is
+    gone. Previews are one line.
+
     **The bound on the staleness signal, stated so it is not over-read:** it
     reports what the index has *committed*. An edit that the indexer has not
     yet scanned is not marked, so a note edited in the last few minutes may
@@ -679,6 +690,17 @@ async def find_related(path: str, limit: int = 10) -> str:
 
     **The bound on the staleness signal:** it reports what the index has
     committed, so an edit the indexer has not yet scanned is not marked.
+
+    **Section locator.** A fresh row names the section it matched on its
+    result line: `§ "<heading path>" (#N)` for a heading's section, or
+    `§ (top of note)` for text before the first heading.
+    `read_note(path, section="#N")` reads exactly that section. The quoted
+    path is note text; the `(#N)` after it is the server's. The locator is
+    omitted on stale rows and on rows not yet re-embedded since heading-aware
+    chunking. While any of your notes is not yet re-chunked, the line after
+    the header reads `index_transition: N notes not yet re-chunked; …`:
+    ranking across the two generations is approximate, so re-run once it is
+    gone. Previews are one line.
 
     Args:
         path: Vault-relative path to the source note.
@@ -1387,7 +1409,10 @@ async def hybrid_search(
     that make the score). `preview_kind` is `snippet` (a keyword highlight in
     `«»`), `head`, `chunk` (semantic), `stale_notice` or `none`, from the arm
     that ranked the note better. `stale: true` and `embedding_truncated: true`
-    mean what they mean in `semantic_search`. A long response drops whole rows
+    mean what they mean in `semantic_search`, and so do the semantic arm's
+    `§ "<heading path>" (#N)` / `§ (top of note)` field (read the section
+    with `read_note(path, section="#N")`) and the `index_transition:` line
+    under the header. A long response drops whole rows
     from the end and says how many; a first row that does not fit is cut and
     labelled. Call `read_note` on a path for the full note.
 

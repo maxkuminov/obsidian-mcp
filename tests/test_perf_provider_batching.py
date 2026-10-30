@@ -58,7 +58,7 @@ async def test_40_chunks_at_16_are_three_requests_in_order(ollama):
     texts = [f"chunk-{i:02d}" + "x" * i for i in range(40)]
     with respx.mock(base_url="http://ollama:11434") as mock:
         route = mock.post("/api/embed").mock(side_effect=_answer_per_input)
-        out = await OllamaProvider().embed_batch(texts)
+        out = await OllamaProvider().embed_batch(texts, kind="document")
 
     sent = [json.loads(c.request.read())["input"] for c in route.calls]
     assert [len(s) for s in sent] == [16, 16, 8]
@@ -71,7 +71,7 @@ async def test_batch_size_one_is_the_pre_batching_shape(ollama, monkeypatch):
     monkeypatch.setattr(settings, "ollama_embed_batch_size", 1)
     with respx.mock(base_url="http://ollama:11434") as mock:
         route = mock.post("/api/embed").mock(side_effect=_answer_per_input)
-        out = await OllamaProvider().embed_batch(["a", "bb", "ccc"])
+        out = await OllamaProvider().embed_batch(["a", "bb", "ccc"], kind="document")
     assert [json.loads(c.request.read())["input"] for c in route.calls] == [
         ["a"], ["bb"], ["ccc"]
     ]
@@ -85,7 +85,7 @@ async def test_a_short_response_fails_the_batch(ollama):
             return_value=Response(200, json={"embeddings": [[0.1]] * 15})
         )
         with pytest.raises(RuntimeError, match="15 vectors for 16 inputs"):
-            await OllamaProvider().embed_batch([f"c{i}" for i in range(16)])
+            await OllamaProvider().embed_batch([f"c{i}" for i in range(16)], kind="document")
 
 
 async def test_a_short_later_slice_fails_the_whole_batch(ollama):
@@ -98,7 +98,7 @@ async def test_a_short_later_slice_fails_the_whole_batch(ollama):
     with respx.mock(base_url="http://ollama:11434") as mock:
         mock.post("/api/embed").mock(side_effect=_respond)
         with pytest.raises(RuntimeError, match="7 vectors for 8 inputs"):
-            await OllamaProvider().embed_batch([f"c{i}" for i in range(24)])
+            await OllamaProvider().embed_batch([f"c{i}" for i in range(24)], kind="document")
 
 
 @pytest.fixture
@@ -119,7 +119,7 @@ async def test_openai_answer_in_index_order_is_accepted(openai):
         mock.post("https://api.example.test/v1/embeddings").mock(
             return_value=_openai_rows([2, 0, 1])
         )
-        out = await OpenAIProvider().embed_batch(["a", "b", "c"])
+        out = await OpenAIProvider().embed_batch(["a", "b", "c"], kind="document")
     assert out == [[0.0], [1.0], [2.0]]
 
 
@@ -136,14 +136,14 @@ async def test_openai_per_request_cardinality_fails_the_batch(openai, indices):
             return_value=_openai_rows(indices)
         )
         with pytest.raises(RuntimeError, match="for 3 inputs"):
-            await OpenAIProvider().embed_batch(["a", "b", "c"])
+            await OpenAIProvider().embed_batch(["a", "b", "c"], kind="document")
     assert route.call_count == 1  # a malformed answer is not retried
 
 
 async def test_embed_one_sends_a_one_element_array(ollama):
     with respx.mock(base_url="http://ollama:11434") as mock:
         route = mock.post("/api/embed").mock(side_effect=_answer_per_input)
-        assert await OllamaProvider().embed_one("query") == [5.0]
+        assert await OllamaProvider().embed_one("query", kind="query") == [5.0]
     assert json.loads(route.calls[0].request.read())["input"] == ["query"]
 
 
@@ -175,7 +175,7 @@ async def test_a_hung_request_fails_at_30s_and_so_does_the_next(
     monkeypatch.setattr(embeddings.asyncio, "wait_for", _spy)
 
     with pytest.raises((asyncio.TimeoutError, TimeoutError)):
-        await provider.embed_batch([f"c{i}" for i in range(20)])
+        await provider.embed_batch([f"c{i}" for i in range(20)], kind="document")
 
     assert seen == [30.0, 30.0]
     assert [len(c) for c in calls] == [16, 4]
@@ -194,8 +194,8 @@ async def test_each_request_carries_its_per_request_timeout(ollama, monkeypatch)
                 200, json={"data": [{"index": 0, "embedding": [0.2]}]}
             )
         )
-        await OllamaProvider().embed_one("q")
-        await OpenAIProvider().embed_one("q")
+        await OllamaProvider().embed_one("q", kind="query")
+        await OpenAIProvider().embed_one("q", kind="query")
 
     def _read_timeout(route):
         return route.calls[0].request.extensions["timeout"]["read"]
@@ -225,9 +225,9 @@ async def test_one_client_serves_every_request_on_a_loop(ollama, monkeypatch):
     with respx.mock(base_url="http://ollama:11434") as mock:
         mock.post("/api/embed").mock(side_effect=_answer_per_input)
         provider = OllamaProvider()
-        await provider.embed_batch([f"c{i}" for i in range(40)])
-        await provider.embed_one("q")
-        await OllamaProvider().embed_one("another instance, same client")
+        await provider.embed_batch([f"c{i}" for i in range(40)], kind="document")
+        await provider.embed_one("q", kind="query")
+        await OllamaProvider().embed_one("another instance, same client", kind="query")
     assert len(built) == 1
 
 

@@ -289,8 +289,9 @@ async def test_the_sweep_probe_cleans_and_chunks_off_the_loop(monkeypatch, vault
     )
     embedded = _embed_world(monkeypatch, vault, backlog=[], sweep=[row])
     record: list = []
+    # #355: the probe is the heading-aware chunker, which cleans inside.
     for name in ("read_note_beneath", "_content_hash", "parse_frontmatter",
-                 "clean_for_embedding", "chunk_text_bounded"):
+                 "chunk_note_bounded"):
         _wrap(monkeypatch, indexer, name, record)
 
     await indexer.embed_vault()
@@ -298,20 +299,20 @@ async def test_the_sweep_probe_cleans_and_chunks_off_the_loop(monkeypatch, vault
     assert embedded == [body], "the included note with no vectors was not repaired"
     assert {label for label, _ in record} == {
         "read_note_beneath", "_content_hash", "parse_frontmatter",
-        "clean_for_embedding", "chunk_text_bounded",
+        "chunk_note_bounded",
     }
     assert [label for label, on_main in record if on_main] == []
 
 
 async def test_embed_note_cleans_and_chunks_off_the_loop(monkeypatch):
     record: list = []
-    _wrap(monkeypatch, embeddings, "clean_for_embedding", record)
 
     def no_chunks(*_a, **_k):
-        _off_main(record, "chunk_text_bounded")
+        _off_main(record, "chunk_note_bounded")
         return [], False
 
-    monkeypatch.setattr(embeddings, "chunk_text_bounded", no_chunks)
+    # #355: sectioning, cleaning and windowing are one call, off the loop.
+    monkeypatch.setattr(embeddings, "chunk_note_bounded", no_chunks)
 
     class _Session:
         async def execute(self, *_a, **_k):
@@ -324,7 +325,7 @@ async def test_embed_note_cleans_and_chunks_off_the_loop(monkeypatch):
     result = await embeddings.embed_note(_Session(), note, "body")
 
     assert result.outcome is NoteEmbedOutcome.CERTIFIED_EMPTY
-    assert {label for label, _ in record} == {"clean_for_embedding", "chunk_text_bounded"}
+    assert {label for label, _ in record} == {"chunk_note_bounded"}
     assert [label for label, on_main in record if on_main] == []
 
 

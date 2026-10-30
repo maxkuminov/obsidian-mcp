@@ -26,6 +26,9 @@ with no statement run:
 6. Fusion, in Python.
 7. Keyword snippets for the keyword-arm rows of the fused page, at most
    `KEYWORD_SNIPPET_ROWS` of them.
+7b. When the semantic arm ran, the owner-scoped count of notes holding
+   vectors of another chunking generation (#355), for the
+   `index_transition:` line — the same snapshot as both arms.
 8. The caller closes the session, which ends the read-only transaction.
 
 The keyword arm runs before the semantic arm so that the only data-plan
@@ -91,6 +94,9 @@ class HybridRow:
     chunk: str | None = None
     stale: bool = False
     embedding_truncated: bool = False
+    #: The semantic arm's section locator (#355): `None` on a stale or
+    #: pre-034 row, or when the note came from the keyword arm alone.
+    section: dict | None = None
 
     @property
     def best_rank(self) -> int:
@@ -115,6 +121,10 @@ class HybridResult:
     overlap: int = 0
     #: `KEYWORD_SNIPPET_ROWS` as it stood for this call.
     snippet_cap: int = 0
+    #: Notes of the caller's owner scope holding vectors of another chunking
+    #: generation (#355, D4), read in this call's snapshot; 0 when the
+    #: semantic arm did not run (no cross-generation ranking took place).
+    rechunk_pending: int = 0
 
 
 def fuse(
@@ -157,7 +167,7 @@ async def hybrid_search(
     unavailable: str | None = None
     embed_start = time.monotonic()
     try:
-        query_embedding = await embeddings.get_embedding(query)
+        query_embedding = await embeddings.get_embedding(query, kind="query")
     except Exception as exc:  # noqa: BLE001 — every provider failure degrades
         unavailable = (
             UNAVAILABLE_INPUT_REJECTED
@@ -226,6 +236,7 @@ async def hybrid_search(
             row.chunk = sr["chunk"]
             row.stale = bool(sr["stale"])
             row.embedding_truncated = bool(sr["embedding_truncated"])
+            row.section = sr.get("section")
         page.append(row)
 
     # ── 7. Keyword snippets for the page's keyword rows, capped ─────────────
@@ -243,6 +254,13 @@ async def hybrid_search(
     # Recorded on every call, as 0-ish when the cap is off (#354 D7): the key
     # is part of every hybrid usage row.
     timing.add_ms("snippet_ms", time.monotonic() - started)
+
+    # ── 7b. The transition count (#355, D4), in this same snapshot ──────────
+    # Only when the semantic arm ran: it is a statement about the semantic
+    # ranking this page was fused from. Owner-scoped, the marker's predicate.
+    rechunk_pending = 0
+    if unavailable is None:
+        rechunk_pending = await embeddings.rechunk_pending_count(session, user_id)
     timing.add_ms("db_ms", time.monotonic() - db_start)
 
     overlap = len(k_by_path.keys() & s_by_path.keys())
@@ -259,6 +277,7 @@ async def hybrid_search(
         semantic_chunks=s_chunks,
         overlap=overlap,
         snippet_cap=cap,
+        rechunk_pending=rechunk_pending,
     )
 
     # ── Telemetry (D7); `result_count` / `result_paths` are the tool's ──────

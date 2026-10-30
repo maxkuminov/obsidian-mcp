@@ -23,6 +23,7 @@ from sqlalchemy import (
     delete,
     func,
     literal,
+    literal_column,
     null,
     or_,
     select,
@@ -55,10 +56,11 @@ from src.services.embeddings import (
     NoteEmbedOutcome,
     StaleCertification,
     certify_embedded,
-    chunk_text_bounded,
+    chunk_note_bounded,
     clean_at_version,
-    clean_for_embedding,
     embed_note,
+    legacy_vectors_sql,
+    vectors_not_current_sql,
 )
 from src.services.fts import (
     aliases_text,
@@ -2310,6 +2312,7 @@ def _scan_vault(
     re_derive: bool,
     stop: threading.Event,
     facts: "RootFacts | None" = None,
+    keep_bodies: bool = False,
 ) -> ScanResult:
     """Walk, stat, read and hash the pinned root. **Runs on a worker thread.**
 
@@ -2400,9 +2403,11 @@ def _scan_vault(
                 read=True,
                 size=st.st_size,
                 mtime=st.st_mtime,
+                # A full-hash (backstop) pass keeps every body too: the
+                # provider-input digest backstop re-chunks it (#355, D3a).
                 raw=(
                     raw
-                    if _needs_body(rel, h, snapshot, re_derive, facts)
+                    if keep_bodies or _needs_body(rel, h, snapshot, re_derive, facts)
                     else None
                 ),
             )
@@ -2438,6 +2443,7 @@ async def _run_scan(
     force_read: bool,
     re_derive: bool,
     facts: "RootFacts | None" = None,
+    keep_bodies: bool = False,
 ) -> ScanResult:
     """`_scan_vault` in a worker thread, with stop-on-cancel.
 
@@ -2456,6 +2462,7 @@ async def _run_scan(
             re_derive=re_derive,
             stop=stop,
             facts=facts,
+            keep_bodies=keep_bodies,
         )
     )
     try:
@@ -2984,6 +2991,9 @@ async def _index_vault_pinned(
     scan = await _run_scan(
         root_fd, snapshot, force_read=force_read, re_derive=re_derive,
         facts=facts if re_derive else None,
+        # The full-hash pass keeps every body for the input-digest backstop
+        # (#355, D3a) — a re-derive's memory shape, once per interval.
+        keep_bodies=backstop,
     )
     skips.extend(scan.skips)
     # Backstop-blocking failures (D12). From the scan: walk failures and read
@@ -3066,6 +3076,83 @@ async def _index_vault_pinned(
                 restarts,
                 retries,
             )
+
+
+def _input_digest_mismatches(rows, candidates: dict, exclude_patterns) -> list[int]:
+    """Ids of the certified rows whose stored input digest is NULL or differs
+    from what the current code would send for them (#355, D3a). Pure CPU —
+    runs off the loop, makes no provider call."""
+    from src.services.embeddings import input_digest, note_provider_inputs
+
+    stale: list[int] = []
+    for row in rows:
+        rel_path, text_in_hand, is_raw = candidates[row.id]
+        body = parse_frontmatter(text_in_hand)[1] if is_raw else text_in_hand
+        excluded = any(
+            fnmatch.fnmatch(row.file_path, pat) for pat in exclude_patterns
+        )
+        expected = input_digest(
+            note_provider_inputs(body, row.title, row.tags, excluded=excluded)
+        )
+        if row.embedded_input_digest != expected:
+            stale.append(row.id)
+    return stale
+
+
+async def _recheck_input_digests(
+    session, user_id: int | None, candidates: dict, log_suffix: str
+) -> None:
+    """Clear the certification of every note certified under the current
+    chunking version whose stored input digest no longer matches (D3a).
+
+    Bounds any invalidation path a title or tag writer missed to
+    `INDEX_FULL_HASH_INTERVAL_HOURS`. Owner-scoped like every write here.
+    """
+    from src.services.embeddings import CHUNKING_VERSION
+
+    owner = "user_id IS NULL" if user_id is None else "user_id = :uid"
+    params: dict = {"ids": list(candidates), "cv": CHUNKING_VERSION}
+    if user_id is not None:
+        params["uid"] = user_id
+    rows = (
+        await session.execute(
+            text(
+                "SELECT id, file_path, title, tags, embedded_input_digest "
+                "FROM notes_metadata "
+                f"WHERE id = ANY(:ids) AND {owner} "
+                "AND embedded_content_hash IS NOT DISTINCT FROM content_hash "
+                "AND embedded_chunking_version = :cv"
+            ),
+            params,
+        )
+    ).fetchall()
+    if not rows:
+        return
+    stale = await asyncio.to_thread(
+        _input_digest_mismatches,
+        rows,
+        candidates,
+        list(settings.embedding_exclude_patterns or []),
+    )
+    if not stale:
+        return
+    clear: dict = {"ids": stale}
+    if user_id is not None:
+        clear["uid"] = user_id
+    await session.execute(
+        text(
+            "UPDATE notes_metadata SET embedded_content_hash = NULL "
+            f"WHERE id = ANY(:ids) AND {owner}"
+        ),
+        clear,
+    )
+    logger.warning(
+        "Full-hash pass%s: %d note(s) were certified for a provider input they "
+        "no longer have (stored input digest missing or different); their "
+        "certification is cleared and the embed pass re-embeds them.",
+        log_suffix,
+        len(stale),
+    )
 
 
 async def _index_vault_attempt(
@@ -3310,6 +3397,10 @@ async def _index_vault_attempt(
         # terminators in each buffered body's frontmatter block, so a task's
         # line number counts from the file's first line.
         path_to_line_offset: dict[str, int] = {}
+        # Notes whose provider-input digest a full-hash pass re-checks (#355,
+        # D3a): row id → (path, raw-or-body, is_raw). Filled on a backstop
+        # pass only, from bytes this pass already holds.
+        digest_candidates: dict[int, tuple[str, str, bool]] = {}
         for rel_path, found in scan.files.items():
             h = found.content_hash
             # A stale extraction marker makes a note changed even when its
@@ -3344,6 +3435,13 @@ async def _index_vault_attempt(
                         "hash": h,
                         **_stat_params(found.stat),
                     })
+                # The input-digest backstop (#355, D3a): a full-hash pass
+                # has every note's bytes in hand, so it can recompute what
+                # the embed pass would send for it, without a provider call.
+                if backstop and found.read and found.raw is not None:
+                    digest_candidates[locked_ids[rel_path]] = (
+                        rel_path, found.raw, True,
+                    )
                 continue
 
             if found.raw is None:
@@ -3403,6 +3501,11 @@ async def _index_vault_attempt(
             path_to_content[rel_path] = content
             path_to_line_offset[rel_path] = frontmatter_line_offset(raw, content)
             title = _note_title(frontmatter, found.name)
+            if backstop and rel_path in existing and existing[rel_path] == h:
+                # Re-upserted with unchanged bytes (a stale marker or a
+                # re-derive): its digest is re-checked after the upsert,
+                # against the title and tags this pass writes.
+                digest_candidates[locked_ids[rel_path]] = (rel_path, content, False)
 
             # Grammar-attributable embedding invalidation, scoped to notes
             # whose recognised spans actually moved. Only asked where it
@@ -3731,6 +3834,36 @@ async def _index_vault_attempt(
                         # not derived under any root until a re-deriving
                         # pass's tail marks it, in this same transaction.
                         "derived_under": null(),
+                        # #355, D3a: the title and tags are inside every
+                        # chunk's provider input (the context prefix), so a
+                        # rewrite that changes either — a re-derive, an
+                        # extraction-version re-upsert, a frontmatter edit —
+                        # clears the certification in this same statement and
+                        # the backlog re-selects the note. Unchanged title and
+                        # tags leave it alone, so a marker bump re-embeds
+                        # nothing on that account.
+                        "embedded_content_hash": case(
+                            (
+                                or_(
+                                    NoteMetadata.title.is_distinct_from(
+                                        stmt.excluded.title
+                                    ),
+                                    # NULL and `{}` build the same prefix (no
+                                    # tags line), so they compare equal.
+                                    func.coalesce(
+                                        NoteMetadata.tags,
+                                        literal_column("'{}'::varchar[]"),
+                                    ).is_distinct_from(
+                                        func.coalesce(
+                                            stmt.excluded.tags,
+                                            literal_column("'{}'::varchar[]"),
+                                        )
+                                    ),
+                                ),
+                                null(),
+                            ),
+                            else_=NoteMetadata.embedded_content_hash,
+                        ),
                     },
                 )
                 return stmt
@@ -3815,6 +3948,15 @@ async def _index_vault_attempt(
                 "Fence-grammar change invalidated embeddings for %d note(s)%s",
                 len(grammar_invalidated),
                 log_suffix,
+            )
+
+        # The full-hash backstop for the provider-input certification (#355,
+        # D3a). After the upsert, so a re-upserted row is compared under the
+        # title and tags this pass just wrote; inside the pass transaction,
+        # which holds the generation lock, so no certification interleaves.
+        if digest_candidates:
+            await _recheck_input_digests(
+                session, user_id, digest_candidates, log_suffix
             )
 
         # Update tsvectors for changed notes
@@ -5333,11 +5475,14 @@ class EmbedBudget:
     user's pass has completed, so a tenant whose very first note exceeds the
     whole budget still advances by one note per pass instead of zero for ever.
 
-    **Only when the pass serves more than one scope.** With one active scope
-    there is no other tenant to be fair to, and a budget there would spread a
-    first index of a few thousand notes over several five-minute-spaced passes
-    for no benefit. That clause is what keeps the default deployment's
-    behaviour identical to today's.
+    **Only when the pass serves more than one scope — except for the
+    chunking-version segment** (#355, D4). With one active scope there is no
+    other tenant to be fair to, and a budget there would spread a first index
+    of a few thousand notes over several five-minute-spaced passes for no
+    benefit. The version-only segment is the exception: it is a re-embed of
+    the whole vault that nobody is waiting for, and unbudgeted it would hold
+    the indexer — and every real edit's keyword update — for an hour or more.
+    See `enter_version_only`.
 
     A stop is **not** a failure: it writes nothing to `indexer_runs.error` and
     logs once per user per pass, the same class of event as a pause. The
@@ -5354,6 +5499,38 @@ class EmbedBudget:
     started_at: float = field(default_factory=time.monotonic)
     #: One WARNING per user per pass, shared by the backlog loop and the sweep.
     announced: bool = False
+    #: Set when the backlog reached its version-only segment (#355, D4).
+    version_only_entered: bool = False
+    #: The segment switched enforcement on in a pass that was not budgeted.
+    enforced_for_version_only: bool = False
+
+    def enter_version_only(self) -> None:
+        """The backlog reached its chunking-version segment (#355, D4).
+
+        That segment is budgeted **whatever the number of active scopes**. In
+        a pass that was already budgeted (multi-scope) nothing changes: the
+        allowance spans both segments, as it always has. In an unbudgeted pass
+        enforcement starts here with a fresh allowance, so the at-least-one-
+        note rule and the note boundary apply to this segment exactly as they
+        do to a multi-scope pass, and real edits — which sort first — are
+        never charged against it.
+        """
+        if self.version_only_entered:
+            return
+        self.version_only_entered = True
+        if self.enforced:
+            return
+        self.enforced = True
+        self.enforced_for_version_only = True
+        self.chunks_submitted = 0
+        self.notes_completed = 0
+        self.started_at = time.monotonic()
+
+    def leave_version_only(self) -> None:
+        """Restore a single-scope pass's unbudgeted state for the sweep."""
+        if self.enforced_for_version_only:
+            self.enforced = False
+            self.enforced_for_version_only = False
 
     @property
     def active(self) -> bool:
@@ -5579,26 +5756,23 @@ async def _embed_vault_pinned(
         # it has to change: the certifying branch below sets or clears it from
         # `EmbedNoteResult.truncated`, and re-stamping an unchanged boolean on
         # every note of every pass would dirty every row for nothing.
-        if user_id is None:
-            sql = """
-                SELECT nm.id, nm.file_path, nm.content_hash, nm.chunks_truncated
-                FROM notes_metadata nm
-                WHERE nm.user_id IS NULL
-                  AND (nm.embedded_content_hash IS NULL
-                       OR nm.embedded_content_hash != nm.content_hash)
-                ORDER BY nm.modified_at DESC
-            """
-            params: dict = {}
-        else:
-            sql = """
-                SELECT nm.id, nm.file_path, nm.content_hash, nm.chunks_truncated
-                FROM notes_metadata nm
-                WHERE nm.user_id = :uid
-                  AND (nm.embedded_content_hash IS NULL
-                       OR nm.embedded_content_hash != nm.content_hash)
-                ORDER BY nm.modified_at DESC
-            """
-            params = {"uid": user_id}
+        #
+        # **The one "not current" predicate** (#355, D4): content-stale *or*
+        # embedded under another chunking version, shared with the dashboard
+        # and the progress endpoint. Content-stale notes come first, then
+        # version-only ones (`version_only`), each newest first, so a real
+        # edit is never queued behind the re-chunking backlog.
+        owner_clause = "nm.user_id IS NULL" if user_id is None else "nm.user_id = :uid"
+        sql = f"""
+            SELECT nm.id, nm.file_path, nm.content_hash, nm.chunks_truncated,
+                   (nm.embedded_content_hash IS NOT DISTINCT FROM nm.content_hash)
+                       AS version_only
+            FROM notes_metadata nm
+            WHERE {owner_clause}
+              AND {vectors_not_current_sql("nm")}
+            ORDER BY version_only, nm.modified_at DESC
+        """
+        params: dict = {} if user_id is None else {"uid": user_id}
         result = await session.execute(text(sql), params)
         unembedded = result.fetchall()
         budget = await _budget_for_pass(session, log_suffix)
@@ -5634,12 +5808,22 @@ async def _embed_vault_pinned(
             if _is_paused():
                 logger.info(f"Embedding pass paused, stopping early{log_suffix}")
                 break
+            # Version-only notes (#355, D4) are held to the budget **in every
+            # mode**, single-user included: without it the first pass after a
+            # chunking change would hold the indexer for the whole re-embed.
+            if getattr(row, "version_only", False):
+                budget.enter_version_only()
             # The budget sits beside the pause and is exactly as much of a
             # decision: between notes, never inside one, and never before this
             # user's pass has completed a note. A stop is not a failure and
             # moves neither counter.
             if budget.exhausted():
-                budget.stop(log_suffix, "the hash-mismatch backlog")
+                budget.stop(
+                    log_suffix,
+                    "the chunking-version backlog"
+                    if getattr(row, "version_only", False)
+                    else "the hash-mismatch backlog",
+                )
                 break
             try:
                 # Skip files matching exclude patterns. Drop any pre-existing
@@ -5673,7 +5857,8 @@ async def _embed_vault_pinned(
                     # generation change could invalidate, so there is nothing
                     # for the lock to protect.
                     await certify_embedded(
-                        session, row.id, row.content_hash, row.file_path
+                        session, row.id, row.content_hash, row.file_path,
+                        provider_inputs=[],
                     )
                     await session.execute(
                         delete(NoteEmbedding).where(NoteEmbedding.note_id == row.id)
@@ -5886,6 +6071,11 @@ async def _embed_vault_pinned(
                 )
             )
 
+        # The version-only segment's enforcement ends with the backlog: the
+        # sweep below keeps the budget it had before #355 in a single-scope
+        # pass (unbudgeted), and its multi-scope behaviour is unchanged.
+        budget.leave_version_only()
+
         # The backlog only ever sees rows whose content changed. Editing
         # `EMBEDDING_EXCLUDE_PATTERNS` changes no content, so without this the
         # new configuration reached only notes that happened to be edited
@@ -5895,7 +6085,37 @@ async def _embed_vault_pinned(
             outcome, budget,
         )
 
+        # `/health`'s non-volumetric `indexer.rechunk` (#355, D4): this
+        # scope's count under the one predicate, observed at the end of its
+        # embed stage and held in process memory. Never a failure, never in
+        # `status`; a failed count leaves the previous observation.
+        await _observe_rechunk(session, user_id, log_suffix)
+
     return outcome
+
+
+async def _observe_rechunk(session, user_id: int | None, log_suffix: str) -> None:
+    owner_clause = "nm.user_id IS NULL" if user_id is None else "nm.user_id = :uid"
+    params: dict = {} if user_id is None else {"uid": user_id}
+    try:
+        pending = (
+            await session.execute(
+                text(
+                    f"SELECT count(*) FROM notes_metadata nm "
+                    f"WHERE {owner_clause} AND {legacy_vectors_sql('nm')}"
+                ),
+                params,
+            )
+        ).scalar() or 0
+        await session.commit()
+    except Exception as e:  # noqa: BLE001 - bookkeeping must not fail the stage
+        logger.warning("Could not count notes pending re-chunking%s: %s", log_suffix, e)
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    indexer_health.record_rechunk(user_id, int(pending))
 
 
 async def _reconcile_exclusions(
@@ -6047,7 +6267,8 @@ async def _reconcile_exclusions(
                 # reason: no provider call, no vector written, and a claim that
                 # holds under every configuration.
                 await certify_embedded(
-                    session, row.id, row.content_hash, row.file_path
+                    session, row.id, row.content_hash, row.file_path,
+                    provider_inputs=[],
                 )
                 await session.execute(
                     delete(NoteEmbedding).where(NoteEmbedding.note_id == row.id)
@@ -6085,14 +6306,14 @@ async def _reconcile_exclusions(
                 continue
 
             _, content = await asyncio.to_thread(parse_frontmatter, raw)
-            # The **bounded** chunker, so "this note produces no chunks" means
-            # the same thing here as it does in `embed_note`, and so the probe
-            # stops at the first chunk instead of chunking a 10 MiB note to
-            # find out it is non-empty.
-            cleaned = await asyncio.to_thread(clean_for_embedding, content)
+            # The **bounded** heading-aware chunker `embed_note` runs (#355),
+            # so "this note produces no chunks" means the same thing here as it
+            # does there — the zero-chunk invariant makes that the pre-034
+            # answer too — and the probe stops one chunk past the cap instead
+            # of chunking a 10 MiB note without bound.
             probe_chunks, _probe_truncated = await asyncio.to_thread(
-                chunk_text_bounded,
-                cleaned,
+                chunk_note_bounded,
+                content,
                 chunk_size=settings.chunk_size,
                 overlap=settings.chunk_overlap,
                 max_chunks=MAX_CHUNKS_PER_NOTE,
@@ -7760,7 +7981,7 @@ async def _prewarm_once() -> tuple[float | None, float | None]:
         from src.services.embeddings import get_embedding
 
         start = time.monotonic()
-        await get_embedding("warmup")
+        await get_embedding("warmup", kind="query")
         embed_ms = (time.monotonic() - start) * 1000
 
     async with async_session() as session:

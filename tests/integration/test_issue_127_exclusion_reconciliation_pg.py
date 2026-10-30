@@ -98,7 +98,7 @@ async def vault(sessionmaker, monkeypatch, tmp_path):
 
     calls = {"n": 0}
 
-    async def fake_batch(chunks):
+    async def fake_batch(chunks, **_kw):
         calls["n"] += 1
         return [[1.0] + [0.0] * (DIM - 1) for _ in chunks]
 

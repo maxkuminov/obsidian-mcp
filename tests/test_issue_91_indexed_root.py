@@ -2209,7 +2209,7 @@ async def test_a_row_that_changes_between_verification_and_certification_is_refu
     monkeypatch.setattr(indexer.settings, "embedding_exclude_patterns", [], raising=False)
     monkeypatch.setattr(indexer, "_is_paused", lambda: False)
 
-    async def fake_batch(chunks):
+    async def fake_batch(chunks, **_kw):
         return [[0.0] * 4 for _ in chunks]
 
     monkeypatch.setattr(embeddings, "get_embeddings_batch", fake_batch)
@@ -2307,7 +2307,7 @@ async def test_an_unchanged_row_is_certified_against_what_was_embedded(
     monkeypatch.setattr(indexer.settings, "embedding_exclude_patterns", [], raising=False)
     monkeypatch.setattr(indexer, "_is_paused", lambda: False)
 
-    async def fake_batch(chunks):
+    async def fake_batch(chunks, **_kw):
         return [[0.0] * 4 for _ in chunks]
 
     monkeypatch.setattr(embeddings, "get_embeddings_batch", fake_batch)

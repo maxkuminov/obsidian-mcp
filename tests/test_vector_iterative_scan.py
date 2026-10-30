@@ -59,6 +59,9 @@ class _Result:
     def scalar_one_or_none(self):
         return self._rows[0] if self._rows else None
 
+    def scalar(self):
+        # The transition count (#355): an empty batch is zero.
+        return self._rows[0] if self._rows else 0
 
 class _RecordingSession:
     """Records every executed statement and replays a scripted row batch.
@@ -77,7 +80,7 @@ class _RecordingSession:
         sql = str(clause)
         self.statements.append(sql)
         self.clauses.append(clause)
-        if sql.lstrip().upper().startswith("SET LOCAL"):
+        if sql.lstrip().upper().startswith(("SET LOCAL", "SET TRANSACTION")):
             return _Result([])
         return _Result(self._batches.pop(0) if self._batches else [])
 
@@ -128,11 +131,11 @@ def _semantic_row(note_id, path, embedding, distance):
 
 
 def _set_locals(statements):
-    return [s for s in statements if s.lstrip().upper().startswith("SET LOCAL")]
+    return [s for s in statements if s.lstrip().upper().startswith(("SET LOCAL", "SET TRANSACTION"))]
 
 
 def _selects(statements):
-    return [s for s in statements if not s.lstrip().upper().startswith("SET LOCAL")]
+    return [s for s in statements if not s.lstrip().upper().startswith(("SET LOCAL", "SET TRANSACTION"))]
 
 
 def _limit_of(clause) -> int:
@@ -152,7 +155,7 @@ def holder():
 
 @pytest.fixture(autouse=True)
 def _fake_embedding(monkeypatch):
-    async def _fake(_text):
+    async def _fake(_text, **_kw):
         return [1.0, 0.0, 0.0]
 
     monkeypatch.setattr("src.services.embeddings.get_embedding", _fake)
@@ -175,9 +178,10 @@ async def test_semantic_search_issues_all_three_set_locals_before_the_select():
     first_select = next(
         i
         for i, s in enumerate(session.statements)
-        if not s.lstrip().upper().startswith("SET LOCAL")
+        if not s.lstrip().upper().startswith(("SET LOCAL", "SET TRANSACTION"))
     )
-    assert first_select == 3, session.statements
+    # Three SET LOCALs plus the #355 SET TRANSACTION that opens the snapshot.
+    assert first_select == 4, session.statements
 
 
 @pytest.mark.asyncio
@@ -285,6 +289,8 @@ async def test_semantic_search_returns_a_plain_list(holder):
         # so a caller cannot mistake "this build does not report staleness"
         # for "nothing here is stale".
         "stale", "embedding_truncated",
+        # #355: the section locator (None for a stale or pre-034 row).
+        "section",
     }
 
 
@@ -341,7 +347,7 @@ class _FindRelatedSession(_RecordingSession):
 
     async def execute(self, clause, *_a, **_k):
         sql = str(clause)
-        if not sql.lstrip().upper().startswith("SET LOCAL") and self._preamble:
+        if not sql.lstrip().upper().startswith(("SET LOCAL", "SET TRANSACTION")) and self._preamble:
             self.statements.append(sql)
             self.clauses.append(clause)
             self._preamble -= 1
@@ -397,7 +403,9 @@ async def test_find_related_overfetch_matches_semantic_search(
 
     await tools.find_related_impl("src.md", limit=limit)
 
-    assert _limit_of(session.clauses[-1]) == expected
+    # The last statement is the #355 transition count; the vector query is
+    # the one before it.
+    assert _limit_of(session.clauses[-2]) == expected
 
 
 @pytest.mark.asyncio
@@ -422,7 +430,8 @@ async def test_find_related_zero_rows_falls_back_to_exact_scan(monkeypatch, hold
     assert "b.md" in out
     assert "SET LOCAL enable_indexscan = off" in " | ".join(session.statements)
     selects = _selects(session.statements)
-    assert selects[-1] == selects[-2]
+    # [-1] is the #355 transition count, read after the re-run.
+    assert selects[-2] == selects[-3]
     assert logged["exact_fallback"] is True
 
 

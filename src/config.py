@@ -437,6 +437,16 @@ class Settings(BaseSettings):
     change_feed_lock_timeout_ms: int = Field(2_000, ge=100, le=30_000)
     embedding_model: str = "bge-m3"
     embedding_dimensions: int = Field(1024, ge=1, le=16000)
+    # Prepended verbatim, with no separator, to every *query* embedding input
+    # and never to a document (#367; heading-chunks design D7). Instruction-
+    # tuned embedders (Qwen3-Embedding) expect e.g. "Instruct: <task>\nQuery: ".
+    # Empty by default, so bge-m3's inputs are byte-identical to before. **Not**
+    # part of the stored embedding fingerprint — every stored vector is a
+    # document vector embedded without it — so changing it neither refuses
+    # startup nor re-embeds anything; it is in the logged, non-stored
+    # retrieval fingerprint instead. At most 1,000 characters; NUL and C0
+    # controls other than LF and TAB are refused at load.
+    embedding_query_instruction: str = Field("", max_length=1000)
     # bge-m3 design point. Must stay strictly greater than `chunk_overlap`:
     # the chunker steps by `max(char_size - char_overlap, 1)`, so at equality
     # the step collapses to one character and `MAX_CHUNKS_PER_NOTE` stops
@@ -1129,6 +1139,20 @@ class Settings(BaseSettings):
             _FieldFilteredSource(dotenv_settings),
             file_secret_settings,
         )
+
+    @field_validator("embedding_query_instruction")
+    @classmethod
+    def _refuse_instruction_controls(cls, v: str) -> str:
+        """NUL and C0 controls other than `\n` and `\t` are refused: the value
+        is prepended to provider input verbatim, and a stray CR or NUL is a
+        silent query degradation nobody would see (design D7)."""
+        for ch in v:
+            if ord(ch) < 0x20 and ch not in "\n\t":
+                raise ValueError(
+                    "EMBEDDING_QUERY_INSTRUCTION contains a control character "
+                    f"(U+{ord(ch):04X}); only line feed and tab are allowed"
+                )
+        return v
 
     @field_validator("log_level", mode="before")
     @classmethod

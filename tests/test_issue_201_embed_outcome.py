@@ -63,6 +63,10 @@ class _NoRows:
     def all(self):
         return []
 
+    def scalar_one_or_none(self):
+        # The note's chunking version (#355): none, so reuse is disabled.
+        return None
+
 
 class _RowcountResult:
     def __init__(self, rowcount):
@@ -185,7 +189,7 @@ async def test_provider_raise_is_its_own_outcome_and_writes_nothing(
 ):
     session, note = _Session(), _Note()
 
-    async def boom(_chunks):
+    async def boom(_chunks, **_kw):
         raise TimeoutError("x" * 5_000)
 
     monkeypatch.setattr(embeddings, "get_embeddings_batch", boom)
@@ -220,7 +224,7 @@ async def test_cardinality_mismatch_is_its_own_outcome_and_writes_nothing(
 ):
     session, note = _Session(), _Note()
 
-    async def short(chunks):
+    async def short(chunks, **_kw):
         return [[0.0, 1.0]] * (len(chunks) - 1)
 
     monkeypatch.setattr(embeddings, "get_embeddings_batch", short)
@@ -247,7 +251,7 @@ async def test_cardinality_mismatch_is_its_own_outcome_and_writes_nothing(
 async def test_zero_chunks_is_certified_and_is_not_an_attempt(monkeypatch):
     session, note = _Session(), _Note()
 
-    async def never(_chunks):  # pragma: no cover - reaching it fails the test
+    async def never(_chunks, **_kw):  # pragma: no cover - reaching it fails the test
         raise AssertionError("no provider call may be made for an empty note")
 
     monkeypatch.setattr(embeddings, "get_embeddings_batch", never)
@@ -274,7 +278,7 @@ async def test_zero_chunks_is_certified_and_is_not_an_attempt(monkeypatch):
 async def test_success_reports_both_counts_equal(monkeypatch, two_chunks):
     session, note = _Session(), _Note()
 
-    async def ok(chunks):
+    async def ok(chunks, **_kw):
         return [[0.0, 1.0] for _ in chunks]
 
     monkeypatch.setattr(embeddings, "get_embeddings_batch", ok)
@@ -310,7 +314,7 @@ async def test_a_fingerprint_that_moves_during_the_provider_call_refuses(
     """
     session, note = _Session(fingerprint=embedding_fingerprint()), _Note()
 
-    async def reset_lands_mid_call(chunks):
+    async def reset_lands_mid_call(chunks, **_kw):
         session.fingerprint = _other_fingerprint()
         return [[0.0, 1.0] for _ in chunks]
 
@@ -345,7 +349,7 @@ async def test_the_lock_is_taken_after_the_provider_call_never_before(
     session, note = _Session(fingerprint=embedding_fingerprint()), _Note()
     lock_state_during_call = []
 
-    async def ok(chunks):
+    async def ok(chunks, **_kw):
         lock_state_during_call.append(session.lock_taken)
         return [[0.0, 1.0] for _ in chunks]
 
@@ -377,7 +381,7 @@ async def test_an_absent_fingerprint_is_not_a_mismatch(monkeypatch, two_chunks):
     """
     session, note = _Session(fingerprint=None), _Note()
 
-    async def ok(chunks):
+    async def ok(chunks, **_kw):
         return [[0.0, 1.0] for _ in chunks]
 
     monkeypatch.setattr(embeddings, "get_embeddings_batch", ok)
@@ -403,7 +407,7 @@ async def test_an_unreadable_fingerprint_refuses_and_is_not_overwritten(
     false one."""
     session, note = _Session(fingerprint="{not json at all"), _Note()
 
-    async def ok(chunks):
+    async def ok(chunks, **_kw):
         return [[0.0, 1.0] for _ in chunks]
 
     monkeypatch.setattr(embeddings, "get_embeddings_batch", ok)
@@ -423,7 +427,7 @@ async def test_an_unreadable_fingerprint_refuses_and_is_not_overwritten(
 async def test_a_matching_fingerprint_certifies_normally(monkeypatch, two_chunks):
     session, note = _Session(fingerprint=embedding_fingerprint()), _Note()
 
-    async def ok(chunks):
+    async def ok(chunks, **_kw):
         return [[0.0, 1.0] for _ in chunks]
 
     monkeypatch.setattr(embeddings, "get_embeddings_batch", ok)
@@ -447,7 +451,7 @@ async def test_a_stale_certification_still_raises_through_the_new_return(
     session = _Session(fingerprint=embedding_fingerprint(), certify_rowcount=0)
     note = _Note()
 
-    async def ok(chunks):
+    async def ok(chunks, **_kw):
         return [[0.0, 1.0] for _ in chunks]
 
     monkeypatch.setattr(embeddings, "get_embeddings_batch", ok)
@@ -477,7 +481,7 @@ async def test_the_embed_path_proceeds_when_indexer_state_is_absent(
     session = _Session(state_table=False)
     note = _Note()
 
-    async def ok(chunks):
+    async def ok(chunks, **_kw):
         return [[0.0, 1.0] for _ in chunks]
 
     monkeypatch.setattr(embeddings, "get_embeddings_batch", ok)
@@ -508,7 +512,7 @@ async def test_a_migrated_database_still_takes_the_lock_and_reads(
     session = _Session(fingerprint=embedding_fingerprint())
     note = _Note()
 
-    async def ok(chunks):
+    async def ok(chunks, **_kw):
         return [[0.0, 1.0] for _ in chunks]
 
     monkeypatch.setattr(embeddings, "get_embeddings_batch", ok)
@@ -566,7 +570,7 @@ async def test_the_call_is_announced_before_a_certification_that_raises(
     note = _Note()
     announce, order = _order_recorder()
 
-    async def ok(chunks):
+    async def ok(chunks, **_kw):
         order.append(("provider", len(chunks)))
         return [[0.0, 1.0] for _ in chunks]
 
@@ -610,7 +614,7 @@ async def test_an_abandoned_provider_call_is_still_announced(
     note = _Note()
     announce, order = _order_recorder()
 
-    async def abandoned(_chunks):
+    async def abandoned(_chunks, **_kw):
         raise asyncio.CancelledError()
 
     monkeypatch.setattr(embeddings, "get_embeddings_batch", abandoned)
@@ -640,7 +644,7 @@ async def test_a_zero_chunk_note_announces_nothing(monkeypatch):
     note = _Note()
     announce, order = _order_recorder()
 
-    async def never(_chunks):  # pragma: no cover - asserted by not being called
+    async def never(_chunks, **_kw):  # pragma: no cover - asserted by not being called
         raise AssertionError("a zero-chunk note called the provider")
 
     monkeypatch.setattr(embeddings, "get_embeddings_batch", never)

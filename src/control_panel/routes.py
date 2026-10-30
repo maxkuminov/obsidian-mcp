@@ -777,9 +777,11 @@ def _vectors_not_current():
     """The one expression for "this note's stored vectors are not current".
 
     ``embedded_content_hash IS NULL OR embedded_content_hash IS DISTINCT FROM
-    content_hash`` — a note never embedded, a note whose certification was
-    invalidated (a move, a grammar bump), or a note edited since it was last
-    embedded.
+    content_hash OR embedded_chunking_version IS DISTINCT FROM
+    CHUNKING_VERSION`` — a note never embedded, a note whose certification was
+    invalidated (a move, a grammar bump, a changed title or tags), a note
+    edited since it was last embedded, or a note embedded under another
+    chunking version (#355).
 
     **`IS DISTINCT FROM`, not `!=`.** A NULL `embedded_content_hash` under `!=`
     yields NULL, which a `WHERE` reads as false, so every never-embedded note
@@ -801,12 +803,13 @@ def _vectors_not_current():
     come to disagree about what "pending" means, which is the failure this
     helper exists to make impossible (design D8).
     """
-    return or_(
-        NoteMetadata.embedded_content_hash.is_(None),
-        NoteMetadata.embedded_content_hash.is_distinct_from(
-            NoteMetadata.content_hash
-        ),
-    )
+    # Since #355 the predicate also counts a note embedded under another
+    # chunking version (`embedded_chunking_version IS DISTINCT FROM
+    # CHUNKING_VERSION`), and it lives beside `CHUNKING_VERSION` so the embed
+    # backlog's SQL and this expression are one definition.
+    from src.services.embeddings import vectors_not_current_expr
+
+    return vectors_not_current_expr()
 
 
 async def _graph_stats(session: AsyncSession, user_id: int | None) -> dict:

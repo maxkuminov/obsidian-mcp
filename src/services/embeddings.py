@@ -5,7 +5,7 @@ import re
 import time
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Callable, Protocol
+from typing import Callable, Literal, Protocol
 
 import httpx
 from sqlalchemy import delete, select, text, update
@@ -329,9 +329,319 @@ def chunk_text(content: str, chunk_size: int = 512, overlap: int = 0) -> list[st
     return chunks
 
 
+# ── Heading-aware chunks (#355, design D1–D3) ──────────────────────────────
+#
+# The chunker splits a note at its ATX headings with **the section-addressing
+# scanner itself** (`src.services.vault._scan_headings` over the
+# frontmatter-stripped body, fence-masked), imported rather than copied — the
+# "no private grammar" rule from #150 — so the ordinal a chunk records is the
+# ordinal `read_note(section="#N")` resolves for the same bytes. Each heading's
+# *own* text (up to the next heading of ANY depth) is one section; the text
+# before the first heading is section 0. Cleaning uses the whole-body fence
+# spans (one `scan_fences` call per note), and each section is windowed by
+# `chunk_text_bounded` with one cap counter across sections.
+
+#: The chunking format the stored vectors were built under, recorded per note
+#: in `notes_metadata.embedded_chunking_version` (NULL means pre-034). It is
+#: deliberately **outside** the stored embedding fingerprint: a note on another
+#: version is re-selected by the embed backlog (`IS DISTINCT FROM`, never `<`)
+#: instead of refusing startup. **Any change to sectioning, to the heading
+#: scan, to `build_embed_prefix` or to `embedding_input` bumps it** (the
+#: embedding-providers requirement), so a note's stored vectors are never
+#: reused, or certified current, under a format they were not built with.
+CHUNKING_VERSION = 1
+
+# ── The one "not current" predicate (#355, design D4; tasks 5.1) ──────────
+#
+# Expressed once, as SQL text and as a SQLAlchemy expression, and read at call
+# time (so a patched `CHUNKING_VERSION` is honoured). The embed backlog, the
+# dashboard pending count, the re-embedding progress endpoint, the
+# `index_transition:` response marker and the `/health` rechunk state all use
+# these. **`IS DISTINCT FROM`, never `<` or `>`**: a NULL, lower *or higher*
+# stamp is a note to re-select, which is what makes a rollback to a lower
+# version a transition rather than a silent "complete" (Codex r2 B2). A test
+# greps `src/` for any ordered comparison.
+
+
+def not_rechunked_sql(alias: str = "nm") -> str:
+    """`<alias>.embedded_chunking_version IS DISTINCT FROM <CHUNKING_VERSION>`."""
+    return f"{alias}.embedded_chunking_version IS DISTINCT FROM {int(CHUNKING_VERSION)}"
+
+
+def vectors_not_current_sql(alias: str = "nm") -> str:
+    """Never embedded, embedded before the indexed content, or embedded under
+    another chunking version."""
+    return (
+        f"({alias}.embedded_content_hash IS NULL "
+        f"OR {alias}.embedded_content_hash IS DISTINCT FROM {alias}.content_hash "
+        f"OR {not_rechunked_sql(alias)})"
+    )
+
+
+def legacy_vectors_sql(alias: str = "nm") -> str:
+    """The **marker / `/health`** predicate (#355, amended after the verifier):
+    the note holds vector rows **and** its chunking version is not the
+    current one. Narrower than the backlog's, on purpose: a note with no
+    vectors yet (newly created, or failing to embed) is not a generation mix,
+    so it must not raise `index_transition:`. A legacy note whose
+    certification a tag edit cleared still serves its old vectors and still
+    counts. The same definition as the harness's `legacy_chunked_notes`.
+    """
+    return (
+        f"(EXISTS (SELECT 1 FROM note_embeddings AS lv WHERE lv.note_id = {alias}.id) "
+        f"AND {not_rechunked_sql(alias)})"
+    )
+
+
+def legacy_vectors_expr():
+    from sqlalchemy import exists
+
+    return exists().where(NoteEmbedding.note_id == NoteMetadata.id).correlate(
+        NoteMetadata
+    ) & not_rechunked_expr()
+
+
+def not_rechunked_expr():
+    from sqlalchemy import literal_column
+
+    # Inlined, like the SQL text form, so both render the same predicate.
+    return NoteMetadata.embedded_chunking_version.is_distinct_from(
+        literal_column(str(int(CHUNKING_VERSION)))
+    )
+
+
+def vectors_not_current_expr():
+    from sqlalchemy import or_
+
+    return or_(
+        NoteMetadata.embedded_content_hash.is_(None),
+        NoteMetadata.embedded_content_hash.is_distinct_from(
+            NoteMetadata.content_hash
+        ),
+        not_rechunked_expr(),
+    )
+
+
+#: The longest context prefix, in characters (design D2). About 75 tokens.
+EMBED_PREFIX_MAX_CHARS = 300
+#: A heading-path component as stored in `note_embeddings.heading_path`.
+HEADING_COMPONENT_MAX_CHARS = 200
+#: A title or heading component inside the embedded prefix.
+PREFIX_COMPONENT_MAX_CHARS = 80
+
+_WHITESPACE_RUN_RE = re.compile(r"\s+")
+
+
+@dataclass(frozen=True)
+class ChunkSpec:
+    """One chunk and the section it came from.
+
+    `text` is exactly what is stored as `note_embeddings.chunk_text` (never
+    prefixed); `heading_path` is outermost-first and empty for section 0;
+    `section_ordinal` is the `#N` selector (0 for the preamble).
+    """
+
+    text: str
+    heading_path: tuple[str, ...]
+    section_ordinal: int
+
+
+def _cut(text: str, limit: int) -> str:
+    """`text` cut to `limit` characters, the cut marked with a trailing `…`."""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _note_sections(body: str) -> list[tuple[int, int, tuple[str, ...], int]]:
+    """`(start, end, heading_path, ordinal)` per section, in document order.
+
+    Section 0 is `body[0 : first heading's line_start]` (or the whole body);
+    section k is heading k's own text, from one terminator past its
+    `line_end` (the step `_section_body_span` takes) up to the next heading's
+    `line_start` **of any depth**. The heading path is built with
+    `_path_chain_match`'s rule — each enclosing step to a strictly shallower
+    heading — by a stack, which is that rule's single-pass form.
+    """
+    from src.services.vault import _LINE_BREAK_RE, _scan_headings
+
+    headings = _scan_headings(body)
+    if not headings:
+        return [(0, len(body), (), 0)]
+    sections: list[tuple[int, int, tuple[str, ...], int]] = [
+        (0, headings[0]["line_start"], (), 0)
+    ]
+    stack: list[tuple[int, str]] = []
+    for i, h in enumerate(headings):
+        while stack and stack[-1][0] >= h["depth"]:
+            stack.pop()
+        component = _cut(h["text"], HEADING_COMPONENT_MAX_CHARS)
+        path = tuple(text for _depth, text in stack) + (component,)
+        stack.append((h["depth"], component))
+        start = h["line_end"]
+        terminator = _LINE_BREAK_RE.match(body, start)
+        if terminator is not None:
+            start = terminator.end()
+        end = (
+            headings[i + 1]["line_start"] if i + 1 < len(headings) else len(body)
+        )
+        sections.append((min(start, end), end, path, i + 1))
+    return sections
+
+
+def _clean_span(body: str, start: int, end: int, spans) -> str:
+    """`body[start:end]` with the intersecting whole-body fence spans removed."""
+    out: list[str] = []
+    cursor = start
+    for a, b in spans:
+        if b <= start or a >= end:
+            continue
+        a, b = max(a, start), min(b, end)
+        if a > cursor:
+            out.append(body[cursor:a])
+        cursor = max(cursor, b)
+    if cursor < end:
+        out.append(body[cursor:end])
+    return "".join(out)
+
+
+def chunk_note_bounded(
+    body: str,
+    *,
+    chunk_size: int = 512,
+    overlap: int = 0,
+    max_chunks: int = MAX_CHUNKS_PER_NOTE,
+) -> tuple[list[ChunkSpec], bool]:
+    """A note body's chunks, split at its ATX headings (design D1).
+
+    `body` is the frontmatter-stripped body — the text `read_note` scans.
+    Heading lines are not part of any chunk. A section whose cleaned text is
+    whitespace-only yields nothing; a long section yields several chunks that
+    share its path and ordinal. A note with no headings chunks byte-identically
+    to `chunk_text_bounded(clean_for_embedding(body))`, all at ordinal 0. The
+    cap is one counter across sections in document order and stops one chunk
+    past it, so the second element keeps `chunk_text_bounded`'s meaning.
+
+    **The zero-chunk invariant.** If every section yields nothing while the
+    whole-body chunker yields something (a note of headings only), the note
+    falls back to that whole-body chunking as section 0, so a note has zero
+    chunks exactly when the pre-change chunker gives it zero.
+
+    Pure and CPU-bound: call sites run it under `asyncio.to_thread`.
+    """
+    spans = scan_fences(body, context=BODY).spans
+    capped = max_chunks > 0
+    out: list[ChunkSpec] = []
+    truncated = False
+    for start, end, path, ordinal in _note_sections(body):
+        cleaned = _clean_span(body, start, end, spans)
+        if not cleaned.strip():
+            continue
+        if capped and len(out) >= max_chunks:
+            # One chunk past the cap materialises here: something is dropped.
+            truncated = True
+            break
+        chunks, cut = chunk_text_bounded(
+            cleaned,
+            chunk_size=chunk_size,
+            overlap=overlap,
+            max_chunks=(max_chunks - len(out)) if capped else 0,
+        )
+        out.extend(ChunkSpec(c, path, ordinal) for c in chunks)
+        if cut:
+            truncated = True
+            break
+    if out:
+        return out, truncated
+    whole, cut = chunk_text_bounded(
+        _remove_spans(body, spans),
+        chunk_size=chunk_size,
+        overlap=overlap,
+        max_chunks=max_chunks,
+    )
+    return [ChunkSpec(c, (), 0) for c in whole], cut
+
+
+def _prefix_component(text: str) -> str:
+    return _cut(_WHITESPACE_RUN_RE.sub(" ", text or "").strip(), PREFIX_COMPONENT_MAX_CHARS)
+
+
+def build_embed_prefix(
+    title: str | None, heading_path, tags
+) -> str:
+    """The context prefix a chunk is embedded under (design D2).
+
+    `{title} > {h1} > … > {hk}`, every component whitespace-collapsed and cut
+    at 80 characters. Over `EMBED_PREFIX_MAX_CHARS`, the outermost headings
+    after the title are replaced by one `…` component, one at a time; the title
+    and the innermost heading are always kept. Then a `tags: a, b` line, only
+    when the whole prefix including it still fits — never partially.
+    """
+    head = _prefix_component(title or "")
+    parts = [_prefix_component(h) for h in (heading_path or ())]
+    breadcrumb = " > ".join([head, *parts])
+    dropped = 0
+    while len(breadcrumb) > EMBED_PREFIX_MAX_CHARS and dropped < len(parts) - 1:
+        dropped += 1
+        breadcrumb = " > ".join([head, "…", *parts[dropped:]])
+    if tags:
+        line = "tags: " + ", ".join(str(t) for t in tags)
+        candidate = f"{breadcrumb}\n{line}"
+        if len(candidate) <= EMBED_PREFIX_MAX_CHARS:
+            return candidate
+    return breadcrumb
+
+
+def embedding_input(prefix: str, chunk: str) -> str:
+    """The one formatter of a provider document input. Changing it bumps
+    `CHUNKING_VERSION`."""
+    return f"{prefix}\n\n{chunk}"
+
+
+def input_digest(inputs: list[str]) -> str:
+    """SHA-256 hex of the canonical JSON of the ordered provider inputs
+    (`[]` for a certified-empty or excluded note), design D3a."""
+    import hashlib
+    import json
+
+    encoded = json.dumps(list(inputs), ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("ascii")).hexdigest()
+
+
+def note_provider_inputs(
+    body: str, title: str | None, tags, *, excluded: bool = False
+) -> list[str]:
+    """Every provider input the current code would send for this note, in
+    order — what `certify_embedded`'s digest covers. Used by the full-hash
+    backstop (D3a), which makes no provider call."""
+    if excluded:
+        return []
+    specs, _truncated = chunk_note_bounded(
+        body,
+        chunk_size=settings.chunk_size,
+        overlap=settings.chunk_overlap,
+        max_chunks=MAX_CHUNKS_PER_NOTE,
+    )
+    return [
+        embedding_input(build_embed_prefix(title, spec.heading_path, tags), spec.text)
+        for spec in specs
+    ]
+
+
+#: Whether an embedding call embeds a search query or a stored document
+#: (#367, design D7). Required everywhere, with no default, so every call site
+#: chooses; `tests/test_embedding_kind.py` sweeps `src/` and `scripts/`.
+EmbeddingKind = Literal["query", "document"]
+
+
 class EmbeddingProvider(Protocol):
-    async def embed_one(self, text: str) -> list[float]: ...
-    async def embed_batch(self, texts: list[str]) -> list[list[float]]: ...
+    """A provider receives `kind` so a backend with a native input type can map
+    it. The query instruction is applied above this layer, once."""
+
+    async def embed_one(self, text: str, *, kind: EmbeddingKind) -> list[float]: ...
+    async def embed_batch(
+        self, texts: list[str], *, kind: EmbeddingKind
+    ) -> list[list[float]]: ...
 
 
 def _coerce_keep_alive(value: str):
@@ -654,12 +964,15 @@ class OllamaProvider:
             )
         return vectors
 
-    async def embed_one(self, text: str) -> list[float]:
+    async def embed_one(self, text: str, *, kind: EmbeddingKind) -> list[float]:
         # The query path: a one-element `input` array, the request shape the
-        # batch sends, so one code path answers both.
+        # batch sends, so one code path answers both. `/api/embed` has no
+        # input-type field, so `kind` is accepted and ignored.
         return (await self._embed_inputs([text]))[0]
 
-    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+    async def embed_batch(
+        self, texts: list[str], *, kind: EmbeddingKind
+    ) -> list[list[float]]:
         """Embed in consecutive fixed-size slices, one `/api/embed` request per
         slice. **The per-request timeout is the only deadline, deliberately**
         (#127 D5; #281 D15).
@@ -784,11 +1097,15 @@ class OpenAIProvider:
             raise last_exc
         raise RuntimeError("OpenAI embeddings failed without an exception")
 
-    async def embed_one(self, text: str) -> list[float]:
+    async def embed_one(self, text: str, *, kind: EmbeddingKind) -> list[float]:
+        # The embeddings endpoint has no input-type field for these models;
+        # `kind` is accepted and ignored.
         result = await self._post([text])
         return result[0]
 
-    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+    async def embed_batch(
+        self, texts: list[str], *, kind: EmbeddingKind
+    ) -> list[list[float]]:
         if not texts:
             return []
         out: list[list[float]] = []
@@ -806,12 +1123,32 @@ def get_provider() -> EmbeddingProvider:
     return OllamaProvider()
 
 
-async def get_embedding(text_input: str) -> list[float]:
-    return await get_provider().embed_one(text_input)
+def _with_instruction(text_input: str, kind: EmbeddingKind) -> str:
+    """The provider input for `text_input`: `EMBEDDING_QUERY_INSTRUCTION`
+    prepended verbatim (no separator) for a query, nothing for a document.
+
+    **The one place the instruction is applied** (design D7). With the default
+    empty instruction every input is byte-identical to `text_input`.
+    """
+    if kind not in ("query", "document"):
+        raise ValueError(f"embedding kind must be 'query' or 'document', got {kind!r}")
+    if kind == "query" and settings.embedding_query_instruction:
+        return settings.embedding_query_instruction + text_input
+    return text_input
 
 
-async def get_embeddings_batch(texts: list[str]) -> list[list[float]]:
-    return await get_provider().embed_batch(texts)
+async def get_embedding(text_input: str, *, kind: EmbeddingKind) -> list[float]:
+    return await get_provider().embed_one(
+        _with_instruction(text_input, kind), kind=kind
+    )
+
+
+async def get_embeddings_batch(
+    texts: list[str], *, kind: EmbeddingKind
+) -> list[list[float]]:
+    return await get_provider().embed_batch(
+        [_with_instruction(t, kind) for t in texts], kind=kind
+    )
 
 
 class StaleCertification(RuntimeError):
@@ -831,9 +1168,17 @@ async def certify_embedded(
     certified_hash: str,
     certified_path: str,
     *,
+    provider_inputs: list[str],
     expire_on: NoteMetadata | None = None,
 ) -> None:
     """Stamp `embedded_content_hash` conditionally, and lock the row doing it.
+
+    **The same UPDATE stamps `embedded_chunking_version = CHUNKING_VERSION` and
+    `embedded_input_digest`** (#355, design D3a/D4): the digest of exactly the
+    ordered provider inputs this certification covers, `[]` for a
+    certified-empty or excluded note. Every certifying branch goes through
+    here, so a note is never certified without both, and `provider_inputs` is
+    required so no caller can forget them.
 
     Public because `embed_vault`'s **exclusion** branch needs the identical
     predicate: adversarial round 2 found it stamping by `id` alone, so a
@@ -873,7 +1218,11 @@ async def certify_embedded(
             NoteMetadata.file_path == certified_path,
             NoteMetadata.content_hash == certified_hash,
         )
-        .values(embedded_content_hash=certified_hash)
+        .values(
+            embedded_content_hash=certified_hash,
+            embedded_chunking_version=CHUNKING_VERSION,
+            embedded_input_digest=input_digest(provider_inputs),
+        )
         .execution_options(synchronize_session=False)
     )
     if result.rowcount != 1:
@@ -887,7 +1236,22 @@ async def certify_embedded(
         # nothing later in this session reads (or flushes) the pre-update
         # value. Passed explicitly rather than inferred, because the exclusion
         # branch certifies from a plain result row that no session maps.
-        session.expire(expire_on, ["embedded_content_hash"])
+        session.expire(
+            expire_on,
+            [
+                "embedded_content_hash",
+                "embedded_chunking_version",
+                "embedded_input_digest",
+            ],
+        )
+
+
+def _stamp_uncertified(note, provider_inputs: list[str]) -> None:
+    """The legacy, uncertified path (unit tests with a stub session): copy the
+    in-memory hash and stamp the chunking version and digest beside it."""
+    note.embedded_content_hash = note.content_hash
+    note.embedded_chunking_version = CHUNKING_VERSION
+    note.embedded_input_digest = input_digest(provider_inputs)
 
 
 class NoteEmbedOutcome(enum.Enum):
@@ -1025,7 +1389,7 @@ class EmbedNoteResult:
 async def _generation_matches(
     session: AsyncSession,
     note: NoteMetadata,
-    reused_rows: dict[int, str] | None = None,
+    reused_rows: dict[int, tuple[str, str]] | None = None,
 ) -> bool:
     """Take the generation lock and re-read the embedding fingerprint under it.
 
@@ -1068,8 +1432,9 @@ async def _generation_matches(
     otherwise unmigrated schema supported: the other required columns and
     tables must still exist.
 
-    **`reused_rows` (#281, D16)** maps the id of every stored row whose vector
-    `embed_note` is reusing to the chunk text it was looked up with. Reuse was
+    **`reused_rows` (#281, D16; #355 D3)** maps the id of every stored row
+    whose vector `embed_note` is reusing to the `(chunk_text, embed_prefix)`
+    pair it was looked up with — the exact embedded input. Reuse was
     licensed by a lookup that has since committed, so the licence is
     re-established here, under the lock: the fingerprint must still be
     *present* and equal (an absent one, or an absent table, licensed nothing),
@@ -1112,20 +1477,25 @@ async def _generation_matches(
         if reused_rows:
             # After the advisory lock, so this SELECT's table lock keeps the
             # lock-first ordering.
-            surviving = dict(
-                (
+            surviving = {
+                row_id: (chunk, prefix)
+                for row_id, chunk, prefix in (
                     await session.execute(
-                        select(NoteEmbedding.id, NoteEmbedding.chunk_text).where(
+                        select(
+                            NoteEmbedding.id,
+                            NoteEmbedding.chunk_text,
+                            NoteEmbedding.embed_prefix,
+                        ).where(
                             NoteEmbedding.note_id == note.id,
                             NoteEmbedding.id.in_(list(reused_rows)),
                         )
                     )
                 ).all()
-            )
+            }
             lost = sum(
                 1
-                for row_id, chunk in reused_rows.items()
-                if surviving.get(row_id) != chunk
+                for row_id, pair in reused_rows.items()
+                if surviving.get(row_id) != pair
             )
             if lost:
                 logger.warning(
@@ -1192,18 +1562,18 @@ async def embed_note(
             "certified_hash and certified_path are one unit: pass both or "
             "neither"
         )
-    # Off the event loop (#278, D8): the cleaner and the chunker are pure
-    # functions of the body, and on a large note they are seconds of CPU that
-    # would otherwise freeze every other request, `/health` included.
-    cleaned = await asyncio.to_thread(clean_for_embedding, content)
-    chunks, truncated = await asyncio.to_thread(
-        chunk_text_bounded,
-        cleaned,
+    # Off the event loop (#278, D8): the sectioner, the cleaner and the
+    # chunker are pure functions of the body, and on a large note they are
+    # seconds of CPU that would otherwise freeze every other request,
+    # `/health` included. Heading-aware since #355 (design D1).
+    specs, truncated = await asyncio.to_thread(
+        chunk_note_bounded,
+        content,
         chunk_size=settings.chunk_size,
         overlap=settings.chunk_overlap,
         max_chunks=MAX_CHUNKS_PER_NOTE,
     )
-    if not chunks:
+    if not specs:
         # Empty/fully-filtered notes are successfully represented by zero
         # vectors. Remove stale vectors and stamp the hash so they do not get
         # selected on every embedding pass forever.
@@ -1214,13 +1584,18 @@ async def embed_note(
         # exempts the exclusion branch (D7c).
         if certified_hash is not None:
             await certify_embedded(
-                session, note.id, certified_hash, certified_path, expire_on=note
+                session,
+                note.id,
+                certified_hash,
+                certified_path,
+                provider_inputs=[],
+                expire_on=note,
             )
         await session.execute(
             delete(NoteEmbedding).where(NoteEmbedding.note_id == note.id)
         )
         if certified_hash is None:
-            note.embedded_content_hash = note.content_hash
+            _stamp_uncertified(note, [])
         await session.flush()
         # `truncated` is False by construction here: a note the cap bit has at
         # least `MAX_CHUNKS_PER_NOTE` chunks.
@@ -1231,33 +1606,46 @@ async def embed_note(
             truncated=False,
         )
 
-    # ── Chunk-vector reuse: the lookup (#281, D16) ───────────────────────
-    # A stored vector is reused for a chunk whose text is byte-identical to a
-    # stored chunk of this note, and only while the stored embedding
-    # fingerprint is present and equal to this process's. The lookup's
+    # ── The provider inputs (#355, design D2) ────────────────────────────
+    # Every chunk is embedded as `prefix + "\n\n" + chunk`, the prefix built
+    # from the row's title and tags and the chunk's heading path. The stored
+    # `chunk_text` stays un-prefixed, for previews.
+    title = getattr(note, "title", None)
+    tags = getattr(note, "tags", None)
+    prefixes = [build_embed_prefix(title, spec.heading_path, tags) for spec in specs]
+    inputs = [embedding_input(p, spec.text) for p, spec in zip(prefixes, specs)]
+
+    # ── Chunk-vector reuse: the lookup (#281, D16; #355 D3) ──────────────
+    # A stored vector is reused for a chunk whose **embedded input** is
+    # byte-identical to a stored row's — `(embed_prefix, chunk_text)` equal —
+    # and only while the stored embedding fingerprint is present and equal to
+    # this process's and the note's stored chunking version is
+    # `CHUNKING_VERSION`. A pre-034 row (NULL prefix) is never reused. The
+    # locator is not in the key: a reused vector is re-inserted with the new
+    # chunk's heading path and ordinal. The lookup's
     # transaction is **ended before any provider I/O on every path** — see
     # `_lookup_reusable_vectors`. Only the certified path reuses: ending the
     # transaction is only safe for a caller that has already ended its own,
     # which both production callers do before they call this function.
-    reusable: dict[str, tuple[int, object]] = {}
+    reusable: dict[tuple[str, str], tuple[int, object]] = {}
     if certified_hash is not None:
         reusable = await _lookup_reusable_vectors(session, note.id)
 
-    vectors: list[object | None] = [None] * len(chunks)
-    #: Stored row id → the chunk text it was looked up with. Re-checked under
-    #: the generation lock before anything is certified.
-    reused_rows: dict[int, str] = {}
+    vectors: list[object | None] = [None] * len(specs)
+    #: Stored row id → the `(chunk_text, embed_prefix)` it was looked up with.
+    #: Re-checked under the generation lock before anything is certified.
+    reused_rows: dict[int, tuple[str, str]] = {}
     to_send: list[int] = []
-    for i, chunk in enumerate(chunks):
-        hit = reusable.get(chunk)
+    for i, (spec, prefix) in enumerate(zip(specs, prefixes)):
+        hit = reusable.get((prefix, spec.text))
         if hit is None:
             to_send.append(i)
             continue
         row_id, stored_vector = hit
         vectors[i] = stored_vector
-        reused_rows[row_id] = chunk
+        reused_rows[row_id] = (spec.text, prefix)
     reusable.clear()
-    sent = [chunks[i] for i in to_send]
+    sent = [inputs[i] for i in to_send]
 
     # ── The accounting boundary, and it is *here* ────────────────────────
     # The caller used to account for the provider call from the returned
@@ -1284,7 +1672,7 @@ async def embed_note(
         if on_provider_call is not None:
             on_provider_call(len(sent))
         try:
-            fresh = await get_embeddings_batch(sent)
+            fresh = await get_embeddings_batch(sent, kind="document")
         except Exception as e:
             # Swallowed here rather than raised, deliberately:
             # `_reconcile_exclusions` calls this function too and its declared
@@ -1337,7 +1725,7 @@ async def embed_note(
     missing = sum(1 for v in vectors if v is None)
     if missing:
         raise RuntimeError(
-            f"{missing} of {len(chunks)} chunks of {note.file_path} have no "
+            f"{missing} of {len(specs)} chunks of {note.file_path} have no "
             "vector; refusing to certify partial coverage"
         )
 
@@ -1364,7 +1752,12 @@ async def embed_note(
     # whole note back.
     if certified_hash is not None:
         await certify_embedded(
-            session, note.id, certified_hash, certified_path, expire_on=note
+            session,
+            note.id,
+            certified_hash,
+            certified_path,
+            provider_inputs=inputs,
+            expire_on=note,
         )
 
     # Only delete the old embeddings once new ones are in hand. If the provider
@@ -1375,34 +1768,42 @@ async def embed_note(
         delete(NoteEmbedding).where(NoteEmbedding.note_id == note.id)
     )
 
-    for i, (chunk, embedding) in enumerate(zip(chunks, vectors)):
+    for i, (spec, prefix, embedding) in enumerate(zip(specs, prefixes, vectors)):
         session.add(NoteEmbedding(
             note_id=note.id,
             chunk_index=i,
-            chunk_text=chunk,
+            chunk_text=spec.text,
             embedding=embedding,
+            heading_path=list(spec.heading_path),
+            section_ordinal=spec.section_ordinal,
+            embed_prefix=prefix,
         ))
 
     await session.flush()
     if certified_hash is None:
-        note.embedded_content_hash = note.content_hash
+        _stamp_uncertified(note, inputs)
     return EmbedNoteResult(
         outcome=NoteEmbedOutcome.EMBEDDED,
         chunks_submitted=len(sent),
-        chunks_embedded=len(chunks),
+        chunks_embedded=len(specs),
         truncated=truncated,
     )
 
 
 async def _lookup_reusable_vectors(
     session: AsyncSession, note_id: int
-) -> dict[str, tuple[int, object]]:
-    """This note's stored vectors that may be reused, keyed by exact chunk text.
+) -> dict[tuple[str, str], tuple[int, object]]:
+    """This note's stored vectors that may be reused, keyed by the exact
+    embedded input `(embed_prefix, chunk_text)`.
 
     Empty — reuse disabled — unless the stored embedding fingerprint is
-    **present** and equal to `embedding_fingerprint()`. An absent fingerprint
-    claims nothing about the stored rows, an absent state table the same, and
-    a differing or unreadable one says they were built under something else.
+    **present** and equal to `embedding_fingerprint()` **and** the note's
+    `embedded_chunking_version` is `CHUNKING_VERSION` (#355, D3: all of a
+    note's rows are written under one version, so this also covers a change
+    to the input formatter that leaves prefix and chunk byte-equal). An absent
+    fingerprint claims nothing about the stored rows, an absent state table
+    the same, and a differing or unreadable one says they were built under
+    something else. A row with a NULL prefix (pre-034) is never a candidate.
 
     **The transaction is ended before this returns, on every path.** A
     lookup that held `AccessShareLock` on `note_embeddings` across the
@@ -1413,30 +1814,43 @@ async def _lookup_reusable_vectors(
     pass has.
     """
     try:
-        found: dict[str, tuple[int, object]] = {}
+        found: dict[tuple[str, str], tuple[int, object]] = {}
         if await state_table_exists(session):
             verdict = compare_fingerprint(
                 await get_state(session, KEY_EMBEDDING_FINGERPRINT),
                 embedding_fingerprint(),
             )
+            version = None
             if verdict.status is FingerprintStatus.MATCH:
+                version = (
+                    await session.execute(
+                        select(NoteMetadata.embedded_chunking_version).where(
+                            NoteMetadata.id == note_id
+                        )
+                    )
+                ).scalar_one_or_none()
+            if verdict.status is FingerprintStatus.MATCH and version == CHUNKING_VERSION:
                 rows = (
                     await session.execute(
                         select(
                             NoteEmbedding.id,
                             NoteEmbedding.chunk_text,
+                            NoteEmbedding.embed_prefix,
                             NoteEmbedding.embedding,
                         )
-                        .where(NoteEmbedding.note_id == note_id)
+                        .where(
+                            NoteEmbedding.note_id == note_id,
+                            NoteEmbedding.embed_prefix.is_not(None),
+                        )
                         .order_by(NoteEmbedding.chunk_index, NoteEmbedding.id)
                     )
                 ).all()
-                for row_id, chunk, vector in rows:
-                    if chunk is None or vector is None:
+                for row_id, chunk, prefix, vector in rows:
+                    if chunk is None or prefix is None or vector is None:
                         continue
-                    # First occurrence wins; a duplicate text has one vector
-                    # per (model, text), so either would do.
-                    found.setdefault(chunk, (row_id, vector))
+                    # First occurrence wins; a duplicate input has one vector
+                    # per (model, input), so either would do.
+                    found.setdefault((prefix, chunk), (row_id, vector))
     except BaseException:
         try:
             await session.rollback()
@@ -1445,6 +1859,78 @@ async def _lookup_reusable_vectors(
         raise
     await session.commit()
     return found
+
+
+def section_of(row, stale: bool) -> dict | None:
+    """The result's `section`, or None for a stale or pre-034 row (#355, D6)."""
+    path = getattr(row, "heading_path", None)
+    ordinal = getattr(row, "section_ordinal", None)
+    if stale or path is None or ordinal is None:
+        return None
+    return {"path": list(path), "ordinal": int(ordinal)}
+
+
+async def rechunk_pending_count(session: AsyncSession, user_id: int | None) -> int:
+    """Notes in `user_id`'s owner scope (total mapping: None is `IS NULL`) that
+    hold vectors of another chunking generation (`legacy_vectors_expr`, #355
+    D4 as amended). Read by the vector tools
+    in the same `REPEATABLE READ, READ ONLY` transaction as their query."""
+    from sqlalchemy import func
+
+    owner = (
+        NoteMetadata.user_id.is_(None)
+        if user_id is None
+        else NoteMetadata.user_id == user_id
+    )
+    return int(
+        (
+            await session.execute(
+                select(func.count(NoteMetadata.id)).where(owner, legacy_vectors_expr())
+            )
+        ).scalar()
+        or 0
+    )
+
+
+def transition_line(pending: int) -> str | None:
+    """The `index_transition:` line, or None at zero (#355, D4)."""
+    if pending <= 0:
+        return None
+    return (
+        f"index_transition: {pending} notes not yet re-chunked; cross-generation "
+        "ranking is approximate, re-run after the backlog drains"
+    )
+
+
+async def ensure_search_snapshot(session: AsyncSession, who: str) -> None:
+    """Open — or verify — the `REPEATABLE READ, READ ONLY` snapshot a vector
+    query and its owner-scoped transition count share (#355, D4), so the
+    `index_transition:` line describes exactly the index the page was ranked
+    against. It must be the transaction's first statement. Every production
+    caller hands in a fresh session; a caller that already opened a
+    transaction must have opened it with exactly this isolation, which is
+    verified rather than assumed — a silently weaker snapshot would let the
+    count and the page disagree."""
+    in_tx = getattr(session, "in_transaction", None)
+    if callable(in_tx) and in_tx():
+        isolation, read_only = (
+            await session.execute(
+                text(
+                    "SELECT current_setting('transaction_isolation'), "
+                    "current_setting('transaction_read_only')"
+                )
+            )
+        ).one()
+        if (isolation, read_only) != ("repeatable read", "on"):
+            raise RuntimeError(
+                f"{who} needs a REPEATABLE READ, READ ONLY snapshot: "
+                "hand it a fresh session, or open the transaction with "
+                f"exactly that isolation (found {isolation}, read_only={read_only})"
+            )
+    else:
+        await session.execute(
+            text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        )
 
 
 @dataclass
@@ -1507,6 +1993,9 @@ async def semantic_arm_rows(
             NoteEmbedding.note_id,
             NoteEmbedding.chunk_index,
             NoteEmbedding.chunk_text,
+            # The locator (#355, D6). Never `embed_prefix`, never the vector.
+            NoteEmbedding.heading_path,
+            NoteEmbedding.section_ordinal,
             NoteMetadata.file_path,
             NoteMetadata.title,
             NoteMetadata.tags,
@@ -1614,8 +2103,13 @@ async def semantic_arm_rows(
             "path": row.file_path,
             "title": row.title,
             "tags": row.tags,
-            "chunk": None if stale else row.chunk_text[:500],
+            # Uncut (#355, D6): the renderer normalises to one line *then*
+            # cuts, so a run of leading whitespace cannot eat the preview.
+            "chunk": None if stale else row.chunk_text,
             "chunk_index": row.chunk_index,
+            # Withheld on a stale row (its positional ordinal describes
+            # superseded content) and absent on a pre-034 row.
+            "section": section_of(row, stale),
             # The database's own cosine distance, as `find_related` reports it
             # (#280, D7). The order above is this distance's order, so the
             # displayed similarity is monotone in the displayed order by
@@ -1663,10 +2157,11 @@ async def semantic_search(
     """
     limit = max(1, min(limit, 50))
     embed_start = time.monotonic()
-    query_embedding = await get_embedding(query)
+    query_embedding = await get_embedding(query, kind="query")
     timing.add_ms("embed_ms", time.monotonic() - embed_start)
 
     db_start = time.monotonic()
+    await ensure_search_snapshot(session, "semantic_search")
     # ef_search=80 lifts HNSW recall@10 to ~98% at modest latency cost.
     # random_page_cost=1.1 is a planner correction, not a storage claim (D20).
     # The planner costs the join's heap side at `relpages`, but every row this

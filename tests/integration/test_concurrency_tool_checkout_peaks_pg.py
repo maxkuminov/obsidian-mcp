@@ -136,7 +136,7 @@ async def env(engine, monkeypatch, tmp_path):
         monkeypatch.setattr(module, 'async_session', maker)
     monkeypatch.setattr(embeddings_service, 'async_session', maker, raising=False)
 
-    async def fake_embedding(_text):
+    async def fake_embedding(_text, **_kw):
         return list(UNIT)
     monkeypatch.setattr(embeddings_service, 'get_embedding', fake_embedding)
 
@@ -268,7 +268,7 @@ async def test_hybrid_search_holds_no_connection_during_the_provider_call(env, m
     provider holds no pooled connection; the call's peak stays one."""
     started, release = asyncio.Event(), asyncio.Event()
 
-    async def slow_embedding(_text):
+    async def slow_embedding(_text, **_kw):
         started.set()
         await release.wait()
         return list(UNIT)

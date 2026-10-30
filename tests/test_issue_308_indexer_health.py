@@ -122,6 +122,8 @@ EXPECTED_KEYS = {
     "max_consecutive_failures",
     "quarantined_notes",
     "last_success_at",
+    # #355: process-wide and non-volumetric, "in_progress" | "complete".
+    "rechunk",
 }
 
 
@@ -488,3 +490,21 @@ def test_sandbox_lifespan_marks_the_indexer_disabled(monkeypatch):
     snap = asyncio.run(_run())
     assert snap["status"] == "disabled"
     assert _health()[1]["status"] == "ok"
+
+
+def test_rechunk_is_a_non_volumetric_state_that_never_degrades(threshold):
+    """#355 (D4): a long, healthy transition leaves `/health` ok; the field
+    is a string, never the count, and names no scope."""
+    indexer_health.record_index(None, True)
+    for remaining in (40, 30, 20, 10, 5, 4, 3, 2, 1, 1):
+        indexer_health.record_embed(None, 0)
+        indexer_health.record_rechunk(None, remaining)
+        indexer_health.record_rechunk(7, 1234)
+        code, body, _ = _health()
+        assert code == 200 and body["status"] == "ok"
+        assert body["indexer"]["rechunk"] == "in_progress"
+        assert "1234" not in str(body) and str(remaining * 1000) not in str(body)
+    indexer_health.record_rechunk(None, 0)
+    indexer_health.record_rechunk(7, 0)
+    _code, body, _ = _health()
+    assert body["indexer"]["rechunk"] == "complete"

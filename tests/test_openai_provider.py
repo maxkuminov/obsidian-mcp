@@ -43,7 +43,7 @@ async def test_single_batch_happy_path(openai_settings):
         mock.post("/embeddings").mock(
             return_value=Response(200, json=_embedding_payload(3, 1024))
         )
-        out = await provider.embed_batch(["a", "b", "c"])
+        out = await provider.embed_batch(["a", "b", "c"], kind="document")
     assert len(out) == 3
     assert all(len(v) == 1024 for v in out)
 
@@ -61,7 +61,7 @@ async def test_subbatching_at_97_inputs(openai_settings):
             Response(200, json=_embedding_payload(96, 1024)),
             Response(200, json=_embedding_payload(1, 1024)),
         ]
-        out = await provider.embed_batch(inputs)
+        out = await provider.embed_batch(inputs, kind="document")
 
     assert len(out) == 97
     assert route.call_count == 2
@@ -92,7 +92,7 @@ async def test_429_retry_then_success(openai_settings, monkeypatch):
             Response(429, json={"error": "rate limited"}),
             Response(200, json=_embedding_payload(1, 1024)),
         ]
-        out = await provider.embed_one("hello")
+        out = await provider.embed_one("hello", kind="query")
     assert len(out) == 1024
     assert route.call_count == 2
 
@@ -115,7 +115,7 @@ async def test_5xx_exhausts_retries(openai_settings, monkeypatch):
             Response(503, json={"error": "down"}),
         ]
         with pytest.raises(Exception):
-            await provider.embed_one("hello")
+            await provider.embed_one("hello", kind="query")
     assert route.call_count == 3
 
 
@@ -126,7 +126,7 @@ async def test_request_includes_dimensions_param(openai_settings):
         route = mock.post("/embeddings").mock(
             return_value=Response(200, json=_embedding_payload(1, 1024))
         )
-        await provider.embed_one("hi")
+        await provider.embed_one("hi", kind="query")
 
     import json
 

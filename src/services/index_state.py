@@ -346,6 +346,35 @@ def embedding_fingerprint() -> str:
     )
 
 
+def retrieval_fingerprint() -> str:
+    """Everything that shapes a query's vector result, as canonical JSON —
+    **never stored and never compared** (#367, heading-chunks design D7).
+
+    The stored embedding fingerprint's fields, plus `chunking_version` (the
+    running `CHUNKING_VERSION`) and `query_instruction_sha256`: the first 16
+    hex digits of SHA-256 over `EMBEDDING_QUERY_INSTRUCTION`'s UTF-8, or null
+    when it is empty. Two deployments that differ only in the instruction
+    share a stored fingerprint (no stored vector depends on the instruction)
+    and have different retrieval fingerprints. Logged once at startup and
+    recorded per semantic arm by the search-evaluation harness. Carries the
+    digest only, never the instruction text.
+    """
+    import hashlib
+
+    # Local: `embeddings` imports this module.
+    from src.services.embeddings import CHUNKING_VERSION
+
+    fields = json.loads(embedding_fingerprint())
+    instruction = settings.embedding_query_instruction or ""
+    fields["chunking_version"] = CHUNKING_VERSION
+    fields["query_instruction_sha256"] = (
+        hashlib.sha256(instruction.encode("utf-8")).hexdigest()[:16]
+        if instruction
+        else None
+    )
+    return _canonical(fields)
+
+
 def fts_fingerprint() -> str:
     """Canonical JSON naming the text-search configs the tsvectors were built
     under. ``{"configs":["english"],"v":1}``
