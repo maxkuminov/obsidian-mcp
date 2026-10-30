@@ -2,7 +2,7 @@
 
 ## Context
 
-`hybrid_search` (#354) and `semantic_search` always return a full page. The semantic arm returns its nearest neighbours however distant they are, so when the keyword arm has nothing either, nothing on the page says the list is noise. The owner's framing (2026-10-30): the search tools are investigation entry points. What the product needs is recall at depth and honest signals about the candidate set, more than precision at rank one. This change adds the honesty signal and two depth metrics. **No row is dropped or reordered by it.**
+`hybrid_search` (#354) and `semantic_search` always return a full page. The semantic arm returns its nearest neighbours however distant they are, so when the keyword arm has nothing either, nothing on the page says the list is noise. The owner's framing (2026-10-30): the search tools are investigation entry points. What the product needs is recall at depth and honest signals about the candidate set, more than precision at rank one. This change adds the honesty signal and two depth metrics. The hint never costs a row; the token is a header token like `arm_depth` and can, at the cap boundary, cost one row, disclosed by the cap footer (L14). Nothing is filtered or reordered.
 
 It ships **hard-off** (threshold 0, Codex round 1 M1). The token appears on every page from day one and reads `ok` until a deployment calibrates a threshold. From day one the usage rows record the evidence that calibration needs.
 
@@ -50,12 +50,12 @@ low  ⇔  threshold > 0  ∧  keyword_all == 0  ∧  (top_similarity is None ∨
 
 **The calibration recipe** (in `DEPLOYMENT.md`, normative per the search-quality delta):
 
-1. Run with the threshold at 0 for N days (the recipe suggests 14, or until each tool has at least 200 clicked-through searches). Usage rows accrue `top_similarity` and, on `hybrid_search`, `keyword_all`.
-2. Run `make search-eval-export`, `mine`, then `python -m scripts.search_eval confidence --data … --threshold 0.50`. This tabulates per tool and per query class (the miner's `identifier` / `prose`; the miner has no third class), and splits clicked-through searches (a shown note was read) from the rest.
-3. Pick the threshold at the noise ceiling of the non-clicked distribution, and **accept it only if the false-low rate on clicked-through pages is below 1 in 50** (the tool prints the PASS/FAIL line).
+1. Run with the threshold at 0 for at least 14 days **and** until **each** tool has at least 200 token-bearing clicked-through pages. Usage rows accrue `confidence`, `top_similarity` and, on `hybrid_search`, `keyword_all`.
+2. Run `make search-eval-export USER_ID=…`, `mine`, then `python -m scripts.search_eval confidence --data … --threshold 0.50`. This tabulates per tool and per query class (the miner's `identifier` / `prose`; the miner has no third class) and splits clicked-through pages (a shown note was read) from the rest. A row is post-change when its `confidence` key is recorded; a keyword-only page (null `top_similarity`) is included and, with `keyword_all = 0`, counts as `low`. The output carries the mine provenance; only `attachable: true` output may leave `.search-eval/`.
+3. Pick the threshold at the noise ceiling of the non-clicked distribution, and **accept it only if both tools' lines read PASS**: false-low rate on clicked-through pages below 1 in 50, per tool, with no aggregate. Fewer than 14 days or 200 clicked-through pages (zero included) is `INSUFFICIENT_DATA`, never a pass. One setting enables both tools, so both lines must pass.
 4. Set it, recreate, and re-run the tabulation after another period.
 
-**The reference deployment sets 0.50 (or whatever the tabulation picks) only after step 3 passes.**
+**The reference deployment sets 0.50 (or whatever the tabulation picks) only after both lines pass in step 3.**
 
 ### D3. Token placement
 
@@ -117,7 +117,7 @@ Both tools record, through the timing holder, on every **page** (zero-result and
 - `top_similarity`: three decimals, whenever a candidate existed;
 - on `hybrid_search`, `keyword_all` (int).
 
-None of these is an `error` marker. Refusals carry none of them (D3). To make D2's tabulation possible, the miner writes a per-search-row artifact, `confidence-rows.jsonl`, under the data directory. It holds `tool`, `class`, `top_similarity`, `keyword_all` and `clicked` (whether the miner credited a judgment to that search row), with no query text and no path. The `confidence` subcommand reads it, connects to no database, and writes counts and rates only.
+None of these is an `error` marker. Refusals carry none of them (D3). To make D2's tabulation possible, the miner writes a per-search-row artifact, `confidence-rows.jsonl`, under the data directory. It holds `tool`, `class`, `top_similarity`, `keyword_all` and `clicked` (whether the miner credited a judgment to that search row), with no query text and no path. The `confidence` subcommand reads it, connects to no database, writes counts and rates only, and carries the mine provenance and `attachable` flag (non-attachable output begins with the `NOT ATTACHABLE` line).
 
 ### D8. Harness: recall@20 and recall@50
 
@@ -136,14 +136,14 @@ The change is additive:
 - three usage keys and one harness subcommand;
 - for `hybrid_search` at the 1,000-character floor, one labelled abbreviation rung.
 
-No row, field, ordering, argument, annotation or tool changes. With the default threshold 0, the only byte change on any existing page is ` — confidence: ok`. The reranker's byte-identity baseline is re-based in its spec (D6). The two tool descriptions gain one sentence each and stay ≤ 4,000.
+No row content, field, ordering, argument, annotation or tool changes; at the cap boundary a page may show one row fewer, disclosed by the existing footer (L14). With the default threshold 0, the only byte change on any existing page is ` — confidence: ok`. The reranker's byte-identity baseline is re-based in its spec (D6). The two tool descriptions gain one sentence each and stay ≤ 4,000.
 
 ## Owner decisions (2026-10-30, round 1 included)
 
 - O1. The token is `confidence: ok | low`, always present on every page of `semantic_search` and `hybrid_search`, part of the base budget.
 - O2. `low` means: `keyword_all == 0` (hybrid) or no keyword arm (semantic), and best similarity below the threshold. `0` never fires.
 - O3. The hint text is the owner's, amended to "no keyword match on all terms" (B2). It is conditional and withdrawn before it can cost a row (B1).
-- O4. No row is dropped by the token or the hint. There is no similarity floor.
+- O4. Nothing is filtered: there is no similarity floor. The hint never costs a row. The token is a header token with no compaction; a boundary row it displaces is disclosed by the cap footer (round 2).
 - O5. The default is 0 at ship. Calibration follows the DEPLOYMENT.md recipe with a < 1-in-50 false-low acceptance line, and the reference deployment sets a value only after it passes (M1).
 - O6. `top_similarity` is taken over the actual candidate set, and the limit-invariance claim is dropped (B3). Service return types are unchanged (M6).
 - O7. A provider-input rejection on `semantic_search` is a refusal with no token (M4).
@@ -165,6 +165,8 @@ No row, field, ordering, argument, annotation or tool changes. With the default 
 - L11. **`confidence` is not part of the miner's query identity.** It is an output.
 - L12. **On `semantic_search`, `limit` can flip the token at the margin**, because the overfetch is `max(5 × limit, 50)` chunks. `hybrid_search`'s arm is fixed at 50 and is limit-invariant.
 - L13. **The miner has two query classes**, `identifier` and `prose`. The recipe tabulates by those two, not by a separate "mixed" class.
+- L14. **The token can cost a boundary row.** It is reserved like `arm_depth`, with no compaction (owner decision, round 2). On a capped `hybrid_search` or `semantic_search(rerank=true)` page whose last row fitted before this change with fewer than 17–18 characters to spare, that row is now omitted, and the existing cap footer states the count (`more: true` on `rerank=true`). Under the default 40,000-character cap that requires a page within 18 characters of the cap.
+- L15. **One setting enables both tools**, so a deployment that rarely uses one tool cannot pass that tool's accrual and cannot enable either until it does.
 
 ## Risks
 
@@ -192,3 +194,11 @@ Verdict FAIL (3 BLOCKER, 6 MAJOR), all accepted and folded in:
 - **M4, provider-input rejection.** It is a refusal with no token or keys. "Every response" became "every page".
 - **M5, staged depth.** A per-arm `staged_depth` is preserved and validated from the runfile source, with an end-to-end import test.
 - **M6, service return types.** They are unchanged. The tool reads the first row, and hybrid computes the value from its semantic arm's rows onto its own result.
+
+## Codex spec review, round 2 (2026-10-30)
+
+B2, B3, M1 (default), M2–M6 verified. B1 not fixed, plus two new MAJORs, all folded in by owner decision:
+
+- **B1, the token can evict a boundary row.** No compaction is added. The "token drops no row" promise is removed: the token is a header token like `arm_depth`, and at the cap boundary a page may show one row fewer than before this change, disclosed by the existing cap footer (L14). A scenario now asserts the footer's count and `more: true`. The hint keeps its row-neutral rule.
+- **M1, calibration gate.** Accrual is at least 14 days **and** at least 200 token-bearing clicked-through pages per tool. The tabulation prints one line per tool, with no aggregate, and zero or insufficient denominators are `INSUFFICIENT_DATA`. Activation requires PASS on both lines (one setting enables both tools, L15). Post-change rows are identified by the recorded `confidence` key, so keyword-only pages with null `top_similarity` are included, and a clicked-through keyword-only `low` counts as a false low.
+- **M2, provenance.** The tabulation inherits the mine provenance and `attachable` flag and prints `NOT ATTACHABLE` for multi-user data. Only attachable output may leave `.search-eval/`. The tests cover the two-user fixture (not attachable) and the `USER_ID=` fixture (attachable).

@@ -43,12 +43,28 @@ No metric threshold applies, and the verdict text SHALL be unchanged by the adde
 
 ## ADDED Requirements
 
-### Requirement: The harness SHALL tabulate confidence calibration evidence from the usage export, read-only and without query text
-`python -m scripts.search_eval confidence --data <dir> --threshold <T>` SHALL read the mined data of a `mine` run and, for `semantic_search` and `hybrid_search` rows that carry `top_similarity`, report per tool and per query class (`identifier`, `prose`): the row count; the distribution of `top_similarity` (deciles); the share of rows that would read `low` at threshold `T` under the shared rule (from `top_similarity` and, for `hybrid_search`, `keyword_all`); and the **false-low rate**, the share of clicked-through searches (a search credited with a judgment by the miner, i.e. one of its shown notes was read) that would read `low` at `T`. It SHALL print a single acceptance line `false-low <rate> (<n>/<m> clicked-through pages) — PASS|FAIL at < 1/50`. It SHALL write a JSON file under the data directory holding counts and rates only, no query text and no note path, and SHALL connect to no database. Rows without `top_similarity` (recorded before this change) SHALL be counted as excluded and not tabulated.
+### Requirement: The harness SHALL tabulate confidence calibration evidence per tool from the usage export, read-only, with the mine provenance and attachability
+`python -m scripts.search_eval confidence --data <dir> --threshold <T>` SHALL read the per-search-row artifact a `mine` run wrote and connect to no database. A row is **post-change** exactly when it carries the recorded `confidence` key; a row without it was logged before this change and SHALL be counted as excluded and not tabulated. Post-change rows whose `top_similarity` is null (a keyword-only `hybrid_search` page, or an empty candidate set) SHALL be included: the would-be value at `T` SHALL be computed by the shared rule from `keyword_all` (0 for `semantic_search`) and `top_similarity` as recorded, so such a row with `keyword_all = 0` reads `low` at every `T > 0`.
 
-#### Scenario: The acceptance line
-- **WHEN** the fixture export holds 60 clicked-through `semantic_search` rows, one of which has `top_similarity` 0.47 and no keyword arm, and `--threshold 0.50` is given
-- **THEN** the report SHALL state `false-low 0.017 (1/60 clicked-through pages) — PASS at < 1/50`
+For each tool (`semantic_search`, `hybrid_search`) separately, and within it per query class (`identifier`, `prose`), it SHALL report the post-change row count, the observed span in days, the deciles of the non-null `top_similarity`, the share that would read `low` at `T`, and the **false-low rate**: the share of post-change clicked-through pages (a search row the miner credited with a judgment: one of its shown notes was read) that would read `low` at `T`, a keyword-only page included. It SHALL print one acceptance line **per tool**: `<tool>: false-low <rate> (<n>/<m> clicked-through pages, <d> days) — PASS|FAIL|INSUFFICIENT_DATA at < 1/50`. A tool's line SHALL be `INSUFFICIENT_DATA` (never PASS) when its post-change rows span fewer than 14 days or it has fewer than 200 clicked-through pages, including zero; otherwise PASS exactly when the rate is below 1/50. There SHALL be no aggregate PASS across tools. Because one setting enables `low` on both tools, the activation rule (the `search-quality` setting requirement) SHALL require PASS on both lines.
+
+The output (the printed table and a JSON file of counts and rates under the data directory, with no query text and no note path) SHALL inherit the `mine` run's provenance: it SHALL carry `provenance` and `attachable`, `attachable` true exactly when `provenance.users` is 1, and for any other provenance the table SHALL begin with the existing `NOT ATTACHABLE` line. Only attachable output MAY leave the private data directory, and the documentation SHALL say so.
+
+#### Scenario: The acceptance lines are per tool
+- **WHEN** a single-user fixture spans 20 days with 200 clicked-through `hybrid_search` pages, none would read `low` at `--threshold 0.50`, and 20 clicked-through `semantic_search` pages, one of which would
+- **THEN** the hybrid line SHALL read PASS, the semantic line SHALL read `INSUFFICIENT_DATA`, and no line SHALL combine the two tools
+
+#### Scenario: A keyword-only clicked-through low counts as a false low
+- **WHEN** a post-change clicked-through `hybrid_search` row has `confidence` recorded, `top_similarity` null and `keyword_all: 0`
+- **THEN** it SHALL be tabulated and SHALL count as a false low at every `T > 0`; a row with no `confidence` key SHALL be counted as excluded
+
+#### Scenario: Too short or too few is not a pass
+- **WHEN** a tool has 250 clicked-through pages over 10 days, or 0 clicked-through pages over 30 days
+- **THEN** its line SHALL read `INSUFFICIENT_DATA`
+
+#### Scenario: Provenance and attachability
+- **WHEN** the tabulation runs on the two-user fixture mined without a user filter, and again on the same fixture mined with `USER_ID=` one user
+- **THEN** the first output SHALL carry `attachable: false` and begin with the `NOT ATTACHABLE` line, and the second SHALL carry `provenance.users: 1` and `attachable: true`
 
 #### Scenario: No leak
 - **WHEN** the tabulation JSON is written for a real export

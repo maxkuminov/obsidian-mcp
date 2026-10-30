@@ -8,7 +8,7 @@ One of those signals is missing. `hybrid_search("xqzvplorth", limit=5)` returns 
 
 Measuring at depth is the other half. The harness (#356) reports recall@5 and recall@10, but an agent reading past rank ten is served by recall@20 and recall@50. Fifty is both the largest `limit` the search tools accept and `hybrid_search`'s arm depth, so recall@50 is the ceiling of what one page can reach.
 
-This change adds the honesty signal and the depth metrics. **No row is ever dropped.**
+This change adds the honesty signal and the depth metrics. Nothing is filtered and the hint never costs a row; the token, like `arm_depth`, can cost one row at the cap boundary, disclosed by the cap footer.
 
 ## What Changes
 
@@ -23,7 +23,7 @@ This change adds the honesty signal and the depth metrics. **No row is ever drop
   - Headers: `hybrid_search` `rerank=false` 400 → 405 (floor 990); `rerank=true` 431 → 444; `semantic_search(rerank=true)` 185 → 199. The `confidence: ok` and low-plus-`any` worst cases measure equal.
   - `hybrid_search`'s first-row ladder gains a last `explain omitted` step. Without it, the both-arms `rerank=true` page with the transition line reaches 1,002 at the 1,000 floor.
 - **`SEARCH_LOW_CONFIDENCE_SIMILARITY`** (float 0–1, **default 0 = hard off at ship**). It is model-dependent and is not part of `retrieval_fingerprint()`. bge-m3's candidate value is 0.50.
-  - `DEPLOYMENT.md` gets a calibration recipe: accrue usage rows, tabulate, accept a threshold only if fewer than 1 in 50 clicked-through pages would read `low`.
+  - `DEPLOYMENT.md` gets a calibration recipe: accrue at least 14 days and 200 clicked-through pages per tool, tabulate a single-user export, and accept a threshold only if both tools' lines PASS (fewer than 1 in 50 clicked-through pages would read `low`; too little data is `INSUFFICIENT_DATA`).
   - The reference deployment sets a value only after that.
 - **Usage rows always record `confidence` and `top_similarity`**, and `keyword_all` on `hybrid_search`. They are recorded whatever the threshold, so calibration has evidence from day one.
 - **The harness gains:**
@@ -31,7 +31,7 @@ This change adds the honesty signal and the depth metrics. **No row is ever drop
   - default `--depth` 20 → 50;
   - a per-arm `staged_depth`, preserved and validated from a `runfile:` source, which nulls any recall@k beyond it;
   - `schema_version` 2, and the golden regenerated once;
-  - a read-only `confidence` subcommand that tabulates calibration evidence.
+  - a read-only `confidence` subcommand that tabulates calibration evidence per tool, with the mine provenance and `attachable` flag.
 
   The verdict text and the no-threshold rule are unchanged.
 

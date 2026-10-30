@@ -19,6 +19,7 @@
   - keyword-only: all-rows → `ok`; only `any` / none → `low`, with the hint before the footer;
   - the same value for `rerank` true and false;
   - the multi-row cap-boundary case (hint withdrawn, same 10 rows; 200 characters more → hint kept, same rows);
+  - token eviction at the boundary: a page whose 10th row fitted pre-change with < 17 spare shows 9 rows, `shown: 9`, and the cap footer's count (and `more: true` on `rerank=true`);
   - the provider-input refusal: no token, no keys;
   - a note whose title or chunk holds `low confidence:` or `confidence: ok` cannot forge either
 - [ ] 2.7 `src/mcp_server/server.py`: one sentence on the token in the `semantic_search` and `hybrid_search` descriptions (≤ 4,000, the #343 test green, the routing sentence unchanged)
@@ -40,15 +41,15 @@
   - `assert_no_leak`
 - [ ] 4.4 Calibration:
   - `mining.py` writes `confidence-rows.jsonl` (`tool`, `class`, `top_similarity`, `keyword_all`, `clicked`; no text, no path);
-  - a new `scripts/search_eval/confidence.py` plus the `confidence` subcommand (deciles, `low` share, false-low rate on clicked-through rows, the PASS/FAIL line at < 1/50, a JSON of counts and rates);
-  - fixture rows and tests (the 1/60 acceptance scenario, no leak, pre-change rows excluded)
+  - a new `scripts/search_eval/confidence.py` plus the `confidence` subcommand: post-change rows identified by the `confidence` key, keyword-only rows included; per tool and per class; one PASS/FAIL/INSUFFICIENT_DATA line per tool (≥ 14 days and ≥ 200 clicked-through pages, < 1/50), no aggregate; a JSON of counts and rates carrying provenance and `attachable`, with the `NOT ATTACHABLE` line for multi-user data;
+  - fixture rows and tests: per-tool lines, a keyword-only false low, insufficient data (short span, zero denominator), pre-change rows excluded, the two-user fixture non-attachable and the `USER_ID=` fixture attachable, no leak
 - [ ] 4.5 Regenerate `tests/fixtures/search_eval/expected-report.json` once, with the reason in the commit message. The diff may contain only the new metric keys, `staged_depth`, depth, `schema_version` and the new deltas
 
 ## 5. Docs (same PR)
 
 - [ ] 5.1 README: a settings row for `SEARCH_LOW_CONFIDENCE_SIMILARITY` (default 0 = off, range 0–1, model-dependent, bge-m3 candidate 0.50, see DEPLOYMENT.md) and one line on the token
 - [ ] 5.2 `.env.example`: the setting, commented, with the "calibrate first; re-calibrate on model change" warning
-- [ ] 5.3 `DEPLOYMENT.md`: a "Calibrating search confidence" section with the D2 recipe and the 1-in-50 acceptance line, and the statement that the reference deployment sets a value only after it passes
+- [ ] 5.3 `DEPLOYMENT.md`: a "Calibrating search confidence" section with the D2 recipe (14 days and 200 clicked-through pages per tool, a single-user export, both lines PASS at < 1/50), the rule that only attachable output leaves `.search-eval/`, and the statement that the reference deployment sets a value only after both lines pass
 - [ ] 5.4 `docs/architecture/search.md`:
   - a new "Confidence (#389)" section (D1–D7, the live numbers, the asymmetry argument, L1–L13);
   - the hybrid D7 and #367 D9 numbers;
