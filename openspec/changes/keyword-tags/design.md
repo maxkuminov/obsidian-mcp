@@ -497,3 +497,9 @@ Verdict on 83b7c75: all six round-1 fixes VERIFIED; one new MAJOR, folded.
    statement reports it and 035 aborts naming the same id; the upgrade note
    says a flagged D-only row must be shortened or rewritten first.
 
+
+## Codex spec review, round 3 (2026-10-30)
+
+Codex spec review, round 3 (2026-10-30): PASS — the round-2 fix VERIFIED,
+no findings. The `d_only` flag in the operator statement catches the D-only
+row that passed `S(v) + S(B)`, and every round-1 fix stands.
