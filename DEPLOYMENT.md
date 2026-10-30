@@ -987,6 +987,15 @@ and needs nothing; the real run is this path, from a checkout with
    run without `hybrid_alt_k`). A hybrid arm fails the run if the embedding
    provider is down during replay, because a keyword-only answer is not
    evidence for the fusion.
+   The rerank arms (#367) are separate factories, so the incumbent
+   `semantic` arm stays unreranked in the same report: `ARMS="semantic
+   scripts.search_eval_arms.rerank:make_semantic_arm
+   scripts.search_eval_arms.rerank:make_hybrid_arm" BASELINE=semantic`,
+   run with `RERANK_URL` pointing at the reranker you mean to measure. Each
+   probes the reranker before the first query (a failed probe exits 64)
+   and fails the run on any answer that was not reranked, a timeout
+   included: raise `RERANK_TIMEOUT_MS` for replay if the reranker is slow,
+   and say so next to the report.
 7. **Attach `report.json` to the PR only if it says `attachable: true`.** It
    carries metrics, counts and hashes, no query text and no note paths. A
    `CORPUS_LOSS` verdict means the candidate lost searchable notes for that
@@ -996,6 +1005,57 @@ and needs nothing; the real run is this path, from a checkout with
    pass/fail threshold: the reviewer reads the deltas against the baseline.
 
 Drop the scratch container afterwards (`docker rm -f omcp-eval`).
+
+### Reranker (optional)
+
+`semantic_search` and `hybrid_search` accept `rerank=true`, which asks a
+cross-encoder reranker to reorder the candidates the call already fetched
+(at most 50 notes, each sent as its title and its best-matching chunk, cut
+to 2,048 characters). Nothing uses it until you set `RERANK_URL`, and the
+default setup does not. **It is not a recommended default**: on a laptop CPU
+scoring 10 documents takes several seconds, so 50 candidates time out at the
+1.5 s default on every call. Treat it as a GPU-only option, and measure it
+with the harness (above) on your own judgments before telling agents to use
+it. The reranker receives the query and candidate note text, so give it the
+same trust as your embedding endpoint.
+
+One wire format is supported: the Jina-compatible `/v1/rerank` that
+`llama-server --reranking` serves (vLLM and Infinity serve it too). As an
+example only, with a `bge-reranker-v2-m3` GGUF of your choice:
+
+```sh
+llama-server --reranking -m <path to bge-reranker-v2-m3 GGUF> \
+    --host 127.0.0.1 --port 8081 -ngl 99
+```
+
+or the same in a container on the server's network. Then, in `.env`:
+
+```sh
+RERANK_URL=http://127.0.0.1:8081/v1/rerank
+# RERANK_TIMEOUT_MS=1500
+```
+
+A reranker on another host needs `https`, or `RERANK_ALLOW_PLAINTEXT=true`
+for plaintext (the embedding override does not cover it). Restart, then
+check:
+
+- the log has one `Rerank transport:` line and `Reranker probe passed`;
+- `/health` reports `"rerank": "enabled"` (`disabled` means the probe
+  failed: the log has one CRITICAL naming the reason, and the server keeps
+  re-probing every 60 s, doubling up to 10 minutes, so a reranker that
+  starts after the server is picked up on its own);
+- `semantic_search(query, rerank=true)` says `reranked: true (candidates: N)`.
+
+A reranker that is slow, down or answering garbage never fails a search:
+the call returns the unreranked page marked `reranked: false (<reason>)`,
+and the usage row records `rerank_reason`. TEI's native `/rerank` and
+Cohere's API are not supported in this release, and there is no
+authentication header.
+
+**Upgrading to this release:** no migration and nothing to re-index. The
+argument is new and optional. Rolling back is a redeploy of the previous
+image; a client still sending `rerank` is then refused by the
+unknown-argument rule.
 
 ## Upgrading: split database roles
 

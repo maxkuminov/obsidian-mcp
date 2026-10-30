@@ -304,7 +304,9 @@ update it in the same change.** What stays here is the short list:
   connecting, and the lifespan exits on an unencrypted session. The active
   embedding URL must be `https` or loopback unless `EMBEDDING_ALLOW_PLAINTEXT`,
   and every embedding HTTP client comes from `embedding_http_client`
-  (`trust_env=False`, no redirects). See
+  (`trust_env=False`, no redirects). The optional reranker (#367) is a third
+  hop under the same policy: `RERANK_URL` judged by the same parser with its
+  own `RERANK_ALLOW_PLAINTEXT`, every client from `rerank_http_client`. See
   [schema and migrations](docs/architecture/schema-and-migrations.md) and
   [indexing and embeddings](docs/architecture/indexing-and-embeddings.md).
 - **The app is never the PostgreSQL superuser** (#324). The lifespan reads
@@ -486,6 +488,25 @@ update it in the same change.** What stays here is the short list:
   `since`/`until`/`order_by`/`cursor` with keyset paging, and a call using
   none of them is byte-identical. See
   [indexing and embeddings](docs/architecture/indexing-and-embeddings.md).
+- **The reranker is opt-in, all or nothing, and can never fail a search**
+  (#367). `rerank: bool = false` is always in `semantic_search`'s and
+  `hybrid_search`'s schemas; `rerank=false` is byte-identical to the render
+  before it. With `RERANK_URL` empty, `rerank=true` answers
+  `reranked: false (not_configured)` — never a refusal. Otherwise the call's
+  already-fetched candidates (≤ 50 notes, `semantic_candidates` / the first
+  50 fused rows; no second retrieval) go to one Jina-compatible `/v1/rerank`
+  exchange under one `RERANK_TIMEOUT_MS` deadline, and the page is either
+  fully reranked (`reranked: true (candidates: N)`, `rerank_score` after the
+  `"} — ` separator) or the capped unreranked baseline with one closed reason
+  code. `rerank=true` always renders hybrid's quoted-object encoding. A
+  failed startup probe (both document orders) disables reranking with one
+  CRITICAL and **never exits**; a background re-probe re-enables it.
+  `/health` gains `rerank: enabled|disabled|absent` without touching
+  `status` or the 200. The session closes before the hop (no connection held),
+  the call stays in the `embedding` class (no version bump), the trust anchor
+  is `EMBEDDING_CA_FILE`'s with a separate plaintext flag, and the CLAUDE.md
+  eval-gate row applies to any rerank change. See
+  [search](docs/architecture/search.md), "Reranking (#367)".
 - `MCP_SANDBOX_MODE=true` is a registry-eval-only switch: lifespan skips `_check_embedding_dim` and the indexer, and `APIKeyMiddleware` bypasses auth on `/mcp/*`. Lets Glama's sandbox build the image and validate MCP introspection without external deps. Never enable in production — tools register but cannot run.
 
 ## MCP tools
@@ -501,7 +522,8 @@ destructive set that drifts from the write bucket.
 
 **Search and read** — `keyword_search`, `semantic_search`, `hybrid_search`
 (RRF of the two, for a query that is neither clearly an identifier nor a
-paraphrase), `read_note`, `list_notes`, `get_tags`, `get_recent`, `get_vault_guide`, `get_changes`
+paraphrase; it and `semantic_search` take the optional `rerank` argument,
+#367), `read_note`, `list_notes`, `get_tags`, `get_recent`, `get_vault_guide`, `get_changes`
 (the change feed, after an `ev:<seq>` cursor or a UTC date; `by` =
 `any | me | agents | human`), and `list_tasks` (see **Tasks** below).
 

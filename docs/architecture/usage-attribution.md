@@ -766,6 +766,15 @@ this table.
   but a real, labelled result was returned, so the row stays analysable on
   the panel and minable by the search-eval harness, unlike
   `semantic_search`'s provider failure, which is a refusal or an exception.
+- **The reranker (#367) reserves five keys** on `semantic_search` and
+  `hybrid_search`: `rerank` (bool, the argument, on every row of both tools),
+  and on a `rerank=true` row `reranked` (bool, always), `rerank_reason`
+  (string, one closed code such as `timeout` or `not_configured`, only when
+  `reranked` is false), `rerank_ms` (int, the exchange time, only when a
+  request was sent) and `rerank_candidates` (int, the candidates scored or
+  considered). `result_paths` are the rendered rows in final, reranked order.
+  **`reranked: false` is not an error marker**: the call returned the honest,
+  labelled unreranked page, so the row stays analysable and minable.
 
 **The identity rule for anything reading these keys: `(usage_logs.user_id,
 path)`, matched NULL-safely.** A path is unique only within an owner —

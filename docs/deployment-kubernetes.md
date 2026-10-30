@@ -252,6 +252,10 @@ List-valued settings: `TRUSTED_PROXY_IPS`, `FTS_CONFIGS` and
 | `OLLAMA_EMBED_BATCH_SIZE` | `16` | Chunks per `/api/embed` request (1 to 256). |
 | `EMBEDDING_ALLOW_PLAINTEXT` | `false` | Acknowledge a plaintext `http://` embedding URL to a non-loopback host. |
 | `EMBEDDING_CA_FILE` | unset | PEM CA for an `https` embedding endpoint behind a private CA. Replaces the default bundle. |
+| `RERANK_URL` | unset | Optional Jina-compatible `/v1/rerank` endpoint (e.g. `llama-server --reranking`) for `rerank=true`. Receives query and note text. Same `https`/loopback rule; an unreachable reranker never blocks startup. See DEPLOYMENT.md, "Reranker (optional)". |
+| `RERANK_MODEL` | unset | Sent as `model` in the rerank request. |
+| `RERANK_TIMEOUT_MS` | `1500` | One deadline per rerank call (100 to 10000); past it the page falls back unreranked. |
+| `RERANK_ALLOW_PLAINTEXT` | `false` | Acknowledge a plaintext `http://` reranker URL to a non-loopback host (separate from the embedding flag). |
 | `EMBEDDING_EXCLUDE_PATTERNS` | `["*.excalidraw.md","Excalidraw/*"]` | fnmatch globs that are keyword-indexed but not embedded (JSON list). |
 | `CHUNK_SIZE` / `CHUNK_OVERLAP` | `512` / `0` | Chunking (tokens). Overlap must be below size. A change needs a reset. |
 
@@ -673,6 +677,15 @@ The procedure:
 5. Confirm the schema matches the models:
    `kubectl -n obsidian-mcp exec deploy/obsidian-mcp -- alembic check` should print
    "No new upgrade operations detected."
+
+**Upgrading to the reranker release (#367)** there is no migration and no
+operator step: `semantic_search` and `hybrid_search` gain an optional
+`rerank` argument whose `false` default leaves their output unchanged, and
+four optional settings (`RERANK_*`, unset by default) enable it. The class
+mapping is unchanged, so readiness evidence carries over. `/health` gains a
+`rerank` field (`absent` until `RERANK_URL` is set; never a non-200).
+Rolling the image back is a plain redeploy; a client still sending `rerank`
+is then refused by the unknown-argument rule.
 
 **Upgrading to `hybrid_search` (#354)** there is no migration and no
 operator step: a new tool, one optional setting (`HYBRID_RRF_K`, default 60,

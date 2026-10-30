@@ -125,6 +125,42 @@ verify=… plaintext_override=…` — scheme, host and port only, never the pat
 query or userinfo. `plaintext_override=True` means the override is what
 admitted this hop (plaintext to a non-loopback host).
 
+### The rerank hop (#367)
+
+The optional reranker is the **third outbound hop** (after the database and
+the embedding endpoint), and it reuses the embedding hop's policy rather than
+inventing one (design D1, D3, D8):
+
+- `RERANK_URL` (empty = absent) is judged by `classify_embedding_url` and the
+  same plaintext rule, with its **own** flag, `RERANK_ALLOW_PLAINTEXT`:
+  `EMBEDDING_ALLOW_PLAINTEXT` does not admit a plaintext reranker. A violation
+  refuses boot; the address class is not restricted (an internal reranker is
+  expected on a private or loopback host — the opposite of `import_from_url`'s
+  SSRF policy, because this URL is operator configuration, never caller
+  input). `MCP_SANDBOX_MODE` skips the URL policy.
+- The **trust anchor is shared**: an `https` reranker is verified against the
+  `EMBEDDING_CA_FILE` context when set, else certifi. Because that file is
+  refused while the embedding URL is plain `http`, a loopback-`http` Ollama
+  plus an `https` reranker under a private CA cannot share it; that reranker
+  needs a publicly trusted certificate (L10). The embedding rule is not
+  relaxed.
+- Every client comes from `transport_security.rerank_http_client`
+  (`trust_env=False`, no redirects, two pooled connections); the AST guard
+  covers `src/services/rerank.py`. `log_rerank_transport()` writes one
+  `Rerank transport: scheme=… host=… port=… verify=… plaintext_override=…`
+  line when `RERANK_URL` is set, and `internal_transport_plaintext`
+  `reason=rerank outcome=override` for a non-loopback `http` URL.
+- The startup probe (both document orders, 10 s) needs no database. **Its
+  failure never exits**: it disables reranking with one CRITICAL, the server
+  serves, and a background re-probe (60 s doubling to 10 min) re-enables it.
+  A reranker outage must not take down the vault; every `rerank=true` answer
+  states the absence, and `/health` reports `rerank: disabled` without
+  touching `status`. Under `MCP_SANDBOX_MODE` there is no probe, no
+  transport line and no re-probe; the state is `disabled` (`probe_skipped`)
+  with a URL, else `absent`.
+
+The query-time behaviour is in [search](search.md), "Reranking (#367)".
+
 ### One pooled client per provider, and Ollama batches (#281)
 
 **D14 — the shared client is built by the factory, never beside it.** Each

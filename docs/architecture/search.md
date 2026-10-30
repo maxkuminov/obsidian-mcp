@@ -308,6 +308,133 @@ literal `«`/`»` in a note collides with the highlight markers; an
 abbreviated first row shows only 40–45 rendered characters of its title and
 path.
 
+## Reranking (#367)
+
+`semantic_search` and `hybrid_search` take `rerank: bool = false`, always in
+the schema. With `rerank=true` an operator-configured cross-encoder
+(`RERANK_URL`) reorders the candidates the call already fetched. It is
+**opt-in and unmeasured by default**: Ollama has no rerank endpoint, a laptop
+CPU takes about 6 s for 10 documents (so 50 candidates time out at the
+1.5 s default on every call), and a small GPU is plausibly sub-second for
+50 but nobody has measured it here. Anthropic's contextual-retrieval study
+saw top-20 retrieval failure fall 2.9% → 1.9% from reranking on top of
+hybrid retrieval; that is somebody else's corpus. The eval gate below is how
+a deployment learns whether it helps on its own.
+
+**One wire format (D2).** The Jina-compatible `/v1/rerank` that
+`llama-server --reranking` serves (vLLM, Infinity, Jina's API too):
+`{"model", "query", "documents", "top_n"}` in, `{"results": [{"index",
+"relevance_score"}]}` out. A response is accepted only when it is a 2xx of at
+most 1 MiB that parses as an object whose `results` holds exactly `n`
+objects, each with a non-bool integer `index` in `[0, n)` (the indices a
+permutation) and a finite non-bool numeric `relevance_score`. Scores are
+mapped by `index`, never by position. TEI's native `/rerank` and Cohere v2
+are not supported (L1).
+
+**The client (D3)** is `transport_security.rerank_http_client`, a sibling of
+`embedding_http_client` with the same policy (`trust_env=False`, no
+redirects, the `EMBEDDING_CA_FILE` context else certifi) and a pool of two
+connections, which bounds the work in flight on the reranker in every
+concurrency mode. One per process, rebuilt per event loop, closed at
+shutdown. One wall-clock deadline (`RERANK_TIMEOUT_MS`) covers the pool
+wait, connect, write and a raw body read under the 1 MiB cap (asked for
+uncompressed; a compressed body fails closed). No retry.
+
+**Candidates and the scored unit (D4, D6).** For `semantic_search` the
+candidates come from one service, `embeddings.semantic_candidates`, which
+the tool and the harness arm both call: the call's unchanged overfetch
+statement, re-sorted and deduped as always, **before** truncation to
+`limit`, capped at 50 notes. The statements are the same as `rerank=false`.
+Because `limit ≤ 50`, every note of the unreranked page is a candidate, so
+reranking can only reorder that page and promote notes from deeper ranks.
+The scored unit is the **note**: `title + "\n\n" + text`, at most 2,048
+code points, where the text is the best-distance chunk taken **before** the
+500-character result cut (`rerank_text`, internal, never on a legacy row).
+A stale note (#200) is sent as its title alone: superseded text never
+leaves the server. For `hybrid_search` the candidates are the first 50 fused
+rows; a note in the semantic arm and not stale sends its chunk, any other
+sends `left(body_excerpt, 2048)` read by one statement **inside the hybrid
+snapshot**, under the owner predicate, after the snippet statements and only
+when such a candidate exists (by path: the semantic arm's rows carry no id).
+A NULL excerpt sends the title. A keyword-only hybrid call still reranks and
+says both `arms: keyword-only (…)` and `reranked: …`.
+
+**Order and all or nothing (D5, D7).** Reranked order is `rerank_score`
+DESC, then the unreranked position ASC; the page is its first `limit` rows,
+every other field keeps its unreranked value. Either every candidate has a
+validated score, or none is used and the page is the **capped unreranked
+baseline** with `reranked: false (<code>)`, the first applicable of
+`not_configured`, `probe_skipped`, `probe_failed`, `no_candidates` (none of
+these sends a request), `timeout`, `transport_error`, `http_error` (3xx
+included), `oversize_response`, `malformed_response`, `count_mismatch`,
+`bad_index`, `non_finite_score`. Any other exception is
+`malformed_response`; cancellation propagates. **The rerank step never
+fails a search.** One WARNING per code per 60 s, with a suppressed count and
+the exception class, never the URL, response text or note text.
+
+**The probe, the state and `/health` (D8).** With `RERANK_URL` set and
+sandbox mode off, the lifespan probes before the first root snapshot: the
+fixed query against one relevant and one irrelevant document, sent in
+**both orders**, scores mapped by index, the relevant one strictly higher
+in each, under 10 s for the pair. That defeats a position-only scorer
+(`probe_wrong_order`) and a constant one (`probe_tie`). A pass enables
+reranking (one INFO); a failure disables it (exactly one CRITICAL naming the
+code) and **the server starts anyway**. A background task re-probes after
+60 s, doubling to 10 minutes (each attempt under `RERANK_TIMEOUT_MS`,
+failures at DEBUG), holds no database connection or lock, and is cancelled
+at shutdown; `enabled` is never revoked (per-call failures show up in the
+usage rows). `/health` reports `rerank: enabled | disabled | absent` and
+nothing else: no URL, host, code or count, no effect on `status`, always 200.
+
+**Rendering (D9).** `rerank=false` is byte-identical to the render before
+#367 on both tools (pinned against origin/main). `rerank=true`, reranked or
+not, always uses hybrid's quoted-object encoding: `semantic_search` rows are
+`- {"title","path","tags","preview_kind","preview"} — similarity: … —
+rerank_score: … — stale: true — embedding_truncated: true`, with
+`rerank_score` (`.4g`) only when reranked; `hybrid_search(rerank=true)`
+appends `rerank_score` after its own server fields. The header carries the
+token on every path (after `arms:` on hybrid), the zero-result line
+included; the semantic header always carries the stale/truncated counts and
+`shown`. The legacy prose degradation footer is not repeated in this
+encoding (the counts and row markers carry it). The response is bounded on
+rendered length by hybrid's rules; when the cap drops rows, the footer is
+`Response cap: N omitted — more: true; narrow with limit= or folder=.` (L14:
+the quoted encoding can show fewer rows than the legacy page). Pinned
+worst cases at 1,000: semantic header ≤ 185, abbreviated structure ≤ 235;
+hybrid header ≤ 431 and structure ≤ 362 with a 20–25 character title/path
+cut floor on `rerank=true` pages (431 + 362 + 25 + 25 + 75 + 75 + 5 = 998).
+
+**Telemetry and concurrency (D10, D11).** `params.rerank` is the argument;
+a `rerank=true` row adds `reranked`, `rerank_reason` (false only),
+`rerank_ms` (when a request was sent) and `rerank_candidates`, and its
+`result_paths` are the rendered rows in final order. `reranked: false` is
+not an error marker. Both tools stay in the `embedding` class, the slot is
+held through the exchange (at most `RERANK_TIMEOUT_MS` longer), and the
+database session is **closed before the request is sent**: no pooled
+connection is held during the hop (the checkout-peak test pins it).
+
+**The eval gate.** A rerank change is a search-path change:
+`make search-eval-snapshot`, then `make search-eval ...
+ARMS="semantic scripts.search_eval_arms.rerank:make_semantic_arm
+scripts.search_eval_arms.rerank:make_hybrid_arm" BASELINE=semantic` with
+`RERANK_URL` set to the reranker the deployment would use. No quality claim
+is made without that report on real hardware.
+
+Accepted limitations (the change's design): L1 one wire format; L2 a note is
+judged on its best-distance chunk only; L3 the 2,048-character cut; L4 a
+stale semantic candidate is scored on its title (hybrid: its excerpt); L5
+the probe catches a mis-wired endpoint, not a weak model; L6 re-enabling
+can lag recovery by up to 10 minutes, and a failure after a passed probe is
+per call only; L7 the extended slot hold mixes into queue-mode readiness
+evidence; L8 the miner's query identity ignores `rerank`; L9 the
+`rerank=false` semantic render keeps its raw title, path and preview; L10
+no separate trust anchor (and none at all for a private-CA reranker while
+the embedding URL is plain `http`); L11 replay fails on any timeout, so a
+slow reranker needs a larger `RERANK_TIMEOUT_MS` for replay; L12 no auth
+header; L13 the reranker sees the caller's note text; L14 a capped
+`rerank=true` page can show fewer rows than the `rerank=false` page, always
+disclosed by the footer.
+
 ## Filtered vector search — the SET LOCALs are correctness, not tuning
 
 Both vector paths (`semantic_search` in `src/services/embeddings.py`,
@@ -718,7 +845,11 @@ no embedding call), and `fallback` + `any_rows` + `snippet_ms` for
 `keyword_search` (#344), and for `hybrid_search` (#354) `embed_ms`, `db_ms`,
 `exact_fallback`, `fallback`, `any_rows`, `snippet_ms` plus `arms`,
 `semantic_unavailable` (keyword-only only), `keyword_rows`, `semantic_rows`,
-`overlap` and `rrf_k`. A single whole-call `duration_ms` could not separate the
+`overlap` and `rrf_k`. A `semantic_search` or `hybrid_search` call with
+`rerank=true` (#367) adds `reranked`, `rerank_reason` (only when false),
+`rerank_ms` (only when a request was sent) and `rerank_candidates`, with
+`embed_ms + db_ms + rerank_ms ≤ duration_ms`; `rerank=false` adds none of
+the four. A single whole-call `duration_ms` could not separate the
 two independent cold paths — provider eviction and HNSW page cache — so the
 last regression had to be diagnosed with hand-run probes against the live DB.
 
@@ -744,7 +875,9 @@ The same holder carries what a search *returned*, which is what
 `timing.record_results` / `timing.record_source_path` in the place where each
 tool's result set is final — `full_text_search` (`src/services/search.py`),
 `semantic_search` (`src/services/embeddings.py`), `hybrid_search_impl`
-(from the rows it actually rendered, after the response bound; #354), and
+(from the rows it actually rendered, after the response bound; #354), both
+tools' `rerank=true` paths (once, from the rendered rows in their final,
+reranked order; `semantic_candidates` records nothing; #367), and
 `find_related_impl` itself, after its dedupe and truncation to `limit`, so the telemetry names what
 the caller was handed and not what the overfetch scanned.
 
@@ -897,7 +1030,11 @@ exits 64), e.g. #354's RRF fusion as
 ARM_OPTS="hybrid_k=60 hybrid_alt_k=20"` with membership `keyword_or_semantic`
 (two factories because `--arm-opt` is one dict for the whole run; a factory
 may declare `required_options`, refused with exit 64 before the generation
-is reserved); #355's heading-aware chunking as the
+is reserved); #367's reranker as `scripts.search_eval_arms.rerank:make_semantic_arm`
+(membership `semantic`) and `make_hybrid_arm` (`keyword_or_semantic`), whose
+async `factory.preflight` probes the reranker before the generation is
+reserved (exit 64 on failure) and which fail the run on any unreranked
+answer (see "Reranking (#367)"); #355's heading-aware chunking as the
 built-in arms replayed on a copy re-chunked after the snapshot; or #367's
 embedding-model trial as `runfile:<path>`, a staged arm file the harness's
 own `run` wrote on a re-embedded copy with the same qrels, snapshot and
