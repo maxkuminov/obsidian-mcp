@@ -292,6 +292,60 @@ async def test_one_snapshot_serves_both_arms(maker, corpus, monkeypatch):
             await session.commit()
 
 
+def _strict_listener_engine(monkeypatch, url, **kw):
+    """An engine carrying the production D3b listener (strict
+    `DATABASE_SSL_MODE`), its probe answered `ssl = true` because the
+    throwaway server has no TLS: the listener's statement runs on every new
+    connection exactly as it does in production."""
+    from src.services import transport_security as ts
+
+    monkeypatch.setattr(ts, "_PG_STAT_SSL_PROBE", "SELECT true, 'TLSv1.3', 'test'")
+    engine = create_async_engine(url, **kw)
+    ts.install_strict_transport_listener(engine)
+    return engine, async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+
+async def test_a_new_strict_mode_connection_opens_no_transaction(migrated_url, corpus,
+                                                                 monkeypatch):
+    """The 2026-10-30 production failure: under a strict `DATABASE_SSL_MODE`
+    the D3b probe ran on every new pooled connection and left the driver's
+    transaction open, so the first session on that connection found a query
+    already run and `SET TRANSACTION ISOLATION LEVEL` was refused. NullPool
+    makes every session a new connection, i.e. every call the bad case."""
+    engine, fresh = _strict_listener_engine(monkeypatch, migrated_url, poolclass=NullPool)
+    u7 = corpus["u7"]
+    try:
+        result = await _hybrid(fresh, folder="Projects/", user_id=u7)
+        assert result.arms == "both" and result.rows
+        async with fresh() as session:
+            assert await full_text_search(session, QUERY, limit=5, user_id=u7)
+        async with fresh() as session:
+            await session.execute(
+                text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"))
+            assert (await session.execute(
+                text("SHOW transaction_isolation"))).scalar() == "repeatable read"
+    finally:
+        await engine.dispose()
+
+
+async def test_parallel_calls_through_a_growing_strict_mode_pool(migrated_url, corpus,
+                                                                 monkeypatch):
+    """The reported shape: five parallel calls, the pool growing to serve
+    them, so some calls get a brand-new connection and some a reused one."""
+    import asyncio
+
+    engine, fresh = _strict_listener_engine(
+        monkeypatch, migrated_url, pool_size=2, max_overflow=6)
+    u7 = corpus["u7"]
+    try:
+        for _ in range(2):
+            results = await asyncio.gather(
+                *(_hybrid(fresh, folder="Projects/", user_id=u7) for _ in range(5)))
+            assert all(r.arms == "both" and r.rows for r in results)
+    finally:
+        await engine.dispose()
+
+
 async def test_the_search_analytics_page_has_a_hybrid_table(migrated_url, maker, corpus,
                                                             monkeypatch):
     """The route indexes `_SEARCH_TOOL_LABELS[tool]` for every query tool; with

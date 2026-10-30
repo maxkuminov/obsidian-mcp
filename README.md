@@ -301,6 +301,8 @@ the wire, so none is cut off by a client's description limit.
   A single arm can beat the fusion on its own kind of query. If the
   embedding provider is down, `hybrid_search` returns the keyword ranking
   marked `arms: keyword-only (semantic unavailable: …)`, never silently
+  degraded: the marker is on every return path, so a keyword-only page
+  cannot pass for a fused one.
 - `rerank=true` on either of the last two asks an optional,
   operator-configured reranker (`RERANK_URL`) to reorder the candidates
   the call already fetched (at most 50 notes). The response is either
