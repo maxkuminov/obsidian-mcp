@@ -168,7 +168,7 @@
   - the instruction's reach into documents.
 
   Two rounds by default, triaged per the workflow. Record the rounds in `design.md`, and record declined findings as accepted limitations.
-- [ ] 10.4 After fixes, re-run 10.1 and the verifier's command set once on the final tree.
+- [x] 10.4 After fixes, re-run 10.1 and the verifier's command set once on the final tree. — final tree: validate 39/39, offline 7389 passed, search-eval exit 0; schema 327 and integration 1131 passed on the merged tree (no src/alembic/integration change since).
 
 ## 11. Archive, merge, deploy, live check
 
