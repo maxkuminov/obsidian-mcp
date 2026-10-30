@@ -111,6 +111,10 @@ class RerankFailure(Exception):
         super().__init__(code)
         self.code = code
         self.exc_class = exc_class
+        #: Whether the request reached the wire (its headers began to be
+        #: written). False for a failure before transmission — a pool wait
+        #: that ran out, a refused connect — which records no `rerank_ms`.
+        self.sent = True
 
 
 @dataclass
@@ -253,6 +257,22 @@ async def score(
     connect, write and read), the body streamed under the 1 MiB cap, then the
     D7 validation. Never retried. `CancelledError` propagates; every other
     exception becomes a code."""
+    sent = False
+
+    async def trace(event_name: str, info) -> None:
+        # httpcore's trace extension: the first byte of the request is about
+        # to be written. Pool acquisition and connect come before it.
+        nonlocal sent
+        if event_name.endswith("send_request_headers.started"):
+            sent = True
+
+    result = await _exchange(query, documents, deadline_s, trace)
+    if isinstance(result, RerankFailure):
+        result.sent = sent
+    return result
+
+
+async def _exchange(query, documents, deadline_s, trace) -> list[float] | RerankFailure:
     n = len(documents)
     body = {
         "model": settings.rerank_model,
@@ -268,6 +288,7 @@ async def score(
                 # Asked for uncompressed, and read raw: the cap is on the
                 # bytes this process holds, never on a decoder's output.
                 headers={"Accept-Encoding": "identity"},
+                extensions={"trace": trace},
                 # The per-phase backstop is the call's own deadline.
                 timeout=httpx.Timeout(deadline_s),
             ) as response:
@@ -378,7 +399,9 @@ async def rerank_candidates(
     ms = int((time.monotonic() - started) * 1000)
     if isinstance(result, RerankFailure):
         _warn(result.code, result.exc_class)
-        return RerankOutcome(False, identity, n, reason=result.code, ms=ms)
+        # `rerank_ms` only when a request was actually sent (D10).
+        return RerankOutcome(False, identity, n, reason=result.code,
+                             ms=ms if result.sent else None)
     order = sorted(identity, key=lambda i: (-result[i], i))
     return RerankOutcome(True, order, n, scores=result, ms=ms)
 

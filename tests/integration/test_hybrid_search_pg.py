@@ -440,3 +440,26 @@ async def test_a_keyword_only_call_still_reranks(maker, corpus, monkeypatch):
         await rerank.close_rerank_client()
         rerank._reset_state_for_tests()
         server.stop()
+
+
+async def test_a_same_path_note_of_another_tenant_never_supplies_the_excerpt(maker, corpus):
+    """Verifier V5: the excerpt statement selects by path, so the owner
+    predicate is what keeps another tenant's note at the same path out."""
+    u7, u8 = corpus["u7"], corpus["u8"]
+    async with maker() as session:
+        await _add_note(session, path=NO_VECTORS, body="zx81 TENANT EIGHT SECRET EXCERPT",
+                        vectors=[], user_id=u8)
+        await session.commit()
+    try:
+        result = await _hybrid(maker, user_id=u7, limit=10, rerank_candidates=True)
+        row = next(r for r in result.rows if r.path == NO_VECTORS)
+        assert row.rerank_text == "zx81 without any embedding"
+        assert all("SECRET" not in (r.rerank_text or "") for r in result.rows)
+        other = await _hybrid(maker, user_id=u8, limit=10, rerank_candidates=True)
+        mine = next(r for r in other.rows if r.path == NO_VECTORS)
+        assert mine.rerank_text == "zx81 TENANT EIGHT SECRET EXCERPT"
+    finally:
+        async with maker() as session:
+            await session.execute(delete(NoteMetadata).where(
+                NoteMetadata.file_path == NO_VECTORS, NoteMetadata.user_id == u8))
+            await session.commit()

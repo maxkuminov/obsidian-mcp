@@ -34,6 +34,9 @@ CANDS = [("Alpha", "alpha bravo"), ("Bravo", "bravo charlie"), ("Charlie", "char
     ("nan", rerank.NON_FINITE_SCORE),
     ("inf", rerank.NON_FINITE_SCORE),
     ("oversize", rerank.OVERSIZE_RESPONSE),
+    ("gzip", rerank.MALFORMED_RESPONSE),
+    ("cl_oversize", rerank.OVERSIZE_RESPONSE),
+    ("chunked_oversize", rerank.OVERSIZE_RESPONSE),
 ])
 async def test_every_rejected_response_falls_back_with_its_code(fake, mode, code):
     fake.mode = mode
@@ -217,3 +220,57 @@ def test_the_client_factory_policy(monkeypatch):
         assert pool._max_connections == 2 and pool._max_keepalive_connections == 2
     finally:
         asyncio.run(client.aclose())
+
+
+async def test_the_request_asks_for_an_uncompressed_body(fake):
+    await rerank.rerank_candidates("bravo", CANDS)
+    assert fake.request_headers[-1]["accept-encoding"] == "identity"
+
+
+async def test_a_declared_oversize_body_is_refused_before_it_is_read(fake, monkeypatch):
+    monkeypatch.setattr(settings, "rerank_timeout_ms", 3000, raising=False)
+    fake.mode = "cl_oversize"
+    started = time.monotonic()
+    out = await rerank.rerank_candidates("q", CANDS)
+    assert out.reason == rerank.OVERSIZE_RESPONSE
+    assert time.monotonic() - started < 1.0, "refused on the header, not by the deadline"
+
+
+async def test_an_unparseable_content_length_is_malformed(monkeypatch):
+    import httpx
+
+    def handler(request):
+        return httpx.Response(200, headers={"content-length": "abc"},
+                              stream=httpx.ByteStream(b"{}"))
+
+    monkeypatch.setattr(settings, "rerank_url", "http://127.0.0.1:9/v1/rerank", raising=False)
+    monkeypatch.setattr(rerank, "_client", httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    monkeypatch.setattr(rerank, "_client_loop", asyncio.get_running_loop())
+    rerank._reset_state_for_tests()
+    rerank._set_enabled()
+    try:
+        out = await rerank.rerank_candidates("q", CANDS)
+    finally:
+        await rerank.close_rerank_client()
+        rerank._reset_state_for_tests()
+    assert out.reason == rerank.MALFORMED_RESPONSE
+
+
+async def test_no_rerank_ms_when_the_pool_wait_runs_out_before_sending(fake, monkeypatch):
+    """Codex round 1 (C3): two calls hold both pooled connections past the
+    deadline; the third never transmits, so it carries no exchange time."""
+    monkeypatch.setattr(settings, "rerank_timeout_ms", 400, raising=False)
+    fake.mode = "sleep:3000"
+    outs = await asyncio.gather(*(rerank.rerank_candidates("q", CANDS) for _ in range(3)))
+    assert [o.reason for o in outs] == [rerank.TIMEOUT] * 3
+    assert sorted(o.ms is None for o in outs) == [False, False, True]
+    assert len(fake.requests) == 2
+
+
+async def test_no_rerank_ms_when_nothing_listens(fake, monkeypatch):
+    from tests.fixtures.fake_reranker import free_port
+
+    monkeypatch.setattr(settings, "rerank_url", f"http://127.0.0.1:{free_port()}/v1/rerank",
+                        raising=False)
+    out = await rerank.rerank_candidates("q", CANDS)
+    assert out.reason == rerank.TRANSPORT_ERROR and out.ms is None

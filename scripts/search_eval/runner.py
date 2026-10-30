@@ -142,17 +142,6 @@ async def run_generation(
         for key in getattr(arm.factory, "required_options", ()) or ():
             if key not in options:
                 raise UsageError(f"arm {arm.spec!r} needs --arm-opt {key}=…")
-    # A factory may declare an async `preflight(options)` that checks an
-    # external dependency before any query is answered (#367: the rerank arms
-    # probe the reranker). Awaited once per distinct preflight, before the
-    # generation is reserved, so its `UsageError` is exit 64, not a failed
-    # generation.
-    seen_preflights: list = []
-    for arm in arms:
-        pre = getattr(arm.factory, "preflight", None)
-        if pre is not None and pre not in seen_preflights:
-            seen_preflights.append(pre)
-            await pre(options)
     runs_dir = data_dir / RUNS_DIR
     gen_dir = runs_dir / generation
     needs_db = any(a.requires_db for a in arms)
@@ -161,6 +150,19 @@ async def run_generation(
         from scripts.search_eval.db import resolve_url
 
         url = resolve_url(database_url)
+
+    # A factory may declare an async `preflight(options)` that checks an
+    # external dependency before any query is answered (#367: the rerank arms
+    # probe the reranker). Awaited once per distinct preflight, after the
+    # replay URL is resolved (no URL, no connection anywhere: Codex round 1)
+    # and before the generation is reserved, so its `UsageError` is exit 64,
+    # not a failed generation.
+    seen_preflights: list = []
+    for arm in arms:
+        pre = getattr(arm.factory, "preflight", None)
+        if pre is not None and pre not in seen_preflights:
+            seen_preflights.append(pre)
+            await pre(options)
 
     manifest = {
         "generation": generation,

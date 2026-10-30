@@ -27,6 +27,7 @@ MODES = (
     "correct", "inverted", "position", "tie", "drip", "sleep:<ms>", "status:<code>",
     "redirect", "not_json", "no_results", "short", "long", "dup_index", "oob_index",
     "bool_index", "nan", "inf", "string_score", "oversize", "sorted", "scores:<json>",
+    "gzip", "cl_oversize", "chunked_oversize",
 )
 
 _WORD = re.compile(r"\w+")
@@ -49,6 +50,8 @@ class FakeReranker:
         self.port = port or free_port()
         self.mode = "correct"
         self.requests: list[dict] = []
+        #: Each request's headers, lower-cased names, as received.
+        self.request_headers: list[dict[str, str]] = []
         self.in_flight = 0
         self.max_in_flight = 0
         self.redirect_target_hits = 0
@@ -75,6 +78,8 @@ class FakeReranker:
                     return
         if scope["path"] == "/elsewhere":
             self.redirect_target_hits += 1
+        self.request_headers.append(
+            {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])})
         body = b""
         while True:
             msg = await receive()
@@ -179,6 +184,29 @@ class FakeReranker:
         if mode == "oversize":
             pad = b" " * (2 << 20)
             return await reply(200, json.dumps(results([1.0] * n)).encode() + pad)
+        if mode == "gzip":
+            import gzip as _gzip
+
+            data = _gzip.compress(json.dumps(results([1.0] * n)).encode())
+            return await reply(200, data, headers=[(b"content-encoding", b"gzip")])
+        if mode == "cl_oversize":
+            # Declares more than 1 MiB and then sends nothing: the client must
+            # refuse on the header alone, before any body byte.
+            await send({"type": "http.response.start", "status": 200,
+                        "headers": [(b"content-type", b"application/json"),
+                                    (b"content-length", str((1 << 20) + 1).encode())]})
+            while (await receive())["type"] != "http.disconnect":
+                pass
+            self.disconnects += 1
+            return
+        if mode == "chunked_oversize":
+            await send({"type": "http.response.start", "status": 200,
+                        "headers": [(b"content-type", b"application/json")]})
+            chunk = b" " * 65536
+            for _ in range(40):   # 2.5 MiB, no Content-Length
+                await send({"type": "http.response.body", "body": chunk, "more_body": True})
+            await send({"type": "http.response.body", "body": b""})
+            return
         if mode.startswith("scores:"):
             return await reply(200, results(json.loads(mode[len("scores:"):])))
         raise AssertionError(f"unknown fake mode {mode!r}")

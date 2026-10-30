@@ -74,6 +74,7 @@ def test_the_factories_resolve_with_their_memberships():
 
 def test_without_a_reranker_the_arm_is_a_usage_error(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "rerank_url", "", raising=False)
+    monkeypatch.setenv("SEARCH_EVAL_DATABASE_URL", "postgresql+asyncpg://u:p@127.0.0.1:1/x")
     d = tmp_path / "d"
     write_data(d, [{"text": "q", "relevant": ["A.md"]}], {"1": {"A.md": dict(ALL)}})
     with pytest.raises(UsageError, match="RERANK_URL"):
@@ -184,3 +185,17 @@ def test_a_keyword_only_hybrid_answer_fails_the_run(tmp_path, monkeypatch, reran
     out = run(d, [HYB])
     assert out.exit_code == EXIT_FAILURE
     assert manifest_of(d)["error"].startswith("UnrerankedAnswer")
+
+
+def test_no_database_url_means_no_probe(tmp_path, monkeypatch, reranker):
+    """Codex round 1 (C2): a reachable reranker and no replay URL exits 64
+    before any connection is made, the probe's included."""
+    monkeypatch.delenv("SEARCH_EVAL_DATABASE_URL", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    d = tmp_path / "d"
+    write_data(d, [{"text": "q", "relevant": ["A.md"]}], {"1": {"A.md": dict(ALL)}})
+    with pytest.raises(UsageError):
+        run(d, [SEM])
+    assert cli_main(["run", "--data", str(d), "--arm", SEM]) == EXIT_USAGE
+    assert reranker.requests == [], "no probe request without a replay URL"
+    assert not (d / "runs").exists()

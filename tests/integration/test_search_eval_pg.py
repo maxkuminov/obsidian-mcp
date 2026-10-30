@@ -588,7 +588,11 @@ def test_the_semantic_rerank_arm_dials_only_the_reranker_and_writes_nothing(
     """#367: `scripts.search_eval_arms.rerank:make_semantic_arm` replays the
     production candidates through the fake reranker on a loopback port; no
     write counter moves, every rerank request reaches the fake, and the answers
-    are the reranked candidates of `semantic_candidates`."""
+    are the reranked candidates of `semantic_candidates`.
+
+    `get_embedding` is stubbed because the provider hop is the ordinary one
+    the incumbent `semantic` arm makes too (design L15), not one the rerank arm
+    adds; the hop under test is `RERANK_URL`, which is real (a loopback fake)."""
     from src.services import embeddings, rerank
     from tests.fixtures.fake_reranker import FakeReranker
 

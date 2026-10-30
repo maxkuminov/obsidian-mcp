@@ -16,8 +16,10 @@ compare the candidate with itself.
 
 Both rerank through `src.services.rerank.rerank_candidates`, the function the
 tools use, calling the services directly (never `_tracked`) with one fresh
-read-only session per query, closed before the rerank exchange. Their only
-non-database hop is `RERANK_URL`, through `rerank_http_client`.
+read-only session per query, closed before the rerank exchange. They embed
+each query through the configured provider, exactly as the incumbent
+`semantic` arm does, and add one hop: `RERANK_URL`, through
+`rerank_http_client` (design L15).
 
 **Before the first answer each arm runs the startup probe** (the factory's
 `preflight`, awaited by the runner before the generation is reserved): no

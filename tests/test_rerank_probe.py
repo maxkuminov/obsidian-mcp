@@ -169,7 +169,9 @@ async def test_the_reranker_starting_after_the_server_is_re_enabled(monkeypatch,
 
     async def fake_sleep(seconds):
         intervals.append(seconds)
-        if len(intervals) == 2:
+        # The reranker comes up during the first wait (the scenario's "ready
+        # 30 seconds later"), so the 60 s re-probe passes.
+        if len(intervals) == 1:
             late.start()
 
     try:
@@ -177,7 +179,7 @@ async def test_the_reranker_starting_after_the_server_is_re_enabled(monkeypatch,
             assert await rerank.startup_probe() is False
             assert rerank.health_state() == "disabled"
             await rerank.reprobe_loop(sleep=fake_sleep)
-        assert intervals == [60, 120]
+        assert intervals == [60]
         assert rerank.health_state() == "enabled"
         levels = [r.levelname for r in caplog.records if r.name == "src.services.rerank"]
         assert levels.count("CRITICAL") == 1 and levels.count("INFO") == 1

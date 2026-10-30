@@ -2840,6 +2840,10 @@ async def _semantic_search_reranked(query, limit, folder, tags, frontmatter, uid
                 user_id=uid,
             )
     except refusals.ProviderInputTooLarge as exc:
+        # Nothing was searched, so there is no reason code and no candidate
+        # count; the row still says the page was not reranked (verifier V4),
+        # beside the refusal's own `provider_input_rejected` marker.
+        timing.record("reranked", False)
         return _semantic_provider_refusal(exc)
     candidates = found.rows
     outcome = await rerank_service.rerank_candidates(

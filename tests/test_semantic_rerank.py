@@ -525,8 +525,13 @@ async def test_provider_input_too_large_stays_the_refusal(monkeypatch, captured,
     monkeypatch.setattr(embeddings, "get_embedding", _too_large)
     _serve(monkeypatch, [row(1)])
     out_true = await tools.semantic_search_impl("q", rerank=True)
+    _, params, _ = captured.last()
     out_false = await tools.semantic_search_impl("q")
     assert str(out_true) == str(out_false) and "reranked" not in str(out_true)
+    assert params["reranked"] is False and params["rerank"] is True
+    assert not {"rerank_reason", "rerank_ms", "rerank_candidates"} & set(params)
+    _, params_false, _ = captured.last()
+    assert "reranked" not in params_false
 
 
 # ── description (D13) ───────────────────────────────────────────────────────
