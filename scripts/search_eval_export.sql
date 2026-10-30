@@ -3,8 +3,8 @@
 --
 --   psql -X -q -A -t -v ON_ERROR_STOP=1 -v days=N -v user_id=<id or empty>
 --
--- It emits one JSON object per line for the keyword_search, semantic_search
--- and read_note rows of the last N days, limited to the fields the miner in
+-- It emits one JSON object per line for the keyword_search, semantic_search,
+-- hybrid_search (#354) and read_note rows of the last N days, limited to the fields the miner in
 -- scripts/search_eval/mining.py consumes. `grant_id` is resolved from
 -- oauth_tokens because the credential principal is the OAuth grant, never the
 -- client id in actor_ref (D2). `user_filter` and `deployment_users` are the
@@ -45,7 +45,7 @@ SELECT json_build_object(
 )::text
 FROM usage_logs ul
 LEFT JOIN oauth_tokens ot ON ot.id = ul.oauth_token_id
-WHERE ul.tool IN ('keyword_search', 'semantic_search', 'read_note')
+WHERE ul.tool IN ('keyword_search', 'semantic_search', 'hybrid_search', 'read_note')
   AND ul.created_at >= now() - make_interval(days => :'days'::int)
   AND (:'user_id' = '' OR ul.user_id = NULLIF(:'user_id', '')::int)
 ORDER BY ul.created_at, ul.id;

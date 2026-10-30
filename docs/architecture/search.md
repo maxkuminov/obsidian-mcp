@@ -171,9 +171,142 @@ phrase adjacency across the head/body boundary; `head:` for a match beyond
 the excerpt or in the title only; pre-031 rows have no excerpt until edited
 or rebuilt; no fallback when no config is eligible; `matched_terms` omitted
 past 32 units; U+0002/U+0003 removed from excerpts; the weight array is a
-heuristic (#356 measures it); no hybrid fusion (#354); a 54000 row stays
+heuristic (#356 measures it); a 54000 row stays
 unweighted after 031 until written again; repeated re-heads shift body
-positions; snippets for the first `KEYWORD_SNIPPET_ROWS` rows only.
+positions; snippets for the first `KEYWORD_SNIPPET_ROWS` rows only. (The
+former "no hybrid fusion (#354)" limitation is closed by `hybrid_search`,
+below.)
+
+## Hybrid search (#354)
+
+`hybrid_search(query, limit=10, folder?, tags?, frontmatter?)` is a **third
+peer**, not a replacement and not a "primary" tool. The one measured
+pgvector + tsvector reciprocal-rank-fusion study (2026-10-22, 94 passages,
+60 queries) is the reason it exists and the reason it is only a peer: Hit@1
+was 41/60 vector-only, 36/60 keyword-only and 46/60 fused (MRR@10 0.782 /
+0.662 / 0.826); exact identifiers went from 2/12 to 9/12, paraphrases *down*
+from 15/24 to 13/24, and Hit@5 did not move (55 → 55). Fusion fixes ranking
+more than recall, and it can hurt paraphrases because the weak lexical list
+gets an equal vote. So all three search descriptions carry one routing
+sentence — identifiers, code symbols, titles or known phrases →
+`keyword_search`; conceptual or paraphrased → `semantic_search`; unsure →
+`hybrid_search` — and none ranks itself or another above the rest. The
+instructions' 512-character lead names all three with their one-word use;
+the `content_hash` clause and `precondition_required` moved to paragraph two
+to make room.
+
+**Service shape (D1).** `src/services/hybrid.py` is an orchestrator over two
+**arm cores** extracted from the existing services without changing them:
+`search.keyword_arm_rows` (the conjunctive block, PostgreSQL's parse, the
+disjunctive fill) plus `search.keyword_snippets`, and
+`embeddings.semantic_arm_rows` (the ordered statement, the zero-row exact
+re-run, the full-precision re-sort, the per-note dedupe, the stale/truncated
+annotation). Neither core issues `SET TRANSACTION`, a `SET LOCAL` or
+telemetry; `full_text_search` and `semantic_search` are their unchanged
+wrappers, so the projection-identity, keyword-ranking and recall suites run
+unmodified. The only addition is `keyword_arm_rows(with_excerpt_flag=True)`,
+hybrid-only, which projects `(body_excerpt IS NULL) AS no_excerpt` on both
+ranking statements — a boolean, never the excerpt — so the header's
+`without excerpt` covers rows past the snippet cap; `full_text_search`
+passes false and its statements (and the GIN plan `test_keyword_plan.py`
+pins) are byte-identical.
+
+**One session, one snapshot, the embedding first (D2).** The query is
+embedded before any statement, so no pooled connection is held during the
+provider call. Then, on one session: `SET TRANSACTION ISOLATION LEVEL
+REPEATABLE READ, READ ONLY` (legal only before the first snapshot-taking
+statement); `SET LOCAL random_page_cost = 1.1`, `hnsw.ef_search = 80`,
+`hnsw.iterative_scan = 'relaxed_order'` (every setting before the first data
+statement); the keyword arm (the snapshot is taken here); the semantic arm;
+after an exact re-run, **`SET LOCAL enable_indexscan = on` before anything
+else** — the snippet statements look rows up by id and must not inherit a
+disabled index scan, which `semantic_search` never had to care about because
+it closes its session straight after; fusion; the snippets. A concurrent
+index commit between the arms is therefore in neither arm of that call. The
+integration suite pins all of it, including a hook between the arms that
+commits a matching note on another connection.
+
+**Fusion (D3).** Each arm is taken to `HYBRID_ARM_DEPTH` (50): 50 keyword
+rows (`all` first, then the `any` fill, in today's order), and a 50-chunk
+semantic overfetch deduped per note. Ranks are 1-based positions. Over note
+paths (unique within the owner scope, which both arms filter by the same
+`apply_note_filters`), `score = Σ 1/(k + rank)` with `k = HYBRID_RRF_K`
+(default 60, 1–1000, a setting, never a call argument). Ties: score DESC,
+then the smaller of the note's arm ranks, then path — no arm wins a tie for
+being that arm. The page is the first `limit` (1–50). **RRF is over each
+arm's top 50, not the full rankings** (L3): a note at rank 51 in both
+(`2/111`) is not a candidate even though it would beat a semantic-only rank
+1 (`1/61`); the header's always-present `arm_depth: keyword n/50, semantic
+c/50 chunks` says when an arm was full.
+
+**Degradation (D4).** Any exception from the embedding call — and only that
+call — makes the semantic arm unavailable: `ProviderInputTooLarge` →
+`provider_input_rejected`, anything else → `provider_error`. One WARNING
+with the exception's **class name only** (a provider message can echo the
+query). The call returns the keyword arm alone, scored by its keyword term,
+marked `arms: keyword-only (semantic unavailable: <code>)` in the header and
+on the zero-result line, with a fixed footer and `arms: "keyword_only"` /
+`semantic_unavailable` in the usage row — **no `error` marker**: it is a
+real, honestly labelled result, and it stays minable. A database error in
+either arm fails the call; there is no semantic-only mode.
+
+**Rendering (D6).** One line per row: a fixed-key object
+`{"title","path","tags","preview_kind","preview"}` whose every value is a
+`change_feed.quote` literal (the `get_changes` rule: `"` and `\`, C0/C1,
+DEL, U+2028/U+2029 escaped), then the separator `"} — `, then the server
+fields — `score` (`.4g`), `semantic_rank` (with similarity) or `-`,
+`keyword_rank` (with `match` and `matched_in`) or `-`, `explain` (the
+`1/(k+rank)` terms, or `…, semantic only` / `…, keyword only`), `stale: true`
+/ `embedding_truncated: true` when true, and any abbreviation labels.
+`preview` is always last, so the object always ends with an unescaped `"}`
+no literal can contain: a note can forge neither a row nor a field on its own
+row (`_one_line` stopped forged *rows*, not forged *fields*). The preview is
+the better-ranked arm's (`snippet` or `head`; `chunk`, at most 200
+characters, or `stale_notice` for a stale row); on equal ranks the keyword
+highlight if there is one, else the chunk; the other arm's when the chosen
+one has none. The echoed query is a literal too.
+
+**The response bound (D7)** is on **rendered** length (`\u00XX` is six
+characters). The query echo is the longest whole-character prefix rendering
+to ≤ 64 (`query_cut` when shorter). The header (≤ 400), the keyword-only
+footer (71) and the cap footer (≤ 75) are reserved; rows are appended while
+each fits and the first that does not ends the page (whole-row drop, the
+omitted count in the footer, `shown:` in the header). A first row that does
+not fit is abbreviated in order — `tags omitted`, `preview omitted`,
+`title_cut`, `path_cut` (each the shortest whole-character prefix rendering
+to ≥ 40, i.e. 40–45; a value ≤ 45 is not cut), then the empty omitted forms
+— and marked `abbreviated`. The cut-form structure is ≤ 340, so the floor is
+400 + 340 + 45 + 45 + 75 + 75 + 5 = 985 ≤ 1,000.
+
+**Telemetry and class (D5, D7).** `embed_ms`, `db_ms`, `exact_fallback`,
+`fallback`, `any_rows`, `snippet_ms`, `arms`, `semantic_unavailable`,
+`keyword_rows`, `semantic_rows`, `overlap`, `rrf_k`; `result_count` /
+`result_paths` are recorded by the tool **from the rendered rows**, so the
+harness credits only what the caller saw. Concurrency class `embedding`,
+shared with `semantic_search` (one provider, one slot); `CLASS_MAPPING_VERSION`
+5.
+
+**Measuring it (D9).** `scripts/search_eval_arms/hybrid.py` replays the
+production service: `make_arm` (`--arm-opt hybrid_k=…`, default the
+setting) and `make_arm_alt` (`hybrid_alt_k`, required — the run exits 64
+without it), membership `keyword_or_semantic`, so one report can hold two
+values of k. A keyword-only answer during replay fails the run.
+
+Accepted limitations (the change's design, L1–L13): equal votes can demote a
+strong single-arm hit (the paraphrase regression is expected on
+`class:prose`; the single-arm tools are the remedy); RRF discards score
+magnitude; RRF is over each arm's top 50 (L3 above); 50 chunks can be
+crowded by a verbose note; during an outage the answer is the keyword
+ranking, labelled; snippets, `matched_in` and the excerpt detail cover the
+first `KEYWORD_SNIPPET_ROWS` keyword rows only; the score compares only
+within one page; staleness has `semantic_search`'s declared bound;
+`keyword_search` and `semantic_search` still render paths and titles raw and
+the semantic chunk preview is not one-lined (a follow-up issue); k = 60 is
+unvalidated on this corpus until a harness report; `--arm-opt` is
+run-global, so three or more values of k need separate generations; a
+literal `«`/`»` in a note collides with the highlight markers; an
+abbreviated first row shows only 40–45 rendered characters of its title and
+path.
 
 ## Filtered vector search — the SET LOCALs are correctness, not tuning
 
@@ -582,7 +715,10 @@ needed. Their relevance counterpart is the
 `usage_logs.params` carries `embed_ms` + `db_ms` + `exact_fallback` for
 `semantic_search`, `db_ms` + `exact_fallback` for `find_related` (it makes
 no embedding call), and `fallback` + `any_rows` + `snippet_ms` for
-`keyword_search` (#344). A single whole-call `duration_ms` could not separate the
+`keyword_search` (#344), and for `hybrid_search` (#354) `embed_ms`, `db_ms`,
+`exact_fallback`, `fallback`, `any_rows`, `snippet_ms` plus `arms`,
+`semantic_unavailable` (keyword-only only), `keyword_rows`, `semantic_rows`,
+`overlap` and `rrf_k`. A single whole-call `duration_ms` could not separate the
 two independent cold paths — provider eviction and HNSW page cache — so the
 last regression had to be diagnosed with hand-run probes against the live DB.
 
@@ -607,8 +743,9 @@ The same holder carries what a search *returned*, which is what
 `/admin/search-analytics` reads. Three keys, written by
 `timing.record_results` / `timing.record_source_path` in the place where each
 tool's result set is final — `full_text_search` (`src/services/search.py`),
-`semantic_search` (`src/services/embeddings.py`), and `find_related_impl`
-itself, after its dedupe and truncation to `limit`, so the telemetry names what
+`semantic_search` (`src/services/embeddings.py`), `hybrid_search_impl`
+(from the rows it actually rendered, after the response bound; #354), and
+`find_related_impl` itself, after its dedupe and truncation to `limit`, so the telemetry names what
 the caller was handed and not what the overfetch scanned.
 
 - **`result_count`** — an int, always, and the **full** count. Not the number
@@ -663,7 +800,8 @@ search quality"; this section is the why.
 
 **What a judgment is.** A usable `read_note` row for path *p* by principal
 *P* credits `(query, p)` only when a usable `keyword_search` /
-`semantic_search` row by the same *P* is strictly earlier, inside the
+`semantic_search` / `hybrid_search` (#354; a keyword-only hybrid row carries
+no `error` and is usable) row by the same *P* is strictly earlier, inside the
 window (`R.created_at - W < S.created_at < R.created_at`, W = 120 s by
 default), and its logged `result_paths` contains *p* by exact string
 equality. When several searches qualify, only the **latest** is credited
@@ -720,7 +858,8 @@ on the restored copy **before any candidate is applied**, every
 | `metadata` | the `notes_metadata` row exists |
 | `keyword` | `notes_metadata.content_tsvector IS NOT NULL` |
 | `semantic` | at least one `note_embeddings` row with `note_id = notes_metadata.id` |
-| `keyword_and_semantic` | both (a hybrid draws from both, so losing either changes it) |
+| `keyword_and_semantic` | both `keyword` and `semantic` |
+| `keyword_or_semantic` | either (a union-retrieving arm such as `hybrid_search`, #354); corpus loss is **per constituent**: losing any constituent the snapshot marked present is loss, even if the other still reaches the note |
 
 `embedded_content_hash` is not part of `semantic`: under #200 a stale vector
 is annotated and still returned (the snapshot records `stale_vector` for
@@ -741,8 +880,12 @@ Worked examples: Q has relevant {A.md, B.md} and the incumbent returns both.
 A candidate whose derivation deletes B.md's `notes_metadata` row returns only
 A.md: recall@10 0.5, `corpus_loss: 1`, exit 2. A re-embedding pass that deletes
 B.md's `note_embeddings` and then fails leaves the row and its tsvector: the
-`semantic` arm (and any `semantic` or `keyword_and_semantic` candidate) gets
-`corpus_loss: 1`, the `keyword` arm none.
+`semantic` arm (and any `semantic`, `keyword_and_semantic` or
+`keyword_or_semantic` candidate) gets `corpus_loss: 1`, the `keyword` arm
+none. A note that was keyword-only in the snapshot is `unsearchable_before`
+for a `keyword_and_semantic` arm but loss for a `keyword_or_semantic` one if
+the candidate clears its tsvector: the AND membership would have certified a
+lost note the production hybrid reaches (Codex spec round 1, #354).
 
 **Arms and generations.** An arm is an async `(EvalQuery, depth) -> list[str]`
 built by a factory from an `ArmContext` (read-only session factory, replay
@@ -750,8 +893,11 @@ corpus, `--arm-opt` options). Built-ins are `keyword`, `semantic` and the
 fixture-only `fixture-lexical` / `fixture-title`. A follow-up adds a
 candidate as `<module>:<factory>` (declaring `factory.membership`, or the run
 exits 64), e.g. #354's RRF fusion as
-`ARMS="keyword semantic scripts.search_eval_arms.hybrid:make_arm"` with
-membership `keyword_and_semantic`; #355's heading-aware chunking as the
+`ARMS="keyword semantic scripts.search_eval_arms.hybrid:make_arm scripts.search_eval_arms.hybrid:make_arm_alt"
+ARM_OPTS="hybrid_k=60 hybrid_alt_k=20"` with membership `keyword_or_semantic`
+(two factories because `--arm-opt` is one dict for the whole run; a factory
+may declare `required_options`, refused with exit 64 before the generation
+is reserved); #355's heading-aware chunking as the
 built-in arms replayed on a copy re-chunked after the snapshot; or #367's
 embedding-model trial as `runfile:<path>`, a staged arm file the harness's
 own `run` wrote on a re-embedded copy with the same qrels, snapshot and

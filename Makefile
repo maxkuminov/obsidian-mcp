@@ -87,7 +87,7 @@ help:
 	@echo "  make reset-embeddings - Drop & recreate embedding column at configured dim"
 	@echo "  make rebuild-tsvectors - Recompute keyword index for FTS_CONFIGS and store snippet excerpts (no embeddings, no API calls)"
 	@echo "  make concurrency-report TARGET=queue|enforce [DAYS=n] [END=iso] - Concurrency readiness verdict (#188; exit 0 only on PASS)"
-	@echo "  make search-eval  - Score retrieval on the synthetic fixture (no DB); with SEARCH_EVAL_DATA=dir SEARCH_EVAL_DATABASE_URL=<restored BACKUP_FULL=1 copy> [ARMS=...] [BASELINE=arm], on real judgments (#356)"
+	@echo "  make search-eval  - Score retrieval on the synthetic fixture (no DB); with SEARCH_EVAL_DATA=dir SEARCH_EVAL_DATABASE_URL=<restored BACKUP_FULL=1 copy> [ARMS=...] [ARM_OPTS=\"k=v ...\"] [BASELINE=arm], on real judgments (#356)"
 	@echo "  make search-eval-export [DAYS=90] [USER_ID=id] - Read-only export of search/read_note usage rows into SEARCH_EVAL_DIR (#356; tenant data, 0700)"
 	@echo "  make search-eval-snapshot SEARCH_EVAL_DATA=dir SEARCH_EVAL_DATABASE_URL=url - Record the restored copy's searchable notes; run it BEFORE applying any candidate"
 	@echo "  make status       - Show container and health status"
@@ -511,9 +511,13 @@ concurrency-report:
 # restored from a BACKUP_FULL=1 dump, and nothing else. The score step's exit
 # code is the recipe's (0 OK, 2 INSUFFICIENT_DATA or CORPUS_LOSS, 64 usage or
 # incomplete run, 1 failure); make itself reports any failure as 2.
+# ARM_OPTS is space-separated key=value pairs, one --arm-opt each, passed to
+# the real-data run (e.g. ARM_OPTS="hybrid_k=60 hybrid_alt_k=20" for the
+# hybrid arms, #354); every arm of the run sees the same options.
 SEARCH_EVAL_DATA ?=
 SEARCH_EVAL_FIXTURE := tests/fixtures/search_eval
 ARMS ?=
+ARM_OPTS ?=
 BASELINE ?=
 MIN_QUERIES ?=
 SEED ?= 0
@@ -542,7 +546,8 @@ search-eval:
 	if [ -f "$(SEARCH_EVAL_DATA)/manual.jsonl" ]; then MANUAL="--manual $(SEARCH_EVAL_DATA)/manual.jsonl"; fi; \
 	$(PYTHON) -m scripts.search_eval mine --export "$(SEARCH_EVAL_DATA)/usage-export.jsonl" \
 		$$MANUAL --out "$(SEARCH_EVAL_DATA)" || exit $$?; \
-	$(PYTHON) -m scripts.search_eval run --data "$(SEARCH_EVAL_DATA)" --arm $(SEARCH_EVAL_ARMS) || exit $$?; \
+	$(PYTHON) -m scripts.search_eval run --data "$(SEARCH_EVAL_DATA)" --arm $(SEARCH_EVAL_ARMS) \
+		$(foreach o,$(ARM_OPTS),--arm-opt $(o)) || exit $$?; \
 	$(PYTHON) -m scripts.search_eval score --data "$(SEARCH_EVAL_DATA)" --arm $(SEARCH_EVAL_ARMS) \
 		--baseline $(SEARCH_EVAL_BASELINE) --min-queries $(SEARCH_EVAL_MIN_QUERIES) --seed $(SEED)
 

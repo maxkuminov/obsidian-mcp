@@ -2462,6 +2462,7 @@ async def _health_strip_or_degraded(session: AsyncSession, user) -> dict:
 _SEARCH_TOOL_LABELS = {
     "keyword_search": "Keyword search",
     "semantic_search": "Semantic search",
+    "hybrid_search": "Hybrid search",
     "find_related": "Related notes",
 }
 

@@ -203,6 +203,7 @@ CALLS = [
     ('find_orphans', 'find_orphans_impl', lambda s: ((), {})),
     ('list_tasks', 'list_tasks_impl', lambda s: ((), {})),  # #350
     ('get_changes', 'get_changes_impl', lambda s: (('ev:0',), {})),  # #351
+    ('hybrid_search', 'hybrid_search_impl', lambda s: (('quartzite',), {'limit': 5})),  # #354
     ('create_note', 'create_note_impl', lambda s: (('new.md', 'first\n'), {})),
     ('edit_note', 'edit_note_impl', lambda s: (('new.md', 'second\n'), {})),
     ('set_frontmatter', 'set_frontmatter_impl',
@@ -260,3 +261,27 @@ async def test_every_registered_tool_stays_within_its_class_multiplier(env):
     assert not refused, f'pre-body refusals instead of real work: {refused}; {outputs}'
     # Every class was actually exercised with at least one real checkout.
     assert all(peak >= 1 for _, peak, _ in measured.values()), measured
+
+
+async def test_hybrid_search_holds_no_connection_during_the_provider_call(env, monkeypatch):
+    """#354 D2: the query is embedded before the transaction opens, so a slow
+    provider holds no pooled connection; the call's peak stays one."""
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_embedding(_text):
+        started.set()
+        await release.wait()
+        return list(UNIT)
+
+    monkeypatch.setattr(embeddings_service, 'get_embedding', slow_embedding)
+    with identity(env):
+        env.meter.reset()
+        task = asyncio.create_task(tools.hybrid_search_impl('quartzite', limit=5))
+        await asyncio.wait_for(started.wait(), 10)
+        await asyncio.sleep(0.5)  # the provider is "slow": nothing may be checked out
+        assert env.meter.active == 0, 'a connection is held during the provider call'
+        release.set()
+        out = await asyncio.wait_for(task, 10)
+    assert 'arms: both' in out, out
+    assert max(env.meter.task_peaks.values(), default=0) <= 1
+    assert env.meter.peak <= CLASS_CONNECTIONS['embedding'] == 1

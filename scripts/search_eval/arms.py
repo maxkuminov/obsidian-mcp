@@ -11,8 +11,10 @@ resolve in this order:
    **complete** generation on another database (e.g. a re-embedded copy);
 3. `<module>:<factory>`: imported with `importlib`. A database-backed factory
    (the default; set `factory.requires_db = False` otherwise) must declare
-   `factory.membership`, one of `metadata`, `keyword`, `semantic` or
-   `keyword_and_semantic` (see `corpus.py`), or the run exits 64.
+   `factory.membership`, one of `metadata`, `keyword`, `semantic`,
+   `keyword_and_semantic` or `keyword_or_semantic` (see `corpus.py`), or the
+   run exits 64. A factory may also declare `factory.required_options`, arm
+   option names the run refuses (exit 64) to start without.
 
 The built-in database arms import the search services lazily, inside the
 factory, and open one fresh session per query from the read-only

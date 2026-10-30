@@ -406,7 +406,7 @@ update it in the same change.** What stays here is the short list:
   mount is not detected (L1) — see
   [indexing and embeddings](docs/architecture/indexing-and-embeddings.md).
 - **Every tool publishes a `title` and all four `ToolAnnotations` hints
-  explicitly** (#343). Seventeen read tools are read-only/idempotent/closed;
+  explicitly** (#343). Eighteen read tools are read-only/idempotent/closed;
   the destructive set is the write-bucket set minus `create_note` plus
   `request_upload` (its `overwrite=True` link overwrites on redemption);
   `import_from_url` alone is open-world. **Hints, not enforcement** — nothing
@@ -417,6 +417,30 @@ update it in the same change.** What stays here is the short list:
   wire (the raw docstring is what ships); the four long ones lead with their
   contract and the reasoning moved to the vault-tools note. See
   [vault tools](docs/architecture/vault-tools.md), "Tool metadata".
+- **`hybrid_search` is a third search peer, not a primary** (#354). All three
+  search descriptions carry one routing sentence (identifiers →
+  `keyword_search`, paraphrase → `semantic_search`, unsure →
+  `hybrid_search`), none ranks a tool above another, and the instructions'
+  lead names all three. It fuses both arms by RRF over note paths, `score =
+  Σ 1/(k + rank)` with `k = HYBRID_RRF_K` (60, 1–1000, no per-call
+  argument), over **each arm's top 50 only** (`arm_depth:` says when an arm
+  was full); ties by the better arm rank, then path. The query is embedded
+  **before** any statement; both arms then run on one session in one
+  `REPEATABLE READ, READ ONLY` snapshot (keyword arm first, `SET LOCAL
+  enable_indexscan = on` restored after an exact re-run, before the
+  snippets). The arm cores (`keyword_arm_rows`, `semantic_arm_rows`) are
+  extracted from the unchanged `keyword_search` / `semantic_search`
+  services, whose output is byte-identical. An embedding failure returns the
+  keyword arm marked `arms: keyword-only (semantic unavailable: …)` on every
+  return path — **never silently**, never an `error` marker, class name
+  only in the log. Every note-controlled field is a `change_feed.quote`
+  JSON literal before the `"} — ` separator; the bound is on rendered
+  length. Concurrency class `embedding`, sharing the slot with
+  `semantic_search` (`CLASS_MAPPING_VERSION` 5). A search-path change: the
+  eval gate row applies, with the harness arms
+  `scripts.search_eval_arms.hybrid:make_arm` / `make_arm_alt`
+  (membership `keyword_or_semantic`). See [search](docs/architecture/search.md),
+  "Hybrid search (#354)".
 - Wikilink graph extracted from note bodies into `note_links`; resolved at index time with same-folder-first preference
 - **Task rows are derived state keyed by note id** (#350, migration 032).
   `note_tasks` has no path and no owner column — both come from the
@@ -466,7 +490,7 @@ update it in the same change.** What stays here is the short list:
 
 ## MCP tools
 
-27 tools, all registered in `src/mcp_server/server.py` and all wrapped by
+28 tools, all registered in `src/mcp_server/server.py` and all wrapped by
 `_tracked`, which resolves the caller's vault root *before* the tool body runs
 — that decorator is the whole enforcement of "this user has no vault"
 ([vault roots and tenancy](docs/architecture/vault-roots-and-tenancy.md)).
@@ -475,8 +499,9 @@ Every registration carries `title=` and `annotations=` (one of four shared
 registration without them, on a description over 4,000 characters, and on a
 destructive set that drifts from the write bucket.
 
-**Search and read** — `keyword_search`, `semantic_search`, `read_note`,
-`list_notes`, `get_tags`, `get_recent`, `get_vault_guide`, `get_changes`
+**Search and read** — `keyword_search`, `semantic_search`, `hybrid_search`
+(RRF of the two, for a query that is neither clearly an identifier nor a
+paraphrase), `read_note`, `list_notes`, `get_tags`, `get_recent`, `get_vault_guide`, `get_changes`
 (the change feed, after an `ev:<seq>` cursor or a UTC date; `by` =
 `any | me | agents | human`), and `list_tasks` (see **Tasks** below).
 
@@ -501,7 +526,7 @@ indexing.
 
 **Tasks** — `list_tasks(folder?, status="open", due_by?, scheduled_by?,
 tags?, limit=100, cursor?)`: checkbox tasks from `note_tasks`, never a file;
-registered after the first 25 (then `get_changes`), so those keep the 5a391ca
+registered after the first 25 (then `get_changes`, then `hybrid_search`), so those keep the 5a391ca
 fixture's order (the rest are in `tools_list_schema_additions.json`; the two
 deliberately amended filter-tool schemas are in
 `tools_list_schema_amendments.json`).

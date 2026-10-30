@@ -42,7 +42,7 @@ from pathlib import Path
 from scripts.search_eval import EXIT_FAILURE, EXIT_OK, UsageError
 from scripts.search_eval._io import atomic_write, ensure_private_dir, pretty_json
 from scripts.search_eval.arms import ArmContext, EvalQuery, ResolvedArm, resolve_arms
-from scripts.search_eval.corpus import Corpus
+from scripts.search_eval.corpus import Corpus, lost
 from scripts.search_eval.metrics import dedup
 from scripts.search_eval.scoring import (
     MANIFEST_FILE,
@@ -100,7 +100,7 @@ def _loss(arm_membership: str, selected: list[str], data: DataDir, judged: dict[
         for p in sorted(judged[qid]):
             if not data.snapshot.member(owner, p, arm_membership):
                 before.setdefault(qid, []).append(p)
-            elif not replay.member(owner, p, arm_membership):
+            elif lost(data.snapshot, replay, owner, p, arm_membership):
                 loss.setdefault(qid, []).append(p)
     return loss, before
 
@@ -134,6 +134,14 @@ async def run_generation(
     sel_hash = selected_hash(selected)
     arms = resolve_arms(list(arm_specs), qrels_sha256=data.qrels_sha256,
                         snapshot_sha256=data.snapshot_sha256, selected_qids_hash=sel_hash)
+    # A factory may name arm options it cannot run without (#354:
+    # `make_arm_alt` needs `hybrid_alt_k`). Checked before the generation is
+    # reserved, so a missing option is a usage error (exit 64), not a failed
+    # generation.
+    for arm in arms:
+        for key in getattr(arm.factory, "required_options", ()) or ():
+            if key not in options:
+                raise UsageError(f"arm {arm.spec!r} needs --arm-opt {key}=…")
     runs_dir = data_dir / RUNS_DIR
     gen_dir = runs_dir / generation
     needs_db = any(a.requires_db for a in arms)

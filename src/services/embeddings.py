@@ -1447,62 +1447,47 @@ async def _lookup_reusable_vectors(
     return found
 
 
-async def semantic_search(
+@dataclass
+class SemanticArm:
+    """The semantic ranking without its embedding call, `SET LOCAL`s,
+    truncation or telemetry (#354 D1): every note the overfetch reached, one
+    row each, in full-precision order."""
+
+    rows: list[dict]
+    #: How many chunk rows the ordered statement (or its exact re-run)
+    #: returned, before the per-note dedupe — `hybrid_search`'s `arm_depth`.
+    chunk_rows: int
+    exact_fallback: bool
+    #: `time.monotonic()` right after the last statement, before the Python
+    #: re-sort and dedupe — where `semantic_search`'s `db_ms` has always
+    #: stopped (#354 keeps its telemetry unchanged).
+    fetched_at: float = 0.0
+
+
+async def semantic_arm_rows(
     session: AsyncSession,
-    query: str,
-    limit: int = 15,
+    query_embedding: list[float],
+    *,
+    overfetch: int,
     folder: str | None = None,
     tags: list[str] | None = None,
     frontmatter: dict | None = None,
     user_id: int | None = None,
-) -> list[dict]:
-    """Embed query and return the best-matching chunk per note (dedup), ordered by cosine distance.
+) -> SemanticArm:
+    """The ordered statement, the zero-row exact re-run, the full-precision
+    re-sort, the per-note dedupe (not truncated) and the stale/truncated
+    annotation — the statements `semantic_search` has always issued after its
+    three `SET LOCAL`s, and nothing else. The caller owns the transaction, the
+    settings and the telemetry.
 
-    The HNSW index picks the candidates; they are re-ranked by full-precision
-    distance, and we over-fetch chunks and dedup per note in Python
-    so a single verbose note can't dominate the result set. Each result is a pointer
-    to a note plus its most-relevant chunk as preview — the caller should `read_note`
-    for full content.
+    **The exact re-run leaves `enable_indexscan = off` set.** `semantic_search`
+    closes its session straight after; a caller that issues further statements
+    (`hybrid_search`) must restore it first (#354 D2).
     """
     # Local, so this function's region is the only part of the module #283
     # touches (see the performance-2026-09 slice table).
     from src.services import vector_index
 
-    limit = max(1, min(limit, 50))
-    embed_start = time.monotonic()
-    query_embedding = await get_embedding(query)
-    timing.add_ms("embed_ms", time.monotonic() - embed_start)
-
-    db_start = time.monotonic()
-    # ef_search=80 lifts HNSW recall@10 to ~98% at modest latency cost.
-    # random_page_cost=1.1 is a planner correction, not a storage claim (D20).
-    # The planner costs the join's heap side at `relpages`, but every row this
-    # statement touches detoasts a vector (and `notes_metadata` a tsvector)
-    # from TOAST pages `relpages` does not count, so at the default of 4 it
-    # overprices the index path and picks a seq scan + sort that degrades
-    # linearly with the vault. The working set is mostly cached, so the lower
-    # page cost is right on an HDD too — `search.py` states the same
-    # rationale for its own hint. All three SET LOCALs scope to the current
-    # transaction.
-    await session.execute(text("SET LOCAL hnsw.ef_search = 80"))
-    await session.execute(text("SET LOCAL random_page_cost = 1.1"))
-    # iterative_scan (pgvector >= 0.8; guarded at startup by
-    # `_check_pgvector_version`) is what keeps a *filtered* search honest.
-    # Without it the HNSW scan hands the planner at most `ef_search`
-    # candidates, the folder/tags/frontmatter/user predicate throws most of
-    # them away, and nothing refills — 45 of 120 folder-filtered probes came
-    # back empty. `relaxed_order` lets the scan keep walking the graph until
-    # the LIMIT is satisfied *after* filtering. Recall is still bounded by
-    # `hnsw.max_scan_tuples` (20,000) and `hnsw.scan_mem_multiplier` (1);
-    # those are the next knobs if the vault outgrows them (~16.7k chunks
-    # today). `relaxed_order` may emit rows slightly out of distance order
-    # across iterations, so we re-sort below — that is presentation only, it
-    # cannot recover candidates the scan never returned.
-    await session.execute(text("SET LOCAL hnsw.iterative_scan = 'relaxed_order'"))
-
-    # Over-fetch by 5x: HNSW is logarithmic so this is essentially free, and it
-    # gives the per-note dedup enough headroom when a note contributes many chunks.
-    overfetch = max(limit * 5, 50)
     # Two expressions (#283, D19). `order` is the index expression verbatim —
     # `embedding::halfvec(D) <=> q::halfvec(D)` — so the planner can use the
     # half-precision HNSW index; it decides only *which* candidates are
@@ -1558,16 +1543,17 @@ async def semantic_search(
     # that query returned empty while NULL-owned matches existed.
     exact_fallback = False
     if not rows:
-        # Transaction-scoped, like the three SET LOCALs above: it applies to
-        # the re-run on the next line and dies with this transaction. The sole
-        # caller (`search_notes_impl`) closes the session as soon as this
-        # function returns, so nothing else can inherit the exact plan — do not
+        # Transaction-scoped, like the three SET LOCALs: it applies to the
+        # re-run on the next line and dies with this transaction.
+        # `semantic_search` closes the session as soon as it returns, so
+        # nothing else can inherit the exact plan there; `hybrid_search`
+        # issues `enable_indexscan = on` before its snippet statements. Do not
         # append further statements after the re-run without re-reading that.
         await session.execute(text("SET LOCAL enable_indexscan = off"))
         rows = (await session.execute(stmt)).fetchall()
         exact_fallback = True
-    timing.record("exact_fallback", exact_fallback)
-    timing.add_ms("db_ms", time.monotonic() - db_start)
+    chunk_rows = len(rows)
+    fetched_at = time.monotonic()
 
     # Re-sort by the full-precision distance before dedupe/truncate:
     # `relaxed_order` does not promise a globally sorted stream, the scan was
@@ -1585,8 +1571,6 @@ async def semantic_search(
             continue
         seen.add(row.note_id)
         deduped.append(row)
-        if len(deduped) >= limit:
-            break
 
     # ── Staleness and truncation, annotated from the already-hydrated row ──
     #
@@ -1652,6 +1636,74 @@ async def semantic_search(
             for row in deduped
         )
     ]
+    return SemanticArm(rows=results, chunk_rows=chunk_rows, exact_fallback=exact_fallback,
+                       fetched_at=fetched_at)
+
+
+async def semantic_search(
+    session: AsyncSession,
+    query: str,
+    limit: int = 15,
+    folder: str | None = None,
+    tags: list[str] | None = None,
+    frontmatter: dict | None = None,
+    user_id: int | None = None,
+) -> list[dict]:
+    """Embed query and return the best-matching chunk per note (dedup), ordered by cosine distance.
+
+    The HNSW index picks the candidates; they are re-ranked by full-precision
+    distance, and we over-fetch chunks and dedup per note in Python
+    so a single verbose note can't dominate the result set. Each result is a pointer
+    to a note plus its most-relevant chunk as preview — the caller should `read_note`
+    for full content.
+
+    The embedding call, the three `SET LOCAL`s, `semantic_arm_rows`, the
+    truncation to `limit` and the telemetry: the statements and their order
+    are what they were before the #354 extraction.
+    """
+    limit = max(1, min(limit, 50))
+    embed_start = time.monotonic()
+    query_embedding = await get_embedding(query)
+    timing.add_ms("embed_ms", time.monotonic() - embed_start)
+
+    db_start = time.monotonic()
+    # ef_search=80 lifts HNSW recall@10 to ~98% at modest latency cost.
+    # random_page_cost=1.1 is a planner correction, not a storage claim (D20).
+    # The planner costs the join's heap side at `relpages`, but every row this
+    # statement touches detoasts a vector (and `notes_metadata` a tsvector)
+    # from TOAST pages `relpages` does not count, so at the default of 4 it
+    # overprices the index path and picks a seq scan + sort that degrades
+    # linearly with the vault. The working set is mostly cached, so the lower
+    # page cost is right on an HDD too — `search.py` states the same
+    # rationale for its own hint. All three SET LOCALs scope to the current
+    # transaction.
+    await session.execute(text("SET LOCAL hnsw.ef_search = 80"))
+    await session.execute(text("SET LOCAL random_page_cost = 1.1"))
+    # iterative_scan (pgvector >= 0.8; guarded at startup by
+    # `_check_pgvector_version`) is what keeps a *filtered* search honest.
+    # Without it the HNSW scan hands the planner at most `ef_search`
+    # candidates, the folder/tags/frontmatter/user predicate throws most of
+    # them away, and nothing refills — 45 of 120 folder-filtered probes came
+    # back empty. `relaxed_order` lets the scan keep walking the graph until
+    # the LIMIT is satisfied *after* filtering. Recall is still bounded by
+    # `hnsw.max_scan_tuples` (20,000) and `hnsw.scan_mem_multiplier` (1);
+    # those are the next knobs if the vault outgrows them (~16.7k chunks
+    # today). `relaxed_order` may emit rows slightly out of distance order
+    # across iterations, so we re-sort below — that is presentation only, it
+    # cannot recover candidates the scan never returned.
+    await session.execute(text("SET LOCAL hnsw.iterative_scan = 'relaxed_order'"))
+
+    # Over-fetch by 5x: HNSW is logarithmic so this is essentially free, and it
+    # gives the per-note dedup enough headroom when a note contributes many chunks.
+    overfetch = max(limit * 5, 50)
+    arm = await semantic_arm_rows(
+        session, query_embedding, overfetch=overfetch, folder=folder, tags=tags,
+        frontmatter=frontmatter, user_id=user_id,
+    )
+    timing.record("exact_fallback", arm.exact_fallback)
+    timing.add_ms("db_ms", arm.fetched_at - db_start)
+
+    results = arm.rows[:limit]
     # Result telemetry, recorded after the dedupe so the count and the paths
     # are what the tool actually returns (#161) — an overfetched, not-yet-
     # deduped row list would report a note twice. Bounds are enforced inside

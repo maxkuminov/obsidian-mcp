@@ -259,11 +259,11 @@ looks the way it does.
 
 ## What's in the box
 
-The server exposes 27 MCP tools across five families, plus the auth
+The server exposes 28 MCP tools across five families, plus the auth
 and ops layer around them.
 
 Every tool is published with a `title` and MCP `ToolAnnotations`, all
-four hints set explicitly: `readOnlyHint` on the seventeen tools that only
+four hints set explicitly: `readOnlyHint` on the eighteen tools that only
 read (search, read, list, graph, `list_tasks`, `get_changes`, `check_upload`), `destructiveHint` on
 the eight that can replace or remove something (`edit_note`,
 `move_note`, `delete_note`, `set_frontmatter`, `write_file`,
@@ -291,6 +291,16 @@ the wire, so none is cut off by a client's description limit.
   [Full-text search language(s)](#full-text-search-languages))
 - `semantic_search(query, folder?, tags?, frontmatter?, limit=15)`,
   vector similarity via pgvector, one preview chunk per note
+- `hybrid_search(query, limit=10, folder?, tags?, frontmatter?)`, both
+  of the above fused by reciprocal rank fusion over each arm's top 50, one
+  line per note with its fused score, each arm's rank and the `1/(k+rank)`
+  terms behind the score. The three are peers, and every description
+  carries the same routing sentence: exact identifiers, code symbols,
+  titles or known phrases go to `keyword_search`; conceptual or
+  paraphrased questions to `semantic_search`; unsure which, `hybrid_search`.
+  A single arm can beat the fusion on its own kind of query. If the
+  embedding provider is down, `hybrid_search` returns the keyword ranking
+  marked `arms: keyword-only (semantic unavailable: …)`, never silently
 - `list_notes(folder?, limit=50, since?, until?, order_by?, cursor?)`,
   sorted by modified time
 - `get_recent(folder?, limit=20, since?, until?, order_by?, cursor?)`,
@@ -936,7 +946,18 @@ naming conventions, and YAML schema before it writes anything.
 ## Upgrading
 
 Pull, then `make deploy` (or rebuild your compose stack); migrations
-run on start. Across the change-feed release (migration 033, #351):
+run on start. Across the hybrid-search release (#354):
+
+- **No migration, nothing re-derived or re-embedded.** A new tool,
+  `hybrid_search`, and one optional setting, `HYBRID_RRF_K` (default 60).
+- **A new concurrency-readiness epoch.** `hybrid_search` shares the
+  `embedding` class with `semantic_search`, so `CLASS_MAPPING_VERSION`
+  moves to 5 and `make concurrency-report` evidence gathered before the
+  upgrade does not carry over.
+- **Rollback** is a redeploy of the previous image; the tool's usage rows
+  stay and are ignored.
+
+Across the change-feed release (migration 033, #351):
 
 - **One migration, no re-derive.** 033 adds
   `notes_metadata.content_changed_at` (backfilled from each note's
@@ -1260,6 +1281,7 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `RANK_WEIGHTS` | `{0.02, 0.2, 0.4, 1.0}` | `keyword_search`'s `ts_rank_cd` weight array `{D, C, B, A}`: the title and aliases are indexed at `A`, the body at `D`. At the default one two-word title match outweighs fifty body repetitions; PostgreSQL's own `D=0.1` lets ten tie it. Four finite numbers, each in [1e-6, 1]; only title-versus-body order moves. |
 | `KEYWORD_EXCERPT_CHARS` | `20000` | Leading characters of each note's indexed text stored for `keyword_search` snippets (1000–100000). Applies to notes indexed afterwards; `make rebuild-tsvectors` rewrites the rest. The snippet cost grows roughly linearly with this; the 300 ms budget was measured at the defaults. |
 | `KEYWORD_SNIPPET_ROWS` | `20` | Rows per `keyword_search` page that get a snippet, whatever `limit` is (0–100; 0 turns snippets off). Bounds the per-call `ts_headline` cost, which grows roughly linearly with this; the 300 ms budget was measured at the defaults. |
+| `HYBRID_RRF_K` | `60` | `hybrid_search`'s reciprocal-rank-fusion constant (1–1000; out of range refuses to start): a note scores the sum over the two arms of `1/(k + rank)`. Smaller lets each arm's top ranks dominate; larger flattens toward counting votes. Measure a change with the harness arms `scripts.search_eval_arms.hybrid:make_arm` / `make_arm_alt` (`ARM_OPTS="hybrid_k=60 hybrid_alt_k=20"`, see `DEPLOYMENT.md`, "Measuring search quality"); there is no per-call argument. |
 | `TRANSFER_TOKEN_TTL_SECONDS` | `600` | Default life of a transfer link. Per-call `expires_in` is clamped to 60–3600. |
 | `TRANSFER_MAX_UPLOAD_SECONDS` | `600` | How long one claimed upload may stream before the token is spent |
 | `TRANSFER_MAX_CONCURRENT_UPLOADS` | `4` | Simultaneous upload streams |
@@ -1713,7 +1735,7 @@ adds a writer wait or drops a usage row because of its observed pressure.
 │ MCP clients  │   HTTP + Bearer key   │   FastAPI app        │
 │  Claude Desk │ ────────────────────▶ │  ┌────────────────┐  │
 │  Claude Code │                       │  │  MCP server    │  │
-│  n8n agents  │                       │  │  (27 tools)    │  │
+│  n8n agents  │                       │  │  (28 tools)    │  │
 │  OpenWebUI   │                       │  └─────┬──────────┘  │
 └──────────────┘                       │        ▼             │
                                        │  ┌────────────────┐  │

@@ -755,6 +755,17 @@ this table.
   value carries its own 10-path / 2048-byte bound, and why `find_related`'s
   grouping key is the separate `source_path` and not the named `path`, which
   is cut at 200 characters and would collapse distinct long paths onto one row.
+- **`hybrid_search` (#354) reserves six more keys**, written through the same
+  holder: `arms` (string, `"both"` or `"keyword_only"`), `semantic_unavailable`
+  (string, `"provider_error"` or `"provider_input_rejected"`, present only on a
+  keyword-only row), `keyword_rows`, `semantic_rows` and `overlap` (ints: notes
+  in the keyword arm, in the semantic arm, and in both) and `rrf_k` (int, the
+  fusion constant used). Its `result_count` / `result_paths` are the rows it
+  **rendered** after the response bound, not the service's page. **A
+  keyword-only row carries no `error` marker**: the embedding provider failed
+  but a real, labelled result was returned, so the row stays analysable on
+  the panel and minable by the search-eval harness, unlike
+  `semantic_search`'s provider failure, which is a refusal or an exception.
 
 **The identity rule for anything reading these keys: `(usage_logs.user_id,
 path)`, matched NULL-safely.** A path is unique only within an owner —

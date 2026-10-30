@@ -10,7 +10,7 @@ reach them. And every predicate the gate already runs *agrees*: the token pins
 owner is still active, the credential is still live. The assignment did not
 change; the directory underneath it did.
 
-So without this check, refusing all 27 tools would still leave the cross-tenant
+So without this check, refusing all 28 tools would still leave the cross-tenant
 write reachable through the one path designed to outlive the session that
 created it — which is the ranked failure for this server (a destructive write
 that clobbers a note, delivered to an agent, with no human seeing the query).

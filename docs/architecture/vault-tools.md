@@ -36,7 +36,7 @@ worst case (not read-only, destructive, open-world), which is how a
 
 | shape | readOnly | destructive | idempotent | openWorld | tools |
 | --- | --- | --- | --- | --- | --- |
-| `_READ_ONLY` | true | false | true | false | `keyword_search`, `semantic_search`, `read_note`, `list_notes`, `get_tags`, `get_recent`, `get_vault_guide`, `read_file`, `list_files`, `get_backlinks`, `get_links`, `get_neighborhood`, `find_related`, `find_orphans`, `check_upload`, `list_tasks` (#350) |
+| `_READ_ONLY` | true | false | true | false | `keyword_search`, `semantic_search`, `read_note`, `list_notes`, `get_tags`, `get_recent`, `get_vault_guide`, `read_file`, `list_files`, `get_backlinks`, `get_links`, `get_neighborhood`, `find_related`, `find_orphans`, `check_upload`, `list_tasks` (#350), `get_changes` (#351), `hybrid_search` (#354) |
 | `_ADDITIVE` | false | false | false | false | `create_note` (no-clobber), `request_download` (mints a capability, destroys nothing) |
 | `_DESTRUCTIVE` | false | true | false | false | `edit_note`, `move_note`, `delete_note`, `set_frontmatter`, `write_file`, `delete_file`, `request_upload` |
 | `_DESTRUCTIVE_OPEN_WORLD` | false | true | false | true | `import_from_url` |
@@ -60,8 +60,9 @@ treat annotations as untrusted unless the server is trusted.
 - not read-only = `W ∪ {request_upload, request_download}`;
 - open-world = `{import_from_url}`, the only tool whose arguments name
   something outside the vault that the server then goes and fetches.
-  `semantic_search` stays closed-world although the embedding provider may be
-  a remote API (L5): the provider is deployment infrastructure under the
+  `semantic_search` — and `hybrid_search` (#354), which makes the same
+  provider round trip — stays closed-world although the embedding provider
+  may be a remote API (L5): the provider is deployment infrastructure under the
   operator's control, configured once in `.env`, not an open-world dependency
   the agent chooses per call — the tool's domain of interaction is the vault;
 - idempotent = read-only. `delete_*` and `set_frontmatter` arguably qualify,
@@ -555,6 +556,7 @@ There are **byte** caps, a **character** cap, a **transport** cap and a process-
 
 - `MAX_FILE_READ_BYTES` / `MAX_FILE_WRITE_BYTES` bound what the **server** reads into or writes out of memory. They refuse the operation.
 - `MAX_READ_RESPONSE_CHARS` (default 40,000 ≈ 10K tokens) bounds what `read_note` / `read_file` **return to the caller**, whose context the result consumes. It truncates rather than refusing. For `read_note` the budget is **per field, not per response**: `content` gets the cap, the heading `outline` gets its own equal budget, and the metadata fields share a third — so a truncated whole-note read can carry several capped components, which is why the description tells the agent to read one section with `section=` rather than page a large note.
+- `hybrid_search` (#354) is bounded by `MAX_READ_RESPONSE_CHARS` **as a whole response, on rendered length** (after JSON-literal escaping, where a control character costs six): the header (≤ 400), the keyword-only footer and the cap footer (each ≤ 75) are reserved, rows are dropped **whole** from the end with the omitted count stated, and a first row that does not fit is abbreviated in a fixed, labelled order (tags, preview, then a 40–45-rendered-character cut of title and path) so the page always makes progress; at the 1,000-character floor the worst case is 985. No cut splits an escape. See [search](search.md), "Hybrid search (#354)".
 - The MCP streamable-HTTP **request body limit** bounds what the transport accepts at all, before any tool runs. It is derived, not configured: `max(2 × MAX_FILE_WRITE_BYTES, 6 × MAX_NOTE_BYTES) + 1 MiB` (61 MiB with the defaults), passed to `FastMCP(max_request_body_size=)` from `Settings.mcp_max_request_body_bytes`. The SDK's own default is 4 MiB, which would silently reject writes far below our documented 25 MB cap. The formula guarantees — for a *canonical* envelope, i.e. JSON-RPC framing plus non-content arguments under 1 MiB — that a base64 `write_file` at the cap (base64 is `4·⌈n/3⌉ ≤ 2n + 2`) and any note write up to `MAX_NOTE_BYTES` (JSON escaping expands a byte at most 6×) always reach the tool, which then decides. Unsupported shapes are bounded by the transport with a bare HTTP 413 and no tool error: text-mode `write_file` whose escaping exceeds the limit (send base64 — always safe), an envelope over 1 MiB, and arguments that are large but discarded.
 - The **body-memory budget** (#322) is the process-wide counterpart of that per-request limit: it bounds the *sum* of request bodies in flight across all `/mcp` requests, before the app reads a byte. Each authenticated POST reserves its declared `Content-Length` (the full per-request limit when unknown) against a budget derived from the container's memory (cgroup limit × 0.5 ÷ 8: 128 MiB of raw body on 2 GiB, one maximum write plus everything else), waits up to 15 s if it does not fit, and is otherwise answered with a transport 429 `code: body_memory`. It does not change the per-request limit, and startup refuses a container too small to admit one maximum body. See [rate limits](rate-limits.md).
 

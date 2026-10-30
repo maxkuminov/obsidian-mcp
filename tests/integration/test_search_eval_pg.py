@@ -537,3 +537,47 @@ def test_deleted_embeddings_are_loss_for_the_semantic_arm_only(loss_db, tmp_path
     assert by["keyword"]["corpus_loss"] == 0
     assert by["semantic"]["corpus_loss"] == 1
     assert res.exit_code == EXIT_INSUFFICIENT and res.report["verdict"] == "CORPUS_LOSS"
+
+
+def test_the_hybrid_arm_replays_the_service_and_writes_nothing(main_db, tmp_path, monkeypatch):
+    """#354: `scripts.search_eval_arms.hybrid:make_arm` answers with exactly the
+    fused paths `hybrid_search` returns for the same query, owner, filters and
+    k, and moves no write counter."""
+    from src.services import hybrid
+
+    url, users = main_db
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+
+    async def fake_get_embedding(text_: str):
+        return [0.01] * DIM
+
+    monkeypatch.setattr("src.services.embeddings.get_embedding", fake_get_embedding)
+    d = tmp_path / "d"
+    arun(write_snapshot(data=d, database_url=url))
+    qids = write_data(d, [
+        {"user_id": users["u1"], "text": "runbook", "relevant": ["Ops/Runbook.md"]},
+        {"user_id": users["u1"], "text": "runbook", "folder": "Ops",
+         "relevant": ["Ops/Runbook.md"]},
+    ])
+    before = _settled_writes(url)
+    spec = "scripts.search_eval_arms.hybrid:make_arm"
+    out = arun(run_generation(d, [spec], generation="H1", database_url=url, depth=20,
+                              arm_options={"hybrid_k": "20"}))
+    assert out.exit_code == EXIT_OK, out.manifest
+    assert _settled_writes(url) == before, "the hybrid arm wrote something"
+    staged = json.loads((d / "runs" / out.manifest["files"][spec]["path"]).read_text())
+    assert staged["meta"]["membership"] == "keyword_or_semantic"
+    assert staged["meta"]["options"] == {"hybrid_k": "20"}
+
+    async def service(folder):
+        engine = _engine(url)
+        maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        async with maker() as s:
+            res = await hybrid.hybrid_search(s, "runbook", limit=20, folder=folder,
+                                             user_id=users["u1"], rrf_k=20)
+        await engine.dispose()
+        return [r.path for r in res.rows]
+
+    assert staged["runs"][qids[("runbook", None)]] == arun(service(None))
+    assert staged["runs"][qids[("runbook", "Ops")]] == arun(service("Ops"))
+    assert "Ops/Other runbook.md" not in staged["runs"][qids[("runbook", None)]]

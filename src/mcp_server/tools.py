@@ -68,6 +68,7 @@ from src.models.db import UsageLog
 from src.services import concurrency, rate_limits, refusals, security_events, timing
 from src.services.tool_outcomes import BodyOutcome, body_refusal as _body_refusal
 from src.services.embeddings import semantic_search
+from src.services import hybrid as hybrid_service
 from src.services.filters import apply_note_filters
 from src.services.quotas import admit as _admit_quota, quota_refusal_message
 from src.services.fts import aliases_text, rehead_tsvector_sql
@@ -2851,6 +2852,336 @@ async def semantic_search_impl(
             lines.append(f"  > {r['chunk'][:200]}...")
     lines.extend(_degradation_footer(stale_count, truncated_count))
     return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# hybrid_search (#354): rendering (D6) and the response bound (D7)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Every note-controlled value (title, path, each tag, the preview) and the
+# echoed query is a JSON string literal under the `get_changes` rule
+# (`change_feed.quote`), inside a fixed-key object that always ends with the
+# `preview` literal. The object therefore always ends with an unescaped `"}`,
+# which no literal can contain, and every server-authored field follows the
+# separator `"} — `. A note can forge neither a row (no literal holds a line
+# break) nor a field on its own row (no note text is outside quotes).
+#
+# Every length below is a **rendered** length — after escaping, where a
+# control character costs six and `"` or `\` two — and no cut ever splits an
+# escape or adds a character inside a literal; a cut is stated only by a
+# server label.
+
+HYBRID_QUERY_ECHO_MAX = 64
+HYBRID_CUT_MIN = 40
+HYBRID_CUT_KEEP_WHOLE = 45
+HYBRID_CHUNK_PREVIEW_CHARS = 200
+HYBRID_KEYWORD_ONLY_FOOTER = (
+    "Keyword arm only: the semantic arm was unavailable; see keyword_search."
+)
+#: The fixed bounds the floor arithmetic (D7) rests on, pinned by the tests.
+HYBRID_HEADER_MAX = 400
+HYBRID_ROW_STRUCTURE_MAX = 340
+HYBRID_FOOTER_MAX = 75
+_HYBRID_SEP = " — "
+
+
+def _hybrid_cap_footer(omitted: int) -> str:
+    noun = "result" if omitted == 1 else "results"
+    return f"Response cap reached: {omitted} more {noun} omitted; narrow the query."
+
+
+def _rendered_len(value: str) -> int:
+    """The rendered content length of `value` as a literal (quotes excluded)."""
+    return len(change_feed.quote(value)) - 2
+
+
+def _rendered_prefix(value: str, *, at_most: int | None = None,
+                     at_least: int | None = None) -> str:
+    """A prefix of whole characters of `value`, measured on rendered length:
+    the longest one whose rendered content is ≤ `at_most`, or the shortest
+    whose rendered content is ≥ `at_least`. Never splits an escape, because
+    it never splits a character."""
+    total = 0
+    for i, ch in enumerate(value):
+        width = _rendered_len(ch)
+        if at_most is not None and total + width > at_most:
+            return value[:i]
+        total += width
+        if at_least is not None and total >= at_least:
+            return value[: i + 1]
+    return value
+
+
+def _hybrid_query_echo(query: str) -> tuple[str, bool]:
+    echo = _rendered_prefix(query, at_most=HYBRID_QUERY_ECHO_MAX)
+    return change_feed.quote(echo), len(echo) < len(query)
+
+
+def _hybrid_cut(value: str) -> tuple[str, bool]:
+    """The D7 title/path cut: unchanged when its rendered content is ≤ 45,
+    otherwise the shortest whole-character prefix rendering to ≥ 40."""
+    if _rendered_len(value) <= HYBRID_CUT_KEEP_WHOLE:
+        return value, False
+    return _rendered_prefix(value, at_least=HYBRID_CUT_MIN), True
+
+
+def _hybrid_arms_token(result) -> str:
+    if result.arms == hybrid_service.ARMS_BOTH:
+        return "arms: both"
+    return f"arms: keyword-only (semantic unavailable: {result.semantic_unavailable})"
+
+
+def _hybrid_preview(r) -> tuple[str, str]:
+    """`(preview_kind, preview)`: the arm with the smaller rank supplies it;
+    on equal ranks the keyword highlight when there is one, otherwise the
+    chunk; the other arm's when the chosen one has none (D6). A stale row's
+    chunk is never shown — the semantic arm's preview is then the notice."""
+    kw = None
+    if r.snippet:
+        kw = ("snippet", r.snippet)
+    elif r.head:
+        kw = ("head", r.head)
+    sem = None
+    if r.semantic_rank is not None:
+        if r.stale or r.chunk is None:
+            sem = ("stale_notice", _STALE_PREVIEW_NOTICE)
+        else:
+            sem = ("chunk", r.chunk[:HYBRID_CHUNK_PREVIEW_CHARS])
+    kr, sr = r.keyword_rank, r.semantic_rank
+    if kr is not None and (sr is None or kr < sr):
+        order = [kw, sem]
+    elif sr is not None and (kr is None or sr < kr):
+        order = [sem, kw]
+    else:
+        order = [kw if kw and kw[0] == "snippet" else None, sem, kw]
+    for choice in order:
+        if choice:
+            return choice
+    return ("none", "")
+
+
+def _hybrid_server_fields(r, k: int) -> list[str]:
+    fields = [f"score: {r.score:.4g}"]
+    if r.semantic_rank is not None:
+        fields.append(f"semantic_rank: {r.semantic_rank} (similarity {r.similarity:.3f})")
+    else:
+        fields.append("semantic_rank: -")
+    if r.keyword_rank is not None:
+        detail = f"match: {r.match}"
+        if r.matched_in:
+            detail += f", matched_in: {','.join(r.matched_in)}"
+        fields.append(f"keyword_rank: {r.keyword_rank} ({detail})")
+    else:
+        fields.append("keyword_rank: -")
+    terms = [f"1/({k}+{rank})" for rank in (r.semantic_rank, r.keyword_rank)
+             if rank is not None]
+    if len(terms) == 2:
+        fields.append(f"explain: {terms[0]} + {terms[1]}")
+    elif r.semantic_rank is not None:
+        fields.append(f"explain: {terms[0]}, semantic only")
+    else:
+        fields.append(f"explain: {terms[0]}, keyword only")
+    if r.stale:
+        fields.append("stale: true")
+    if r.embedding_truncated:
+        fields.append("embedding_truncated: true")
+    return fields
+
+
+def _hybrid_row_line(r, k: int, *, title: str, path: str, tags: list[str],
+                     preview: tuple[str, str], labels: list[str]) -> str:
+    q = change_feed.quote
+    obj = (
+        "{"
+        f'"title":{q(title)},"path":{q(path)},'
+        f'"tags":[{",".join(q(t) for t in tags)}],'
+        f'"preview_kind":{q(preview[0])},"preview":{q(preview[1])}'
+        "}"
+    )
+    return "- " + obj + _HYBRID_SEP + _HYBRID_SEP.join(
+        [*_hybrid_server_fields(r, k), *labels]
+    )
+
+
+def _hybrid_full_row(r, k: int) -> str:
+    return _hybrid_row_line(
+        r, k, title=r.title or "", path=r.path, tags=list(r.tags or []),
+        preview=_hybrid_preview(r), labels=[],
+    )
+
+
+def _hybrid_abbreviated_row(r, k: int, room: int) -> str:
+    """The first row when it does not fit (D7): drop the tags, drop the
+    preview, cut the title, cut the path, then the empty omitted forms —
+    stopping as soon as it fits. Every step is labelled after the separator,
+    and the row ends `abbreviated`."""
+    title, path = r.title or "", r.path
+    tags = list(r.tags or [])
+    preview = _hybrid_preview(r)
+    labels: list[str] = []
+
+    def line() -> str:
+        return _hybrid_row_line(r, k, title=title, path=path, tags=tags,
+                                preview=preview, labels=[*labels, "abbreviated"])
+
+    steps = []
+    if tags:
+        steps.append("tags")
+    if preview != ("none", ""):
+        steps.append("preview")
+    steps += ["title_cut", "path_cut", "title_omit", "path_omit"]
+    for step in steps:
+        if step == "tags":
+            tags = []
+            labels.append("tags omitted")
+        elif step == "preview":
+            preview = ("none", "")
+            labels.append("preview omitted")
+        elif step == "title_cut":
+            title, cut = _hybrid_cut(title)
+            if not cut:
+                continue
+            labels.append("title_cut")
+        elif step == "path_cut":
+            path, cut = _hybrid_cut(path)
+            if not cut:
+                continue
+            labels.append("path_cut")
+        elif step == "title_omit":
+            title = ""
+            if "title_cut" not in labels:
+                labels.append("title_cut")
+            labels.append("title omitted")
+        elif step == "path_omit":
+            path = ""
+            if "path_cut" not in labels:
+                labels.append("path_cut")
+            labels.append("path omitted")
+        if len(line()) <= room:
+            break
+    return line()
+
+
+def _hybrid_provenance_tokens(query_cut: bool, result, rows) -> list[str]:
+    """The provenance tokens every hybrid response carries, the zero-result
+    line included (each stated even when zero): `query_cut` when cut, `arms`,
+    `rrf_k`, `arm_depth`, the per-arm counts, stale/truncated, `without
+    excerpt`, `shown`, and the snippet-cap token."""
+    keyword_rows = [r for r in rows if r.keyword_rank is not None]
+    parts = ["query_cut"] if query_cut else []
+    parts += [
+        _hybrid_arms_token(result),
+        f"rrf_k: {result.rrf_k}",
+        f"arm_depth: keyword {result.keyword_rows}/{hybrid_service.HYBRID_ARM_DEPTH}, "
+        f"semantic {result.semantic_chunks}/{hybrid_service.HYBRID_ARM_DEPTH} chunks",
+        f"semantic: {result.semantic_rows} notes, keyword: {result.keyword_rows} notes "
+        f"(all {result.keyword_all}, any {result.keyword_any}), in both: {result.overlap}",
+        f"stale: {sum(1 for r in rows if r.stale)}, "
+        f"truncated: {sum(1 for r in rows if r.embedding_truncated)}",
+        f"without excerpt: {sum(1 for r in keyword_rows if r.no_excerpt)}",
+        f"shown: {len(rows)}",
+    ]
+    if result.snippet_cap == 0:
+        parts.append("snippets: off")
+    elif len(keyword_rows) > result.snippet_cap:
+        parts.append(f"snippets: first {result.snippet_cap}")
+    return parts
+
+
+def _hybrid_header(q_lit: str, query_cut: bool, result, rows, found: int) -> str:
+    return _HYBRID_SEP.join([
+        f"Found {found} hybrid results for {q_lit}",
+        *_hybrid_provenance_tokens(query_cut, result, rows),
+    ]) + ":"
+
+
+def render_hybrid_results(query: str, result, *, budget: int | None = None
+                          ) -> tuple[str, list[str]]:
+    """The `hybrid_search` text form and the paths it rendered, in order.
+
+    Bounded by `budget` (default `MAX_READ_RESPONSE_CHARS`) on rendered
+    length: the header and both footers are reserved, rows are appended in
+    fused order while each fits, the first that does not ends the page, and
+    later rows are dropped whole. A first row that does not fit is abbreviated
+    instead, so the page always makes progress.
+    """
+    limit_chars = settings.max_read_response_chars if budget is None else budget
+    q_lit, query_cut = _hybrid_query_echo(query)
+    keyword_only = result.arms != hybrid_service.ARMS_BOTH
+    if not result.rows:
+        # The same provenance tokens as a non-empty header, all at zero where
+        # nothing was found: an absent token is not evidence of absence.
+        line = _HYBRID_SEP.join([
+            f"No hybrid results for {q_lit}",
+            *_hybrid_provenance_tokens(query_cut, result, []),
+        ])
+        if keyword_only:
+            line += "\n" + HYBRID_KEYWORD_ONLY_FOOTER
+        return line, []
+
+    page = result.rows
+    k = result.rrf_k
+    # Counts over the whole page bound the counts over any prefix of it, so
+    # this header is never shorter than the one finally rendered.
+    reserved = len(_hybrid_header(q_lit, query_cut, result, page, len(page)))
+    if keyword_only:
+        reserved += 1 + len(HYBRID_KEYWORD_ONLY_FOOTER)
+    reserved += 1 + HYBRID_FOOTER_MAX
+    room = limit_chars - reserved
+    lines: list[str] = []
+    for r in page:
+        line = _hybrid_full_row(r, k)
+        if 1 + len(line) > room:
+            break
+        lines.append(line)
+        room -= 1 + len(line)
+    if not lines:
+        lines.append(_hybrid_abbreviated_row(page[0], k, room - 1))
+    shown = page[: len(lines)]
+
+    out = [_hybrid_header(q_lit, query_cut, result, shown, len(page)), *lines]
+    if keyword_only:
+        out.append(HYBRID_KEYWORD_ONLY_FOOTER)
+    omitted = len(page) - len(shown)
+    if omitted:
+        out.append(_hybrid_cap_footer(omitted))
+    return "\n".join(out), [r.path for r in shown]
+
+
+@_tracked(
+    "hybrid_search",
+    ["query", "limit", "folder", "tags", "frontmatter"],
+    arg_char_caps={"query": MAX_SEARCH_QUERY_CHARS},
+)
+async def hybrid_search_impl(
+    query: str,
+    limit: int = 10,
+    folder: str | None = None,
+    tags: list[str] | None = None,
+    frontmatter: dict | None = None,
+) -> str:
+    """Reciprocal rank fusion of the keyword and semantic arms (#354).
+
+    An embedding failure is not a refusal: the service returns the keyword
+    arm alone, marked `arms: keyword-only (semantic unavailable: <code>)` on
+    every return path and in the usage row, which carries no error marker
+    (D4). `result_count` / `result_paths` are the rows actually rendered.
+    """
+    limit = _clamp_limit(limit, hybrid_service.HYBRID_MAX_LIMIT)
+    uid = current_user_id.get()
+    async with async_session() as session:
+        result = await hybrid_service.hybrid_search(
+            session,
+            query,
+            limit=limit,
+            folder=folder,
+            tags=tags,
+            frontmatter=frontmatter,
+            user_id=uid,
+        )
+    rendered, paths = render_hybrid_results(query, result)
+    timing.record_results(paths)
+    return rendered
 
 
 @_tracked("get_vault_guide", [])

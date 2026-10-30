@@ -22,6 +22,7 @@ from src.mcp_server.tools import (
     get_recent_impl,
     get_tags_impl,
     get_vault_guide_impl,
+    hybrid_search_impl,
     import_from_url_impl,
     list_files_impl,
     list_notes_impl,
@@ -105,7 +106,7 @@ def _origin_patterns(origins) -> list[str]:
 #
 # The classification, pinned by `tests/test_issue_343_tool_metadata.py`
 # against the code rather than a list:
-#   read-only   = the seventeen tools that neither change vault bytes nor mint a
+#   read-only   = the eighteen tools that neither change vault bytes nor mint a
 #                 capability (idempotent, closed-world)
 #   destructive = the write-bucket set (`_tracked(write_class=True)`) minus
 #                 `create_note` (no-clobber, additive) plus `request_upload`
@@ -136,15 +137,16 @@ _DESTRUCTIVE_OPEN_WORLD = ToolAnnotations(
 # depend on a client having read this (claude.ai is reported to drop it).
 SERVER_INSTRUCTIONS = (
     "Agent memory in a markdown Obsidian vault. Search with `keyword_search` "
-    "or `semantic_search`; read with `read_note`; write with `create_note` or "
+    "(identifiers), `semantic_search` (paraphrase) or `hybrid_search` "
+    "(unsure); read with `read_note`; write with `create_note` or "
     "`edit_note` (`dry_run=true` first). `get_vault_guide` describes this "
     "vault's conventions (one call per session). `create_note` never "
-    "overwrites. Editing tools take `expected_hash` (a read's `content_hash`) "
-    "and refuse, writing nothing, if it changed; optional by default (an "
-    "unguarded stale edit overwrites) unless the deployment requires it "
-    "(`precondition_required`)."
+    "overwrites. Edits take `expected_hash` and refuse, writing nothing, if "
+    "it changed; optional by default (an unguarded stale edit overwrites) "
+    "unless the deployment requires it."
     "\n\n"
-    "Round trips: only `content` from a complete whole-note `read_note` "
+    "`expected_hash` is a read's `content_hash`; a deployment that requires "
+    "it refuses an unguarded edit (`precondition_required`). Round trips: only `content` from a complete whole-note `read_note` "
     "(`offset=0`, `truncated=false`) may go back as a full replacement; a "
     "section's `content` goes back only with the same `section=` selector; "
     "finish a truncated read before writing, or the rest of the note is lost. "
@@ -196,7 +198,9 @@ async def keyword_search(
     """Full-text keyword search via PostgreSQL tsvector. Use this for exact identifiers,
     code symbols, proper nouns, titles, or known phrases — anywhere semantic noise hurts.
 
-    For conceptual or paraphrased queries, use semantic_search instead.
+    Exact identifiers, code symbols, titles or known phrases: `keyword_search`.
+    Conceptual or paraphrased questions: `semantic_search`. Unsure which:
+    `hybrid_search`.
 
     **Bare terms are ANDed**: `budget forecast` matches only notes containing
     both stems. Notes matching every term come first, tagged `match: all`;
@@ -401,9 +405,11 @@ async def semantic_search(
     """Vector similarity search over the vault's chunk embeddings. Use this for conceptual
     or paraphrased queries — anywhere exact word matching would miss the point.
 
-    For exact identifiers, code symbols, proper nouns, or known phrases, use keyword_search instead.
+    Exact identifiers, code symbols, titles or known phrases: `keyword_search`.
+    Conceptual or paraphrased questions: `semantic_search`. Unsure which:
+    `hybrid_search`.
 
-    Each result is one note (deduped) with its best-matching chunk as a ~200-character preview.
+    Each result is one note (deduped) with its closest-matching chunk as a ~200-character preview.
     Call `read_note` on a result's path to get the full note content.
 
     The header line carries a stale count and a truncated count, always —
@@ -1345,6 +1351,62 @@ async def get_changes(
     """
     return await get_changes_impl(
         since=since, folder=folder, kinds=kinds, by=by, limit=limit
+    )
+
+
+@mcp.tool(title="Hybrid search", annotations=_READ_ONLY)
+async def hybrid_search(
+    query: str,
+    limit: int = 10,
+    folder: str | None = None,
+    tags: list[str] | None = None,
+    frontmatter: dict | None = None,
+) -> str:
+    """Keyword and semantic search fused into one ranking, for a query that is not clearly an identifier or a paraphrase.
+
+    Exact identifiers, code symbols, titles or known phrases: `keyword_search`.
+    Conceptual or paraphrased questions: `semantic_search`. Unsure which:
+    `hybrid_search`.
+
+    Both arms run for the same query and filters in one database snapshot:
+    the `keyword_search` ranking and the `semantic_search` ranking, each taken
+    to its top 50. They are fused by reciprocal rank fusion over note paths
+    with equal votes: a note's score is the sum, over the arms that found it,
+    of `1/(k + rank)` (`k` is the server's `HYBRID_RRF_K`, shown as `rrf_k`).
+    A note outside both top-50 lists is not considered; the header's
+    `arm_depth: keyword n/50, semantic c/50 chunks` says when an arm was full.
+    Fusion helps when the query's kind is unclear, and a single arm can rank
+    better than it on its own kind of query (an exact identifier, or a pure
+    paraphrase); use that arm's tool then.
+
+    One line per result: a JSON object of the note-controlled fields
+    `{"title","path","tags","preview_kind","preview"}` (every value a JSON
+    string, so note text cannot forge a field), then the server fields:
+    `score`, semantic_rank (with similarity) or `-`, keyword_rank (with
+    `match` and `matched_in`) or `-`, and `explain` (the `1/(k+rank)` terms
+    that make the score). `preview_kind` is `snippet` (a keyword highlight in
+    `«»`), `head`, `chunk` (semantic), `stale_notice` or `none`, from the arm
+    that ranked the note better. `stale: true` and `embedding_truncated: true`
+    mean what they mean in `semantic_search`. A long response drops whole rows
+    from the end and says how many; a first row that does not fit is cut and
+    labelled. Call `read_note` on a path for the full note.
+
+    The header always says `arms:`. `arms: both` is a fused answer. `arms:
+    keyword-only (semantic unavailable: provider_error | provider_input_rejected)`
+    means the embedding provider failed or refused the query: the page is the
+    keyword arm alone, in keyword order, and `semantic_search` will fail the
+    same way until the provider recovers.
+
+    Args:
+        query: What you are looking for — words, a phrase or a question.
+        limit: Maximum number of results (default 10, at most 50).
+        folder: Optional folder prefix (e.g. "Projects/").
+        tags: Optional list of tag names; only notes carrying ALL listed tags match.
+        frontmatter: Optional dict of frontmatter key/value pairs; strict type matching —
+            string "0" does not match integer 0 (e.g. {"status": "active"}).
+    """
+    return await hybrid_search_impl(
+        query, limit=limit, folder=folder, tags=tags, frontmatter=frontmatter
     )
 
 

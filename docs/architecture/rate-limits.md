@@ -1029,11 +1029,18 @@ ending in a 500, shared with the panel and `/token`.
 
 | Class | Tools | Ceiling | Connections |
 | --- | --- | --- | --- |
-| `embedding` | `semantic_search` | 1 | 1 |
+| `embedding` | `semantic_search`, `hybrid_search` (#354, `CLASS_MAPPING_VERSION` 5) | 1 | 1 |
 | `vector` | `find_related` | 1 | 1 |
 | `write` | the eight write-class tools (L3) | 1 | 2 |
 | `scan` | `keyword_search`, `list_notes`, `get_tags`, `get_neighborhood`, `find_orphans`, `list_files`, `list_tasks` (#350, `CLASS_MAPPING_VERSION` 3), `get_changes` (#351, `CLASS_MAPPING_VERSION` 4) | 2 | 1 |
 | `light` | `read_note`, `read_file`, `get_recent`, `get_vault_guide`, `get_backlinks`, `get_links`, `request_upload`, `check_upload`, `request_download` | 4 | 1 |
+
+`hybrid_search` makes the same embedding-provider round trip as
+`semantic_search`, so the two **share the one `embedding` slot**: under
+`queue`/`enforce` a burst of hybrid calls queues semantic calls (intended,
+one provider), and a call that degrades to keyword-only still held the slot —
+the class is per tool, not per outcome. Its database work is one session
+held only after the embedding returns, so one connection.
 
 #261's `other` held 15 of the 25 tools and was pinned to 1. Raising it alone
 would let one tenant's scans hold every cheap-read slot, so it was split by

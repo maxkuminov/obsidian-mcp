@@ -541,6 +541,12 @@ class Settings(BaseSettings):
     # this, by `KEYWORD_EXCERPT_CHARS` and by the config count, never by the
     # page size. 0 disables snippets.
     keyword_snippet_rows: int = Field(20, ge=0, le=100)
+    # `hybrid_search`'s reciprocal-rank-fusion constant (#354): a note's
+    # fused score is the sum over the two arms of `1 / (k + rank)`. A small k
+    # lets each arm's top ranks dominate; a large one flattens toward a vote
+    # count. Operator configuration, measured with the harness arm
+    # (`scripts/search_eval_arms/hybrid.py`); there is no per-call argument.
+    hybrid_rrf_k: int = Field(60, ge=1, le=1000)
 
     embedding_provider: Literal["ollama", "openai"] = "ollama"
     openai_api_key: str | None = None

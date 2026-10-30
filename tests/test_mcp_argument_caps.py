@@ -220,13 +220,14 @@ def test_a_structured_tool_refuses_in_its_own_shape():
 
 
 def test_the_cap_is_declared_on_both_search_tools():
-    for impl in (tools.search_notes_impl, tools.semantic_search_impl):
+    # Three since #354: `hybrid_search_impl` declares the same cap.
+    for impl in (tools.search_notes_impl, tools.semantic_search_impl, tools.hybrid_search_impl):
         source = f"{impl.__wrapped__.__name__}"
         assert source  # the impls exist; the declaration is checked below
     import inspect
 
     source = inspect.getsource(tools)
-    assert source.count('arg_char_caps={"query": MAX_SEARCH_QUERY_CHARS}') == 2
+    assert source.count('arg_char_caps={"query": MAX_SEARCH_QUERY_CHARS}') == 3
 
 
 # ── the provider's own limit ────────────────────────────────────────────────
