@@ -4,7 +4,7 @@ Refs #367 (the reranker half). The embedding-model / query-instruction half of #
 
 `semantic_search` orders notes by the cosine distance of one query vector to one chunk vector. A bi-encoder ranks recall well and fine order poorly: the right note is usually in the 50-chunk overfetch, often not at rank 1. A cross-encoder reranker reads the query and each candidate together and fixes exactly that. Anthropic measured top-20 retrieval failure 2.9% → 1.9% from reranking on top of hybrid retrieval. Ollama has no rerank endpoint (ollama#3368, open since 2024-03), but llama.cpp's `llama-server` serves `/v1/rerank` for `bge-reranker-v2-m3` and `Qwen3-Reranker-0.6B` GGUFs. The cost is the problem. On a laptop CPU, scoring 10 documents takes about 6 s, which rules it out as a default path. On a small shared GPU, 50 candidates are plausibly sub-second, but nobody has measured it. So the reranker ships **opt-in, per call, behind an operator-configured endpoint**, with hard failure semantics: it either reorders the page visibly or leaves it exactly as it was, visibly. The search evaluation harness (#356) exists now, so the gain can be measured on the operator's own judgments before anyone recommends turning it on.
 
-**Sequencing.** This change is sequenced **after `hybrid-search`** (#354, proposed on branch `hybrid-search`, not yet merged). The `rerank` argument lands on both `semantic_search` and `hybrid_search`. If `hybrid-search` has not merged when this change is implemented, the implementer adds `rerank` to `semantic_search` only. The `hybrid_search` half then becomes a follow-up: one argument on the tool, plus the candidate-text statement (design D6). The requirements for it are written here and apply when that tool exists (see the `reranker` spec, "rerank on hybrid_search"). The implementer records which path was taken in the PR body and in the design's implementation notes.
+**Sequencing.** This change is sequenced **after `hybrid-search`** (#354), which merged on 2026-10-30 before implementation began. The `rerank` argument therefore lands on both `semantic_search` and `hybrid_search` (task 0.1 rebased the deltas onto the merged 28-tool text).
 
 ## What Changes
 
@@ -30,11 +30,11 @@ The README default is unchanged: no reranker is configured. No migration.
 
 - `search-quality`: MODIFIED "Search calls record per-phase timing" (`rerank_ms` and the rerank keys on `semantic_search`, and `result_paths` recorded in the final order).
 - `search-evaluation`: MODIFIED "Replay SHALL connect only to the named URL…" (a rerank arm's only non-database hop is `RERANK_URL` through the rerank client), and ADDED "The harness SHALL ship replayable rerank arms that fail the run rather than score an unreranked answer".
-- `mcp-request-routing`: MODIFIED "Tool metadata SHALL leave the published tool surface otherwise unchanged" (an amendment entry for `semantic_search` differing only by the optional `rerank` property). If `hybrid-search` merges first, the implementer rebases this delta onto that change's version of the requirement (28 tools, `hybrid_search` third in the additions fixture carrying `rerank`) as pre-implementation task 0.1. Otherwise the 27-tool text stands.
+- `mcp-request-routing`: MODIFIED "Tool metadata SHALL leave the published tool surface otherwise unchanged" (an amendment entry for `semantic_search` differing only by the optional `rerank` property, and the `hybrid_search` additions entry carrying it too; rebased onto the merged 28-tool text by task 0.1).
 - `internal-transport-security`: MODIFIED "The server SHALL report each outbound hop's transport once at startup" (a rerank line).
 - `security-event-logging`: MODIFIED "A plaintext internal hop SHALL be recorded once per process start as a catalogued event" (`reason` gains `rerank`).
 
-`hybrid-search` is not merged, so it cannot carry a MODIFIED delta from here. Its `rerank` behaviour is specified in the `reranker` capability and refers to `hybrid_search` by name.
+`hybrid_search`'s `rerank` behaviour is specified in the `reranker` capability and refers to the tool by name; the `hybrid-search` capability carries no delta from here.
 
 ## Impact
 

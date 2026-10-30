@@ -2,7 +2,7 @@ Refs #367 (reranker half). Read `proposal.md`, `design.md` (D1–D14, the owner 
 
 ## 0. Pre-implementation
 
-- [ ] 0.1 **Rebase the `mcp-request-routing` delta before writing code** (Codex round 1). If `hybrid-search` has merged, replace this change's MODIFIED "Tool metadata SHALL leave…" block with the merged spec's text plus the rerank additions: 28 tools, `hybrid_search` third in the additions fixture with the optional `rerank` property, and the `semantic_search` amendment. Commit that before archive. If it has not merged, keep the 27-tool text (only `semantic_search` gains `rerank`). Likewise re-check the hybrid rendering, bound and membership references in `design.md` D6, D9 and D12 against the merged hybrid spec. Run `openspec validate reranker --strict`.
+- [x] 0.1 **Rebase the `mcp-request-routing` delta before writing code** (Codex round 1). If `hybrid-search` has merged, replace this change's MODIFIED "Tool metadata SHALL leave…" block with the merged spec's text plus the rerank additions: 28 tools, `hybrid_search` third in the additions fixture with the optional `rerank` property, and the `semantic_search` amendment. Commit that before archive. If it has not merged, keep the 27-tool text (only `semantic_search` gains `rerank`). Likewise re-check the hybrid rendering, bound and membership references in `design.md` D6, D9 and D12 against the merged hybrid spec. Run `openspec validate reranker --strict`.
 
 ## 1. Settings and validation
 
