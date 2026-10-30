@@ -6,7 +6,8 @@ database. Nothing here does I/O except `load_export` / `load_manual`, which
 read the one file the caller names.
 
 **A judgment.** A usable `read_note` row R for path p, by principal P, credits
-`(query, p)` only when a usable `keyword_search` / `semantic_search` row S by
+`(query, p)` only when a usable `keyword_search` / `semantic_search` /
+`hybrid_search` (#354; a keyword-only hybrid row is usable) row S by
 the same P satisfies `R.created_at - W < S.created_at < R.created_at` and S's
 logged `result_paths` contains p by exact string equality. When several
 searches qualify, only the **latest** is credited (ties on `created_at` are
@@ -51,7 +52,7 @@ from scripts.search_eval import UsageError
 from scripts.search_eval._io import canonical_json
 from scripts.search_eval.classify import CLASSES, classify
 
-SEARCH_TOOLS = ("keyword_search", "semantic_search")
+SEARCH_TOOLS = ("keyword_search", "semantic_search", "hybrid_search")
 READ_TOOL = "read_note"
 EXPORT_TOOLS = (*SEARCH_TOOLS, READ_TOOL)
 

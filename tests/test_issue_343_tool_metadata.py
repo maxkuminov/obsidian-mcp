@@ -93,7 +93,7 @@ LEAD_CHARS = 1_500
 INSTRUCTIONS_CAP = 2_000
 INSTRUCTIONS_LEAD = 512
 
-# The seventeen tools that neither change vault bytes nor mint a capability. Named
+# The eighteen tools that neither change vault bytes nor mint a capability. Named
 # explicitly so a read tool added without annotations fails on its name, not
 # only on a count.
 READ_TOOLS = frozenset({
@@ -102,6 +102,7 @@ READ_TOOLS = frozenset({
     "get_links", "get_neighborhood", "find_related", "find_orphans", "check_upload",
     "list_tasks",  # #350
     "get_changes",  # #351
+    "hybrid_search",  # #354
 })
 RESTRUCTURED_WRITE_TOOLS = ("edit_note", "move_note", "set_frontmatter")
 # The refusal statement is qualified in every description that makes one: the
@@ -192,9 +193,10 @@ def tool_shaped_references(text: str, words: frozenset[str]) -> set[str]:
 # ── 1. completeness ──────────────────────────────────────────────────────────
 
 
-def test_exactly_27_tools():
-    # 25 → 26: `list_tasks` (#350); 26 → 27: `get_changes` (#351).
-    assert len(listed()) == 27
+def test_exactly_28_tools():
+    # 25 → 26: `list_tasks` (#350); 26 → 27: `get_changes` (#351);
+    # 27 → 28: `hybrid_search` (#354).
+    assert len(listed()) == 28
 
 
 @pytest.mark.parametrize("tool", listed(), ids=lambda t: t.name)
@@ -410,11 +412,15 @@ def test_the_instructions_qualify_both_statements():
         r"server refusals end with one machine-readable line, `mcp-refusal \{\"code\":…\}`", text
     )
     assert "protocol-layer argument errors do not carry it" in text
+    # #354 moved the `precondition_required` code out of the lead (the lead
+    # names the three search peers within 512 characters); the qualified
+    # statement and the code both stay.
     assert re.search(
         r"optional by default \(an unguarded stale edit overwrites\) unless the deployment "
-        r"requires it \(`precondition_required`\)",
+        r"requires it",
         text,
     )
+    assert "a deployment that requires it refuses an unguarded edit (`precondition_required`)" in text
     assert "without it a stale edit overwrites" not in text
 
 
@@ -461,7 +467,7 @@ async def test_names_order_and_schemas_match_the_5a391ca_fixture():
     additions = json.loads(ADDITIONS.read_text(encoding="utf-8"))
     amendments = {row["name"]: row for row in json.loads(AMENDMENTS.read_text(encoding="utf-8"))}
     assert len(frozen) == 25
-    assert [row["name"] for row in additions] == ["list_tasks", "get_changes"]
+    assert [row["name"] for row in additions] == ["list_tasks", "get_changes", "hybrid_search"]
     fixture = [amendments.get(row["name"], row) for row in frozen] + additions
     live = await mcp.list_tools()
     # The first 25 are the frozen surface, in order; the rest the additions.

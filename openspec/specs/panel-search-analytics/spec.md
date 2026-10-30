@@ -1,10 +1,10 @@
 # panel-search-analytics Specification
 
 ## Purpose
-TBD - created by archiving change panel-search-analytics. Update Purpose after archive.
+What the search tools record about their results and how the admin panel shows it: `keyword_search`, `semantic_search`, `hybrid_search` and `find_related` log a bounded `result_count` and `result_paths` (and `find_related` its source), and the search-analytics page reports, per tool and over a selectable window, the most frequent and the zero-result queries or sources and the retrieval coverage, scoped by owner and excluding error and refusal rows.
 ## Requirements
 ### Requirement: Search result telemetry
-`keyword_search`, `semantic_search`, and `find_related` SHALL record into their logged params the final `result_count` and the returned note paths under an explicit telemetry contract — at most the first 10 paths and at most 2048 bytes total for the paths value, dropping paths from the end to fit, applied at the record site after any merge into logged params (the generic param truncation does not cover merged telemetry) — without altering tool responses or existing param keys. `find_related` SHALL additionally record its source under the telemetry key `source_path`: the full path when it is at most 1024 bytes of UTF-8, otherwise its sha256 hex digest, keeping grouping non-colliding.
+`keyword_search`, `semantic_search`, `hybrid_search` and `find_related` SHALL record into their logged params the final `result_count` and the returned note paths under an explicit telemetry contract — at most the first 10 paths and at most 2048 bytes total for the paths value, dropping paths from the end to fit, applied at the record site after any merge into logged params (the generic param truncation does not cover merged telemetry) — without altering tool responses or existing param keys. `find_related` SHALL additionally record its source under the telemetry key `source_path`: the full path when it is at most 1024 bytes of UTF-8, otherwise its sha256 hex digest, keeping grouping non-colliding.
 
 #### Scenario: Count and paths logged
 - **WHEN** a semantic_search returns 4 notes
@@ -18,8 +18,12 @@ TBD - created by archiving change panel-search-analytics. Update Purpose after a
 - **WHEN** find_related is called on a missing or not-yet-embedded source note
 - **THEN** the row carries an error marker (added to those return paths, which today return plain strings unmarked) and is excluded from zero-result analytics, while a valid source with no neighbors remains a true zero-result row
 
+#### Scenario: hybrid_search logs what it rendered
+- **WHEN** a `hybrid_search` call renders 6 results
+- **THEN** its usage_logs row's params include result_count 6 and those 6 paths in rendered order
+
 ### Requirement: Search analytics views
-The panel SHALL provide an admin search-analytics page over a selectable window (24 hours, 7 days, 30 days) showing: for `keyword_search` and `semantic_search`, the most frequent queries with call counts and mean result count, and the zero-result queries with counts; for `find_related`, the same tables grouped and labeled by source note path (it has no query), using the `source_path` telemetry value — the full path, or its digest for paths over the telemetry contract's 1024-byte bound — (the tool's named `path` param is truncated in logs and unsuitable for grouping). All groupings and coverage joins SHALL scope identity to (usage_logs.user_id, path) with NULL-safe owner matching, since identical paths can exist for different users. Error-marked and refusal-marked rows are excluded.
+The panel SHALL provide an admin search-analytics page over a selectable window (24 hours, 7 days, 30 days) showing: for `keyword_search`, `semantic_search` and `hybrid_search`, each in its own table, the most frequent queries with call counts and mean result count, and the zero-result queries with counts; for `find_related`, the same tables grouped and labeled by source note path (it has no query), using the `source_path` telemetry value — the full path, or its digest for paths over the telemetry contract's 1024-byte bound — (the tool's named `path` param is truncated in logs and unsuitable for grouping). All groupings and coverage joins SHALL scope identity to (usage_logs.user_id, path) with NULL-safe owner matching, since identical paths can exist for different users. Error-marked and refusal-marked rows are excluded.
 
 #### Scenario: Top and zero-result queries
 - **WHEN** the operator selects a window containing search calls
@@ -29,10 +33,13 @@ The panel SHALL provide an admin search-analytics page over a selectable window 
 - **WHEN** find_related was called on the same source note five times, once with zero results
 - **THEN** the find_related table shows that path with five calls and its zero-result occurrence is counted in the zero-result view
 
+#### Scenario: A hybrid query table
+- **WHEN** the window contains `hybrid_search` calls
+- **THEN** the page SHALL show a `hybrid_search` table of top and zero-result queries, grouped by the `query` param like the other two, with no template change and no Content-Security-Policy violation
+
 ### Requirement: Retrieval coverage
 The analytics page SHALL present retrieval coverage as top-logged retrievals — explicitly labeled as counting appearances within each call's first 10 logged results — plus the notes never appearing in any logged result, and SHALL display the logging-cap caveat beside BOTH the ranking and the never-retrieved list.
 
 #### Scenario: Coverage lists
 - **WHEN** the coverage section renders for a window
 - **THEN** the ranking is labeled as top-10-logged appearances with the caveat shown, and the never-retrieved list contains only indexed notes absent from every logged result of the window, also carrying the caveat
-

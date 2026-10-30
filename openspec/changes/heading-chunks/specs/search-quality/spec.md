@@ -47,3 +47,18 @@ Both tools' descriptions SHALL state that a fresh row carries `§ "<heading path
 #### Scenario: Metadata test
 - **WHEN** `tests/test_issue_343_tool_metadata.py` runs
 - **THEN** both descriptions SHALL mention the locator and `section="#N"` and SHALL be at most 4,000 characters
+
+### Requirement: `hybrid_search` SHALL carry the same transition line, section locator and one-line chunk preview as the other vector tools
+`hybrid_search`'s semantic arm SHALL embed its query with `kind="query"` and SHALL project the locator columns through the shared semantic arm. Whenever its semantic arm runs, its response SHALL carry the `index_transition:` line under the same owner-scoped predicate as `semantic_search` and `find_related`, read in the same `REPEATABLE READ, READ ONLY` snapshot as both arms, directly after the header, on the empty path too, and absent at zero; an agent SHALL NOT receive the mixed-generation warning from one vector tool and not from another over the same index. When the semantic arm is unavailable no cross-generation ranking took place, and the line SHALL be absent. A fresh row from the semantic arm SHALL carry the locator as a server field after the separator (`§ "<heading path>" (#N)` or `§ (top of note)`), withheld on stale and pre-034 rows; an abbreviated row SHALL drop it and say `section omitted`. A chunk preview SHALL be the `_preview_line` normalisation of the uncut chunk. The response bound SHALL hold at the 1,000-character floor with the line and a locator present: the line appears only when both arms ran, so the keyword-only footer is absent, and the abbreviation continues into the omitted forms when needed.
+
+#### Scenario: The same warning on all three tools
+- **WHEN** the caller's scope has notes holding vectors of another generation and `hybrid_search` runs with both arms
+- **THEN** its response SHALL carry the `index_transition:` line directly after the header, with the count `semantic_search` would report
+
+#### Scenario: Keyword-only carries no transition line
+- **WHEN** the semantic arm is unavailable
+- **THEN** the response SHALL carry no `index_transition:` line
+
+#### Scenario: The floor holds with the line and a locator
+- **WHEN** the response cap is 1,000 characters and the worst-case header, row, transition line and locator are present
+- **THEN** the response SHALL be at most 1,000 characters

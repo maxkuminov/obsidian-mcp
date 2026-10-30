@@ -37,10 +37,13 @@ from src.services.pool_budget import CLASS_CONNECTIONS, budget_terms
 # and counters from a different classification never mix in one window.
 # 3: `list_tasks` added to `scan` (#350).
 # 4: `get_changes` added to `scan` (#351).
-CLASS_MAPPING_VERSION = 4
+# 5: hybrid_search added to embedding (#354).
+CLASS_MAPPING_VERSION = 5
 
 TOOL_CLASSES = {
-    "semantic_search": "embedding",
+    # `hybrid_search` makes the same provider round trip as `semantic_search`,
+    # so the two share the `embedding` slot (#354, design D5).
+    **dict.fromkeys(("semantic_search", "hybrid_search"), "embedding"),
     "find_related": "vector",
     **dict.fromkeys(("create_note", "edit_note", "move_note", "delete_note",
                      "set_frontmatter", "write_file", "delete_file",

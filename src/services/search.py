@@ -28,6 +28,7 @@ cannot drop a note from both blocks (Codex C-1):
    and is recorded as `snippet_ms`.
 """
 import time
+from dataclasses import dataclass, field
 
 from sqlalchemy import Integer, cast, func, literal_column, select, text
 from sqlalchemy.dialects.postgresql import REGCONFIG, TSQUERY
@@ -60,25 +61,32 @@ RENDER_STOP = "»"
 
 
 async def _ranked_block(
-    session, tsquery, *, folder, tags, frontmatter, user_id, limit, exclude=None
+    session, tsquery, *, folder, tags, frontmatter, user_id, limit, exclude=None,
+    with_excerpt_flag=False,
 ):
     """One ranking statement: the conjunctive one (`exclude=None`) or the
-    disjunctive one (`exclude=<the conjunctive tsquery>`)."""
+    disjunctive one (`exclude=<the conjunctive tsquery>`).
+
+    `with_excerpt_flag` (hybrid only, #354 D1) adds one boolean column,
+    `(body_excerpt IS NULL) AS no_excerpt`, to the projection — a flag, never
+    the excerpt text. `full_text_search` leaves it off, so its statement (and
+    the GIN plan `test_keyword_plan.py` pins) is byte-identical.
+    """
     rank = rank_expression(NoteMetadata.content_tsvector, tsquery).label("rank")
     # Explicit projection (#280, design D6): `id` for the snippet statement
     # and the four columns the result renders. `ts_rank_cd` and `@@` still
     # read the tsvector server-side; what is never shipped is the vector, the
     # excerpt or `frontmatter`. Both are deferred with raiseload on the model.
-    stmt = (
-        select(
-            NoteMetadata.id,
-            NoteMetadata.file_path,
-            NoteMetadata.title,
-            NoteMetadata.tags,
-            rank,
-        )
-        .where(NoteMetadata.content_tsvector.op("@@")(tsquery))
-    )
+    columns = [
+        NoteMetadata.id,
+        NoteMetadata.file_path,
+        NoteMetadata.title,
+        NoteMetadata.tags,
+        rank,
+    ]
+    if with_excerpt_flag:
+        columns.append(NoteMetadata.body_excerpt.is_(None).label("no_excerpt"))
+    stmt = select(*columns).where(NoteMetadata.content_tsvector.op("@@")(tsquery))
     if exclude is not None:
         # The conjunctive block was not full, so every row matching the
         # conjunctive query is already in it: this excludes exactly those.
@@ -217,8 +225,8 @@ async def _snippets(session, ids: list[int], tsquery, plan: FallbackPlan | None)
     return out
 
 
-def _row_dict(row, match: str) -> dict:
-    return {
+def _row_dict(row, match: str, with_excerpt_flag: bool = False) -> dict:
+    out = {
         "id": row.id,
         "path": row.file_path,
         "title": row.title,
@@ -226,6 +234,93 @@ def _row_dict(row, match: str) -> dict:
         "rank": float(row.rank),
         "match": match,
     }
+    if with_excerpt_flag:
+        out["no_excerpt"] = bool(row.no_excerpt)
+    return out
+
+
+_NO_SNIPPET = {
+    "snippet": None, "head": None, "matched_in": [],
+    "matched_terms": None, "has_excerpt": False,
+}
+
+
+@dataclass
+class KeywordArm:
+    """The keyword ranking without its transaction preamble, snippets or
+    telemetry (#354 D1): the assembled `all`-then-`any` rows plus what the
+    snippet statements and the telemetry need."""
+
+    rows: list[dict] = field(default_factory=list)
+    and_query: object = None
+    any_query: object = None
+    plan: FallbackPlan | None = None
+    fallback: str = "not_needed"
+
+
+async def keyword_arm_rows(
+    session,
+    query: str,
+    *,
+    limit: int,
+    folder: str | None = None,
+    tags: list[str] | None = None,
+    frontmatter: dict | None = None,
+    user_id: int | None = None,
+    with_excerpt_flag: bool = False,
+) -> KeywordArm:
+    """The conjunctive block, PostgreSQL's parse and the disjunctive fill, in
+    that order — the statements `full_text_search` has always issued, and
+    nothing else: no `SET TRANSACTION`, no `SET LOCAL`, no telemetry. The
+    caller owns the transaction (one snapshot for every statement, Codex
+    C-1) and the hint."""
+    and_query = combined_tsquery(query)
+    filters = dict(folder=folder, tags=tags, frontmatter=frontmatter, user_id=user_id)
+    all_rows = await _ranked_block(
+        session, and_query, limit=limit, with_excerpt_flag=with_excerpt_flag,
+        **filters,
+    )
+    results = [_row_dict(r, "all", with_excerpt_flag) for r in all_rows]
+
+    snippet_rows = settings.keyword_snippet_rows
+    plan: FallbackPlan | None = None
+    fallback = "not_needed"
+    any_query = None
+    if len(results) < limit or snippet_rows > 0:
+        # PostgreSQL's parse of the caller's query, never the caller's string
+        # (design D3). Needed for the fallback and for `matched_terms`.
+        plan = fallback_plan(await _parsed_texts(session, query))
+    if len(results) < limit:
+        if plan is not None and plan.eligible:
+            any_query = fallback_tsquery(plan, query)
+            any_rows = await _ranked_block(
+                session, any_query, limit=limit - len(results),
+                exclude=and_query, with_excerpt_flag=with_excerpt_flag,
+                **filters,
+            )
+            results.extend(_row_dict(r, "any", with_excerpt_flag) for r in any_rows)
+            fallback = "ran"
+        else:
+            fallback = "skipped"
+    return KeywordArm(
+        rows=results, and_query=and_query, any_query=any_query, plan=plan,
+        fallback=fallback,
+    )
+
+
+async def keyword_snippets(session, rows: list[dict], arm: KeywordArm) -> None:
+    """The per-block snippet statements for `rows` (which the caller has
+    already cut to its snippet cap), applied in place. The `all` block's
+    statements first, then the `any` block's — `full_text_search`'s order."""
+    details: dict = {}
+    all_ids = [r["id"] for r in rows if r["match"] == "all"]
+    any_ids = [r["id"] for r in rows if r["match"] == "any"]
+    if all_ids:
+        details.update(await _snippets(session, all_ids, arm.and_query, arm.plan))
+    if any_ids and arm.any_query is not None:
+        details.update(await _snippets(session, any_ids, arm.any_query, arm.plan))
+    for r in rows:
+        r.update(details.get(r["id"], dict(_NO_SNIPPET, matched_in=[])))
 
 
 async def full_text_search(
@@ -244,9 +339,12 @@ async def full_text_search(
     returned dict carries `path`, `title`, `tags`, `rank`, `match`
     (`"all"` | `"any"`), and — for the first `KEYWORD_SNIPPET_ROWS` rows —
     `snippet`, `head`, `matched_in`, `matched_terms` and `has_excerpt`.
+
+    The preamble, then `keyword_arm_rows`, then `keyword_snippets`, then the
+    telemetry: the statements and their order are what they were before the
+    #354 extraction, which `hybrid_search` reuses inside its own transaction.
     """
     limit = max(1, min(limit, 500))
-    and_query = combined_tsquery(query)
 
     # The same transaction-scoped hint the vector path uses, for the same
     # reason: the planner's cost model does not see detoast I/O. It costs the
@@ -273,50 +371,16 @@ async def full_text_search(
     )
     await session.execute(text("SET LOCAL random_page_cost = 1.1"))
 
-    filters = dict(folder=folder, tags=tags, frontmatter=frontmatter, user_id=user_id)
-    all_rows = await _ranked_block(session, and_query, limit=limit, **filters)
-    results = [_row_dict(r, "all") for r in all_rows]
+    arm = await keyword_arm_rows(
+        session, query, limit=limit, folder=folder, tags=tags,
+        frontmatter=frontmatter, user_id=user_id,
+    )
+    results = arm.rows
 
     snippet_rows = settings.keyword_snippet_rows
-    plan: FallbackPlan | None = None
-    fallback = "not_needed"
-    any_query = None
-    if len(results) < limit or snippet_rows > 0:
-        # PostgreSQL's parse of the caller's query, never the caller's string
-        # (design D3). Needed for the fallback and for `matched_terms`.
-        plan = fallback_plan(await _parsed_texts(session, query))
-    if len(results) < limit:
-        if plan is not None and plan.eligible:
-            any_query = fallback_tsquery(plan, query)
-            any_rows = await _ranked_block(
-                session, any_query, limit=limit - len(results),
-                exclude=and_query, **filters,
-            )
-            results.extend(_row_dict(r, "any") for r in any_rows)
-            fallback = "ran"
-        else:
-            fallback = "skipped"
-
     if snippet_rows > 0:
         started = time.monotonic()
-        page = results[:snippet_rows]
-        details: dict = {}
-        all_ids = [r["id"] for r in page if r["match"] == "all"]
-        any_ids = [r["id"] for r in page if r["match"] == "any"]
-        if all_ids:
-            details.update(await _snippets(session, all_ids, and_query, plan))
-        if any_ids and any_query is not None:
-            details.update(await _snippets(session, any_ids, any_query, plan))
-        for r in page:
-            r.update(
-                details.get(
-                    r["id"],
-                    {
-                        "snippet": None, "head": None, "matched_in": [],
-                        "matched_terms": None, "has_excerpt": False,
-                    },
-                )
-            )
+        await keyword_snippets(session, results[:snippet_rows], arm)
         timing.add_ms("snippet_ms", time.monotonic() - started)
 
     for r in results:
@@ -326,7 +390,7 @@ async def full_text_search(
     # `_tracked` merge cannot truncate — see `src/services/timing.py`. Outside
     # a tracked tool call (the panel, the benchmarks) there is no holder and
     # this is a no-op.
-    timing.record("fallback", fallback)
+    timing.record("fallback", arm.fallback)
     timing.record("any_rows", sum(1 for r in results if r["match"] == "any"))
     timing.record_results(r["path"] for r in results)
     return results

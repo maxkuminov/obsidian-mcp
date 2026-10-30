@@ -6,6 +6,14 @@
 | `keyword`              | `notes_metadata.content_tsvector IS NOT NULL`                |
 | `semantic`             | at least one `note_embeddings` row has `note_id = m.id`      |
 | `keyword_and_semantic` | both `keyword` and `semantic`                                |
+| `keyword_or_semantic`  | `keyword` or `semantic` (a union-retrieving arm, #354)       |
+
+Corpus loss is the replay database no longer holding what the snapshot held.
+For every membership but one that is "not a member in the replay". For
+`keyword_or_semantic` it is **per constituent** (`lost`): a path counts as
+lost when any constituent the snapshot marked present (`keyword`, `semantic`
+or both) is absent from the replay, even if the other one still reaches it —
+the candidate changed what that constituent can see.
 
 `embedded_content_hash` is **not** part of membership: under #200 a stale
 vector is annotated and still returned. The snapshot records it as
@@ -21,7 +29,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-MEMBERSHIPS: tuple[str, ...] = ("metadata", "keyword", "semantic", "keyword_and_semantic")
+MEMBERSHIPS: tuple[str, ...] = (
+    "metadata", "keyword", "semantic", "keyword_and_semantic", "keyword_or_semantic",
+)
+
+#: The constituents whose loss is checked one by one (see `lost`).
+_PER_CONSTITUENT = {"keyword_or_semantic": ("keyword", "semantic")}
 
 
 def owner_key(user_id: int | None) -> str:
@@ -56,7 +69,23 @@ class Corpus:
             return bool(e.get("semantic"))
         if membership == "keyword_and_semantic":
             return bool(e.get("keyword")) and bool(e.get("semantic"))
+        if membership == "keyword_or_semantic":
+            return bool(e.get("keyword")) or bool(e.get("semantic"))
         raise ValueError(f"unknown membership {membership!r}")
 
     def owner_entries(self, user_id: int | None) -> dict:
         return self.data.get(owner_key(user_id), {})
+
+
+def lost(snapshot: Corpus, replay: Corpus, user_id: int | None, path: str,
+         membership: str) -> bool:
+    """Whether a path the snapshot marks searchable under `membership` is
+    corpus loss in `replay`. The caller has already checked
+    `snapshot.member(...)`."""
+    constituents = _PER_CONSTITUENT.get(membership)
+    if constituents is None:
+        return not replay.member(user_id, path, membership)
+    return any(
+        snapshot.member(user_id, path, c) and not replay.member(user_id, path, c)
+        for c in constituents
+    )

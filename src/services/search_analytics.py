@@ -74,7 +74,7 @@ from src.services.usage_stats import (
 
 #: The two tools whose calls are grouped by their query text, in the order the
 #: page shows them.
-QUERY_TOOLS: tuple[str, ...] = ("keyword_search", "semantic_search")
+QUERY_TOOLS: tuple[str, ...] = ("keyword_search", "semantic_search", "hybrid_search")
 
 #: `find_related` takes a note, not a query, so it gets its own tables keyed by
 #: the source note. Kept separate from `QUERY_TOOLS` everywhere rather than
@@ -88,6 +88,7 @@ RELATED_TOOL = "find_related"
 GROUP_KEYS: dict[str, str] = {
     "keyword_search": "query",
     "semantic_search": "query",
+    "hybrid_search": "query",
     RELATED_TOOL: "source_path",
 }
 

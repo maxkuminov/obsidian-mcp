@@ -674,6 +674,13 @@ The procedure:
    `kubectl -n obsidian-mcp exec deploy/obsidian-mcp -- alembic check` should print
    "No new upgrade operations detected."
 
+**Upgrading to `hybrid_search` (#354)** there is no migration and no
+operator step: a new tool, one optional setting (`HYBRID_RRF_K`, default 60,
+1–1000, set in the ConfigMap if at all), and `CLASS_MAPPING_VERSION` 5, which
+starts a new readiness epoch for `make concurrency-report` (`hybrid_search`
+shares the `embedding` class with `semantic_search`). Rolling the image back
+is a plain redeploy: the tool disappears and its usage rows stay.
+
 **Across migration 032 (task listing, #350)** there is no operator step.
 The first pass after the rollout re-derives every note once at extraction
 version 4 and stores its checkbox tasks; nothing is re-embedded. Until it

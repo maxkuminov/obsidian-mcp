@@ -499,8 +499,15 @@ def test_keyword_search_docstring_states_the_semantics_and_fields():
 
 def test_the_two_search_tools_remain_symmetric_peers():
     keyword, semantic = _description("keyword_search"), _description("semantic_search")
-    assert "use semantic_search instead" in keyword
-    assert "use keyword_search instead" in semantic
+    # The three-peer routing sentence (#354) replaced the two "use … instead"
+    # lines; it names every peer and ranks none.
+    routing = (
+        "Exact identifiers, code symbols, titles or known phrases: `keyword_search`. "
+        "Conceptual or paraphrased questions: `semantic_search`. Unsure which: "
+        "`hybrid_search`."
+    )
+    assert routing in " ".join(keyword.split())
+    assert routing in " ".join(semantic.split())
     for doc in (keyword, semantic):
         lowered = doc.lower()
         assert "primary" not in lowered and "preferred" not in lowered
