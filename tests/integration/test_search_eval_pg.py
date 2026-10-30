@@ -581,3 +581,62 @@ def test_the_hybrid_arm_replays_the_service_and_writes_nothing(main_db, tmp_path
     assert staged["runs"][qids[("runbook", None)]] == arun(service(None))
     assert staged["runs"][qids[("runbook", "Ops")]] == arun(service("Ops"))
     assert "Ops/Other runbook.md" not in staged["runs"][qids[("runbook", None)]]
+
+
+def test_the_semantic_rerank_arm_dials_only_the_reranker_and_writes_nothing(
+        main_db, tmp_path, monkeypatch):
+    """#367: `scripts.search_eval_arms.rerank:make_semantic_arm` replays the
+    production candidates through the fake reranker on a loopback port; no
+    write counter moves, every rerank request reaches the fake, and the answers
+    are the reranked candidates of `semantic_candidates`."""
+    from src.services import embeddings, rerank
+    from tests.fixtures.fake_reranker import FakeReranker
+
+    url, users = main_db
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+
+    async def fake_get_embedding(text_: str):
+        return [0.01] * DIM
+
+    monkeypatch.setattr("src.services.embeddings.get_embedding", fake_get_embedding)
+    server = FakeReranker().start()
+    # Reverse the vector order, so the answer differs from the incumbent's.
+    server.scorer = lambda q, docs: [float(i) for i in range(len(docs))]
+    monkeypatch.setattr(settings, "rerank_url", server.url)
+    monkeypatch.setattr(rerank, "_client", None)
+    rerank._reset_state_for_tests()
+    try:
+        d = tmp_path / "d"
+        arun(write_snapshot(data=d, database_url=url))
+        qids = write_data(d, [
+            {"user_id": users["u1"], "text": "runbook", "relevant": ["Ops/Runbook.md"]},
+        ])
+        before = _settled_writes(url)
+        spec = "scripts.search_eval_arms.rerank:make_semantic_arm"
+        out = arun(run_generation(d, ["semantic", spec], generation="R1", database_url=url,
+                                  depth=20))
+        assert out.exit_code == EXIT_OK, out.manifest
+        assert _settled_writes(url) == before, "the rerank arm wrote something"
+        staged = json.loads((d / "runs" / out.manifest["files"][spec]["path"]).read_text())
+        assert staged["meta"]["membership"] == "semantic"
+        probe = [r for r in server.requests if r["query"] == rerank.PROBE_QUERY]
+        scored = [r for r in server.requests if r["query"] == "runbook"]
+        assert len(probe) == 2 and len(scored) == 1, "probe, then one request per query"
+
+        async def expected():
+            engine = _engine(url)
+            maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+            async with maker() as s:
+                found = await embeddings.semantic_candidates(s, "runbook", limit=20,
+                                                             user_id=users["u1"])
+            await engine.dispose()
+            return [r["path"] for r in reversed(found.rows)][:20]
+
+        answer = staged["runs"][qids[("runbook", None)]]
+        assert answer == arun(expected()) and len(answer) >= 2
+        incumbent = json.loads(
+            (d / "runs" / out.manifest["files"]["semantic"]["path"]).read_text())
+        assert incumbent["runs"][qids[("runbook", None)]] == list(reversed(answer))
+    finally:
+        rerank._reset_state_for_tests()
+        server.stop()

@@ -197,6 +197,8 @@ async def test_openai_does_not_follow_a_redirect(monkeypatch):
 _SWEPT = (
     ROOT / "src" / "services" / "embeddings.py",
     ROOT / "src" / "control_panel" / "routes.py",
+    # The reranker hop (#367): its one client comes from `rerank_http_client`.
+    ROOT / "src" / "services" / "rerank.py",
 )
 
 
@@ -228,7 +230,7 @@ def _client_constructions(path: Path) -> list[int]:
 def test_no_http_client_is_built_outside_the_factory(path):
     assert _client_constructions(path) == [], (
         f"{path.name} builds an httpx client directly; use "
-        "transport_security.embedding_http_client"
+        "transport_security.embedding_http_client (or rerank_http_client)"
     )
 
 
@@ -245,3 +247,5 @@ def test_every_embedding_call_site_uses_the_factory():
     sources = {p.name: p.read_text() for p in _SWEPT}
     assert sources["embeddings.py"].count("embedding_http_client(") == 2
     assert sources["routes.py"].count("embedding_http_client(") == 1
+    assert sources["rerank.py"].count("rerank_http_client(") == 1
+    assert "embedding_http_client(" not in sources["rerank.py"]

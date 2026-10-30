@@ -515,19 +515,44 @@ def test_the_live_dotted_reference_is_covered():
     assert "read_note" in tool_shaped_references(text, first_words())
 
 
-def test_the_amendments_add_only_the_four_optional_window_properties():
+#: What each amendment adds to its frozen entry, and nothing else: #351's
+#: four optional window properties, and #367's optional `rerank` boolean.
+AMENDED_PROPERTIES = {
+    "get_recent": NOTE_WINDOW_PROPERTIES,
+    "list_notes": NOTE_WINDOW_PROPERTIES,
+    "semantic_search": {"rerank"},
+}
+RERANK_PROPERTY = {"default": False, "title": "Rerank", "type": "boolean"}
+
+
+def test_the_amendments_add_only_their_optional_properties():
     """#351: `get_recent` and `list_notes` gain `since`, `until`, `order_by`
-    and `cursor`, all optional; nothing else of their frozen schemas moves."""
+    and `cursor`; #367: `semantic_search` gains `rerank` (boolean, default
+    false). All optional; nothing else of their frozen schemas moves."""
     frozen = {row["name"]: row for row in json.loads(FIXTURE.read_text(encoding="utf-8"))}
     amendments = json.loads(AMENDMENTS.read_text(encoding="utf-8"))
-    assert sorted(row["name"] for row in amendments) == ["get_recent", "list_notes"]
+    assert sorted(row["name"] for row in amendments) == sorted(AMENDED_PROPERTIES)
     for row in amendments:
         before = frozen[row["name"]]
+        expected = AMENDED_PROPERTIES[row["name"]]
         assert row["outputSchema"] == before["outputSchema"], row["name"]
         added = set(row["inputSchema"]["properties"]) - set(before["inputSchema"]["properties"])
-        assert added == NOTE_WINDOW_PROPERTIES, row["name"]
+        assert added == expected, row["name"]
         assert not added & set(row["inputSchema"].get("required", [])), row["name"]
         trimmed = json.loads(json.dumps(row["inputSchema"]))
-        for name in NOTE_WINDOW_PROPERTIES:
+        for name in expected:
             del trimmed["properties"][name]
         assert trimmed == before["inputSchema"], row["name"]
+    semantic = next(row for row in amendments if row["name"] == "semantic_search")
+    assert semantic["inputSchema"]["properties"]["rerank"] == RERANK_PROPERTY
+
+
+def test_the_hybrid_additions_entry_carries_rerank():
+    """#367: `hybrid_search`'s additions entry carries the optional `rerank`
+    boolean; the rest of it is #354's entry."""
+    additions = {row["name"]: row for row in json.loads(ADDITIONS.read_text(encoding="utf-8"))}
+    schema = additions["hybrid_search"]["inputSchema"]
+    assert schema["properties"]["rerank"] == RERANK_PROPERTY
+    assert "rerank" not in schema.get("required", [])
+    assert set(schema["properties"]) == {"query", "limit", "folder", "tags", "frontmatter",
+                                         "rerank"}

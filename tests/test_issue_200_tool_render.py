@@ -339,6 +339,9 @@ async def test_semantic_search_adds_no_usage_params_key(monkeypatch, captured):
     assert set(params) <= {
         "query", "limit", "folder", "tags", "frontmatter",
         "embed_ms", "db_ms", "exact_fallback", "result_count", "result_paths",
+        # #367: the logged argument (false here); the rerank keys only ride
+        # a rerank=true call.
+        "rerank",
     }
 
 
