@@ -204,7 +204,17 @@ The operator runs the SQL equivalent against the live 034 database before
 merging (`DEPLOYMENT.md`, read-only, counts and ids only). It approximates
 `tags_text` in SQL (full forms plus `/` replaced by spaces, no cut — an
 over-estimate) and takes the existing head from the vector itself, which
-the re-head replaces with an equal `A` part. One config shown; with several,
+the re-head replaces with an equal `A` part. That holds only for a row
+that *has* an `A` part: a D-only row 031 left at the limit (#344 L10)
+gains its whole title-and-aliases head in 035, which the stored vector
+does not contain and the aliases rule cannot be computed in one portable
+statement (Codex r2). The statement therefore **flags every candidate row
+with no `A` lexeme** (`d_only`) in addition to the size check — a false
+flag (a title that stems to nothing, `The`) is acceptable, a false pass is
+not. A flagged D-only row is fixed before upgrading by shortening the note,
+or by letting the current image write it through the halving retreat (an
+edit, or `make rebuild-tsvectors`), after which it has an `A` part and the
+size check applies to it. One config shown; with several,
 add one `to_tsvector` per config to `b`. Prototyped on PG16:
 
 ```sql
@@ -224,11 +234,13 @@ WITH tagged AS (
   + (SELECT coalesce(sum((octet_length(lexeme) + 1) / 2 * 2
        + CASE WHEN cardinality(positions) > 0 THEN 2 + 2 * cardinality(positions) ELSE 0 END), 0)
      FROM unnest(b)) AS bytes
+    , length(ts_filter(v, '{a}')) = 0 AS d_only
   FROM tagged WHERE length(b) > 0
 )
 SELECT count(*) AS tagged_rows,
-       count(*) FILTER (WHERE bytes > 1048511) AS over_limit,
-       array_agg(id ORDER BY id) FILTER (WHERE bytes > 1048511) AS ids,
+       count(*) FILTER (WHERE bytes > 1048511 OR d_only) AS flagged,
+       array_agg(id ORDER BY id) FILTER (WHERE bytes > 1048511 OR d_only) AS ids,
+       count(*) FILTER (WHERE d_only) AS d_only,
        max(bytes) AS largest
 FROM est;
 ```
@@ -470,4 +482,18 @@ folded.
 6. **MINOR — tags-only match on an empty body.** → no preview line, never
    a fabricated `head:`, `matched_in: tags`, not counted as a missing
    excerpt; the renderer distinguishes an empty headline from none.
+
+## Codex spec review, round 2 (2026-10-30)
+
+Verdict on 83b7c75: all six round-1 fixes VERIFIED; one new MAJOR, folded.
+
+1. **MAJOR — the operator's pre-merge SQL could pass a D-only row that
+   035's preflight then aborts on.** It estimated `S(v) + S(B)`, assuming
+   `v` already carries its `A` head; a row 031 left D-only gains the head
+   in 035. → The statement flags every candidate with no `A` lexeme
+   (`d_only`) besides the size check; the schema-integrity requirement
+   forbids a false pass; a scenario and a schema-gate test seed a D-only row
+   that passes `S(v) + S(B)` but exceeds `S(D) + S(A + B)`, and assert the
+   statement reports it and 035 aborts naming the same id; the upgrade note
+   says a flagged D-only row must be shortened or rewritten first.
 
