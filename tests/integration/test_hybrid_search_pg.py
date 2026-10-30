@@ -406,3 +406,114 @@ async def test_the_search_analytics_page_has_a_hybrid_table(migrated_url, maker,
     assert "Keyword search" in body and "Semantic search" in body
     assert "Hybrid search" in body
     assert "hybrid-panel-probe" in body
+
+
+# ── #367: rerank candidates (design D6) ─────────────────────────────────────
+
+NO_VECTORS = "Empty/no-vectors.md"
+
+
+async def test_a_keyword_only_candidate_is_scored_on_its_excerpt_from_the_same_snapshot(
+        maker, corpus, monkeypatch):
+    """The excerpt statement runs inside the hybrid snapshot: an excerpt
+    committed on another connection between the arms is not what is sent."""
+    u7 = corpus["u7"]
+
+    async def commit_between_arms(session):
+        async with maker() as other:
+            await other.execute(text(
+                "UPDATE notes_metadata SET body_excerpt = 'CHANGED AFTER THE SNAPSHOT' "
+                "WHERE file_path = :p"), {"p": NO_VECTORS})
+            await other.commit()
+
+    monkeypatch.setattr(hybrid, "_between_arms_hook", commit_between_arms)
+    try:
+        result = await _hybrid(maker, user_id=u7, limit=10, rerank_candidates=True)
+    finally:
+        monkeypatch.setattr(hybrid, "_between_arms_hook", None)
+        async with maker() as session:
+            await session.execute(text(
+                "UPDATE notes_metadata SET body_excerpt = 'zx81 without any embedding' "
+                "WHERE file_path = :p"), {"p": NO_VECTORS})
+            await session.commit()
+    row = next(r for r in result.rows if r.path == NO_VECTORS)
+    assert row.semantic_rank is None and row.keyword_rank is not None
+    assert row.rerank_text == "zx81 without any embedding"
+    both = next(r for r in result.rows if r.path == "Projects/both.md")
+    assert both.semantic_rank is not None and both.rerank_text == both.chunk
+    # Another tenant's excerpt is never read (the owner predicate).
+    assert all(not r.path.endswith(("tenant8.md", "ownerless.md")) for r in result.rows)
+
+
+async def test_a_null_excerpt_sends_the_title_alone(maker, corpus):
+    u7 = corpus["u7"]
+    async with maker() as session:
+        await session.execute(text(
+            "UPDATE notes_metadata SET body_excerpt = NULL WHERE file_path = :p"),
+            {"p": NO_VECTORS})
+        await session.commit()
+    try:
+        result = await _hybrid(maker, user_id=u7, limit=10, rerank_candidates=True)
+    finally:
+        async with maker() as session:
+            await session.execute(text(
+                "UPDATE notes_metadata SET body_excerpt = 'zx81 without any embedding' "
+                "WHERE file_path = :p"), {"p": NO_VECTORS})
+            await session.commit()
+    row = next(r for r in result.rows if r.path == NO_VECTORS)
+    assert row.rerank_text is None
+    from src.services.rerank import build_document
+
+    assert build_document(row.title, row.rerank_text) == row.title
+
+
+async def test_a_keyword_only_call_still_reranks(maker, corpus, monkeypatch):
+    from src.config import settings
+    from src.services import rerank
+    from tests.fixtures.fake_reranker import FakeReranker
+
+    async def _down(_text, **_kw):
+        raise ConnectionError("provider unreachable")
+
+    monkeypatch.setattr(embeddings, "get_embedding", _down)
+    server = FakeReranker().start()
+    monkeypatch.setattr(settings, "rerank_url", server.url)
+    monkeypatch.setattr(rerank, "_client", None)
+    rerank._reset_state_for_tests()
+    rerank._set_enabled()
+    try:
+        result = await _hybrid(maker, folder="Projects/", user_id=corpus["u7"], limit=10,
+                               rerank_candidates=True)
+        assert result.arms == "keyword_only"
+        outcome = await rerank.rerank_candidates(
+            QUERY, [(r.title, r.rerank_text) for r in result.rows])
+        assert outcome.reranked is True and outcome.candidates == len(result.rows)
+        sent = server.requests[-1]["documents"]
+        assert all(doc for doc in sent) and any("zx81" in doc for doc in sent)
+    finally:
+        await rerank.close_rerank_client()
+        rerank._reset_state_for_tests()
+        server.stop()
+
+
+async def test_a_same_path_note_of_another_tenant_never_supplies_the_excerpt(maker, corpus):
+    """Verifier V5: the excerpt statement selects by path, so the owner
+    predicate is what keeps another tenant's note at the same path out."""
+    u7, u8 = corpus["u7"], corpus["u8"]
+    async with maker() as session:
+        await _add_note(session, path=NO_VECTORS, body="zx81 TENANT EIGHT SECRET EXCERPT",
+                        vectors=[], user_id=u8)
+        await session.commit()
+    try:
+        result = await _hybrid(maker, user_id=u7, limit=10, rerank_candidates=True)
+        row = next(r for r in result.rows if r.path == NO_VECTORS)
+        assert row.rerank_text == "zx81 without any embedding"
+        assert all("SECRET" not in (r.rerank_text or "") for r in result.rows)
+        other = await _hybrid(maker, user_id=u8, limit=10, rerank_candidates=True)
+        mine = next(r for r in other.rows if r.path == NO_VECTORS)
+        assert mine.rerank_text == "zx81 TENANT EIGHT SECRET EXCERPT"
+    finally:
+        async with maker() as session:
+            await session.execute(delete(NoteMetadata).where(
+                NoteMetadata.file_path == NO_VECTORS, NoteMetadata.user_id == u8))
+            await session.commit()

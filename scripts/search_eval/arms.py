@@ -14,7 +14,9 @@ resolve in this order:
    `factory.membership`, one of `metadata`, `keyword`, `semantic`,
    `keyword_and_semantic` or `keyword_or_semantic` (see `corpus.py`), or the
    run exits 64. A factory may also declare `factory.required_options`, arm
-   option names the run refuses (exit 64) to start without.
+   option names the run refuses (exit 64) to start without, and an async
+   `factory.preflight(options)` the run awaits before any query is answered
+   (a `UsageError` there exits 64; #367's rerank arms probe the reranker).
 
 The built-in database arms import the search services lazily, inside the
 factory, and open one fresh session per query from the read-only

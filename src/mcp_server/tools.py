@@ -74,6 +74,8 @@ from src.services.embeddings import (
     transition_line,
 )
 from src.services import hybrid as hybrid_service
+from src.services import rerank as rerank_service
+from src.services.embeddings import semantic_candidates
 from src.services.filters import apply_note_filters
 from src.services.quotas import admit as _admit_quota, quota_refusal_message
 from src.services.fts import aliases_text, rehead_tsvector_sql
@@ -2833,7 +2835,7 @@ async def get_recent_impl(
 
 @_tracked(
     "semantic_search",
-    ["query", "limit", "folder", "tags", "frontmatter"],
+    ["query", "limit", "folder", "tags", "frontmatter", "rerank"],
     arg_char_caps={"query": MAX_SEARCH_QUERY_CHARS},
 )
 async def semantic_search_impl(
@@ -2842,6 +2844,7 @@ async def semantic_search_impl(
     folder: str | None = None,
     tags: list[str] | None = None,
     frontmatter: dict | None = None,
+    rerank: bool = False,
 ) -> str:
     """Vector similarity search over the configured embedding provider's vectors.
 
@@ -2854,6 +2857,8 @@ async def semantic_search_impl(
     """
     limit = _clamp_limit(limit, _MAX_SEMANTIC_RESULTS)
     uid = current_user_id.get()
+    if rerank:
+        return await _semantic_search_reranked(query, limit, folder, tags, frontmatter, uid)
     try:
         async with async_session() as session:
             results = await semantic_search(
@@ -2870,44 +2875,7 @@ async def semantic_search_impl(
             # was ranked against (#355, D4). Owner-scoped.
             pending = await rechunk_pending_count(session, uid)
     except refusals.ProviderInputTooLarge as exc:
-        # The provider refused the input against **its own** token limit,
-        # which `MAX_SEARCH_QUERY_CHARS` cannot promise: 8,192 characters of a
-        # densely-tokenizing script still exceed it. The caller sees the same
-        # `argument_too_long` code it would have seen from the character cap,
-        # carrying the provider's stated reason, so there is one actionable
-        # failure mode for "the query was too large" rather than a raw
-        # provider error.
-        #
-        # **The marker is different, and post-body.** This branch is reached
-        # only after the body ran, resolved a vault and made a network round
-        # trip, so `provider_input_rejected` stays out of the pre-body refusal
-        # predicate: enumerating it would drop a real provider round trip out
-        # of the latency percentiles. The caller-facing code and the
-        # operator-facing marker answer different questions and are permitted
-        # to differ — here they do.
-        return BodyOutcome(
-            "Error: the embedding provider refused this query as too large "
-            f"for its own input limit: {exc.reason} The query is under "
-            f"{MAX_SEARCH_QUERY_CHARS} characters, but a character cap cannot "
-            "promise a token limit. Send a shorter query.",
-            refusals.Refusal(
-                code=refusals.ARGUMENT_TOO_LONG,
-                scope="provider",
-                # **No `limit` and no `limit_unit`.** The limit that actually
-                # fired is the provider's, it is a *token* limit, and this
-                # server does not know its value — the provider states it in
-                # prose or not at all. Quoting `MAX_SEARCH_QUERY_CHARS` here
-                # (the previous shape) told a parsing agent that a
-                # 8,192-character bound had been exceeded by a query that was
-                # under it, which is a machine-readable falsehood: an agent
-                # trimming to that number would be refused again, identically.
-                # The prose still explains *why* the character cap did not
-                # catch it; the payload asserts nothing it cannot support.
-                limit=None,
-                limit_unit=None,
-            ),
-            marker=_PROVIDER_INPUT_REJECTED_MARKER,
-        )
+        return _semantic_provider_refusal(exc)
     if not results:
         return "\n".join(_with_transition(
             [f"No semantic results for '{_header_scalar(query)}' (embeddings may still be building)"],
@@ -2939,6 +2907,99 @@ async def semantic_search_impl(
             lines.append(f"  > {_preview_line(r['chunk'], 200)}...")
     lines.extend(_degradation_footer(stale_count, truncated_count))
     return "\n".join(_with_transition(lines, pending))
+
+
+async def _semantic_search_reranked(query, limit, folder, tags, frontmatter, uid):
+    """`semantic_search(rerank=true)` (#367, D4–D11). The candidates come
+    from the shared `semantic_candidates` service inside the session; the
+    session is **closed** before the rerank exchange (no pooled connection is
+    held during it); the page is rendered in the quoted-object encoding on
+    success and on every fallback alike."""
+    try:
+        async with async_session() as session:
+            found = await semantic_candidates(
+                session,
+                query,
+                limit=limit,
+                folder=folder,
+                tags=tags,
+                frontmatter=frontmatter,
+                user_id=uid,
+            )
+            # The same snapshot as the vector query (#355, D4), owner-scoped,
+            # read before the session closes and the rerank hop begins.
+            pending = await rechunk_pending_count(session, uid)
+    except refusals.ProviderInputTooLarge as exc:
+        # Nothing was searched, so there is no reason code and no candidate
+        # count; the row still says the page was not reranked (verifier V4),
+        # beside the refusal's own `provider_input_rejected` marker.
+        timing.record("reranked", False)
+        return _semantic_provider_refusal(exc)
+    candidates = found.rows
+    outcome = await rerank_service.rerank_candidates(
+        query, [(r["title"], r.get("rerank_text")) for r in candidates]
+    )
+    page = [candidates[i] for i in outcome.order][:limit]
+    scores = [outcome.scores[i] for i in outcome.order][:limit] if outcome.reranked else None
+    rendered, paths = render_semantic_rerank_results(query, page, outcome, scores=scores,
+                                                     pending=pending)
+    _record_rerank(outcome)
+    timing.record_results(paths)
+    return rendered
+
+
+def _record_rerank(outcome) -> None:
+    """D10: the rerank keys on the usage row. `reranked: false` is not an
+    error marker — the call returned an honest, labelled page."""
+    timing.record("reranked", outcome.reranked)
+    if not outcome.reranked:
+        timing.record("rerank_reason", outcome.reason)
+    if outcome.ms is not None:
+        timing.record("rerank_ms", int(outcome.ms))
+    timing.record("rerank_candidates", outcome.candidates)
+
+
+def _semantic_provider_refusal(exc: refusals.ProviderInputTooLarge):
+    """The `argument_too_long` refusal for a query the provider rejected,
+    on both `semantic_search` paths (no rerank token: nothing was searched)."""
+    # The provider refused the input against **its own** token limit,
+    # which `MAX_SEARCH_QUERY_CHARS` cannot promise: 8,192 characters of a
+    # densely-tokenizing script still exceed it. The caller sees the same
+    # `argument_too_long` code it would have seen from the character cap,
+    # carrying the provider's stated reason, so there is one actionable
+    # failure mode for "the query was too large" rather than a raw
+    # provider error.
+    #
+    # **The marker is different, and post-body.** This branch is reached
+    # only after the body ran, resolved a vault and made a network round
+    # trip, so `provider_input_rejected` stays out of the pre-body refusal
+    # predicate: enumerating it would drop a real provider round trip out
+    # of the latency percentiles. The caller-facing code and the
+    # operator-facing marker answer different questions and are permitted
+    # to differ — here they do.
+    return BodyOutcome(
+        "Error: the embedding provider refused this query as too large "
+        f"for its own input limit: {exc.reason} The query is under "
+        f"{MAX_SEARCH_QUERY_CHARS} characters, but a character cap cannot "
+        "promise a token limit. Send a shorter query.",
+        refusals.Refusal(
+            code=refusals.ARGUMENT_TOO_LONG,
+            scope="provider",
+            # **No `limit` and no `limit_unit`.** The limit that actually
+            # fired is the provider's, it is a *token* limit, and this
+            # server does not know its value — the provider states it in
+            # prose or not at all. Quoting `MAX_SEARCH_QUERY_CHARS` here
+            # (the previous shape) told a parsing agent that a
+            # 8,192-character bound had been exceeded by a query that was
+            # under it, which is a machine-readable falsehood: an agent
+            # trimming to that number would be refused again, identically.
+            # The prose still explains *why* the character cap did not
+            # catch it; the payload asserts nothing it cannot support.
+            limit=None,
+            limit_unit=None,
+        ),
+        marker=_PROVIDER_INPUT_REJECTED_MARKER,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -3004,12 +3065,14 @@ def _hybrid_query_echo(query: str) -> tuple[str, bool]:
     return change_feed.quote(echo), len(echo) < len(query)
 
 
-def _hybrid_cut(value: str) -> tuple[str, bool]:
+def _hybrid_cut(value: str, *, floor: int = HYBRID_CUT_MIN,
+                keep_whole: int = HYBRID_CUT_KEEP_WHOLE) -> tuple[str, bool]:
     """The D7 title/path cut: unchanged when its rendered content is ≤ 45,
-    otherwise the shortest whole-character prefix rendering to ≥ 40."""
-    if _rendered_len(value) <= HYBRID_CUT_KEEP_WHOLE:
+    otherwise the shortest whole-character prefix rendering to ≥ 40. A
+    `hybrid_search(rerank=true)` page cuts to 20–25 instead (#367, D9)."""
+    if _rendered_len(value) <= keep_whole:
         return value, False
-    return _rendered_prefix(value, at_least=HYBRID_CUT_MIN), True
+    return _rendered_prefix(value, at_least=floor), True
 
 
 def _hybrid_arms_token(result) -> str:
@@ -3085,8 +3148,11 @@ def _hybrid_locator(r) -> list[str]:
     return [loc[len(" · "):]] if loc else []
 
 
-def _hybrid_row_line(r, k: int, *, title: str, path: str, tags: list[str],
-                     preview: tuple[str, str], labels: list[str]) -> str:
+def _object_row_line(*, title: str, path: str, tags: list[str],
+                     preview: tuple[str, str], fields: list[str]) -> str:
+    """One row: the fixed-key quoted object, `preview` last, then the
+    server-authored fields after the separator (#354 D6; reused by
+    `semantic_search(rerank=true)`, #367 D9)."""
     q = change_feed.quote
     obj = (
         "{"
@@ -3095,31 +3161,51 @@ def _hybrid_row_line(r, k: int, *, title: str, path: str, tags: list[str],
         f'"preview_kind":{q(preview[0])},"preview":{q(preview[1])}'
         "}"
     )
-    return "- " + obj + _HYBRID_SEP + _HYBRID_SEP.join(
-        [*_hybrid_server_fields(r, k), *labels]
+    return "- " + obj + _HYBRID_SEP + _HYBRID_SEP.join(fields)
+
+
+def _hybrid_row_line(r, k: int, *, title: str, path: str, tags: list[str],
+                     preview: tuple[str, str], labels: list[str],
+                     extra: tuple[str, ...] = ()) -> str:
+    return _object_row_line(
+        title=title, path=path, tags=tags, preview=preview,
+        fields=[*_hybrid_server_fields(r, k), *extra, *labels],
     )
 
 
-def _hybrid_full_row(r, k: int) -> str:
+def _hybrid_full_row(r, k: int, extra: tuple[str, ...] = ()) -> str:
     return _hybrid_row_line(
         r, k, title=r.title or "", path=r.path, tags=list(r.tags or []),
-        preview=_hybrid_preview(r), labels=_hybrid_locator(r),
+        preview=_hybrid_preview(r), labels=_hybrid_locator(r), extra=extra,
     )
 
 
-def _hybrid_abbreviated_row(r, k: int, room: int) -> str:
+def _hybrid_abbreviated_row(r, k: int, room: int, *, extra: tuple[str, ...] = (),
+                            cut=_hybrid_cut) -> str:
     """The first row when it does not fit (D7): drop the tags, drop the
     preview, cut the title, cut the path, then the empty omitted forms —
     stopping as soon as it fits. Every step is labelled after the separator,
     and the row ends `abbreviated`."""
-    title, path = r.title or "", r.path
-    tags = list(r.tags or [])
-    preview = _hybrid_preview(r)
-    labels: list[str] = ["section omitted"] if _hybrid_locator(r) else []
+    return _abbreviated_row(
+        lambda **kw: _hybrid_row_line(r, k, extra=extra, **kw),
+        title=r.title or "", path=r.path, tags=list(r.tags or []),
+        preview=_hybrid_preview(r), room=room, cut=cut,
+        labels=["section omitted"] if _hybrid_locator(r) else [],
+    )
+
+
+def _abbreviated_row(line_for, *, title: str, path: str, tags: list[str],
+                     preview: tuple[str, str], room: int, cut,
+                     labels: list[str] | None = None) -> str:
+    """The abbreviation ladder shared by `hybrid_search` and
+    `semantic_search(rerank=true)`; `line_for(title=, path=, tags=, preview=,
+    labels=)` renders one candidate line. `labels` are the ones the row
+    starts with (`section omitted` when a locator is dropped, #355)."""
+    labels = list(labels or [])
 
     def line() -> str:
-        return _hybrid_row_line(r, k, title=title, path=path, tags=tags,
-                                preview=preview, labels=[*labels, "abbreviated"])
+        return line_for(title=title, path=path, tags=tags,
+                        preview=preview, labels=[*labels, "abbreviated"])
 
     steps = []
     if tags:
@@ -3135,13 +3221,13 @@ def _hybrid_abbreviated_row(r, k: int, room: int) -> str:
             preview = ("none", "")
             labels.append("preview omitted")
         elif step == "title_cut":
-            title, cut = _hybrid_cut(title)
-            if not cut:
+            title, was_cut = cut(title)
+            if not was_cut:
                 continue
             labels.append("title_cut")
         elif step == "path_cut":
-            path, cut = _hybrid_cut(path)
-            if not cut:
+            path, was_cut = cut(path)
+            if not was_cut:
                 continue
             labels.append("path_cut")
         elif step == "title_omit":
@@ -3159,15 +3245,19 @@ def _hybrid_abbreviated_row(r, k: int, room: int) -> str:
     return line()
 
 
-def _hybrid_provenance_tokens(query_cut: bool, result, rows) -> list[str]:
+def _hybrid_provenance_tokens(query_cut: bool, result, rows,
+                              rerank_token: str | None = None) -> list[str]:
     """The provenance tokens every hybrid response carries, the zero-result
     line included (each stated even when zero): `query_cut` when cut, `arms`,
     `rrf_k`, `arm_depth`, the per-arm counts, stale/truncated, `without
     excerpt`, `shown`, and the snippet-cap token."""
     keyword_rows = [r for r in rows if r.keyword_rank is not None]
     parts = ["query_cut"] if query_cut else []
+    parts.append(_hybrid_arms_token(result))
+    if rerank_token is not None:
+        # #367 (D9): after `arms:`, on every return path of a rerank=true call.
+        parts.append(rerank_token)
     parts += [
-        _hybrid_arms_token(result),
         f"rrf_k: {result.rrf_k}",
         f"arm_depth: keyword {result.keyword_rows}/{hybrid_service.HYBRID_ARM_DEPTH}, "
         f"semantic {result.semantic_chunks}/{hybrid_service.HYBRID_ARM_DEPTH} chunks",
@@ -3185,14 +3275,17 @@ def _hybrid_provenance_tokens(query_cut: bool, result, rows) -> list[str]:
     return parts
 
 
-def _hybrid_header(q_lit: str, query_cut: bool, result, rows, found: int) -> str:
+def _hybrid_header(q_lit: str, query_cut: bool, result, rows, found: int,
+                   rerank_token: str | None = None) -> str:
     return _HYBRID_SEP.join([
         f"Found {found} hybrid results for {q_lit}",
-        *_hybrid_provenance_tokens(query_cut, result, rows),
+        *_hybrid_provenance_tokens(query_cut, result, rows, rerank_token),
     ]) + ":"
 
 
-def render_hybrid_results(query: str, result, *, budget: int | None = None
+def render_hybrid_results(query: str, result, *, budget: int | None = None,
+                          rerank: "rerank_service.RerankOutcome | None" = None,
+                          rerank_scores: dict[str, float] | None = None,
                           ) -> tuple[str, list[str]]:
     """The `hybrid_search` text form and the paths it rendered, in order.
 
@@ -3205,6 +3298,18 @@ def render_hybrid_results(query: str, result, *, budget: int | None = None
     limit_chars = settings.max_read_response_chars if budget is None else budget
     q_lit, query_cut = _hybrid_query_echo(query)
     keyword_only = result.arms != hybrid_service.ARMS_BOTH
+    # #367 (D9): a rerank=true page carries the token after `arms:`, the
+    # rerank_score after hybrid's server fields, the 20–25 cut floor and the
+    # `more: true` cap footer. `rerank is None` is today's page, unchanged.
+    token = rerank.token if rerank is not None else None
+    cut = _hybrid_rerank_cut if rerank is not None else _hybrid_cut
+    cap_footer = _rerank_cap_footer if rerank is not None else _hybrid_cap_footer
+
+    def extra(r) -> tuple[str, ...]:
+        if rerank_scores is None:
+            return ()
+        return (_rerank_score_field(rerank_scores[r.path]),)
+
     # The mixed-generation warning, exactly as the other vector tools give it
     # (#355, D4): directly after the header, only when the semantic arm ran.
     transition = transition_line(getattr(result, "rechunk_pending", 0) or 0)
@@ -3213,7 +3318,7 @@ def render_hybrid_results(query: str, result, *, budget: int | None = None
         # nothing was found: an absent token is not evidence of absence.
         line = _HYBRID_SEP.join([
             f"No hybrid results for {q_lit}",
-            *_hybrid_provenance_tokens(query_cut, result, []),
+            *_hybrid_provenance_tokens(query_cut, result, [], token),
         ])
         if transition:
             line += "\n" + transition
@@ -3225,7 +3330,7 @@ def render_hybrid_results(query: str, result, *, budget: int | None = None
     k = result.rrf_k
     # Counts over the whole page bound the counts over any prefix of it, so
     # this header is never shorter than the one finally rendered.
-    reserved = len(_hybrid_header(q_lit, query_cut, result, page, len(page)))
+    reserved = len(_hybrid_header(q_lit, query_cut, result, page, len(page), token))
     if keyword_only:
         reserved += 1 + len(HYBRID_KEYWORD_ONLY_FOOTER)
     if transition:
@@ -3234,28 +3339,178 @@ def render_hybrid_results(query: str, result, *, budget: int | None = None
     room = limit_chars - reserved
     lines: list[str] = []
     for r in page:
-        line = _hybrid_full_row(r, k)
+        line = _hybrid_full_row(r, k, extra(r))
         if 1 + len(line) > room:
             break
         lines.append(line)
         room -= 1 + len(line)
     if not lines:
-        lines.append(_hybrid_abbreviated_row(page[0], k, room - 1))
+        lines.append(_hybrid_abbreviated_row(page[0], k, room - 1, extra=extra(page[0]),
+                                             cut=cut))
     shown = page[: len(lines)]
 
-    out = [_hybrid_header(q_lit, query_cut, result, shown, len(page)),
+    out = [_hybrid_header(q_lit, query_cut, result, shown, len(page), token),
            *([transition] if transition else []), *lines]
     if keyword_only:
         out.append(HYBRID_KEYWORD_ONLY_FOOTER)
     omitted = len(page) - len(shown)
     if omitted:
-        out.append(_hybrid_cap_footer(omitted))
+        out.append(cap_footer(omitted))
     return "\n".join(out), [r.path for r in shown]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# rerank=true rendering (#367, D9)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Both tools' `rerank=true` responses — reranked and every fallback alike —
+# use the quoted-object row encoding above. `rerank=false` keeps each tool's
+# own rendering byte for byte. The only rerank-derived text is the header
+# token (a closed code or a count) and `rerank_score`, server-formatted from
+# a validated finite score, always after the `"} — ` separator.
+
+#: The `hybrid_search(rerank=true)` title/path cut floor (D9): 20–25
+#: rendered characters, so the floor sum with the rerank token and
+#: `rerank_score` still fits 1,000.
+HYBRID_RERANK_CUT_MIN = 20
+HYBRID_RERANK_CUT_KEEP_WHOLE = 25
+#: Pinned by the tests (D9): the semantic rerank=true header and the
+#: abbreviated row's structure at their worst case.
+SEMANTIC_RERANK_HEADER_MAX = 185
+SEMANTIC_RERANK_ROW_STRUCTURE_MAX = 235
+#: The hybrid rerank=true header and structure worst cases (D9).
+HYBRID_RERANK_HEADER_MAX = 431
+HYBRID_RERANK_ROW_STRUCTURE_MAX = 362
+
+
+def _hybrid_rerank_cut(value: str) -> tuple[str, bool]:
+    return _hybrid_cut(value, floor=HYBRID_RERANK_CUT_MIN,
+                       keep_whole=HYBRID_RERANK_CUT_KEEP_WHOLE)
+
+
+def _rerank_cap_footer(omitted: int) -> str:
+    """The rerank=true cap footer: the omitted count and `more: true`, with
+    the remedy — neither tool has a cursor (D9, L14). ≤ 75 characters."""
+    return f"Response cap: {omitted} omitted — more: true; narrow with limit= or folder=."
+
+
+def _rerank_score_field(score: float) -> str:
+    return f"rerank_score: {score:.4g}"
+
+
+def _semantic_rerank_preview(r: dict) -> tuple[str, str]:
+    """`chunk` (one line of the uncut stored chunk, at most 200 characters,
+    by `_preview_line` as on the `rerank=false` page, #355 D6), the stale
+    notice (a stale row's chunk is withheld by the service), or `none`."""
+    if r["chunk"] is None:
+        return ("stale_notice", _STALE_PREVIEW_NOTICE)
+    chunk = _preview_line(r["chunk"], HYBRID_CHUNK_PREVIEW_CHARS)
+    return ("chunk", chunk) if chunk else ("none", "")
+
+
+def _semantic_locator(r: dict) -> list[str]:
+    """The row's section locator as one server field after the markers, as on
+    `hybrid_search` (#355); an abbreviated row drops it with `section
+    omitted`."""
+    loc = _section_locator(r.get("section"))
+    return [loc[len(" · "):]] if loc else []
+
+
+def _semantic_rerank_fields(r: dict, score: float | None) -> list[str]:
+    fields = [f"similarity: {r['similarity']:.3f}"]
+    if score is not None:
+        fields.append(_rerank_score_field(score))
+    if r["stale"]:
+        fields.append("stale: true")
+    if r["embedding_truncated"]:
+        fields.append("embedding_truncated: true")
+    return fields
+
+
+def _semantic_rerank_line(r: dict, score: float | None, *, title: str, path: str,
+                          tags: list[str], preview: tuple[str, str],
+                          labels: list[str]) -> str:
+    return _object_row_line(title=title, path=path, tags=tags, preview=preview,
+                            fields=[*_semantic_rerank_fields(r, score), *labels])
+
+
+def _semantic_rerank_header(q_lit: str, query_cut: bool, rows: list[dict], found: int,
+                            token: str) -> str:
+    return _HYBRID_SEP.join([
+        f"Found {found} semantic matches for {q_lit}",
+        *(["query_cut"] if query_cut else []),
+        f"{sum(1 for r in rows if r['stale'])} stale, "
+        f"{sum(1 for r in rows if r['embedding_truncated'])} truncated",
+        token,
+        f"shown: {len(rows)}",
+    ]) + ":"
+
+
+def render_semantic_rerank_results(
+    query: str, rows: list[dict], outcome, *, scores: list[float] | None = None,
+    budget: int | None = None, pending: int = 0,
+) -> tuple[str, list[str]]:
+    """`semantic_search(rerank=true)`: the page `rows` (already in final
+    order and truncated to `limit`) in the quoted-object encoding, bounded by
+    `budget` (default `MAX_READ_RESPONSE_CHARS`) on rendered length under
+    hybrid's rules. `scores[i]` is row `i`'s rerank score, only when the page
+    was reranked. Returns the text and the paths rendered, in order."""
+    limit_chars = settings.max_read_response_chars if budget is None else budget
+    q_lit, query_cut = _hybrid_query_echo(query)
+    token = outcome.token
+    # The `index_transition:` line directly after the header, as on the
+    # `rerank=false` page (#355, D4), reserved in the budget.
+    transition = transition_line(pending)
+    if not rows:
+        zero = _HYBRID_SEP.join([
+            f"No semantic results for {q_lit} (embeddings may still be building)",
+            *(["query_cut"] if query_cut else []),
+            "0 stale, 0 truncated",
+            token,
+            "shown: 0",
+        ])
+        return zero + ("\n" + transition if transition else ""), []
+
+    def score_of(i: int) -> float | None:
+        return scores[i] if scores is not None else None
+
+    reserved = len(_semantic_rerank_header(q_lit, query_cut, rows, len(rows), token))
+    if transition:
+        reserved += 1 + len(transition)
+    reserved += 1 + HYBRID_FOOTER_MAX
+    room = limit_chars - reserved
+    lines: list[str] = []
+    for i, r in enumerate(rows):
+        line = _semantic_rerank_line(
+            r, score_of(i), title=r["title"] or "", path=r["path"],
+            tags=list(r.get("tags") or []), preview=_semantic_rerank_preview(r),
+            labels=_semantic_locator(r),
+        )
+        if 1 + len(line) > room:
+            break
+        lines.append(line)
+        room -= 1 + len(line)
+    if not lines:
+        first = rows[0]
+        lines.append(_abbreviated_row(
+            lambda **kw: _semantic_rerank_line(first, score_of(0), **kw),
+            title=first["title"] or "", path=first["path"],
+            tags=list(first.get("tags") or []), preview=_semantic_rerank_preview(first),
+            room=room - 1, cut=_hybrid_cut,
+            labels=["section omitted"] if _semantic_locator(first) else [],
+        ))
+    shown = rows[: len(lines)]
+    out = [_semantic_rerank_header(q_lit, query_cut, shown, len(rows), token),
+           *([transition] if transition else []), *lines]
+    omitted = len(rows) - len(shown)
+    if omitted:
+        out.append(_rerank_cap_footer(omitted))
+    return "\n".join(out), [r["path"] for r in shown]
 
 
 @_tracked(
     "hybrid_search",
-    ["query", "limit", "folder", "tags", "frontmatter"],
+    ["query", "limit", "folder", "tags", "frontmatter", "rerank"],
     arg_char_caps={"query": MAX_SEARCH_QUERY_CHARS},
 )
 async def hybrid_search_impl(
@@ -3264,6 +3519,7 @@ async def hybrid_search_impl(
     folder: str | None = None,
     tags: list[str] | None = None,
     frontmatter: dict | None = None,
+    rerank: bool = False,
 ) -> str:
     """Reciprocal rank fusion of the keyword and semantic arms (#354).
 
@@ -3274,6 +3530,8 @@ async def hybrid_search_impl(
     """
     limit = _clamp_limit(limit, hybrid_service.HYBRID_MAX_LIMIT)
     uid = current_user_id.get()
+    if rerank:
+        return await _hybrid_search_reranked(query, limit, folder, tags, frontmatter, uid)
     async with async_session() as session:
         result = await hybrid_service.hybrid_search(
             session,
@@ -3285,6 +3543,37 @@ async def hybrid_search_impl(
             user_id=uid,
         )
     rendered, paths = render_hybrid_results(query, result)
+    timing.record_results(paths)
+    return rendered
+
+
+async def _hybrid_search_reranked(query, limit, folder, tags, frontmatter, uid) -> str:
+    """`hybrid_search(rerank=true)` (#367, D6, D9): the first 50 fused rows
+    and their candidate text in the hybrid snapshot; the session is **closed**
+    before the rerank exchange, so no pooled connection is held during it."""
+    async with async_session() as session:
+        result = await hybrid_service.hybrid_search(
+            session,
+            query,
+            limit=limit,
+            folder=folder,
+            tags=tags,
+            frontmatter=frontmatter,
+            user_id=uid,
+            rerank_candidates=True,
+        )
+    candidates = result.rows
+    outcome = await rerank_service.rerank_candidates(
+        query, [(r.title, r.rerank_text) for r in candidates]
+    )
+    result.rows = [candidates[i] for i in outcome.order][:limit]
+    scores = (
+        {candidates[i].path: outcome.scores[i] for i in range(len(candidates))}
+        if outcome.reranked else None
+    )
+    rendered, paths = render_hybrid_results(query, result, rerank=outcome,
+                                            rerank_scores=scores)
+    _record_rerank(outcome)
     timing.record_results(paths)
     return rendered
 

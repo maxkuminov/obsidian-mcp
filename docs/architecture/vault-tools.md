@@ -64,7 +64,9 @@ treat annotations as untrusted unless the server is trusted.
   provider round trip — stays closed-world although the embedding provider
   may be a remote API (L5): the provider is deployment infrastructure under the
   operator's control, configured once in `.env`, not an open-world dependency
-  the agent chooses per call — the tool's domain of interaction is the vault;
+  the agent chooses per call — the tool's domain of interaction is the vault.
+  The optional reranker behind both tools' `rerank=true` (#367) is treated
+  the same way, so their annotations do not change;
 - idempotent = read-only. `delete_*` and `set_frontmatter` arguably qualify,
   but a wrong `true` lets a client re-run a write silently while a wrong
   `false` costs one confirmation, so the hint is set in the safe direction.

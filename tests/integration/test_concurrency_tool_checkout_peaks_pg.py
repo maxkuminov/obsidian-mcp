@@ -285,3 +285,48 @@ async def test_hybrid_search_holds_no_connection_during_the_provider_call(env, m
     assert 'arms: both' in out, out
     assert max(env.meter.task_peaks.values(), default=0) <= 1
     assert env.meter.peak <= CLASS_CONNECTIONS['embedding'] == 1
+
+
+@pytest.fixture
+def slow_reranker(monkeypatch):
+    """#367: a fake reranker that sleeps 1 s before answering, enabled."""
+    from src.services import rerank
+    from tests.fixtures.fake_reranker import FakeReranker
+
+    server = FakeReranker().start()
+    server.mode = 'sleep:1000'
+    monkeypatch.setattr(settings, 'rerank_url', server.url)
+    monkeypatch.setattr(settings, 'rerank_timeout_ms', 5000)
+    monkeypatch.setattr(rerank, '_client', None)
+    rerank._reset_state_for_tests()
+    rerank._set_enabled()
+    yield server
+    rerank._reset_state_for_tests()
+    server.stop()
+
+
+@pytest.mark.parametrize('impl', ['semantic_search_impl', 'hybrid_search_impl'])
+async def test_a_rerank_call_holds_no_connection_during_the_exchange(env, slow_reranker, impl):
+    """#367 D11: the session closes before the rerank request is sent, so a
+    reranker that takes a second holds no pooled connection; the per-tool
+    peak stays one and the class is unchanged."""
+    from src.services import rerank
+
+    with identity(env):
+        env.meter.reset()
+        task = asyncio.create_task(getattr(tools, impl)('quartzite', limit=5, rerank=True))
+        for _ in range(200):
+            if slow_reranker.requests:
+                break
+            await asyncio.sleep(0.01)
+        assert slow_reranker.requests, 'the rerank request was sent'
+        for _ in range(5):   # sampled through the reranker's sleep
+            assert env.meter.active == 0, 'a connection is held during the rerank exchange'
+            await asyncio.sleep(0.15)
+        out = await asyncio.wait_for(task, 10)
+    await rerank.close_rerank_client()
+    assert 'reranked: true (candidates: ' in out, out
+    assert max(env.meter.task_peaks.values(), default=0) <= 1
+    assert env.meter.peak <= CLASS_CONNECTIONS['embedding'] == 1
+    assert concurrency.TOOL_CLASSES['semantic_search'] == 'embedding'
+    assert concurrency.TOOL_CLASSES['hybrid_search'] == 'embedding'

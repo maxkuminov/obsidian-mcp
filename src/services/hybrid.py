@@ -29,6 +29,9 @@ with no statement run:
 7b. When the semantic arm ran, the owner-scoped count of notes holding
    vectors of another chunking generation (#355), for the
    `index_transition:` line — the same snapshot as both arms.
+7c. Only for `rerank=true` (#367, D6), and only when a candidate lacks a
+    usable semantic chunk: one statement reading `left(body_excerpt, 2048)`
+    for those candidates, under the owner predicate, in the same snapshot.
 8. The caller closes the session, which ends the read-only transaction.
 
 The keyword arm runs before the semantic arm so that the only data-plan
@@ -94,6 +97,9 @@ class HybridRow:
     chunk: str | None = None
     stale: bool = False
     embedding_truncated: bool = False
+    #: #367: the reranker's candidate text (`rerank=true` only), never
+    #: rendered. `None` sends the title alone.
+    rerank_text: str | None = None
     #: The semantic arm's section locator (#355): `None` on a stale or
     #: pre-034 row, or when the note came from the keyword arm alone.
     section: dict | None = None
@@ -127,6 +133,32 @@ class HybridResult:
     rechunk_pending: int = 0
 
 
+async def _fill_excerpts(session, page: list[HybridRow], *, user_id: int | None) -> None:
+    """#367 (D6): a candidate that is not in the semantic arm, or is stale
+    there, is scored on its stored `body_excerpt` (the text the keyword
+    vector was built from), read by one statement in this call's snapshot,
+    under the owner predicate, only when such a candidate exists. A NULL
+    excerpt (a pre-031 row) sends the title alone. The rows are already
+    chosen: this reads text for them and retrieves nothing."""
+    from sqlalchemy import func, select
+
+    from src.models.db import NoteMetadata
+    from src.services.filters import apply_note_filters
+    from src.services.rerank import RERANK_DOC_CHARS, bounded_text
+
+    needs = [r for r in page if r.semantic_rank is None or r.stale]
+    if not needs:
+        return
+    stmt = select(
+        NoteMetadata.file_path,
+        func.left(NoteMetadata.body_excerpt, RERANK_DOC_CHARS).label("excerpt"),
+    ).where(NoteMetadata.file_path.in_([r.path for r in needs]))
+    stmt = apply_note_filters(stmt, user_id=user_id)
+    excerpts = {row.file_path: row.excerpt for row in (await session.execute(stmt)).fetchall()}
+    for r in needs:
+        r.rerank_text = bounded_text(r.title, excerpts.get(r.path))
+
+
 def fuse(
     keyword_paths: list[str], semantic_paths: list[str], k: int
 ) -> list[tuple[str, float, int | None, int | None]]:
@@ -156,9 +188,20 @@ async def hybrid_search(
     frontmatter: dict | None = None,
     user_id: int | None = None,
     rrf_k: int | None = None,
+    rerank_candidates: bool = False,
 ) -> HybridResult:
-    """Both arms in one read-only repeatable-read snapshot, fused (D1–D4)."""
+    """Both arms in one read-only repeatable-read snapshot, fused (D1–D4).
+
+    With `rerank_candidates` (#367, D6) the page is the first
+    `RERANK_MAX_CANDIDATES` fused rows (never fewer than `limit`), each with
+    its `rerank_text`; the caller reranks and truncates. Without it, nothing
+    here changes."""
     limit = max(1, min(limit, HYBRID_MAX_LIMIT))
+    depth = limit
+    if rerank_candidates:
+        from src.services.rerank import RERANK_MAX_CANDIDATES
+
+        depth = max(limit, RERANK_MAX_CANDIDATES)
     k = int(rrf_k) if rrf_k is not None else settings.hybrid_rrf_k
     filters = dict(folder=folder, tags=tags, frontmatter=frontmatter, user_id=user_id)
 
@@ -208,7 +251,8 @@ async def hybrid_search(
     exact_fallback = False
     if unavailable is None:
         s_arm = await embeddings.semantic_arm_rows(
-            session, query_embedding, overfetch=HYBRID_ARM_DEPTH, **filters
+            session, query_embedding, overfetch=HYBRID_ARM_DEPTH,
+            with_rerank_text=rerank_candidates, **filters
         )
         s_rows, s_chunks, exact_fallback = (
             s_arm.rows, s_arm.chunk_rows, s_arm.exact_fallback
@@ -221,7 +265,7 @@ async def hybrid_search(
     s_by_path = {r["path"]: r for r in s_rows}
     fused = fuse([r["path"] for r in k_arm.rows], [r["path"] for r in s_rows], k)
     page: list[HybridRow] = []
-    for path, score, k_rank, s_rank in fused[:limit]:
+    for path, score, k_rank, s_rank in fused[:depth]:
         kr, sr = k_by_path.get(path), s_by_path.get(path)
         src = kr if kr is not None else sr
         row = HybridRow(
@@ -237,6 +281,8 @@ async def hybrid_search(
             row.stale = bool(sr["stale"])
             row.embedding_truncated = bool(sr["embedding_truncated"])
             row.section = sr.get("section")
+            if rerank_candidates:
+                row.rerank_text = sr.get("rerank_text")
         page.append(row)
 
     # ── 7. Keyword snippets for the page's keyword rows, capped ─────────────
@@ -261,6 +307,9 @@ async def hybrid_search(
     rechunk_pending = 0
     if unavailable is None:
         rechunk_pending = await embeddings.rechunk_pending_count(session, user_id)
+    # ── 7c. Candidate text for rows without a usable semantic chunk (#367) ──
+    if rerank_candidates:
+        await _fill_excerpts(session, page, user_id=user_id)
     timing.add_ms("db_ms", time.monotonic() - db_start)
 
     overlap = len(k_by_path.keys() & s_by_path.keys())

@@ -1,7 +1,9 @@
 """Transport policy for the application's own outbound hops (#184, #185).
 
 Two hops leave this process to reach a dependency: the database connection
-and the embedding endpoint. This module owns how each of them is secured, so
+and the embedding endpoint (plus, when `RERANK_URL` is set, the optional
+reranker of #367, which reuses the embedding endpoint's policy through
+`rerank_http_client`). This module owns how each of them is secured, so
 that no call site can decide it on its own:
 
 * **Database.** `DATABASE_SSL_MODE` (libpq's vocabulary, default `prefer`) is
@@ -504,16 +506,26 @@ def classify_embedding_url(url: str, setting: str = "the embedding URL") -> Embe
 
 
 def check_embedding_url_policy(
-    url: str, *, setting: str, allow_plaintext: bool
+    url: str,
+    *,
+    setting: str,
+    allow_plaintext: bool,
+    allow_setting: str = "EMBEDDING_ALLOW_PLAINTEXT",
+    what: str = "every chunk and query",
 ) -> EmbeddingEndpoint:
-    """D6 rules 0–4: `https`, loopback `http`, or `http` under the override."""
+    """D6 rules 0–4: `https`, loopback `http`, or `http` under the override.
+
+    `allow_setting` names the override in the message: the embedding hop's
+    `EMBEDDING_ALLOW_PLAINTEXT`, or the reranker's `RERANK_ALLOW_PLAINTEXT`
+    (#367) — two separate written decisions, never one admitting the other.
+    """
     endpoint = classify_embedding_url(url, setting)
     if endpoint.scheme == "http" and not endpoint.is_loopback and not allow_plaintext:
         raise ValueError(
             f"{setting} uses plaintext http to the non-loopback host "
-            f"{endpoint.host!r}, so every chunk and query would cross the "
+            f"{endpoint.host!r}, so {what} would cross the "
             "network unencrypted. Use an https endpoint (with EMBEDDING_CA_FILE "
-            "for an internal CA), or set EMBEDDING_ALLOW_PLAINTEXT=true to "
+            f"for an internal CA), or set {allow_setting}=true to "
             "acknowledge the plaintext hop."
         )
     return endpoint
@@ -592,6 +604,65 @@ def embedding_http_client(timeout: float) -> httpx.AsyncClient:
         follow_redirects=False,
         trust_env=False,
     )
+
+
+def rerank_http_client(timeout: float) -> httpx.AsyncClient:
+    """The only way to build an HTTP client aimed at `RERANK_URL` (#367, D3).
+
+    The embedding hop's transport policy — `trust_env=False`,
+    `follow_redirects=False`, `verify=` the `EMBEDDING_CA_FILE` context else
+    certifi's bundle — plus a pool of at most two connections, which bounds
+    the work in flight on the reranker whatever the concurrency mode.
+    """
+    from src.config import settings
+
+    ctx = settings.embedding_ssl_context or certifi_ssl_context()
+    return httpx.AsyncClient(
+        timeout=timeout,
+        verify=ctx,
+        follow_redirects=False,
+        trust_env=False,
+        limits=httpx.Limits(max_connections=2, max_keepalive_connections=2),
+    )
+
+
+def log_rerank_transport() -> None:
+    """#367 (D3): one INFO line for the rerank hop when `RERANK_URL` is set.
+
+    Scheme, host, port, trust source and the override only — never the path,
+    query or userinfo. A non-loopback `http` URL (admitted only by
+    `RERANK_ALLOW_PLAINTEXT`) also emits `internal_transport_plaintext` with
+    `reason=rerank outcome=override`.
+    """
+    from src.config import settings
+    from src.services import security_events
+
+    if not settings.rerank_url:
+        return
+    try:
+        endpoint = classify_embedding_url(settings.rerank_url, "RERANK_URL")
+    except ValueError as exc:
+        logger.error("Rerank transport: unparseable (%s)", exc)
+        return
+    plaintext_remote = endpoint.scheme == "http" and not endpoint.is_loopback
+    if endpoint.scheme == "http":
+        verify = "n/a"
+    elif settings.embedding_ssl_context is not None:
+        verify = "ca-file"
+    else:
+        verify = "certifi"
+    logger.info(
+        "Rerank transport: scheme=%s host=%s port=%s verify=%s plaintext_override=%s",
+        endpoint.scheme,
+        endpoint.host,
+        endpoint.port,
+        verify,
+        plaintext_remote,
+    )
+    if plaintext_remote:
+        security_events.emit(
+            "internal_transport_plaintext", reason="rerank", outcome="override"
+        )
 
 
 def log_embedding_transport() -> None:

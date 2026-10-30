@@ -87,7 +87,7 @@ help:
 	@echo "  make reset-embeddings - Drop & recreate embedding column at configured dim"
 	@echo "  make rebuild-tsvectors - Recompute keyword index for FTS_CONFIGS and store snippet excerpts (no embeddings, no API calls)"
 	@echo "  make concurrency-report TARGET=queue|enforce [DAYS=n] [END=iso] - Concurrency readiness verdict (#188; exit 0 only on PASS)"
-	@echo "  make search-eval  - Score retrieval on the synthetic fixture (no DB); with SEARCH_EVAL_DATA=dir SEARCH_EVAL_DATABASE_URL=<restored BACKUP_FULL=1 copy> [ARMS=...] [ARM_OPTS=\"k=v ...\"] [BASELINE=arm], on real judgments (#356)"
+	@echo "  make search-eval  - Score retrieval on the synthetic fixture (no DB); with SEARCH_EVAL_DATA=dir SEARCH_EVAL_DATABASE_URL=<restored BACKUP_FULL=1 copy> [ARMS=...] [ARM_OPTS=\"k=v ...\"] [BASELINE=arm], on real judgments (#356); rerank arms: scripts.search_eval_arms.rerank:make_semantic_arm / make_hybrid_arm with RERANK_URL set (#367)"
 	@echo "  make search-eval-export [DAYS=90] [USER_ID=id] - Read-only export of search/read_note usage rows into SEARCH_EVAL_DIR (#356; tenant data, 0700)"
 	@echo "  make search-eval-snapshot SEARCH_EVAL_DATA=dir SEARCH_EVAL_DATABASE_URL=url - Record the restored copy's searchable notes; run it BEFORE applying any candidate"
 	@echo "  make status       - Show container and health status"
@@ -513,7 +513,10 @@ concurrency-report:
 # incomplete run, 1 failure); make itself reports any failure as 2.
 # ARM_OPTS is space-separated key=value pairs, one --arm-opt each, passed to
 # the real-data run (e.g. ARM_OPTS="hybrid_k=60 hybrid_alt_k=20" for the
-# hybrid arms, #354); every arm of the run sees the same options.
+# hybrid arms, #354); every arm of the run sees the same options. The rerank
+# arms (#367) are factories, not options, so ARMS="semantic
+# scripts.search_eval_arms.rerank:make_semantic_arm" BASELINE=semantic keeps
+# the incumbent unreranked; they need RERANK_URL in the environment.
 SEARCH_EVAL_DATA ?=
 SEARCH_EVAL_FIXTURE := tests/fixtures/search_eval
 ARMS ?=

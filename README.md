@@ -289,7 +289,7 @@ the wire, so none is cut off by a client's description limit.
   note's opening words, for a title match). The text-search config(s) are
   configurable via `FTS_CONFIGS` (see
   [Full-text search language(s)](#full-text-search-languages))
-- `semantic_search(query, folder?, tags?, frontmatter?, limit=15)`,
+- `semantic_search(query, folder?, tags?, frontmatter?, limit=15, rerank=false)`,
   vector similarity via pgvector, one one-line preview chunk per note.
   Notes are chunked at their headings, and each chunk is embedded under a
   `Title > Heading > Subheading` context prefix. A fresh row names the
@@ -298,7 +298,7 @@ the wire, so none is cut off by a client's description limit.
   and rows not yet re-embedded since the upgrade to heading-aware chunks,
   carry no locator. While any of your notes is still on the old chunking,
   each response says so on an `index_transition:` line under its header
-- `hybrid_search(query, limit=10, folder?, tags?, frontmatter?)`, both
+- `hybrid_search(query, limit=10, folder?, tags?, frontmatter?, rerank=false)`, both
   of the above fused by reciprocal rank fusion over each arm's top 50, one
   line per note with its fused score, each arm's rank and the `1/(k+rank)`
   terms behind the score. The three are peers, and every description
@@ -310,6 +310,13 @@ the wire, so none is cut off by a client's description limit.
   marked `arms: keyword-only (semantic unavailable: …)`, never silently
   degraded: the marker is on every return path, so a keyword-only page
   cannot pass for a fused one.
+- `rerank=true` on either of the last two asks an optional,
+  operator-configured reranker (`RERANK_URL`) to reorder the candidates
+  the call already fetched (at most 50 notes). The response is either
+  fully reranked (`reranked: true (candidates: N)`, a `rerank_score` per
+  row) or the unreranked page marked `reranked: false (<reason>)`;
+  without a reranker it answers `reranked: false (not_configured)`. Its
+  rows are one-line quoted objects, like `hybrid_search`'s
 - `list_notes(folder?, limit=50, since?, until?, order_by?, cursor?)`,
   sorted by modified time
 - `get_recent(folder?, limit=20, since?, until?, order_by?, cursor?)`,
@@ -956,7 +963,19 @@ naming conventions, and YAML schema before it writes anything.
 ## Upgrading
 
 Pull, then `make deploy` (or rebuild your compose stack); migrations
-run on start. Across the hybrid-search release (#354):
+run on start. Across the reranker release (#367):
+
+- **No migration, nothing re-derived or re-embedded.** `semantic_search`
+  and `hybrid_search` gain an optional `rerank` argument (default false,
+  output unchanged), and four optional settings (`RERANK_URL`,
+  `RERANK_MODEL`, `RERANK_TIMEOUT_MS`, `RERANK_ALLOW_PLAINTEXT`). Nothing
+  changes until you set `RERANK_URL`. The concurrency class mapping is
+  unchanged, so readiness evidence carries over.
+- **Rollback** is a redeploy of the previous image. A client that keeps
+  sending `rerank` is then refused by the unknown-argument rule, which is
+  the normal cost of rolling back a new argument.
+
+Across the hybrid-search release (#354):
 
 - **No migration, nothing re-derived or re-embedded.** A new tool,
   `hybrid_search`, and one optional setting, `HYBRID_RRF_K` (default 60).
@@ -1308,6 +1327,10 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Override for Azure or proxies. Same transport rule as `OLLAMA_URL` when this provider is active. |
 | `EMBEDDING_ALLOW_PLAINTEXT` | `false` | Permit `http` to a non-loopback embedding host. Without it such a URL refuses to start. `.env.example` sets it `true` to match its `http://ollama:11434` default. |
 | `EMBEDDING_CA_FILE` | — | Trust anchor (PEM) for an `https` embedding endpoint behind an internal CA; replaces the default certifi bundle. Refused with an `http` URL. Embedding clients ignore `HTTP(S)_PROXY`, `SSL_CERT_*` and `.netrc`. |
+| `RERANK_URL` | — | Full URL of an optional reranker speaking the Jina-compatible `/v1/rerank` format (`llama-server --reranking`, vLLM, Infinity), e.g. `http://127.0.0.1:8081/v1/rerank`. Empty means no reranker: `rerank=true` answers `reranked: false (not_configured)`. **The endpoint receives the query and candidate note text.** Same transport rule as the embedding URL (`https`, loopback `http`, or `RERANK_ALLOW_PLAINTEXT`); a bad URL refuses to start, an unreachable reranker never does (it is probed at startup and re-probed in the background; `/health` reports `rerank`). Opt-in: no quality gain is claimed until you measure it with the harness on a GPU reranker, and a CPU reranker will time out at the default deadline. See `DEPLOYMENT.md`, "Reranker (optional)". |
+| `RERANK_MODEL` | — | Sent as `model` in the rerank request (≤ 200 characters). `llama-server` serves one model and ignores it. |
+| `RERANK_TIMEOUT_MS` | `1500` | One deadline per rerank call (100–10000), covering connect, write and read; past it the page falls back unreranked with `reranked: false (timeout)`. Also the extra time a `rerank=true` call can hold its concurrency slot. |
+| `RERANK_ALLOW_PLAINTEXT` | `false` | Permit `http` to a non-loopback reranker host. Separate from `EMBEDDING_ALLOW_PLAINTEXT`, which does not cover it. An `https` reranker is verified against `EMBEDDING_CA_FILE` when set, else certifi's bundle. |
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI model. Changing it post-deploy requires `make reset-embeddings`; the server refuses to start until the stored vectors match. See [Switching providers or models](#switching-providers-or-models). |
 | `CHUNK_SIZE` | `512` | Approx tokens per chunk (4-char heuristic) |
 | `CHUNK_OVERLAP` | `0` | Token overlap between chunks |

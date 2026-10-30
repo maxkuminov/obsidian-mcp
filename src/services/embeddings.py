@@ -1959,6 +1959,7 @@ async def semantic_arm_rows(
     tags: list[str] | None = None,
     frontmatter: dict | None = None,
     user_id: int | None = None,
+    with_rerank_text: bool = False,
 ) -> SemanticArm:
     """The ordered statement, the zero-row exact re-run, the full-precision
     re-sort, the per-note dedupe (not truncated) and the stale/truncated
@@ -2130,6 +2131,18 @@ async def semantic_arm_rows(
             for row in deduped
         )
     ]
+    if with_rerank_text:
+        # #367 (D4): the reranker's candidate text, from the uncut projected
+        # chunk (never a preview cut), bounded so title + "\n\n" + text fits
+        # the 2,048-character document. A stale row carries none —
+        # superseded text never leaves the server — and is sent as its title.
+        # Python only: the statement and its projection are unchanged.
+        from src.services.rerank import bounded_text
+
+        for result, row in zip(results, deduped):
+            result["rerank_text"] = (
+                None if result["stale"] else bounded_text(row.title, row.chunk_text)
+            )
     return SemanticArm(rows=results, chunk_rows=chunk_rows, exact_fallback=exact_fallback,
                        fetched_at=fetched_at)
 
@@ -2156,6 +2169,70 @@ async def semantic_search(
     are what they were before the #354 extraction.
     """
     limit = max(1, min(limit, 50))
+    arm = await _semantic_overfetch(
+        session, query, limit=limit, folder=folder, tags=tags,
+        frontmatter=frontmatter, user_id=user_id,
+    )
+    results = arm.rows[:limit]
+    # Result telemetry, recorded after the dedupe so the count and the paths
+    # are what the tool actually returns (#161) — an overfetched, not-yet-
+    # deduped row list would report a note twice. Bounds are enforced inside
+    # `record_results`; no-op outside a tracked tool call.
+    timing.record_results(r["path"] for r in results)
+    return results
+
+
+@dataclass
+class SemanticCandidates:
+    """`semantic_search(rerank=true)`'s candidates (#367, D4): the per-note
+    deduped rows of the call's overfetch, in vector order, before truncation
+    to `limit`, capped at `RERANK_MAX_CANDIDATES`. Each row is a legacy result
+    row plus the internal `rerank_text`."""
+
+    rows: list[dict]
+    limit: int
+
+
+async def semantic_candidates(
+    session: AsyncSession,
+    query: str,
+    *,
+    limit: int = 15,
+    folder: str | None = None,
+    tags: list[str] | None = None,
+    frontmatter: dict | None = None,
+    user_id: int | None = None,
+) -> SemanticCandidates:
+    """The one candidate-fetch service the tool and the harness rerank arm
+    share (#367, D4). The embedding call, the three `SET LOCAL`s and the
+    statement are exactly `semantic_search`'s; the timing keys are recorded;
+    `record_results` is **not** called — the tool records the final order.
+    Because `limit ≤ 50` and the candidates are the first `min(50, n)` deduped
+    notes, every note of the unreranked page is a candidate."""
+    from src.services.rerank import RERANK_MAX_CANDIDATES
+
+    limit = max(1, min(limit, 50))
+    arm = await _semantic_overfetch(
+        session, query, limit=limit, folder=folder, tags=tags,
+        frontmatter=frontmatter, user_id=user_id, with_rerank_text=True,
+    )
+    return SemanticCandidates(rows=arm.rows[:RERANK_MAX_CANDIDATES], limit=limit)
+
+
+async def _semantic_overfetch(
+    session: AsyncSession,
+    query: str,
+    *,
+    limit: int,
+    folder: str | None,
+    tags: list[str] | None,
+    frontmatter: dict | None,
+    user_id: int | None,
+    with_rerank_text: bool = False,
+) -> SemanticArm:
+    """`semantic_search`'s embedding call, `SET LOCAL`s, overfetch statement
+    and timing — shared verbatim with `semantic_candidates` (#367), so the
+    two issue the same statements in the same order."""
     embed_start = time.monotonic()
     query_embedding = await get_embedding(query, kind="query")
     timing.add_ms("embed_ms", time.monotonic() - embed_start)
@@ -2193,15 +2270,8 @@ async def semantic_search(
     overfetch = max(limit * 5, 50)
     arm = await semantic_arm_rows(
         session, query_embedding, overfetch=overfetch, folder=folder, tags=tags,
-        frontmatter=frontmatter, user_id=user_id,
+        frontmatter=frontmatter, user_id=user_id, with_rerank_text=with_rerank_text,
     )
     timing.record("exact_fallback", arm.exact_fallback)
     timing.add_ms("db_ms", arm.fetched_at - db_start)
-
-    results = arm.rows[:limit]
-    # Result telemetry, recorded after the dedupe so the count and the paths
-    # are what the tool actually returns (#161) — an overfetched, not-yet-
-    # deduped row list would report a note twice. Bounds are enforced inside
-    # `record_results`; no-op outside a tracked tool call.
-    timing.record_results(r["path"] for r in results)
-    return results
+    return arm

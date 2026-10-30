@@ -401,6 +401,7 @@ async def semantic_search(
     folder: str | None = None,
     tags: list[str] | None = None,
     frontmatter: dict | None = None,
+    rerank: bool = False,
 ) -> str:
     """Vector similarity search over the vault's chunk embeddings. Use this for conceptual
     or paraphrased queries — anywhere exact word matching would miss the point.
@@ -448,6 +449,14 @@ async def semantic_search(
     presents text the index knows to be superseded", not "no result is ever
     out of date".
 
+    `rerank=true` asks the deployment's reranker to reorder the candidates
+    this call already fetched; it can add up to the configured timeout. Its
+    rows are one-line quoted objects followed by server fields (with
+    `rerank_score` when reranked). The header says `reranked: true` or
+    `reranked: false (<reason>)`, and an unreranked page keeps the unreranked
+    order; `reranked: false (not_configured)` means this deployment has no
+    reranker.
+
     Args:
         query: Natural language description of what you're looking for.
         limit: Maximum number of distinct notes to return (default 15).
@@ -456,9 +465,12 @@ async def semantic_search(
             (e.g. ["product"]).
         frontmatter: Optional dict of frontmatter key/value pairs; strict type matching —
             string "0" does not match integer 0 (e.g. {"status": "active"}).
+        rerank: Reorder the fetched candidates with the deployment's reranker
+            (default false).
     """
     return await semantic_search_impl(
-        query, limit=limit, folder=folder, tags=tags, frontmatter=frontmatter
+        query, limit=limit, folder=folder, tags=tags, frontmatter=frontmatter,
+        rerank=rerank,
     )
 
 
@@ -1383,6 +1395,7 @@ async def hybrid_search(
     folder: str | None = None,
     tags: list[str] | None = None,
     frontmatter: dict | None = None,
+    rerank: bool = False,
 ) -> str:
     """Keyword and semantic search fused into one ranking, for a query that is not clearly an identifier or a paraphrase.
 
@@ -1422,6 +1435,14 @@ async def hybrid_search(
     keyword arm alone, in keyword order, and `semantic_search` will fail the
     same way until the provider recovers.
 
+    `rerank=true` asks the deployment's reranker to reorder the candidates
+    this call already fetched; it can add up to the configured timeout. Its
+    rows are one-line quoted objects followed by server fields (with
+    `rerank_score` after them when reranked). The header says
+    `reranked: true` or `reranked: false (<reason>)`, and an unreranked page
+    keeps the unreranked order; `reranked: false (not_configured)` means
+    this deployment has no reranker.
+
     Args:
         query: What you are looking for — words, a phrase or a question.
         limit: Maximum number of results (default 10, at most 50).
@@ -1429,9 +1450,12 @@ async def hybrid_search(
         tags: Optional list of tag names; only notes carrying ALL listed tags match.
         frontmatter: Optional dict of frontmatter key/value pairs; strict type matching —
             string "0" does not match integer 0 (e.g. {"status": "active"}).
+        rerank: Reorder the first 50 fused candidates with the deployment's
+            reranker (default false).
     """
     return await hybrid_search_impl(
-        query, limit=limit, folder=folder, tags=tags, frontmatter=frontmatter
+        query, limit=limit, folder=folder, tags=tags, frontmatter=frontmatter,
+        rerank=rerank,
     )
 
 

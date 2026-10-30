@@ -576,6 +576,28 @@ class Settings(BaseSettings):
     # Parsed once, at settings construction, in every mode including sandbox.
     embedding_ca_file: Annotated[str | None, BeforeValidator(_off_means_none)] = None
 
+    # ── Optional reranker (#367) ───────────────────────────────────────────
+    #
+    # `RERANK_URL` is the **full** endpoint URL of a Jina-compatible
+    # `/v1/rerank` server (llama-server `--reranking`, vLLM, Infinity); empty
+    # means the feature is absent and `rerank=true` answers
+    # `reranked: false (not_configured)`. The URL is judged by the embedding
+    # hop's parser and plaintext rule (`https`, loopback `http`, or `http`
+    # admitted by `RERANK_ALLOW_PLAINTEXT` — a separate written decision from
+    # `EMBEDDING_ALLOW_PLAINTEXT`); a policy violation refuses boot, a
+    # reranker that is merely down never does. An `https` reranker is
+    # verified against `EMBEDDING_CA_FILE`'s context, else certifi. The
+    # endpoint receives note text. See "Reranking (#367)" in
+    # docs/architecture/search.md.
+    rerank_url: str = ""
+    # Sent as `model` in the request body; llama-server serves one model and
+    # ignores it.
+    rerank_model: str = Field("", max_length=200)
+    # One wall-clock deadline per rerank exchange (pool wait, connect, write
+    # and read); past it the page falls back with `reranked: false (timeout)`.
+    rerank_timeout_ms: int = Field(1500, ge=100, le=10000)
+    rerank_allow_plaintext: bool = False
+
     # Caps for the raw file-access tools (read_file / write_file). Read is
     # checked against on-disk size before reading; write against the decoded
     # byte length. Read default (10 MB) matches MAX_NOTE_BYTES and guards
@@ -1707,6 +1729,28 @@ class Settings(BaseSettings):
                 "where a trust anchor verifies nothing. Use an https endpoint "
                 "or unset EMBEDDING_CA_FILE."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_rerank_transport(self) -> "Settings":
+        """#367 (design D1): `RERANK_MODEL` holds no control character, and a
+        non-empty `RERANK_URL` passes the embedding hop's URL rules with its
+        own plaintext flag. The URL policy is skipped under `MCP_SANDBOX_MODE`,
+        like the embedding policy; the address class is not restricted (an
+        internal reranker is expected on a private or loopback host)."""
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in self.rerank_model):
+            raise ValueError("RERANK_MODEL contains a control character")
+        if not self.rerank_url or self.mcp_sandbox_mode:
+            return self
+        from src.services.transport_security import check_embedding_url_policy
+
+        check_embedding_url_policy(
+            self.rerank_url,
+            setting="RERANK_URL",
+            allow_plaintext=self.rerank_allow_plaintext,
+            allow_setting="RERANK_ALLOW_PLAINTEXT",
+            what="every rerank query and candidate note text",
+        )
         return self
 
     @model_validator(mode="after")

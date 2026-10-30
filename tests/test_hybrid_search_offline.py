@@ -811,7 +811,7 @@ def test_the_rrf_k_default_and_range():
 
 def test_the_tool_takes_no_k_argument():
     props = server.mcp._tool_manager.get_tool("hybrid_search").parameters["properties"]
-    assert set(props) == {"query", "limit", "folder", "tags", "frontmatter"}
+    assert set(props) == {"query", "limit", "folder", "tags", "frontmatter", "rerank"}
 
 
 # ── #355: the transition line, the locator and the one-line preview ─────────

@@ -37,10 +37,12 @@ from src.services.index_state import (
     state_table_exists,
 )
 from src.services.embeddings import close_provider_client
+from src.services import rerank as rerank_service
 from src.services.indexer import run_indexer_loop
 from src.services.transport_security import (
     check_database_transport,
     log_embedding_transport,
+    log_rerank_transport,
 )
 from src.services.rate_limits import flush_all
 from src.services import body_budget
@@ -582,6 +584,9 @@ async def lifespan(app: FastAPI):
             # No indexer runs here by design: `/health` says `disabled`, which
             # does not by itself make the top-level status `degraded`.
             indexer_health.mark_disabled()
+            # #367: no probe and no transport line; `/health` reads
+            # `disabled` when RERANK_URL is set, else `absent`.
+            rerank_service.mark_sandbox()
             # Sandbox mode still has to be *ready*: the admission gate refuses
             # every multi-user caller until a snapshot is published, and a
             # sandbox that never publishes one would refuse every registered
@@ -623,6 +628,15 @@ async def lifespan(app: FastAPI):
         await _check_fts_fingerprint()
         # #344: a count, a WARNING, nothing else — see the function.
         await _warn_missing_keyword_excerpts()
+        # #367 (D8): the optional reranker. Its transport line, then one
+        # two-order probe that needs no database. A failure disables reranking
+        # with one CRITICAL and **never exits** — a reranker outage must not
+        # take down the vault — and starts the bounded background re-probe.
+        reprobe_task = None
+        if settings.rerank_url:
+            log_rerank_transport()
+            if not await rerank_service.startup_probe():
+                reprobe_task = asyncio.create_task(rerank_service.reprobe_loop())
         # E1 — **synchronously, before the app serves, and before the indexer
         # task exists.** An asynchronously-published snapshot is not startup
         # enforcement: a tool call between the first accepted connection and the
@@ -666,6 +680,14 @@ async def lifespan(app: FastAPI):
             except Exception as e:  # noqa: BLE001 - shutdown, never fatal
                 logging.getLogger(__name__).error(
                     f"Closing the embedding provider client failed: {e}"
+                )
+            # #367: the re-probe task first, then the rerank client.
+            try:
+                await rerank_service.stop_task(reprobe_task)
+                await rerank_service.close_rerank_client()
+            except Exception as e:  # noqa: BLE001 - shutdown, never fatal
+                logging.getLogger(__name__).error(
+                    f"Closing the rerank client failed: {type(e).__name__}"
                 )
             # The refusal coalescer's last flush, **before `engine.dispose()`**:
             # every window still holding a pending count writes the row it owes
@@ -904,6 +926,12 @@ async def health():
     note is quarantined — the top-level `status` is `degraded` too.
     `disabled` (`MCP_SANDBOX_MODE`) does not by itself degrade the top level.
 
+    `rerank` (#367) is `enabled`, `disabled` (the probe failed or was skipped
+    in sandbox mode) or `absent` (no `RERANK_URL`). It never names the URL,
+    host, reason or a count, never probes, and `disabled` does **not** make
+    the top-level `status` `degraded`: reranking is an opt-in quality layer
+    and every `rerank=true` response states its absence.
+
     **The HTTP status is 200 in every case.** Kubernetes uses this endpoint
     for liveness, and a restart loop cannot repair vault content or an
     embedding-provider outage; monitors alert on the `status` field instead.
@@ -921,6 +949,7 @@ async def health():
             "transfer_mount_check_available": (
                 vault_fs.mount_identity_available()
             ),
+            "rerank": rerank_service.health_state(),
         }
     )
 
