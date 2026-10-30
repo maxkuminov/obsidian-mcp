@@ -183,6 +183,56 @@ not in `body_excerpt`, so nothing in the excerpt is the match.
   or any text). A migration that succeeded leaves no tagged row untagged;
 - one summary line: re-headed, already tagged, without tag lexemes.
 
+**The size preflight (owner decision after round 1).** Before the first
+UPDATE, under the same lock and configs, 035 reads every row the rewrite
+would change (the two predicates) and estimates its post-035 data size as
+`S(ts_filter(v, '{d}')) + S(head(title, aliases, tags))`, the head built by
+the shared builder (per-row or batched read-only statements; the head is at
+most a few KiB, so building it cannot itself hit the limit). `S(v)` is
+PostgreSQL's own accounting of the string area, summed over `unnest(v)`:
+the lexeme's bytes rounded up to even, plus `2 + 2 × npos` when it has
+positions. It is an upper bound for a concatenation (a lexeme in two parts
+is stored once). Measured on PG16: a stored vector with `S = 1,048,174`
+failed at the twelfth added 32-character tag word with PostgreSQL reporting
+1,048,610 against the formula's 1,048,606 — within four bytes — so the
+abort threshold is 1,048,575 − 64 = **1,048,511**. Any row over it aborts
+the migration with nothing written, naming the count and the ids. A false
+abort is possible only for a row within 64 bytes of the limit. The
+rewrite's all-or-nothing rule stays as the backstop.
+
+The operator runs the SQL equivalent against the live 034 database before
+merging (`DEPLOYMENT.md`, read-only, counts and ids only). It approximates
+`tags_text` in SQL (full forms plus `/` replaced by spaces, no cut — an
+over-estimate) and takes the existing head from the vector itself, which
+the re-head replaces with an equal `A` part. One config shown; with several,
+add one `to_tsvector` per config to `b`. Prototyped on PG16:
+
+```sql
+WITH tagged AS (
+  SELECT id, content_tsvector AS v,
+         setweight(to_tsvector('english',
+           array_to_string(tags, E'\n') || E'\n' ||
+           replace(array_to_string(tags, E'\n'), '/', ' ')), 'B') AS b
+  FROM notes_metadata
+  WHERE content_tsvector IS NOT NULL AND cardinality(tags) > 0
+    AND length(ts_filter(content_tsvector, '{b}')) = 0
+), est AS (
+  SELECT id,
+    (SELECT coalesce(sum((octet_length(lexeme) + 1) / 2 * 2
+       + CASE WHEN cardinality(positions) > 0 THEN 2 + 2 * cardinality(positions) ELSE 0 END), 0)
+     FROM unnest(v))
+  + (SELECT coalesce(sum((octet_length(lexeme) + 1) / 2 * 2
+       + CASE WHEN cardinality(positions) > 0 THEN 2 + 2 * cardinality(positions) ELSE 0 END), 0)
+     FROM unnest(b)) AS bytes
+  FROM tagged WHERE length(b) > 0
+)
+SELECT count(*) AS tagged_rows,
+       count(*) FILTER (WHERE bytes > 1048511) AS over_limit,
+       array_agg(id ORDER BY id) FILTER (WHERE bytes > 1048511) AS ids,
+       max(bytes) AS largest
+FROM est;
+```
+
 **A 54000 failure and its remedy.** The tags text is at most 2,048
 characters, so only a vector already within a few KiB of 1 MiB can cross
 the limit. Nothing is committed, so the database is still at 034. On
@@ -386,9 +436,7 @@ parts; the server instructions are untouched (they do not gloss
   (byte-exact vectors, L1) or merely mention it? Default: mention.
 - Is weight `B` right for tags, or should a deliberate label tie the title
   (`A`)? The issue's wording suggests the latter; the brief chose `B`.
-- A 54000 abort on k8s is an outage until the digest is reverted (D5). Is
-  that acceptable, or should a pre-flight (`make` target or Job) report
-  rows within 4 KiB of the limit before the merge?
+- *(Answered 2026-10-30: add the preflight — D5, "The size preflight".)*
 
 ## Codex spec review, round 1 (2026-10-30)
 
