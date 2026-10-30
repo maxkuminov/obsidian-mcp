@@ -22,11 +22,14 @@ each query through the configured provider, exactly as the incumbent
 `rerank_http_client` (design L15).
 
 **Before the first answer each arm runs the startup probe** (the factory's
-`preflight`, awaited by the runner before the generation is reserved): no
-`RERANK_URL` or a failing probe is a usage error (exit 64). **Any answer that
-is not reranked fails the run** (exit 1, a `failed` manifest) — a timeout, an
-HTTP error, anything — and so does a keyword-only hybrid answer: a degraded
-answer scored as the reranker is wrong evidence. Raise `RERANK_TIMEOUT_MS` for
+`preflight`, awaited by the runner after the replay URL is resolved and before
+the generation is reserved): no `RERANK_URL` or a failing probe is a usage
+error (exit 64). **`no_candidates` is an empty answer**: the query is scored as
+returning no results and counted per arm as `empty_candidates` in the
+manifest. **Every other answer that is not reranked fails the run** (exit 1, a
+`failed` manifest, `UnrerankedAnswer`) — a timeout, an HTTP error, anything —
+and so does a keyword-only hybrid answer: a degraded answer scored as the
+reranker is wrong evidence. Raise `RERANK_TIMEOUT_MS` for
 replay if the reranker is slow (L11), and say so in the report.
 """
 from __future__ import annotations
@@ -58,6 +61,15 @@ async def preflight(options: dict[str, str]) -> None:
     rerank._set_enabled()
 
 
+def _empty(outcome) -> bool:
+    """`no_candidates`: the search found nothing, so there was nothing to
+    rerank. An empty answer, scored as returning no results and counted in
+    the manifest as `empty_candidates` — not an unreranked answer."""
+    from src.services import rerank
+
+    return not outcome.reranked and outcome.reason == rerank.NO_CANDIDATES
+
+
 def _require(outcome) -> None:
     if not outcome.reranked:
         raise UnrerankedAnswer(
@@ -81,10 +93,13 @@ def make_semantic_arm(ctx: ArmContext) -> Arm:
         outcome = await rerank.rerank_candidates(
             q.text, [(r["title"], r.get("rerank_text")) for r in candidates]
         )
-        if candidates:
-            _require(outcome)
+        if _empty(outcome):
+            arm.empty_candidates += 1
+            return []
+        _require(outcome)
         return [candidates[i]["path"] for i in outcome.order][:limit]
 
+    arm.empty_candidates = 0
     return arm
 
 
@@ -115,10 +130,13 @@ def make_hybrid_arm(ctx: ArmContext) -> Arm:
         outcome = await rerank.rerank_candidates(
             q.text, [(r.title, r.rerank_text) for r in candidates]
         )
-        if candidates:
-            _require(outcome)
+        if _empty(outcome):
+            arm.empty_candidates += 1
+            return []
+        _require(outcome)
         return [candidates[i].path for i in outcome.order][:limit]
 
+    arm.empty_candidates = 0
     return arm
 
 

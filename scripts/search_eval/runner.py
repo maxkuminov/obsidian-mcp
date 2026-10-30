@@ -208,6 +208,9 @@ async def run_generation(
             replay = replay_corpus or (Corpus.load(fixture_corpus) if fixture_corpus else data.snapshot)
         ctx = ArmContext(session_factory=maker, corpus=replay, options=options)
         files: dict[str, dict] = {}
+        #: Per arm, the queries an arm reported as having nothing to score
+        #: (#367's rerank arms: `no_candidates`), when the arm reports any.
+        empty_candidates: dict[str, int] = {}
         for arm in arms:
             current = arm
             meta = {
@@ -245,11 +248,21 @@ async def run_generation(
                 loss, before = _loss(arm.membership, selected, data, drift.judged, replay)
                 meta.update({"source": "replay", "corpus_loss": loss,
                              "unsearchable_before": before, "missing_queries": []})
+                # An arm may count queries it answered empty because there was
+                # nothing to score (`fn.empty_candidates`, #367). Recorded in
+                # its run file and in the manifest; the query still scores as
+                # an empty answer.
+                counted = getattr(fn, "empty_candidates", None)
+                if counted is not None:
+                    meta["empty_candidates"] = int(counted)
+                    empty_candidates[arm.spec] = int(counted)
             rel = f"{generation}/{arm.slug}.json"
             digest = atomic_write(runs_dir / rel, pretty_json({"meta": meta, "runs": runs}))
             files[arm.spec] = {"path": rel, "sha256": digest}
         current = None
         manifest = {**manifest, "status": "complete", "files": files}
+        if empty_candidates:
+            manifest["empty_candidates"] = empty_candidates
         publish(manifest)
         return RunOutcome(EXIT_OK, manifest)
     except Exception as e:  # noqa: BLE001 - any failure fails the generation

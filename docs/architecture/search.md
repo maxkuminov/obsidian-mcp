@@ -1050,7 +1050,8 @@ is reserved); #367's reranker as `scripts.search_eval_arms.rerank:make_semantic_
 (membership `semantic`) and `make_hybrid_arm` (`keyword_or_semantic`), whose
 async `factory.preflight` probes the reranker before the generation is
 reserved (exit 64 on failure) and which fail the run on any unreranked
-answer (see "Reranking (#367)"); #355's heading-aware chunking as the
+answer except `no_candidates`, an empty answer counted per arm as
+`empty_candidates` in the manifest (see "Reranking (#367)"); #355's heading-aware chunking as the
 built-in arms replayed on a copy re-chunked after the snapshot; or #367's
 embedding-model trial as `runfile:<path>`, a staged arm file the harness's
 own `run` wrote on a re-embedded copy with the same qrels, snapshot and

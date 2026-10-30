@@ -199,3 +199,64 @@ def test_no_database_url_means_no_probe(tmp_path, monkeypatch, reranker):
     assert cli_main(["run", "--data", str(d), "--arm", SEM]) == EXIT_USAGE
     assert reranker.requests == [], "no probe request without a replay URL"
     assert not (d / "runs").exists()
+
+
+# ── no_candidates is an empty answer (Codex round 2; owner triage) ─────────
+
+
+def _assert_one_empty(d, out, spec):
+    from scripts.search_eval.scoring import score
+
+    assert out.exit_code == EXIT_OK, out.manifest
+    assert out.manifest["empty_candidates"] == {spec: 1}
+    staged = json.loads((d / "runs" / out.manifest["files"][spec]["path"]).read_text())
+    assert staged["meta"]["empty_candidates"] == 1
+    assert list(staged["runs"].values()) == [[]]
+    res = score(d, [spec], min_queries=1)
+    assert res.report["arms"][0]["metrics"]["overall"]["recall@10"] == 0.0
+
+
+def test_a_zero_candidate_query_is_an_empty_answer_for_the_semantic_arm(tmp_path, monkeypatch,
+                                                                       reranker):
+    _stub_replay_db(monkeypatch, [], {"1": {"A.md": dict(ALL)}})
+    d = tmp_path / "d"
+    write_data(d, [{"text": "q", "relevant": ["A.md"]}], {"1": {"A.md": dict(ALL)}})
+    _assert_one_empty(d, run(d, [SEM]), SEM)
+    assert all(r["query"] == rerank.PROBE_QUERY for r in reranker.requests), "no rerank request"
+
+
+def test_a_zero_candidate_query_is_an_empty_answer_for_the_hybrid_arm(tmp_path, monkeypatch,
+                                                                     reranker):
+    async def fake_hybrid(session, query, **kw):
+        return hybrid_service.HybridResult(rows=[])
+
+    monkeypatch.setattr(hybrid_service, "hybrid_search", fake_hybrid)
+    _stub_replay_db(monkeypatch, [], {"1": {"A.md": dict(ALL)}})
+    d = tmp_path / "d"
+    write_data(d, [{"text": "q", "relevant": ["A.md"]}], {"1": {"A.md": dict(ALL)}})
+    _assert_one_empty(d, run(d, [HYB]), HYB)
+
+
+@pytest.mark.parametrize("spec", [SEM, HYB])
+def test_any_other_unreranked_reason_still_fails_the_run(tmp_path, monkeypatch, reranker, spec):
+    async def fake_hybrid(session, query, **kw):
+        rows = [hybrid_service.HybridRow(path="A.md", title="A", tags=[], score=0.1,
+                                         keyword_rank=1, rerank_text="text")]
+        return hybrid_service.HybridResult(rows=rows)
+
+    monkeypatch.setattr(hybrid_service, "hybrid_search", fake_hybrid)
+    _stub_replay_db(monkeypatch, [row(1, "A.md")], {"1": {"A.md": dict(ALL)}})
+    real = rerank.score
+
+    async def failing_after_probe(query, documents, *, deadline_s):
+        if query != rerank.PROBE_QUERY:
+            reranker.mode = "status:500"
+        return await real(query, documents, deadline_s=deadline_s)
+
+    monkeypatch.setattr(rerank, "score", failing_after_probe)
+    d = tmp_path / "d"
+    write_data(d, [{"text": "q", "relevant": ["A.md"]}], {"1": {"A.md": dict(ALL)}})
+    out = run(d, [spec])
+    assert out.exit_code == EXIT_FAILURE
+    m = manifest_of(d)
+    assert m["status"] == "failed" and m["error"].startswith("UnrerankedAnswer")

@@ -994,7 +994,8 @@ and needs nothing; the real run is this path, from a checkout with
    run with `RERANK_URL` pointing at the reranker you mean to measure. Each
    probes the reranker before the first query (a failed probe exits 64)
    and fails the run on any answer that was not reranked, a timeout
-   included: raise `RERANK_TIMEOUT_MS` for replay if the reranker is slow,
+   included (a query whose search finds nothing is scored as empty and
+   counted per arm as `empty_candidates` in the manifest): raise `RERANK_TIMEOUT_MS` for replay if the reranker is slow,
    and say so next to the report.
 7. **Attach `report.json` to the PR only if it says `attachable: true`.** It
    carries metrics, counts and hashes, no query text and no note paths. A
