@@ -53,6 +53,9 @@ from scripts.search_eval._io import canonical_json
 from scripts.search_eval.classify import CLASSES, classify
 
 SEARCH_TOOLS = ("keyword_search", "semantic_search", "hybrid_search")
+#: The tools whose pages carry the `confidence` token (#389).
+CONFIDENCE_TOOLS = ("semantic_search", "hybrid_search")
+CONFIDENCE_VALUES = ("ok", "low")
 READ_TOOL = "read_note"
 EXPORT_TOOLS = (*SEARCH_TOOLS, READ_TOOL)
 
@@ -322,6 +325,35 @@ class MineResult:
     queries: list[dict]
     qrels: dict[str, dict[str, int]]
     report: dict = field(default_factory=dict)
+    #: One row per usable `semantic_search` / `hybrid_search` search row
+    #: (#389, D7): the `confidence` subcommand's calibration evidence. No text, no path.
+    confidence_rows: list[dict] = field(default_factory=list)
+
+
+def _number_or_none(v: Any) -> float | None:
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return float(v)
+
+
+def confidence_row(s: dict, clicked: bool) -> dict:
+    """The calibration evidence of one search row (#389, D7): `tool`, the
+    miner's query `class`, `created_at` (the export's UTC epoch
+    microseconds, unchanged), `top_similarity`, `keyword_all`, `clicked`
+    and — only when the usage row recorded one — `confidence`. A row
+    without the key predates the token and is excluded by the tabulator."""
+    p = s["params"]
+    row = {
+        "tool": s["tool"],
+        "class": classify(normalize_text(p["query"])),
+        "created_at": s["created_at"],
+        "top_similarity": _number_or_none(p.get("top_similarity")),
+        "keyword_all": p.get("keyword_all") if _is_int(p.get("keyword_all")) else None,
+        "clicked": clicked,
+    }
+    if p.get("confidence") in CONFIDENCE_VALUES:
+        row["confidence"] = p["confidence"]
+    return row
 
 
 @dataclass
@@ -412,6 +444,7 @@ def mine(rows: list[dict], *, window_seconds: float = DEFAULT_WINDOW_SECONDS,
         entries.sort()
 
     credited_pairs: set[tuple[str, str]] = set()
+    clicked_positions: set[int] = set()
     credits = 0
     unattributed = 0
     for r in reads:
@@ -429,6 +462,7 @@ def mine(rows: list[dict], *, window_seconds: float = DEFAULT_WINDOW_SECONDS,
             continue
         credits += 1
         pos = hit[2]
+        clicked_positions.add(pos)
         qid = search_qid[pos]
         credited_pairs.add((qid, path))
         queries[qid].relevant.add(path)
@@ -503,7 +537,11 @@ def mine(rows: list[dict], *, window_seconds: float = DEFAULT_WINDOW_SECONDS,
         "manual_excluded_other_owner": n_manual_other_owner,
         "provenance": provenance,
     }
-    return MineResult(queries=out_queries, qrels=qrels, report=report)
+    confidence_rows = [confidence_row(s, pos in clicked_positions)
+                       for pos, s in enumerate(searches) if s["tool"] in CONFIDENCE_TOOLS]
+    report["confidence_rows"] = len(confidence_rows)
+    return MineResult(queries=out_queries, qrels=qrels, report=report,
+                      confidence_rows=confidence_rows)
 
 
 # --------------------------------------------------------------------------

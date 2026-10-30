@@ -38,7 +38,10 @@ SELECT json_build_object(
             WHERE e.key IN (
                 'query', 'folder', 'tags', 'frontmatter', 'limit',
                 'result_paths', 'result_count', 'path', 'section',
-                'error', 'over_quota'
+                'error', 'over_quota',
+                -- #389: the confidence evidence (`mine` writes
+                -- confidence-rows.jsonl from it; no text, no path).
+                'confidence', 'top_similarity', 'keyword_all'
             )
         )
     END

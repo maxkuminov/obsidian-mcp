@@ -41,7 +41,13 @@ from pathlib import Path
 
 from scripts.search_eval import EXIT_FAILURE, EXIT_OK, UsageError
 from scripts.search_eval._io import atomic_write, ensure_private_dir, pretty_json
-from scripts.search_eval.arms import ArmContext, EvalQuery, ResolvedArm, resolve_arms
+from scripts.search_eval.arms import (
+    ArmContext,
+    EvalQuery,
+    ResolvedArm,
+    resolve_arms,
+    runfile_source_depth,
+)
 from scripts.search_eval.corpus import Corpus, lost
 from scripts.search_eval.metrics import dedup
 from scripts.search_eval.scoring import (
@@ -54,7 +60,9 @@ from scripts.search_eval.scoring import (
     selected_hash,
 )
 
-DEFAULT_DEPTH = 20
+#: 50 since #389: the tools' largest `limit` and `hybrid_search`'s arm depth,
+#: so recall@50 is the ceiling of what one page can reach.
+DEFAULT_DEPTH = 50
 #: The generation's own copy of its manifest. An arm slug never starts with
 #: `_`, so it cannot collide with a staged arm file.
 GENERATION_MANIFEST_FILE = "_manifest.json"
@@ -238,13 +246,17 @@ async def run_generation(
             current = arm
             meta = {
                 "arm": arm.spec, "label": arm.label, "membership": arm.membership,
-                "options": options, "depth": depth, "generation": generation,
+                "options": options, "depth": depth, "staged_depth": depth,
+                "generation": generation,
                 "selected_qids_hash": sel_hash, "qrels_sha256": data.qrels_sha256,
                 "snapshot_sha256": data.snapshot_sha256,
             }
             if arm.kind == "runfile":
                 src_meta, src_runs = arm.runfile["meta"], arm.runfile["runs"]
                 runs = {qid: dedup(src_runs[qid])[:depth] for qid in selected if qid in src_runs}
+                # #389 (D8): never deeper than the source was staged; scoring
+                # nulls every recall@k with k above it.
+                meta["staged_depth"] = min(depth, runfile_source_depth(src_meta))
                 if _is_semantic(arm.membership):
                     # Whatever the staging harness recorded, or null (#355).
                     meta["retrieval_fingerprint"] = src_meta.get("retrieval_fingerprint")
