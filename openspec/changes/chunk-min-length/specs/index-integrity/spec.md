@@ -3,32 +3,40 @@
 ### Requirement: The indexer SHALL chunk a note at its ATX headings using the section-addressing scanner, so a chunk's ordinal is the one `read_note` resolves
 `embed_note` SHALL split the body it embeds into sections using the same heading scanner that `read_note(section=…)` and `edit_note(section=…)` use to resolve selectors. It SHALL scan the same frontmatter-stripped body, so a line inside fenced or inline code is never a boundary.
 
-- **Sections.** Section *k* (k ≥ 1) SHALL be the text of the *k*-th heading in document order, from the line after the heading line up to the next heading of any depth or the end of the body. Section 0 SHALL be the text before the first heading, or the whole body when there is none.
-- **Cleaning.** Each section SHALL be cleaned by removing the fence spans that the shared recognizer finds over the **whole** body.
-- **Lengths.** A section is *non-empty* when its cleaned text, stripped, is not empty. It is *short* when it is non-empty and its stripped length in code points is below `CHUNK_MIN_CHARS`.
+**Sections and lengths.**
+- Section *k* (k ≥ 1) SHALL be the text of the *k*-th heading in document order, from the line after the heading line up to the next heading of any depth or the end of the body.
+- Section 0 SHALL be the text before the first heading, or the whole body when there is none.
+- Each section SHALL be cleaned by removing the fence spans the shared recognizer finds over the **whole** body.
+- Let `W = CHUNK_SIZE × 4`. The effective minimum SHALL be `m = min(CHUNK_MIN_CHARS, W // 2)`. `CHUNK_MIN_CHARS` is the module constant 200. It is not a setting and not a fingerprint field, so every previously valid `CHUNK_SIZE` remains valid. A change to the constant is a change of chunking format and SHALL bump `CHUNKING_VERSION`.
+- A section is *non-empty* when its cleaned text, stripped, is not empty. It is *short* when it is non-empty and its stripped length in code points is below `m`.
 
-**Grouping.** Non-empty sections SHALL be grouped in document order:
-- A group opens at a non-empty section. While the group's text is short, it extends to the next non-empty section, and it closes once it reaches the minimum.
-- A group's text SHALL be the contiguous raw span from its first section's own text to its last section's end, cleaned with the whole-body fence spans. It therefore includes the heading lines of absorbed sections and of any empty sections between them.
-- At the end of the body, a group that is still short SHALL join the previous group, if there is one. Otherwise it SHALL stand alone as the note's only group.
-- With `CHUNK_MIN_CHARS = 0`, every non-empty section SHALL be its own group.
+**Grouping.** Non-empty sections SHALL be grouped in document order.
+- A group opens at a non-empty section. While its text is short and another non-empty section follows, it SHALL extend to that section, and it closes once it reaches `m`.
+- A group's text SHALL be the contiguous raw span from its first section's own text to its last section's end, cleaned with the whole-body fence spans. It therefore includes the heading lines of absorbed sections and of empty sections between them.
+- At the end of the body, a group that is still short SHALL join the last closed group, if one exists.
+- If no closed group exists, the short group SHALL stand alone only when the note's whole cleaned body, heading lines included, is also short. Otherwise the note SHALL be chunked as one group of its whole cleaned body at ordinal 0.
 - Heading lines SHALL NOT be part of the text of a group that holds one section.
 
-**Windowing.** Each group's text SHALL be windowed at `CHUNK_SIZE × 4` characters with the configured overlap.
-- **Lookback.** A window that does not reach the end of its text SHALL cut just after the last line break, or failing that the last whitespace character, within the final `min(200, window ÷ 10)` characters of the window. A window with neither SHALL be cut at the full width.
-- **Overlap.** With overlap above zero, the next window's start SHALL move forward to just after the first whitespace within the same lookback, and it SHALL always advance by at least one character.
-- **Tail.** When the text left after a cut has a stripped length below `CHUNK_MIN_CHARS`, the window SHALL run to the end of the text instead.
+**Windowing.** Each group's text SHALL be windowed with `L = min(200, W // 10)`. A *word start* is a non-whitespace character at the start of the text or after a whitespace character. A *line start* is a word start whose preceding whitespace contains a line break.
+- **Cut.** A window starting at `a` whose limit `a + W` falls before the end of the text SHALL be cut at the last line start in `(a + W − L, a + W]`. Failing that, it SHALL be cut at the last word start in that range. Failing that, it SHALL be cut at `a + W`. The next window SHALL start at the cut.
+- **Overlap.** With overlap above zero, the next start SHALL be `max(cut − overlap × 4, a + 1)`, moved forward to the first word start at or before the cut, and SHALL NOT be moved beyond the cut.
+- **Tail.** When the text after a cut would have a stripped length below `m`, the cut SHALL be recomputed by the same rule with the limit `n − m`, where `n` is the length of the text with trailing whitespace removed. The re-cut SHALL only move a cut earlier.
+- A window SHALL be stored as its raw text, unstripped, and only when its stripped text is non-empty.
+- No chunk's text SHALL be longer than `W`.
+- Every non-heading cleaned character of a section SHALL be inside at least one chunk.
 
-**Locator.** Each chunk's `section_ordinal` SHALL be the deepest heading ordinal N whose `read_note(section="#N")` body span contains the chunk's raw span, or 0 when no heading's body contains it.
-- Its `heading_path` SHALL be that section's enclosing headings, outermost first, each component trimmed and cut at 200 characters with a marked cut. Section 0's path is the empty array.
+**Locator.** Each chunk's `section_ordinal` SHALL be the deepest heading ordinal N whose `read_note(section="#N")` body span contains the chunk's raw span, or 0 when none does.
+- Its `heading_path` SHALL be that section's enclosing headings, outermost first, each component trimmed and cut at 200 characters with a marked cut. The path is empty for 0.
 - Its prefix SHALL be built from that path.
 - A chunk drawn from one section's own text SHALL therefore record that section's ordinal.
 - Every chunk SHALL be a substring of its locator section's body with the whole-body fence spans removed.
 
-If no section is non-empty while the whole-body chunker would yield at least one chunk for the cleaned body, the note SHALL be chunked as one group of the whole cleaned body at ordinal 0. A note SHALL therefore yield zero chunks exactly when the pre-#355 chunker yields zero. The per-note chunk cap SHALL count across all groups in document order, and the truncation marker SHALL keep its meaning. The grouping, the lookback and the tail rule are part of the chunking format, recorded as `CHUNKING_VERSION` 2.
+**No sections.** If no section is non-empty while the whole-body chunker would yield a chunk for the cleaned body, the note SHALL be chunked as one group of the whole cleaned body at ordinal 0. A note SHALL therefore yield zero chunks exactly when the pre-#355 chunker yields zero.
+
+**Cap and version.** The per-note chunk cap SHALL count across all groups in document order, and the truncation marker SHALL keep its meaning. These rules are chunking format version 2.
 
 #### Scenario: A heading inside a code fence is not a boundary
-- **WHEN** a note contains a fenced block whose content includes a line `# Not a heading`, inside a section headed `## Real` whose text is at least `CHUNK_MIN_CHARS`
+- **WHEN** a note contains a fenced block whose content includes a line `# Not a heading`, inside a section headed `## Real` whose text is at least `m`
 - **THEN** no section boundary SHALL fall at that line, and every chunk of that section SHALL record the ordinal of `## Real`
 
 #### Scenario: Ordinal parity with section addressing
@@ -36,45 +44,57 @@ If no section is non-empty while the whole-body chunker would yield at least one
 - **THEN** `read_note(path, section="#N")` SHALL resolve, and the chunk's text SHALL be a substring of that section's body with the whole-body fence spans removed
 
 #### Scenario: Text before the first heading
-- **WHEN** a note has at least `CHUNK_MIN_CHARS` of prose above its first heading
+- **WHEN** a note has at least `m` characters of prose above its first heading
 - **THEN** that prose SHALL be chunked at ordinal 0 with an empty heading path
 
 #### Scenario: A short lead merges into its first subsection under its own locator
-- **WHEN** a note holds `## Email Triage`, then the single line `See entries in the Email Triage log`, then `### 2026-10-01` followed by 300 characters of text
-- **THEN** no chunk SHALL be shorter than `CHUNK_MIN_CHARS`
+- **WHEN** a note holds `## Email Triage`, then the single line `See entries in the Email Triage log`, then `### 2026-10-01` followed by 300 characters of text, at the default `CHUNK_SIZE`
+- **THEN** no chunk's stripped text SHALL be shorter than 200
 - **AND** the first chunk SHALL contain the short line and the `### 2026-10-01` heading line, and SHALL record the ordinal and path of `## Email Triage`
 
 #### Scenario: A short section merges into a following sibling under their common parent
-- **WHEN** `# Project` contains `## A` with 40 characters of text, followed by `## B` with 600 characters
-- **THEN** the chunk holding `## A`'s text SHALL record `# Project`'s ordinal, and SHALL be contained in `read_note(section=` that ordinal `)`
+- **WHEN** `# Project` contains `## A` with 40 characters of text, followed by `## B` with 600 characters, at the default `CHUNK_SIZE`
+- **THEN** the chunk holding `## A`'s text SHALL record `# Project`'s ordinal and SHALL be contained in that section's body
 
 #### Scenario: A short last section merges backward
-- **WHEN** a note's final section holds 30 characters and an earlier section holds 600
+- **WHEN** a note's final section holds 30 characters and an earlier section holds 600, at the default `CHUNK_SIZE`
 - **THEN** the 30 characters SHALL be the end of the previous group's last chunk, and no chunk SHALL consist of them alone
 
+#### Scenario: An outline with one tiny body
+- **WHEN** a note holds sixty headings with empty bodies, followed by a heading whose body is `x`, and its whole cleaned body is longer than `m`
+- **THEN** it SHALL be chunked as one group of the whole cleaned body at ordinal 0, and no chunk SHALL consist of `x` alone
+
 #### Scenario: A whole note shorter than the minimum keeps one chunk
-- **WHEN** a note's whole cleaned text is shorter than `CHUNK_MIN_CHARS` and not empty
+- **WHEN** a note's whole cleaned body is shorter than `m` and not empty
 - **THEN** exactly one chunk SHALL be stored for it, and the note SHALL NOT be certified as empty
 
 #### Scenario: No four-character tail and no mid-word cut
-- **WHEN** a section's cleaned text is 2,048 × 2 + 4 characters of prose ending in `themselves`
-- **THEN** no chunk SHALL equal `lves`, and no chunk SHALL start or end inside a word that has whitespace within the lookback
+- **WHEN** a section's cleaned text is 2,048 × 2 + 4 characters of prose ending in `themselves`, at the default `CHUNK_SIZE`
+- **THEN** no chunk SHALL equal `lves`, the final chunk's stripped text SHALL be at least 200, and no cut SHALL fall inside a word when a word start exists in its lookback
+
+#### Scenario: A hard cut with overlap skips nothing
+- **WHEN** `CHUNK_SIZE` is 100 (W = 400), the overlap is 1, and a section's cleaned text is 400 `A`, 20 `B`, one space and 500 `C`
+- **THEN** every `B` SHALL be inside a stored chunk, and chunking SHALL terminate
+
+#### Scenario: A merged tail never makes a chunk longer than a window
+- **WHEN** a group's text is `W + m − 1` characters and its chunks are embedded under a 300-character prefix
+- **THEN** no chunk text SHALL exceed `W` characters, every provider input SHALL be at most `W + 302` characters, and the final chunk's stripped text SHALL be at least `m`
 
 #### Scenario: A run without whitespace is cut hard
 - **WHEN** a section holds a 5,000-character run with no whitespace
 - **THEN** it SHALL be cut at the full window width, and chunking SHALL terminate
 
+#### Scenario: Every previously valid chunk size still starts
+- **WHEN** a deployment with `CHUNK_SIZE=64`, or `CHUNK_SIZE=1`, starts the version-2 build
+- **THEN** startup SHALL proceed, and the effective minimum SHALL be 128, or 2, respectively
+
 #### Scenario: A parent with only subsections
-- **WHEN** a `## Parent` heading is followed directly by `### Child` with at least `CHUNK_MIN_CHARS` of body text
+- **WHEN** a `## Parent` heading is followed directly by `### Child` with at least `m` characters of body text
 - **THEN** no group SHALL open at `## Parent`, and the child's chunks SHALL record the path `["Parent", "Child"]`
 
 #### Scenario: A long section
-- **WHEN** a single section's cleaned text spans three windows and its remainder after the second cut is at least `CHUNK_MIN_CHARS`
+- **WHEN** a single section's cleaned text spans three windows and its remainder after the second cut is at least `m` stripped
 - **THEN** three chunks SHALL be stored, with the same ordinal and heading path and consecutive chunk indexes
-
-#### Scenario: Merging disabled
-- **WHEN** `CHUNK_MIN_CHARS` is 0
-- **THEN** every non-empty section SHALL be windowed on its own, and only the lookback SHALL differ from version 1
 
 #### Scenario: A note of headings only
 - **WHEN** a note consists only of heading lines

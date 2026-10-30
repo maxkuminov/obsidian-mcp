@@ -5,7 +5,11 @@ For every database-backed arm whose membership includes `semantic`, the harness'
 
 - **`retrieval_fingerprint()`**, as the producing process computed it.
 - **`legacy_chunked_notes`**: the number of the replay copy's notes, **within the arm's provenance owner**, that hold vector rows and whose `embedded_chunking_version` is not the current `CHUNKING_VERSION`.
-- **`chunk_lengths`**: `{chunks, under_min, p10, p50, p90}` over the provenance owner's stored chunks, where length is the code-point length of the stripped `chunk_text`, `under_min` counts chunks shorter than the running `CHUNK_MIN_CHARS`, and the percentiles are discrete. It SHALL be null when the owner has no chunks or the copy predates migration 034.
+- **`chunk_lengths`**: `{chunks, p10, p50, p90, whole_short, whitespace_windows, under_min}` over the provenance owner's stored chunks. It SHALL be null when the owner has no chunks or the copy predates migration 034. `m` is the running effective minimum and `W` the running window in characters. A chunk is *below the minimum* when `length(btrim(chunk_text)) < m`.
+  - The percentiles SHALL be discrete percentiles of `length(btrim(chunk_text))`.
+  - `whole_short` SHALL count chunks below the minimum whose note holds exactly one chunk.
+  - `whitespace_windows` SHALL count chunks below the minimum whose raw `length(chunk_text)` is at least `W / 4`, counted with integer division.
+  - `under_min` SHALL count chunks below the minimum whose note holds more than one chunk and whose raw length is below `W / 4`, counted with integer division. A conforming chunker yields `under_min = 0`. The predicate SHALL be one SQL text that the operator recipe and the tests share.
 
 **Provenance owner.** It is the `user_id` the export was filtered to (`USER_ID=` or `mine --user-id`), read from the `user_id` of the report's queries. The miner guarantees one owner for a single-user report. It SHALL be compared NULL-safe, so the ownerless scope is covered. A single-user report with no queries records null for both counts. Only when the report's provenance is `"multi"`, and the report is therefore not attachable, SHALL the counts cover all owners.
 
@@ -18,7 +22,7 @@ For every database-backed arm whose membership includes `semantic`, the harness'
 
 #### Scenario: A candidate run on a fully re-embedded copy
 - **WHEN** the built-in `semantic` arm runs on a copy whose every embedded note carries the current chunking version
-- **THEN** its report entry SHALL carry the retrieval fingerprint, `legacy_chunked_notes: 0`, and a `chunk_lengths` object
+- **THEN** its report entry SHALL carry the retrieval fingerprint, `legacy_chunked_notes: 0`, and a `chunk_lengths` object with `under_min: 0`
 
 #### Scenario: A baseline from an older harness
 - **WHEN** a `runfile:` arm staged by a harness without these fields is scored
