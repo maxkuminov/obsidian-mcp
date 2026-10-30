@@ -212,6 +212,11 @@ def _stub_replay_db(monkeypatch):
 
     monkeypatch.setattr(db, "open_readonly", fake_open)
     monkeypatch.setattr(db, "fetch_membership", fake_membership)
+
+    async def fake_legacy(_session, _owner):
+        return 0  # #355: the hybrid arm is semantic-bearing, so it is recorded
+
+    monkeypatch.setattr(db, "legacy_chunked_notes", fake_legacy)
     monkeypatch.setenv("SEARCH_EVAL_DATABASE_URL", "postgresql+asyncpg://u:p@127.0.0.1:1/x")
 
 
@@ -256,6 +261,11 @@ def test_a_keyword_only_answer_fails_the_run(tmp_path, monkeypatch):
 
     monkeypatch.setattr(db, "open_readonly", fake_open)
     monkeypatch.setattr(db, "fetch_membership", fake_membership)
+
+    async def fake_legacy(_session, _owner):
+        return 0  # #355: the hybrid arm is semantic-bearing, so it is recorded
+
+    monkeypatch.setattr(db, "legacy_chunked_notes", fake_legacy)
     monkeypatch.setenv("SEARCH_EVAL_DATABASE_URL", "postgresql+asyncpg://u:p@127.0.0.1:1/x")
     d = tmp_path / "d"
     write_data(d, [{"text": "q", "relevant": ["A.md"]}], {"1": {"A.md": dict(ALL)}})
