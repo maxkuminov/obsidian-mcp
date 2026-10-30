@@ -300,8 +300,10 @@ crowded by a verbose note; during an outage the answer is the keyword
 ranking, labelled; snippets, `matched_in` and the excerpt detail cover the
 first `KEYWORD_SNIPPET_ROWS` keyword rows only; the score compares only
 within one page; staleness has `semantic_search`'s declared bound;
-`keyword_search` and `semantic_search` still render paths and titles raw and
-the semantic chunk preview is not one-lined (a follow-up issue); k = 60 is
+`keyword_search` and `semantic_search` still render paths and titles raw
+(the semantic chunk preview, in all three vector tools, is one line since
+#355: `_preview_line` collapses whitespace and escapes controls, closing
+#385); k = 60 is
 unvalidated on this corpus until a harness report; `--arm-opt` is
 run-global, so three or more values of k need separate generations; a
 literal `«`/`»` in a note collides with the highlight markers; an

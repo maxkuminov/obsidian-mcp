@@ -620,6 +620,16 @@ reading; L11; bounded timeouts in the 034 downgrade.
 
 Declined: none.
 
+## Codex implementation review, round 2 (2026-10-30)
+
+PASS on f2edbf9: all three round-1 findings (M1, m1, m2) VERIFIED, no BLOCKER
+or MAJOR in the full adversarial pass, including the hybrid integration and
+the migration interleavings. One MINOR, fixed: `search.md`'s hybrid
+accepted-limitations paragraph still said the semantic chunk preview is not
+one-lined; it now says `_preview_line` normalises it in all three vector
+tools (closing #385), keeping only the raw path/title clause, and the
+archived hybrid design's L9 records that #355 closes the preview half.
+
 ## Implementation notes
 
 Choices the spec left open, one line each.
