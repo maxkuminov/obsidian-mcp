@@ -388,7 +388,7 @@ def legacy_vectors_sql(alias: str = "nm") -> str:
     counts. The same definition as the harness's `legacy_chunked_notes`.
     """
     return (
-        f"(EXISTS (SELECT 1 FROM note_embeddings ne_v WHERE ne_v.note_id = {alias}.id) "
+        f"(EXISTS (SELECT 1 FROM note_embeddings AS lv WHERE lv.note_id = {alias}.id) "
         f"AND {not_rechunked_sql(alias)})"
     )
 
