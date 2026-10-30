@@ -166,7 +166,7 @@
   - the downgrade;
   - locator and preview forgery;
   - the instruction's reach into documents.
-  
+
   Two rounds by default, triaged per the workflow. Record the rounds in `design.md`, and record declined findings as accepted limitations.
 - [ ] 10.4 After fixes, re-run 10.1 and the verifier's command set once on the final tree.
 
