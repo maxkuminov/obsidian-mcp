@@ -5,7 +5,7 @@ The `run` step SHALL connect only to the URL named by `SEARCH_EVAL_DATABASE_URL`
 
 The step SHALL set `default_transaction_read_only=on` on every connection it creates, and SHALL assert `transaction_read_only = on` before the first arm call, aborting otherwise. The built-in `keyword` and `semantic` arms SHALL issue no write. Replay SHALL NOT pass through `_tracked`.
 
-The shipped rerank arms (`scripts/search_eval_arms/rerank.py`) SHALL make exactly one kind of non-database connection: to `RERANK_URL`, through `transport_security.rerank_http_client`; they SHALL NOT dial any other host. An imported `module:factory` arm runs with whatever privileges the replay URL grants. The harness SHALL document that the restored copy, not the session default, is what protects data from such an arm.
+The shipped rerank arms (`scripts/search_eval_arms/rerank.py`) SHALL make the same embedding-provider connection the arm they wrap makes (the built-in `semantic` arm and the hybrid arm embed each query through the configured provider), plus `RERANK_URL` through `transport_security.rerank_http_client`; they SHALL NOT dial any other host. An imported `module:factory` arm runs with whatever privileges the replay URL grants. The harness SHALL document that the restored copy, not the session default, is what protects data from such an arm.
 
 #### Scenario: The built-in arms write nothing
 - **WHEN** the `keyword` arm replays seeded queries against a seeded copy
@@ -19,7 +19,7 @@ The shipped rerank arms (`scripts/search_eval_arms/rerank.py`) SHALL make exactl
 - **WHEN** `run` is invoked with a database-backed arm and neither `SEARCH_EVAL_DATABASE_URL` nor `--database-url` is set
 - **THEN** it exits with the usage-error code without connecting anywhere
 
-#### Scenario: A rerank arm dials only the reranker and writes nothing
+#### Scenario: A rerank arm dials no new host beyond the reranker and writes nothing
 - **WHEN** the integration test replays `scripts.search_eval_arms.rerank:make_semantic_arm` against a seeded copy with the fake reranker on a loopback port, reading `pg_stat_user_tables` before and after
 - **THEN** no insert, update or delete counter SHALL have moved, and the fake reranker SHALL have received every rerank request the arm made
 

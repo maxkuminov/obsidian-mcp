@@ -29,7 +29,7 @@ The README default is unchanged: no reranker is configured. No migration.
 ### Modified Capabilities
 
 - `search-quality`: MODIFIED "Search calls record per-phase timing" (`rerank_ms` and the rerank keys on `semantic_search`, and `result_paths` recorded in the final order).
-- `search-evaluation`: MODIFIED "Replay SHALL connect only to the named URL…" (a rerank arm's only non-database hop is `RERANK_URL` through the rerank client), and ADDED "The harness SHALL ship replayable rerank arms that fail the run rather than score an unreranked answer".
+- `search-evaluation`: MODIFIED "Replay SHALL connect only to the named URL…" (a rerank arm makes the provider connection of the arm it wraps, plus `RERANK_URL` through the rerank client, and nothing else), and ADDED "The harness SHALL ship replayable rerank arms that fail the run rather than score an unreranked answer".
 - `mcp-request-routing`: MODIFIED "Tool metadata SHALL leave the published tool surface otherwise unchanged" (an amendment entry for `semantic_search` differing only by the optional `rerank` property, and the `hybrid_search` additions entry carrying it too; rebased onto the merged 28-tool text by task 0.1).
 - `internal-transport-security`: MODIFIED "The server SHALL report each outbound hop's transport once at startup" (a rerank line).
 - `security-event-logging`: MODIFIED "A plaintext internal hop SHALL be recorded once per process start as a catalogued event" (`reason` gains `rerank`).

@@ -150,7 +150,7 @@ A probe attempt SHALL send two rerank requests with a fixed query and the same t
 
 #### Scenario: Backoff
 - **WHEN** the reranker stays down
-- **THEN** re-probe attempts SHALL occur at 60, 120, 240 and 480 seconds after the failure and every 600 seconds thereafter, with no further CRITICAL record
+- **THEN** re-probe attempts SHALL occur at intervals of 60, 120, 240 and 480 seconds, then every 600 seconds, with no further CRITICAL record
 
 #### Scenario: Shutdown
 - **WHEN** the process shuts down while the state is `disabled`

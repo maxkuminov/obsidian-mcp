@@ -91,7 +91,7 @@ This is what `llama-server --reranking` serves, and vLLM, Infinity and Jina's AP
 ### D6. `hybrid_search` (when it exists)
 
 - Candidates: the first 50 rows of the fused list (the union can hold 100) in fused order, before truncation to `limit`. The same superset property holds.
-- Document text: `title + "\n\n" + X`, cut to 2,048 characters. X is the note's semantic-arm chunk when the note is in the semantic arm and not stale. The semantic chunk is taken before any preview cut, and the whole document is bounded at 2,048 characters. Otherwise X is the excerpt's leading characters up to that bound (`left(notes_metadata.body_excerpt, 2048)`, the text the keyword vector was built from), read by **one extra statement inside the hybrid transaction and snapshot**: `SELECT id, left(body_excerpt, 2048) FROM notes_metadata WHERE id = ANY(:ids)` with the owner predicate, issued after the keyword snippet statements (after hybrid's D2 step 7) and only when such a candidate exists. A NULL excerpt (a pre-031 row) sends the title alone. This fetches text for candidates already chosen, it is not a retrieval, and it runs under the snapshot that chose them.
+- Document text: `title + "\n\n" + X`, cut to 2,048 characters. X is the note's semantic-arm chunk when the note is in the semantic arm and not stale. The semantic chunk is taken before any preview cut, and the whole document is bounded at 2,048 characters. Otherwise X is the excerpt's leading characters up to that bound (`left(notes_metadata.body_excerpt, 2048)`, the text the keyword vector was built from), read by **one extra statement inside the hybrid transaction and snapshot**: `SELECT file_path, left(body_excerpt, 2048) FROM notes_metadata WHERE file_path IN (…)` under the owner predicate (path, not id: the semantic arm's rows carry no note id, and `(user_id, file_path)` is unique), issued after the keyword snippet statements (after hybrid's D2 step 7) and only when such a candidate exists. A NULL excerpt (a pre-031 row) sends the title alone. This fetches text for candidates already chosen, it is not a retrieval, and it runs under the snapshot that chose them.
 - A keyword-only hybrid call (embedding provider down) still reranks: the reranker is a separate hop. The header carries both markers: `arms: keyword-only (…)` and `reranked: …`.
 - The harness arm for hybrid fails the run on either degradation.
 - `hybrid-search` merged before implementation (task 0.1), so all of D6 is built. Re-checked against the merged code: the excerpt statement follows hybrid's step 7 (snippets), the D9 floor arithmetic starts from hybrid's pinned 400 / 340 / 75 / 75 bounds, and D12's `keyword_or_semantic` membership and `hybrid_k` passthrough (`ARM_OPTS`) exist as described.
@@ -174,7 +174,7 @@ Found 10 semantic matches for "deploy runbook" — 0 stale, 0 truncated — rera
   - `make_hybrid_arm` (membership **`keyword_or_semantic`**, with hybrid-search's per-constituent corpus-loss rule; Codex round 1) does the same over the hybrid service's untruncated fused candidates, reading `hybrid_k` from `ctx.options` (defaulting to `HYBRID_RRF_K`) through the hybrid change's `ARM_OPTS` passthrough. It exists only once `hybrid-search` has merged. Without it, importing the factory raises `UsageError` (exit 64) naming the missing service.
 - **Each factory checks the reranker before the first answer**: it runs the D8 probe, and a failing probe raises `UsageError`. An arm whose answer for any query comes back `reranked: false` (any code), or keyword-only for hybrid, **raises, so the run fails** (exit 1, `failed` manifest). A degraded answer scored as the reranker is wrong evidence. Timeouts during replay are therefore visible as failed runs, and the harness doc says to raise `RERANK_TIMEOUT_MS` for replay if the reranker is slow (L11).
 - Factories, not `--arm-opt rerank=true`. The option dict is run-global (hybrid-search L11), so an option would rerank the incumbent `semantic` arm as well, and the A/B would compare the candidate with itself.
-- The arms make one non-database hop, to `RERANK_URL` through `rerank_http_client`. They call the services directly, never `_tracked`, and write nothing (the `pg_stat_user_tables` assertion).
+- A rerank arm makes the same embedding-provider connection the arm it wraps makes (the incumbent `semantic` arm has always embedded each query), plus `RERANK_URL` through `rerank_http_client`; nothing else (Codex implementation review round 1, C1; L15). They call the services directly, never `_tracked`, and write nothing (the `pg_stat_user_tables` assertion).
 - Eval-gate invocation: `ARMS="semantic scripts.search_eval_arms.rerank:make_semantic_arm"` (plus `hybrid scripts.search_eval_arms.rerank:make_hybrid_arm` when hybrid exists), `BASELINE=semantic`.
 
 ### D13. Docstrings and the tool schema
@@ -263,6 +263,7 @@ Verdict on 2d8ea06: the spec and task 7.4 close the capped-page case. **NOT_FIXE
 - **L12** No authentication header, so a reranker behind an auth proxy cannot be used in v1.
 - **L14** Under `MAX_READ_RESPONSE_CHARS`, a `rerank=true` page (reranked or fallback) can show fewer rows than the `rerank=false` page of the same call, because the quoted encoding is longer. Rows are dropped whole from the end, and the cap footer always discloses the omitted count with `more: true`. It is never silent.
 - **L13** The reranker sees the caller's note text. It has the embedding provider's trust and is documented, but not otherwise mitigated.
+- **L15** The rerank harness arms embed each replayed query through the configured provider, exactly as the incumbent `semantic` arm does. A precomputed-query-vector seam that would let replay run with the provider blocked was declined as scope (Codex implementation review round 1, C1); the arms' only new outbound hop is `RERANK_URL`.
 
 ## Implementation notes
 
@@ -281,10 +282,21 @@ Choices the spec left open, one line each (recorded during implementation, 2026-
 - The `rerank=true` cap footer on both tools is `Response cap: N omitted — more: true; narrow with limit= or folder=.` (≤ 69 characters); `hybrid_search(rerank=false)` keeps its own footer.
 - Pinned worst cases at 1,000 (measured 181 / 230 / 427 / 360): semantic header ≤ 185 and abbreviated structure ≤ 235; hybrid `rerank=true` header ≤ 431 and structure ≤ 362, title/path cut 20–25 (431 + 362 + 25 + 25 + 75 + 75 + 5 = 998).
 - `rerank_candidates` is recorded on every `rerank=true` row whose search ran (0 for an empty result); `rerank_ms` only when a request was sent.
-- A provider input rejection on `rerank=true` returns the existing `argument_too_long` refusal unchanged, with no rerank token (nothing was searched).
-- Harness: the probe runs in a new generic hook, an async `factory.preflight(options)` that the runner awaits once per distinct hook before reserving the generation, so a failed probe exits 64 with no generation directory.
+- A provider input rejection on `rerank=true` returns the existing `argument_too_long` refusal unchanged, with no rerank token; its usage row records `reranked: false` and no reason, count or time, since nothing was searched (verifier V4).
+- `rerank_ms` is recorded only when the request reached the wire, detected by httpcore's trace extension (`…send_request_headers.started`); a pool wait or connect failure before it records none (Codex C3).
+- Harness: the probe runs in a new generic hook, an async `factory.preflight(options)` that the runner awaits once per distinct hook after resolving the replay URL and before reserving the generation, so no URL means no probe and a failed probe exits 64 with no generation directory (Codex C2).
 - Harness: an empty answer (`no_candidates`) is an empty run, not a failure; every other `reranked: false` raises `UnrerankedAnswer`.
 - `make_hybrid_arm`'s "hybrid service missing" `UsageError` path is kept but untested: the service ships with #354.
 - `RERANK_MODEL`'s control-character rule lives in the `_validate_rerank_transport` model validator; its length bound is `Field(max_length=200)`.
 - `check_embedding_url_policy` gained `allow_setting` and `what` parameters; the embedding message is byte-identical (a test pins its wording).
 - The rerank WARNING carries `suppressed_since_last`, the number of records the previous window withheld for that code.
+
+## Codex implementation review, round 1 (2026-10-30)
+
+Verdict on 553253d: FAIL, 3 MAJOR. One was a spec-text defect, two were fixed.
+
+1. **MAJOR (spec text): the rerank arms dial the embedding provider, which the search-evaluation delta said they must not.** The incumbent `semantic` arm has always embedded each query through the provider, so the sentence was wrong rather than the code. → The delta and D12 now say a rerank arm makes the connection the arm it wraps makes, plus `RERANK_URL`; the precomputed-vector seam is declined as scope (L15). The integration test's `get_embedding` stub stands in for that ordinary provider hop.
+2. **MAJOR: factory preflights ran before `resolve_url`**, so a reachable reranker was probed with no replay URL. → Preflights now run after the URL is resolved and before the generation is reserved; a test asserts exit 64 with zero requests at the fake.
+3. **MAJOR: `rerank_ms` was recorded for a pool timeout that sent nothing.** → `RerankFailure.sent` comes from httpcore's trace extension; `ms` is left unset when the request never reached the wire. Tested with three concurrent calls against two held connections, and with nothing listening.
+
+The verifier's round (0 blocking, 6 minor) was folded into the same commits: preflight ordering (as 2), the backoff scenario's wording, the `gzip` / `cl_oversize` / `chunked_oversize` fake modes with an `Accept-Encoding: identity` assertion and an unparseable-`Content-Length` test, `reranked: false` on the provider-rejection row, a same-path other-tenant excerpt fixture, and the re-probe test passing at 60 s.
