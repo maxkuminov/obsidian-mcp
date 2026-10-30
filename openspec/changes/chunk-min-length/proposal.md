@@ -58,11 +58,15 @@ of a second disruption later.
   note in the background, under the budget. The `index_transition:` line and
   `/health` `rechunk: in_progress` return until the backlog drains. **This is
   a second whole-vault transition shortly after #355's.**
-- **Reuse across format-compatible versions.** The formatter does not change,
-  so the reuse lookup accepts a note stamped 1 or 2
-  (`INPUT_COMPATIBLE_CHUNKING_VERSIONS`). The exact-pair key and the
-  under-lock recheck are unchanged. Unchanged single-window chunks keep their
-  vectors.
+- **Reuse across versions.** Each version's embedded-text formatter is
+  frozen per version (`EMBEDDED_TEXT_FORMATTERS`). A stored vector is reused
+  when its prefix and its embedded text under its stamped version match the new
+  chunk's. The under-lock recheck is unchanged. Unchanged single-window chunks
+  keep their vectors unless they hold a whitespace run longer than 8
+  characters.
+- **Bounded whitespace in the provider input.** Before embedding, runs of more
+  than 8 whitespace characters are collapsed to one space. The stored text
+  stays raw.
 - **Observation.** The embed stage's completion log line gains
   `(S submitted, R reused)`, counts only. Semantic harness arms record
   `chunk_lengths`, including a deterministic `under_min` that must be 0.

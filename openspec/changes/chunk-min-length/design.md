@@ -347,15 +347,23 @@ edits neither function. So between versions 1 and 2, an equal pair is the
 same provider input and the same vector. Codex round 1 confirmed this
 reasoning ("the compatible-version reuse key itself is sound").
 
-- `INPUT_COMPATIBLE_CHUNKING_VERSIONS = frozenset({1, 2})`. Reuse rule 2
-  becomes "the stamp is in the set". NULL is never in it. The fingerprint,
-  non-NULL prefix, exact pair and under-lock recheck rules are unchanged.
-- **The set's rule:** it holds exactly the versions whose two formatter
-  functions produce identical output. A version that changes either function
-  resets the set to `{new}`. A golden test of both functions fails until the
-  set is reviewed.
+- **Amended by D9 (third commit).** Version 2 changes the embedded text, so
+  a single compatible set no longer works. Each version's embedded-text
+  formatter is frozen in `EMBEDDED_TEXT_FORMATTERS = {1: identity, 2:
+  collapse_long_runs}`, the same pattern as the per-version extraction
+  cleaners.
+- **Reuse rule 2** now requires that the stamp is a key of the table (NULL
+  never is), that the prefixes are equal, and that `fmt[stamp](stored_text)
+  == fmt[2](new_text)`. In other words, the provider input the vector was
+  built from equals the input that would now be sent. The fingerprint,
+  non-NULL prefix and under-lock recheck rules are unchanged.
+- **Rule for the table:** a frozen entry is never edited. A version that
+  changes the embedded-text formatter adds an entry. A version that changes
+  `build_embed_prefix` or the separator clears the table to its own entry.
+  A golden test of every entry fails until a change is reviewed.
 - **The effect.** A single-window section of at least `m` keeps an identical
-  pair, and so reuses its vector. That holds because the single-window branch
+  pair, and so reuses its vector unless its text holds a whitespace run longer
+  than 8 characters (D9). That holds because the single-window branch
   was and stays unstripped, and the locator, and with it the prefix, is the
   same. Merged chunks, windows of multi-window sections, and re-tailed sections
   go to the provider. The share is measured (D8), not guessed. The upper bound
@@ -470,6 +478,38 @@ for the candidate arm's label, read
   `INSUFFICIENT_DATA`, when any of the four `ci95` is null, or when the
   verdict is `CORPUS_LOSS`, which invalidates the run.
 
+## D9: Whitespace in the embedded input is bounded (third commit)
+
+Round 2 left one gap. A chunk over `W` raw is over only by whitespace (L3),
+but the provider input was `prefix + raw chunk`. The `A×100 + space×3000 +
+B×100` case would therefore send more than 3,000 characters to the provider.
+That costs tokens and latency, and on a token-limited endpoint it risks the
+truncation M2 removed.
+
+- **The rule.** The provider input is `embed_prefix + "\n\n" +
+  embedded_text(chunk_text)`. `embedded_text` replaces every run of **more than
+  8** whitespace characters with one space. Whitespace means the six ASCII
+  characters of D1's length rule. Shorter runs and all other characters are
+  kept. Stored `chunk_text` stays raw, so previews, containment and the locator
+  are untouched. `embedded_input_digest` covers the inputs as sent, as before.
+- **Why 8.** Paragraph breaks (`\n\n`, `\r\n\r\n`), two-level list
+  indentation and table padding stay byte-identical. That keeps their
+  structure in the embedding and keeps their v1 vectors reusable. A longer
+  run carries no meaning.
+- **Bound.** A chunk of at most `W` raw has embedded text of at most `W`, so
+  #355's maximum (`W + 302`) holds exactly. An L3 chunk's embedded text is at
+  most `clen + 7r`, where `r` is the number of whitespace runs of 2 to 8
+  characters in it. Its input therefore exceeds #355's maximum by at most `7r`.
+  **Pinned:** for `A×100 + space×3000 + B×100` under prefix `P`, the embedded
+  text is `A×100 + " " + B×100` and the input length is `len(P) + 203`.
+- **Reuse cost.** Only chunks that contain a run longer than 8 miss version-1
+  reuse (D6). Fenced code is masked before chunking, so these runs are rare.
+  Two kinds remain: lists nested three levels deep with 4-space indentation, or
+  five deep with 2-space indentation (a newline plus 8 or more spaces), and
+  runs of blank lines. D8's `(S submitted, R reused)` line measures the actual
+  share. Collapsing such a run also drops that list's deep indentation from the
+  embedding, which is accepted.
+
 ## Rollout: what the operator sees
 
 - **Deploy.** No migration, no new setting, and no refused startup for any
@@ -513,8 +553,9 @@ for the candidate arm's label, read
 4. **Lookback** cuts at a line start, then a word start, within `min(200,
    W/10)`. The overlap snap never passes the cut. The stored chunk text is the
    raw window (D1).
-5. **Reuse across `INPUT_COMPATIBLE_CHUNKING_VERSIONS = {1, 2}`**, guarded by
-   a golden formatter test (D6).
+5. **Reuse across versions through frozen per-version embedded-text
+   formatters `{1, 2}`** (originally a compatible set; amended by D9), guarded
+   by a golden formatter test (D6).
 6. **Ship immediately after #355**, accepting a second transition (D5).
 7. **The length distribution lives in the harness and the provider work in
    one log line.** Nothing new on the dashboard (D8).
@@ -523,6 +564,9 @@ for the candidate arm's label, read
    reranker and the harness would all need to know about.
 9. **The release bar** is D8's CI95 rule over four cells.
 10. **No migration.**
+11. **Whitespace runs longer than 8 characters are collapsed in the provider
+    input only**, with per-version frozen embedded-text formatters for reuse
+    (D9, D6).
 
 ## Codex spec review, round 1 (2026-10-30)
 
@@ -565,10 +609,10 @@ Declined: none.
 - **L3** (replaces round 1's whitespace-window exception). The minimum is
   never waived. When whitespace makes the minimum incompatible with a raw
   length of at most `W`, a window may exceed `W` raw, by whitespace only. Its
-  `clen` stays at most `W`. A tokenizer that charges per whitespace character
-  could see such an input longer than version 1's maximum. These windows are
-  counted as `raw_over_window`, and the proof that the exception is
-  unavoidable is in D7.
+  `clen` stays at most `W`. The provider never receives the long runs (D9).
+  Such an input exceeds version 1's maximum by at most 7 characters per short
+  whitespace run. These windows are counted as `raw_over_window`, and the
+  proof that the exception is unavoidable is in D7.
 - **L4** — A run with no whitespace in the lookback, such as base64, a long
   URL or CJK text without spaces, is still cut hard.
 - **L5** — Lengths are counted in code points, not tokens. The rule is

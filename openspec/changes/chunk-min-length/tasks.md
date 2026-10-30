@@ -22,8 +22,8 @@
   - Keep the headings-only fallback as one group.
   - Keep one cap counter across groups.
 - [ ] 2.3 D4 locator: build a cleaned-to-raw offset map per group, compute each chunk's raw span, and take the deepest N with `raw span ⊆ _section_body_span(N)` (imported), else 0. Take the heading path and the prefix from N.
-- [ ] 2.4 Set `CHUNKING_VERSION = 2` and add `INPUT_COMPATIBLE_CHUNKING_VERSIONS = frozenset({1, 2})`, with the docstring rule (D6).
-- [ ] 2.5 Make the reuse lookup accept a stamp that is in the set; NULL never is. Every other `== CHUNKING_VERSION` site, such as the backstop's `= :cv`, stays strict, with a justifying comment.
+- [ ] 2.4 Set `CHUNKING_VERSION = 2` and add `EMBEDDED_TEXT_FORMATTERS = {1: identity, 2: collapse_long_runs}`, with the docstring rule (D6, D9). `embedding_input(prefix, chunk)` returns `prefix + "\n\n" + EMBEDDED_TEXT_FORMATTERS[CHUNKING_VERSION](chunk)`, and `embedded_input_digest` and `note_provider_inputs` use it unchanged.
+- [ ] 2.5 Make the reuse lookup accept a stamp that is a key of the table (NULL never is), with equal prefixes and `fmt[stamp](stored) == fmt[2](new)`. Every other `== CHUNKING_VERSION` site, such as the backstop's `= :cv`, stays strict, with a justifying comment.
 - [ ] 2.6 Unit tests in `tests/test_chunk_min_length.py`:
   - **Live fixture 1.** `## Email Triage\nSee entries in the Email Triage log\n### 2026-10-01\n<300 chars>`: no chunk is under the minimum. The first chunk contains the short line and the `###` line, at the ordinal of `## Email Triage`.
   - **Live fixture 2.** A section of 2,048·2 + 4 characters ending `…themselves`: no chunk is `lves`, and no cut falls inside a word that has whitespace in its lookback.
@@ -50,9 +50,15 @@
   - The raw length is at most `W` whenever the generated text has no whitespace run longer than `W − 2m`. Otherwise any excess is whitespace only.
   - D8's `under_min` (`clen < m` in a note with more than one chunk) is 0.
   - A note has zero chunks exactly when `chunk_text_bounded(clean_for_embedding(body))` has zero.
-- [ ] 2.8 Golden formatter test: `embedding_input` and `build_embed_prefix` on fixed inputs match committed outputs. On mismatch, fail with "formatter changed: reset INPUT_COMPATIBLE_CHUNKING_VERSIONS".
+- [ ] 2.8 Golden formatter test: every `EMBEDDED_TEXT_FORMATTERS` entry, `embedding_input` and `build_embed_prefix` on fixed inputs match committed outputs. On a mismatch it fails with "frozen formatter changed: add an entry or clear the table".
+- [ ] 2.8a D9 tests:
+  - For `A×100 + space×3000 + B×100` under prefix `P`, the provider input is `P + "\n\n" + A×100 + " " + B×100` (length `len(P) + 203`), and the stored `chunk_text` keeps the run.
+  - Runs of exactly 8, and `\n\n`, are kept byte-for-byte.
+  - A run of 9 tabs or CRs collapses to one space.
+  - NBSP runs are not collapsed.
+  - For every chunk of at most `W` raw in the 2.7 property test, the input is at most `W + 302`.
 - [ ] 2.9 Update the version literals in `test_heading_chunks.py`, `test_heading_chunks_reuse.py`, `test_heading_chunks_pg.py` and `test_search_eval_pg.py`. Reuse cases:
-  - A v1 stamp with an identical pair reuses.
+  - A v1 stamp with an identical pair and no run longer than 8 reuses; the same pair holding a 12-space run does not.
   - A NULL stamp does not reuse.
   - A stamp outside the set does not reuse.
   - The under-lock recheck still fails on a concurrent rewrite.

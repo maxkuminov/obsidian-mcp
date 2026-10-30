@@ -17,7 +17,7 @@
 - If no closed group exists, the short group SHALL stand alone only when the note's whole cleaned body, heading lines included, is also short. Otherwise the note SHALL be chunked as one group of its whole cleaned body at ordinal 0.
 - Heading lines SHALL NOT be part of the text of a group that holds one section.
 
-**One length.** Every length in this requirement SHALL be the *collapsed length* `clen(t)`. That is the code-point length of `t` after every maximal run of the whitespace characters U+0009–U+000D and U+0020 is replaced by one space and leading and trailing spaces are removed. This applies to the minimum, section shortness, cut admissibility, tail balancing and the evaluation harness's `under_min`. The stored `chunk_text` SHALL be the raw window, unstripped, so reuse keys and previews are unaffected. A window SHALL be stored only when its `clen` is non-zero.
+**One length.** Every length in this requirement SHALL be the *collapsed length* `clen(t)`. That is the code-point length of `t` after every maximal run of the whitespace characters U+0009–U+000D and U+0020 is replaced by one space and leading and trailing spaces are removed. This applies to the minimum, section shortness, cut admissibility, tail balancing and the evaluation harness's `under_min`. The stored `chunk_text` SHALL be the raw window, unstripped, so previews are unaffected. The provider input is defined by the prefix requirement. A window SHALL be stored only when its `clen` is non-zero.
 
 **Windowing.** Each group's text SHALL be windowed with `L = min(200, W // 10)`. A *word start* is a non-whitespace character at the start of the text or after a whitespace character. A *line start* is a word start whose preceding whitespace contains a line break. A cut `c` for a window starting at `a` is *admissible* when `clen(text[a:c]) ≥ m`.
 - **Cut.** A window starting at `a` whose limit `a + W` falls before the end of the text SHALL be cut at the first admissible choice of these, in order: the last line start in `(a + W − L, a + W]`; the last word start in that range; `a + W`. Only when `clen(text[a:a+W]) < m`, it SHALL be cut at the first word start after `a + W` that is admissible, or else at the first admissible position. The next window SHALL start at the cut.
@@ -120,11 +120,46 @@
 - **WHEN** a note's groups together yield more than `MAX_CHUNKS_PER_NOTE` chunks
 - **THEN** the first `MAX_CHUNKS_PER_NOTE` in document order SHALL be stored and the note SHALL be marked truncated
 
+### Requirement: The text sent to the provider for a chunk SHALL be a bounded title-and-heading prefix followed by the chunk, and the stored chunk text SHALL stay un-prefixed
+For every chunk, the input `embed_note` sends to the provider SHALL be `embed_prefix + "\n\n" + embedded_text(chunk_text)`, built by one function. `embedded_text` SHALL replace every maximal run of more than 8 whitespace characters with one space, using the same six ASCII whitespace characters as the collapsed length (U+0009–U+000D, U+0020). Runs of 8 or fewer characters, and every other character, SHALL be kept. `embedded_text` is the version-2 entry of the frozen formatter table.
+
+`embed_prefix` SHALL be built as follows:
+- The note's title (the shared title rule), followed by ` > ` and each heading-path component.
+- Each component SHALL be whitespace-collapsed and cut at 80 characters with a marked cut.
+- Then a line `tags: ` followed by the note's tags, comma-separated, in stored order, only when the whole prefix including it is at most 300 characters.
+- When the breadcrumb alone exceeds 300 characters, the outermost headings after the title SHALL be replaced by one `…` component until it fits. The title and the innermost heading SHALL always be kept.
+
+The row SHALL store `embed_prefix` and the raw, un-prefixed `chunk_text`, which is never collapsed. Previews SHALL be drawn from `chunk_text` only. `embedded_input_digest` SHALL be computed over the provider inputs as sent.
+
+**The bound this gives.** A chunk of raw length at most `W` has embedded text of at most `W`, so its provider input stays within #355's maximum of `W + 302`. The one exception is a chunk that exceeds `W` raw by whitespace (the chunking requirement's bound). Its embedded text is at most `clen + 7r`, where `r` is the number of whitespace runs of 2 to 8 characters it holds. Because `clen ≤ W`, its input exceeds #355's maximum by at most `7r` characters.
+
+#### Scenario: Prefix shape
+- **WHEN** a chunk of section `## Plan` under `# Project` in a note titled `Alpha` tagged `work` is embedded
+- **THEN** the provider input SHALL be `Alpha > Project > Plan\ntags: work\n\n` followed by the chunk's embedded text, and the stored `chunk_text` SHALL NOT contain the prefix
+
+#### Scenario: A whitespace-heavy chunk is sent collapsed
+- **WHEN** a stored chunk is 100 `A`, 3,000 spaces and 100 `B` under prefix `P`
+- **THEN** the provider input SHALL be `P + "\n\n" + 100 A + " " + 100 B`, of length `len(P) + 203`
+- **AND** the stored `chunk_text` SHALL still hold the 3,000 spaces
+
+#### Scenario: Ordinary whitespace is kept
+- **WHEN** a chunk contains paragraph breaks, an indented list of up to 8 spaces and single spaces only
+- **THEN** its embedded text SHALL equal its `chunk_text`
+
+#### Scenario: Tags that do not fit are omitted entirely
+- **WHEN** adding the tags line would make the prefix longer than 300 characters
+- **THEN** the prefix SHALL contain no tags line
+
+#### Scenario: A deep, long breadcrumb is cut from the outside
+- **WHEN** a six-level heading path's breadcrumb exceeds 300 characters
+- **THEN** the prefix SHALL keep the title and the innermost heading, SHALL replace outer headings with `…`, and SHALL be at most 300 characters
+
 ### Requirement: An unchanged chunk SHALL reuse its stored vector only when that vector provably belongs to the current generation
-`embed_note` SHALL reuse a stored vector of the note for a chunk whose **embedded input** is byte-identical to the stored row's. That is, the chunk's `(embed_prefix, chunk_text)` pair equals the stored row's pair. Only the remaining chunks SHALL be sent to the provider. Reuse SHALL happen only if all of the following hold. Otherwise every chunk SHALL be embedded as before.
+`embed_note` SHALL reuse a stored vector of the note for a chunk whose **provider input** is byte-identical to the input the stored vector was embedded from. That is, the prefixes are equal and the embedded texts are equal, under the rules below. Only the remaining chunks SHALL be sent to the provider. Reuse SHALL happen only if all of the following hold. Otherwise every chunk SHALL be embedded as before.
 - **Lookup transaction.** The lookup of stored `(id, chunk_text, embed_prefix, embedding)` rows, of the note's `embedded_chunking_version` and of the stored embedding fingerprint runs in a read-only transaction that is committed before any provider call.
 - **Fingerprint.** The stored embedding fingerprint is present and equal to the current one. An absent fingerprint SHALL disable reuse.
-- **Chunking version.** The note's `embedded_chunking_version` is a member of `INPUT_COMPATIBLE_CHUNKING_VERSIONS`. That is the set of chunking versions whose input formatter (`embedding_input`) and prefix builder (`build_embed_prefix`) produce identical output, and it always contains `CHUNKING_VERSION`. A NULL stamp is never a member. Otherwise reuse SHALL be disabled for the whole note. A version that changes either function SHALL reset the set to that version alone, and a golden test of both functions' output SHALL fail until the set is reviewed.
+- **Chunking version.** The note's `embedded_chunking_version` is a key of the frozen per-version formatter table (`EMBEDDED_TEXT_FORMATTERS`, which is `{1: identity, 2: collapse runs of more than 8 whitespace characters}`). A NULL stamp is never a key. If the stamp is not a key, reuse SHALL be disabled for the whole note.
+- **Same provider input.** The stored row's `embed_prefix` equals the new chunk's prefix. The stored row's embedded text, meaning its `chunk_text` passed through the formatter of the note's **stamped** version, equals the new chunk's embedded text under the current version's formatter. A version-1 row therefore reuses only when its text holds no whitespace run longer than 8 characters. A frozen formatter SHALL NOT be edited, and a golden test of every entry SHALL fail until a changed entry is reviewed. A version that changes the prefix builder SHALL clear the table to its own entry.
 - **Prefix present.** A row whose `embed_prefix` is NULL SHALL NOT be reused.
 - **Rows survive.** Under the generation lock, after the provider call and before certification, every reused row still exists for this note with the same `chunk_text` and `embed_prefix`. Otherwise the attempt SHALL certify nothing, write nothing and report `GENERATION_MISMATCH`.
 
@@ -135,7 +170,7 @@ The cardinality check SHALL apply to the chunks actually sent. The note SHALL be
 A note whose chunks are all reusable SHALL make no provider call. It SHALL NOT be counted as a provider attempt, even when the under-lock check fails and it reports `GENERATION_MISMATCH`, and it SHALL debit no chunk budget.
 
 #### Scenario: An append re-embeds only the new tail
-- **WHEN** a note's content is extended so that every earlier chunk's text and prefix are unchanged, and its chunking version is in the compatible set
+- **WHEN** a note's content is extended so that every earlier chunk's text and prefix are unchanged, and its chunking version is a key of the formatter table
 - **THEN** only the new chunks SHALL be sent to the provider and the note SHALL be certified with every chunk present
 
 #### Scenario: No fingerprint, no reuse
@@ -143,12 +178,16 @@ A note whose chunks are all reusable SHALL make no provider call. It SHALL NOT b
 - **THEN** no stored vector SHALL be reused
 
 #### Scenario: A legacy row is never reused
-- **WHEN** a note's stored rows predate migration 034 (NULL `embed_prefix`), or its `embedded_chunking_version` is NULL or not in `INPUT_COMPATIBLE_CHUNKING_VERSIONS`
+- **WHEN** a note's stored rows predate migration 034 (NULL `embed_prefix`), or its `embedded_chunking_version` is NULL or not a key of `EMBEDDED_TEXT_FORMATTERS`
 - **THEN** every chunk SHALL be sent to the provider
 
 #### Scenario: A version-1 note re-chunked under version 2 reuses its unchanged chunks
 - **WHEN** a note stamped version 1 is re-selected under version 2, and one of its single-window sections of at least `CHUNK_MIN_CHARS` yields the same `(embed_prefix, chunk_text)` pair as its stored row
 - **THEN** that chunk's stored vector SHALL be reused, only the changed chunks SHALL be sent to the provider, and the note SHALL be stamped version 2
+
+#### Scenario: A version-1 row holding a long whitespace run is not reused
+- **WHEN** a note stamped version 1 is re-selected under version 2, and a stored chunk equal to a new chunk contains a run of 12 spaces
+- **THEN** that chunk SHALL be sent to the provider, because its version-1 input kept the run and its version-2 input collapses it
 
 #### Scenario: A changed prefix defeats reuse
 - **WHEN** a note's tags or title change and its chunk texts do not
@@ -163,7 +202,7 @@ A note whose chunks are all reusable SHALL make no provider call. It SHALL NOT b
 - **THEN** the attempt SHALL certify nothing and write nothing, and SHALL not deadlock with the reset
 
 #### Scenario: Nothing to send
-- **WHEN** every chunk of a changed note has a stored row with the same prefix and text, under a chunking version in the compatible set
+- **WHEN** every chunk of a changed note has a stored row with the same prefix and text, under a chunking version that is a key of the formatter table
 - **THEN** no provider call SHALL be made, the note SHALL be certified, and the pass's attempt count and chunk budget SHALL be unchanged
 
 #### Scenario: An all-reuse note loses a reset race without an attempt

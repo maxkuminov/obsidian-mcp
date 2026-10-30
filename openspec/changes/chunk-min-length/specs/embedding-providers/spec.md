@@ -8,11 +8,11 @@ The system SHALL track the chunking format as the integer `CHUNKING_VERSION`, re
 - the window-boundary lookback and its constant;
 - the locator rule;
 - whether window text is stored raw;
-- the prefix and the embedded-input formatter.
+- the prefix, the embedded-text formatter (version 2 collapses whitespace runs longer than 8 characters) and the embedded-input formatter.
 
 The current version SHALL be 2.
 
-A change of chunking format SHALL re-select notes through the embed backlog, as the index-integrity requirement on chunking versions states. It SHALL NOT refuse startup or require the reset workflow. A change to any element of the chunking format SHALL bump `CHUNKING_VERSION`. A change to the input formatter or the prefix builder that can alter a provider input for an unchanged `(embed_prefix, chunk_text)` pair SHALL also reset `INPUT_COMPATIBLE_CHUNKING_VERSIONS` to the new version alone. A bump that leaves both functions unchanged MAY add the new version to the existing set, and version 2 does so, giving `{1, 2}`. `CHUNK_MIN_CHARS` SHALL NOT be a configuration setting and SHALL NOT be part of the stored fingerprint. Its effective value depends only on the chunk size, which is already in the fingerprint.
+A change of chunking format SHALL re-select notes through the embed backlog, as the index-integrity requirement on chunking versions states. It SHALL NOT refuse startup or require the reset workflow. A change to any element of the chunking format SHALL bump `CHUNKING_VERSION`. The embedded-text formatter of each version SHALL be frozen in a per-version table (`EMBEDDED_TEXT_FORMATTERS`), in the same way as the per-version extraction cleaners. Vector reuse SHALL compare the stored row's text under its stamped version's formatter with the new text under the current formatter, so a version that changes the embedded-text formatter adds an entry and never edits one. Version 2 adds the collapse of whitespace runs longer than 8 characters, giving the entries `{1, 2}`. A version that changes the prefix builder SHALL clear the table to its own entry. `CHUNK_MIN_CHARS` SHALL NOT be a configuration setting and SHALL NOT be part of the stored fingerprint. Its effective value depends only on the chunk size, which is already in the fingerprint.
 
 This is not the per-row model identity that the fingerprint requirement forbids. That prohibition exists because vectors from two models in one column make distance meaningless. A chunking change leaves provider, model and dimensions unchanged, and those stay in the stored, refusing fingerprint, so legacy and re-chunked vectors share one space. A transition still changes ranking, and with it which notes fit inside a bounded page. That is why every vector-search response declares the transition while it lasts, as the index-integrity requirement on chunking versions states.
 
@@ -27,4 +27,4 @@ This is not the per-row model identity that the fingerprint requirement forbids.
 #### Scenario: The version-2 deploy over a version-1 index
 - **WHEN** the version-2 build starts over an index built and certified by the version-1 build, with any previously valid configuration
 - **THEN** the computed embedding fingerprint SHALL equal the stored one byte for byte, and startup SHALL proceed
-- **AND** every note SHALL be in the backlog, and stored vectors whose `(embed_prefix, chunk_text)` pair recurs under version 2 SHALL be reused
+- **AND** every note SHALL be in the backlog, and a stored vector SHALL be reused when its prefix and its version-1 embedded text equal a new chunk's prefix and version-2 embedded text
