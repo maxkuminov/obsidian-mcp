@@ -325,6 +325,15 @@ def _verify_new_connection(dbapi_connection: Any, connection_record: Any) -> Non
     Runs once per **new** connection (a pool `connect` event), never per
     checkout. The adapted asyncpg cursor runs synchronously here because the
     pool connects inside SQLAlchemy's greenlet.
+
+    **The probe's transaction is rolled back before the connection is handed
+    out.** The adapted cursor autobegins a driver-level transaction, and a
+    `connect` listener is not followed by any reset, so without the rollback
+    the first session on every new connection inherited an open transaction
+    with a query already run in it: its `SET TRANSACTION ISOLATION LEVEL
+    REPEATABLE READ, READ ONLY` (keyword, hybrid, tasks, change feed) was
+    refused with `ActiveSQLTransactionError`, and every other first statement
+    silently ran inside the probe's transaction (2026-10-30, `search.md`).
     """
     cursor = dbapi_connection.cursor()
     try:
@@ -344,6 +353,9 @@ def _verify_new_connection(dbapi_connection: Any, connection_record: Any) -> Non
             "A new database connection is not encrypted although "
             "DATABASE_SSL_MODE is strict; the connection was discarded."
         )
+    # Not swallowed: a connection whose rollback fails is not one to hand out,
+    # and the pool discards a connection its `connect` event raised on.
+    dbapi_connection.rollback()
 
 
 def install_strict_transport_listener(engine: Any) -> None:

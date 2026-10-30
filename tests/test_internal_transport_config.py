@@ -499,12 +499,16 @@ class _FakeDBAPIConnection:
     def __init__(self, row):
         self.cursor_obj = _FakeCursor(row)
         self.closed = False
+        self.rollbacks = 0
 
     def cursor(self):
         return self.cursor_obj
 
     def close(self):
         self.closed = True
+
+    def rollback(self):
+        self.rollbacks += 1
 
 
 @pytest.mark.parametrize("row", [(False, None, None), None])
@@ -520,6 +524,15 @@ def test_the_listener_passes_an_encrypted_connection():
     conn = _FakeDBAPIConnection((True, "TLSv1.3", "TLS_AES_256_GCM_SHA384"))
     ts._verify_new_connection(conn, None)
     assert not conn.closed
+
+
+def test_the_listener_ends_the_probe_transaction_before_handing_out():
+    """The probe autobegins a driver transaction; a `connect` listener gets no
+    reset after it, so the listener must roll back itself, or the first
+    session's `SET TRANSACTION ISOLATION LEVEL` is refused (2026-10-30)."""
+    conn = _FakeDBAPIConnection((True, "TLSv1.3", "TLS_AES_256_GCM_SHA384"))
+    ts._verify_new_connection(conn, None)
+    assert conn.rollbacks == 1 and not conn.closed
 
 
 def test_install_is_idempotent():

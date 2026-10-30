@@ -95,6 +95,22 @@ superset property is asserted over a generated
 query corpus under `english` and `english,simple`. Telemetry: `fallback`
 (`ran | skipped | not_needed`) and `any_rows` in `usage_logs.params`.
 
+**"Nothing run" includes the connection's own setup (2026-10-30).** Under a
+strict `DATABASE_SSL_MODE` the D3b listener (`_verify_new_connection` in
+`src/services/transport_security.py`) runs its `pg_stat_ssl` probe through
+the adapted asyncpg cursor on every **new** pooled connection; that cursor
+autobegins a driver transaction, and a pool `connect` event is followed by no
+reset. So the first session on each new connection inherited an open
+transaction with the probe already run in it, and its `SET TRANSACTION` was
+refused with `ActiveSQLTransactionError` — in `keyword_search`,
+`hybrid_search`, `list_tasks` and the change feed alike. It was intermittent
+because only a brand-new connection carries it: a reused one was rolled back
+on return, so it showed up when parallel calls grew the pool (or after an
+overflow connection was discarded) and not on a retry. The rule now: the
+listener rolls the probe back before the connection is handed out, and
+nothing that runs on a connection before a session's first statement may
+leave a transaction open (`test_a_new_strict_mode_connection_opens_no_transaction`).
+
 `matched_terms` is per config: for each config whose parse is a plain
 conjunction of ≤ 32 units, the count of its positive units present in the
 vector over that count; the row renders the pair with the greatest ratio
