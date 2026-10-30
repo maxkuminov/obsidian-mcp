@@ -508,3 +508,30 @@ def test_rechunk_is_a_non_volumetric_state_that_never_degrades(threshold):
     indexer_health.record_rechunk(7, 0)
     _code, body, _ = _health()
     assert body["indexer"]["rechunk"] == "complete"
+
+
+def test_rechunk_is_in_progress_until_the_first_embed_stage_reports():
+    """#355 follow-up: "not yet observed" is not "zero pending". Production
+    read `complete` over 4,206 pre-034 notes before the first embed stage."""
+    assert indexer_health.snapshot()["rechunk"] == "in_progress"
+    indexer_health.record_rechunk(None, 0)
+    assert indexer_health.snapshot()["rechunk"] == "complete"
+    indexer_health.record_rechunk(None, 5)
+    assert indexer_health.snapshot()["rechunk"] == "in_progress"
+    _code, body, _ = _health()
+    assert body["indexer"]["rechunk"] == "in_progress" and "5" not in json.dumps(
+        body["indexer"]["rechunk"]
+    )
+
+
+def test_rechunk_waits_for_every_known_scope():
+    indexer_health.record_rechunk(1, 0)
+    indexer_health.record_index(2, True)  # known, never counted
+    assert indexer_health.snapshot()["rechunk"] == "in_progress"
+    indexer_health.record_rechunk(2, 0)
+    assert indexer_health.snapshot()["rechunk"] == "complete"
+
+
+def test_rechunk_reads_complete_when_indexing_is_disabled():
+    indexer_health.mark_disabled()
+    assert indexer_health.snapshot()["rechunk"] == "complete"
