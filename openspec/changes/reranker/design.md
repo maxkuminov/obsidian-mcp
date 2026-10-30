@@ -263,3 +263,28 @@ Verdict on 2d8ea06: the spec and task 7.4 close the capped-page case. **NOT_FIXE
 - **L12** No authentication header, so a reranker behind an auth proxy cannot be used in v1.
 - **L14** Under `MAX_READ_RESPONSE_CHARS`, a `rerank=true` page (reranked or fallback) can show fewer rows than the `rerank=false` page of the same call, because the quoted encoding is longer. Rows are dropped whole from the end, and the cap footer always discloses the omitted count with `more: true`. It is never silent.
 - **L13** The reranker sees the caller's note text. It has the embedding provider's trust and is documented, but not otherwise mitigated.
+
+## Implementation notes
+
+Choices the spec left open, one line each (recorded during implementation, 2026-10-30):
+
+- Sequencing: `hybrid-search` (#354) had merged, so every task including the [hybrid] ones was done; task 13.4 does not apply.
+- Each exchange passes `timeout=httpx.Timeout(deadline_s)` per request, so the httpx per-phase backstop equals that call's own deadline (the 10 s probe is not cut by a 1.5 s client default).
+- The body is requested with `Accept-Encoding: identity` and read raw; a response with any other `Content-Encoding` is `malformed_response` (the 1 MiB cap bounds bytes held, never a decoder's output).
+- A declared `Content-Length` over 1 MiB is `oversize_response` before any body byte is read; an unparseable one is `malformed_response`.
+- The re-probe schedule is read as intervals (60, 120, 240, 480, 600, 600 … s between attempts), per D8's wording.
+- Before any probe has run (no lifespan: a test, or the harness before its preflight), a configured reranker answers `probe_failed`.
+- The process client is rebuilt when the running event loop changes (the server has one loop; harness and test processes run several in turn).
+- The D6 excerpt statement selects by `file_path IN (…)` plus the owner predicate rather than by id: the semantic arm's rows carry no note id, and path is unique per owner.
+- `hybrid_search(rerank=true)` computes snippets exactly as today over the 50-row candidate list (first `KEYWORD_SNIPPET_ROWS` keyword rows); a row promoted from beyond that cap previews its chunk, head or `none`. The fallback page's previews equal the `rerank=false` page's.
+- The `rerank=true` semantic page does not repeat the legacy prose degradation paragraphs; the header's stale/truncated counts and the row markers carry them. Its zero-result line keeps "(embeddings may still be building)" and adds the counts, the token and `shown: 0`.
+- The `rerank=true` cap footer on both tools is `Response cap: N omitted — more: true; narrow with limit= or folder=.` (≤ 69 characters); `hybrid_search(rerank=false)` keeps its own footer.
+- Pinned worst cases at 1,000 (measured 181 / 230 / 427 / 360): semantic header ≤ 185 and abbreviated structure ≤ 235; hybrid `rerank=true` header ≤ 431 and structure ≤ 362, title/path cut 20–25 (431 + 362 + 25 + 25 + 75 + 75 + 5 = 998).
+- `rerank_candidates` is recorded on every `rerank=true` row whose search ran (0 for an empty result); `rerank_ms` only when a request was sent.
+- A provider input rejection on `rerank=true` returns the existing `argument_too_long` refusal unchanged, with no rerank token (nothing was searched).
+- Harness: the probe runs in a new generic hook, an async `factory.preflight(options)` that the runner awaits once per distinct hook before reserving the generation, so a failed probe exits 64 with no generation directory.
+- Harness: an empty answer (`no_candidates`) is an empty run, not a failure; every other `reranked: false` raises `UnrerankedAnswer`.
+- `make_hybrid_arm`'s "hybrid service missing" `UsageError` path is kept but untested: the service ships with #354.
+- `RERANK_MODEL`'s control-character rule lives in the `_validate_rerank_transport` model validator; its length bound is `Field(max_length=200)`.
+- `check_embedding_url_policy` gained `allow_setting` and `what` parameters; the embedding message is byte-identical (a test pins its wording).
+- The rerank WARNING carries `suppressed_since_last`, the number of records the previous window withheld for that code.
