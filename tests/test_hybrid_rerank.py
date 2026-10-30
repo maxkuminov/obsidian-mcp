@@ -139,7 +139,8 @@ async def test_reranked_rows_carry_the_score_after_hybrids_fields(monkeypatch, c
     out = await tools.hybrid_search_impl("q", limit=10, rerank=True)
     assert len(fake.requests[-1]["documents"]) == 50
     header = out.splitlines()[0]
-    assert re.search(r" — arms: both — reranked: true \(candidates: 50\) — rrf_k: ", header)
+    assert re.search(r" — arms: both — reranked: true \(candidates: 50\) — confidence: ok — rrf_k: ",
+                     header)
     rows = [_split_row(line) for line in out.splitlines() if line.startswith("- {")]
     assert rows[0][0]["path"] == "s20.md"
     for obj, tail in rows:
@@ -233,14 +234,19 @@ def test_the_fixed_bounds_with_rerank():
     q_lit, query_cut = tools._hybrid_query_echo("\x01" * 8192)
     token = "reranked: false (malformed_response)"
     header = tools._hybrid_header(q_lit, query_cut, result, worst_rows, 50, token)
-    assert len(header) <= tools.HYBRID_RERANK_HEADER_MAX == 431, len(header)
+    assert len(header) <= tools.HYBRID_RERANK_HEADER_MAX == 444, len(header)
     labels = ["tags omitted", "preview omitted", "title_cut", "path_cut", "abbreviated"]
     structure = tools._hybrid_row_line(
         worst_rows[0], 1000, title="", path="", tags=[], preview=("none", ""), labels=labels,
         extra=(tools._rerank_score_field(-1.234e-100),))
     assert len(structure) <= tools.HYBRID_RERANK_ROW_STRUCTURE_MAX == 362, len(structure)
     assert max(len(tools._rerank_cap_footer(n)) for n in range(1, 51)) <= 75
-    assert 431 + 362 + 25 + 25 + 75 + 75 + 5 == 998 <= 1000
+    # Before #389 the cut form summed 431 + 362 + 25 + 25 + 75 + 75 + 5 = 998.
+    # The `confidence` token (13 more header characters at the worst case)
+    # takes it past 1,000, so the keyword-only rerank=true worst case falls
+    # through to the labelled omitted form (L6); the per-case sums are pinned
+    # in `tests/test_search_confidence.py`.
+    assert 444 + 362 + 25 + 25 + 75 + 75 + 5 == 1011
 
 
 @pytest.mark.parametrize("mode", ["correct", "not_json"])
@@ -343,9 +349,10 @@ def test_the_hybrid_worst_case_with_a_transition_line_and_a_locator(monkeypatch,
 def test_the_floor_arithmetic_with_the_transition_line():
     """After #355 a both-arms page reserves the `index_transition:` line
     (≤ 127 characters at a ten-digit count). With it the cut form sums to
-    1,004 at the worst case, so that case falls through to the labelled
-    omitted form, which fits: the 1,000 bound holds, the 20–25 cut does not
-    always survive (recorded in the archived design's implementation notes)."""
+    1,021 at the worst case (1,004 before the #389 token), and the omitted
+    form to 1,002, so that case falls through to the last rung, `explain
+    omitted` (#389, D5), which fits: the 1,000 bound holds, the 20–25 cut
+    does not always survive (L6)."""
     from src.services.embeddings import transition_line
 
     rows = [HybridRow(path=f"{i}.md", title="", tags=[], score=2 / 1050, keyword_rank=50,
@@ -367,6 +374,12 @@ def test_the_floor_arithmetic_with_the_transition_line():
     omitted = len(tools._hybrid_row_line(
         rows[0], 1000, title="", path="", tags=[], preview=("none", ""),
         labels=[*base, "title omitted", "path omitted", "abbreviated"], extra=score))
-    assert (header, line, cut_form) == (371, 127, 378)
-    assert header + 1 + line + 1 + cut_form + 25 + 25 + 1 + 75 == 1004
-    assert header + 1 + line + 1 + omitted + 1 + 75 <= 1000
+    explain_omitted = len(tools._hybrid_row_line(
+        rows[0], 1000, title="", path="", tags=[], preview=("none", ""),
+        labels=[*base, "title omitted", "path omitted", "abbreviated"], extra=score,
+        omit_explain=True))
+    assert (header, line, cut_form, omitted) == (388, 127, 378, 409)
+    assert header + 1 + line + 1 + cut_form + 25 + 25 + 1 + 75 == 1021
+    assert header + 1 + line + 1 + omitted + 1 + 75 == 1002
+    assert omitted - explain_omitted == 19
+    assert header + 1 + line + 1 + explain_omitted + 1 + 75 == 983 <= 1000
