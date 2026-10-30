@@ -26,15 +26,24 @@ cast; query side: bound argument to ``websearch_to_tsquery``) and never
 string-interpolated. The startup allowlist check in :func:`validate_fts_configs`
 exists for clear error messages, not as the primary injection defense.
 
-## The vector's shape (#344)
+## The vector's shape (#344, #391)
 
-Since migration 031 a keyword vector is **``A(title) || A(aliases) ||
-D(body)``**, per configured config, concatenated in the order *title parts for
-every config, aliases parts for every config, content parts for every config*.
+Since migration 035 a keyword vector is **``A(title) || A(aliases) ||
+B(tags) || D(body)``**, per configured config, concatenated in the order
+*title parts for every config, aliases parts for every config, tags parts for
+every config, content parts for every config* (031 introduced the ``A`` head;
+035 added the ``B`` tags part inside it). The tags text is :func:`tags_text`
+over the note's extracted tags: each tag's full form plus its ``/``-segments,
+because PostgreSQL parses ``ctx/phone`` as one ``file`` token that a query for
+``phone`` never matches. Weight ``C`` is unused. Every builder takes a required
+keyword ``tags_bind``; every writer under ``src/`` passes a bind name, and only
+migration 031 passes ``None`` (no tags part), so it keeps building the head it
+always built. An empty tags part shifts nothing (measured: ``A(t) || B('') ||
+D(b) = A(t) || D(b)``), so an untagged note's vector is byte-equal under both.
 The content part is byte-identical to the pre-031 fragment, and ``to_tsvector``
 assigns weight ``D`` to every lexeme, so a pre-031 vector is exactly the body
 part of a post-031 one. That is what lets :func:`rehead_tsvector_sql` replace a
-vector's head from stored columns — ``head || ts_filter(content_tsvector,
+vector's head (title, aliases and tags) from stored columns — ``head || ts_filter(content_tsvector,
 '{d}')`` — with no file access: migration 031 uses it over every row, and both
 move paths use it because the title is derived from the path.
 
@@ -45,8 +54,9 @@ weights and their **relative** positions — ``@@``, the phrase operators and
 assigned them, so each application shifts the body by the previous head's
 length. The first application over a D-only vector is byte-exact; repeated
 applications drift, which is why 031 skips a row that already carries a weight
-``A`` lexeme and why the move paths are specified on matching and ranking, not
-bytes (design D1/D6, L11).
+``A`` lexeme, 035 one that already carries a weight ``B`` lexeme, and why the
+move paths are specified on matching and ranking, not bytes (design D1/D6,
+L11; #391 L1).
 
 Ranking uses :func:`rank_expression`: ``ts_rank_cd(RANK_WEIGHTS, vector,
 query)`` with the weight array bound as ``float4[]``. At the default
@@ -87,6 +97,12 @@ from src.config import settings
 #: small against the 1 MiB tsvector limit, because the halving retreat in
 #: `write_tsvector_bounded` only ever shrinks the **body** bind.
 FTS_ALIASES_MAX_CHARS = 2048
+
+#: The tags text bound to the vector is cut here, at a whole-line (whole-tag)
+#: boundary — the same reason as the aliases cap: the head must stay small
+#: against the 1 MiB tsvector limit (#391, design D2). A constant, not a
+#: setting (OD4).
+FTS_TAGS_MAX_CHARS = 2048
 
 #: `matched_terms` is computed per config only when that config's plain
 #: conjunction has at most this many positive units — one `@@` per unit per
@@ -160,22 +176,44 @@ def _per_config(template: str, configs: list[str] | None = None) -> list[str]:
     ]
 
 
+def tags_tsvector_sql(
+    tags_bind: str = "tags_text", configs: list[str] | None = None
+) -> tuple[str, dict]:
+    """The weight-`B` tags parts alone, one per config (#391, D1).
+
+    Used inside the head by :func:`head_tsvector_sql` and on its own by
+    migration 035's skip predicate (`length(<this>) > 0`: the row's tags
+    produce at least one lexeme), so 035 never composes ``to_tsvector(``
+    itself.
+    """
+    parts = _per_config(f"setweight(to_tsvector({{cfg}}, :{tags_bind}), 'B')", configs)
+    return " || ".join(parts), _cfg_params(configs)
+
+
 def head_tsvector_sql(
     title_bind: str = "title",
     aliases_bind: str = "aliases",
     configs: list[str] | None = None,
+    *,
+    tags_bind: str | None,
 ) -> tuple[str, dict]:
-    """The weight-`A` head: title parts for every config, then aliases parts.
+    """The head: weight-`A` title parts for every config, then weight-`A`
+    aliases parts, then — when `tags_bind` is a bind name — weight-`B` tags
+    parts (#391). `tags_bind=None` omits the tags parts; only migration 031
+    passes it, and its fragment is byte-identical to the pre-#391 text.
 
     Returns ``(fragment, params)`` like :func:`index_tsvector_sql`; the caller
-    binds the title under ``title_bind`` and the joined aliases text under
-    ``aliases_bind`` (``aliases_text``).
+    binds the title under ``title_bind``, the joined aliases text under
+    ``aliases_bind`` (``aliases_text``) and the tags text under ``tags_bind``
+    (``tags_text``).
     """
     parts = _per_config(
         f"setweight(to_tsvector({{cfg}}, :{title_bind}), 'A')", configs
     ) + _per_config(
         f"setweight(to_tsvector({{cfg}}, :{aliases_bind}), 'A')", configs
     )
+    if tags_bind is not None:
+        parts.append(tags_tsvector_sql(tags_bind, configs)[0])
     return " || ".join(parts), _cfg_params(configs)
 
 
@@ -200,6 +238,8 @@ def index_tsvector_sql(
     title_bind: str = "title",
     aliases_bind: str = "aliases",
     configs: list[str] | None = None,
+    *,
+    tags_bind: str | None,
 ) -> tuple[str, dict]:
     """Build the SQL fragment + bind params for a full ``content_tsvector``.
 
@@ -209,12 +249,16 @@ def index_tsvector_sql(
     ... SET content_tsvector = <fragment>`` statement, and ``params`` are the
     config-name bind values to merge into the statement's parameter dict.
 
-    The caller supplies the title, the aliases text and the body under the
-    three bind names; this helper only varies *which configs* parse them.
-    Every writer of ``content_tsvector`` goes through this function, the
-    rebuild included, so the stored shape is one shape.
+    The caller supplies the title, the aliases text, the tags text and the
+    body under the four bind names; this helper only varies *which configs*
+    parse them. Every writer of ``content_tsvector`` goes through this
+    function, the rebuild included, so the stored shape is one shape.
+    ``tags_bind`` is required and every writer under ``src/`` passes a name
+    (an AST test pins it).
     """
-    head, params = head_tsvector_sql(title_bind, aliases_bind, configs)
+    head, params = head_tsvector_sql(
+        title_bind, aliases_bind, configs, tags_bind=tags_bind
+    )
     body, _ = body_tsvector_sql(content_bind, configs)
     return f"{head} || {body}", params
 
@@ -223,15 +267,20 @@ def rehead_tsvector_sql(
     title_bind: str = "title",
     aliases_bind: str = "aliases",
     configs: list[str] | None = None,
+    *,
+    tags_bind: str | None,
 ) -> tuple[str, dict]:
     """Replace a stored vector's head from stored columns, no body needed.
 
     ``head || ts_filter(content_tsvector, '{d}')``: the filter keeps the
     weight-`D` body (lexemes, weights, relative positions) and drops any
-    existing head. See the module docstring for what it does and does not
-    preserve, and why 031 guards it with a skip predicate.
+    existing head — title, aliases and tags parts alike. See the module
+    docstring for what it does and does not preserve, and why 031 and 035
+    guard it with a skip predicate.
     """
-    head, params = head_tsvector_sql(title_bind, aliases_bind, configs)
+    head, params = head_tsvector_sql(
+        title_bind, aliases_bind, configs, tags_bind=tags_bind
+    )
     return f"{head} || ts_filter(content_tsvector, '{{d}}')", params
 
 
@@ -295,6 +344,37 @@ def aliases_text(frontmatter: dict | None) -> str:
     """The aliases joined for the vector's `:aliases` bind, cut at
     `FTS_ALIASES_MAX_CHARS` characters."""
     return "\n".join(note_aliases(frontmatter))[:FTS_ALIASES_MAX_CHARS]
+
+
+def tags_text(tags: list[str] | None) -> str:
+    """The tags text for the vector's tags bind, by the one rule every writer
+    and migration 035 use (#391, design D2).
+
+    Over the list `vault.extract_tags` returns (the list `notes_metadata.tags`
+    stores), in list order: one line per tag holding the tag, followed — when
+    it contains `/` — by each non-empty `/`-segment, space-separated
+    (`ctx/phone` → `ctx/phone ctx phone`); lines joined with `\n`; U+0000,
+    U+0002 and U+0003 removed; cut at `FTS_TAGS_MAX_CHARS` characters at a
+    whole-line boundary (the line that would cross the bound and every later
+    one are dropped). `None` and `[]` give the empty string.
+    """
+    lines: list[str] = []
+    used = 0
+    for raw in tags or ():
+        tag = strip_sentinels(str(raw))
+        if not tag:
+            continue
+        line = tag
+        if "/" in tag:
+            segments = [seg for seg in tag.split("/") if seg]
+            if segments:
+                line = " ".join([tag, *segments])
+        cost = len(line) + (1 if lines else 0)
+        if used + cost > FTS_TAGS_MAX_CHARS:
+            break
+        lines.append(line)
+        used += cost
+    return "\n".join(lines)
 
 
 def excerpt_of(content: str) -> str:

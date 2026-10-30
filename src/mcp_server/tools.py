@@ -78,7 +78,7 @@ from src.services import rerank as rerank_service
 from src.services.embeddings import semantic_candidates
 from src.services.filters import apply_note_filters
 from src.services.quotas import admit as _admit_quota, quota_refusal_message
-from src.services.fts import aliases_text, rehead_tsvector_sql
+from src.services.fts import aliases_text, rehead_tsvector_sql, tags_text
 from src.services.search import full_text_search
 from src.services.usage_params import render_usage_params
 from src.services.usage_stats import OVER_QUOTA_PARAM
@@ -2153,11 +2153,16 @@ def render_keyword_results(query: str, results: list[dict]) -> str:
     highlighted fragments, `«»`) or `head:` (the excerpt's leading words, when
     the excerpt held no highlight — a title/alias match, or a match beyond the
     stored excerpt). A row with no stored excerpt has no second line and is
-    counted; a row beyond the cap carries neither. The snippet is a
-    note-controlled field: never cut or marked by the server, and rendered on
-    one line (whitespace runs, line breaks included, become one space) so a
-    note cannot forge a result row. A split match — one term in the title,
-    another in the body — renders `matched_in: title+body`. `rank` is
+    counted; a row beyond the cap carries neither; a row whose stored excerpt
+    is empty (a note with no body) has no second line and is not counted. The
+    snippet is a note-controlled field: never cut or marked by the server,
+    and rendered on one line (whitespace runs, line breaks included, become
+    one space) so a note cannot forge a result row. `matched_in` names the
+    parts — `title` (title or aliases), `tags`, `body` — that alone match,
+    comma-joined; a split match names its first minimal combination
+    (`title+tags`, `title+body`, `tags+body`, else `title+tags+body`), and a
+    tags-only or split match renders `head:` (tags are not in the excerpt,
+    #391). `rank` is
     rendered with three significant digits, not three decimals (#380): a
     body-only cover under the default weights is on the order of 1e-4, which
     `.3f` printed as `0.000` beside an `any` row's `2.66` — seven apparent
@@ -2189,10 +2194,16 @@ def render_keyword_results(query: str, results: list[dict]) -> str:
         if terms:
             line += f" — terms: {terms[0]}/{terms[1]}"
         lines.append(line)
-        if r.get("snippet"):
-            lines.append(f"  snippet: {_one_line(r['snippet'])}")
-        elif r.get("head"):
-            lines.append(f"  head: {_one_line(r['head'])}")
+        # Three states, decided by identity, never truthiness (#391, Codex r1
+        # m1): a snippet; a computed head (a string — the empty string for a
+        # note with no body, which renders no line and is not a missing
+        # excerpt); or nothing computed (`None`: beyond the cap, or a NULL
+        # excerpt, counted in the header).
+        snippet, head = r.get("snippet"), r.get("head")
+        if snippet is not None:
+            lines.append(f"  snippet: {_one_line(snippet)}")
+        elif head is not None and head != "":
+            lines.append(f"  head: {_one_line(head)}")
     if no_excerpt:
         lines.append(
             f"\n**{no_excerpt} of these notes {'has' if no_excerpt == 1 else 'have'} "
@@ -3028,7 +3039,7 @@ HYBRID_KEYWORD_ONLY_FOOTER = (
 )
 #: The fixed bounds the floor arithmetic (D7) rests on, pinned by the tests.
 HYBRID_HEADER_MAX = 400
-HYBRID_ROW_STRUCTURE_MAX = 340
+HYBRID_ROW_STRUCTURE_MAX = 345
 HYBRID_FOOTER_MAX = 75
 _HYBRID_SEP = " — "
 
@@ -3380,7 +3391,7 @@ SEMANTIC_RERANK_HEADER_MAX = 185
 SEMANTIC_RERANK_ROW_STRUCTURE_MAX = 235
 #: The hybrid rerank=true header and structure worst cases (D9).
 HYBRID_RERANK_HEADER_MAX = 431
-HYBRID_RERANK_ROW_STRUCTURE_MAX = 362
+HYBRID_RERANK_ROW_STRUCTURE_MAX = 367
 
 
 def _hybrid_rerank_cut(value: str) -> tuple[str, bool]:
@@ -6457,13 +6468,16 @@ async def _move_note_locked(
         # destination target's own descriptor: the inode there has been proved
         # to be the one we moved, and the descriptor resolves no pathname.
         from src.services.indexer import _note_title  # local: avoids a cycle
-        from src.services.vault import parse_frontmatter
+        from src.services.vault import extract_tags, parse_frontmatter
 
         dest_name = PurePosixPath(to_rel).name
         moved_title: str | None = None
         # The parsed frontmatter of the moved file, for the vector's head
         # (#344, D6): the aliases come from the same parse as the title.
         moved_frontmatter: dict | None = None
+        # The moved file's tags, for the vector's `B` part (#391, D6): the
+        # shared extraction over the same parse's body and frontmatter.
+        moved_tags: list[str] | None = None
         # The bytes the **rename** published, captured from the same read the
         # title derivation already performs (D9: one read, and the hash it
         # yields describes exactly the bytes that read saw). `None` when the
@@ -6474,8 +6488,13 @@ async def _move_note_locked(
             renamed_bytes = read_bytes_at(
                 dst_target, max_bytes=MAX_NOTE_BYTES, label=to_rel
             )
-            moved_frontmatter, _ = parse_frontmatter(renamed_bytes.decode("utf-8"))
-            moved_title = _note_title(moved_frontmatter, dest_name)
+            parsed_frontmatter, moved_body = parse_frontmatter(
+                renamed_bytes.decode("utf-8")
+            )
+            parsed_tags = extract_tags(moved_body, parsed_frontmatter)
+            moved_title = _note_title(parsed_frontmatter, dest_name)
+            # All three together or none: the head falls back as one unit.
+            moved_frontmatter, moved_tags = parsed_frontmatter, parsed_tags
         except Exception as exc:
             # Best-effort fallback, declared: the file vanished, is no longer
             # decodable, or its frontmatter no longer parses. Derive from the
@@ -6537,30 +6556,36 @@ async def _move_note_locked(
                 # exclusion decision is re-taken against the path it now has.
                 title = moved_title
                 head_frontmatter = moved_frontmatter
-                if title is None or head_frontmatter is None:
+                head_tags = moved_tags
+                if title is None or head_frontmatter is None or head_tags is None:
                     # The fallback needs the row, so it is resolved inside the
-                    # same transaction as the UPDATE. Title and aliases fall
-                    # back together: both derive from the same frontmatter.
+                    # same transaction as the UPDATE. Title, aliases and tags
+                    # fall back together, from **this owner's** row (the owner
+                    # predicate: two tenants may hold the same path) — the
+                    # stored sanitized frontmatter and the stored `tags`, one
+                    # statement (#391, D6). Best-effort; the next content
+                    # change rewrites the whole vector from the file.
                     row = (await session.execute(
-                        select(NoteMetadata.frontmatter).where(
+                        select(NoteMetadata.frontmatter, NoteMetadata.tags).where(
                             NoteMetadata.file_path == from_rel,
                             _note_owner_predicate(uid),
                         )
-                    )).scalar_one_or_none()
-                    head_frontmatter = row or {}
-                    if title is None:
-                        title = _note_title(head_frontmatter, dest_name)
+                    )).first()
+                    head_frontmatter = (row.frontmatter if row is not None else None) or {}
+                    head_tags = list((row.tags if row is not None else None) or [])
+                    title = _note_title(head_frontmatter, dest_name)
 
                 # The vector's head, from the same title and the shared
                 # aliases rule; the body part and `body_excerpt` are untouched
                 # — the content did not move. Bind names are the head's own so
                 # they cannot collide with the column assignments' binds.
                 rehead_frag, rehead_params = rehead_tsvector_sql(
-                    "head_title", "head_aliases"
+                    "head_title", "head_aliases", tags_bind="head_tags"
                 )
                 rehead_expr = text(rehead_frag).bindparams(
                     head_title=title,
                     head_aliases=aliases_text(head_frontmatter),
+                    head_tags=tags_text(head_tags),
                     **rehead_params,
                 )
 

@@ -60,7 +60,7 @@ DIM = 64  # irrelevant here; keeps the migration cheap.
 # The current head. Every case that migrates forward asserts it, so adding a
 # revision without teaching this module about it fails loudly rather than
 # leaving the new migration unexercised.
-HEAD_REVISION = "034"
+HEAD_REVISION = "035"
 
 CONSTRAINT = "ck_oauth_clients_auth_method_secret"
 MARKER = "created by 013_schema_reconciliation"
@@ -7651,3 +7651,351 @@ def test_downgrade_034_leaves_units_it_did_not_create():
         assert alembic_version(url) == "033"
         assert column_state_029(url, "notes_metadata", "embedded_input_digest") is not None
         assert column_state_029(url, "notes_metadata", "embedded_chunking_version") is None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 035 — tags in the keyword vector (#391)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# No schema object. A data step under the generation lock and the stored
+# fingerprint's configs: a read-only size preflight, then an all-or-nothing
+# re-head adding `B(tags)` to every vector that has no tags part yet and
+# whose tags produce a lexeme. Downgrade strips every `B` lexeme.
+
+SIZE_LIMIT_035 = 1048575
+PREFLIGHT_MAX_035 = 1048511
+
+
+def _fts():
+    from src.services import fts
+
+    return fts
+
+
+def insert_tagged_note(url, note_id, path, title, frontmatter, tags, body, *,
+                       headed=True, cfg="english"):
+    """A row as 034 left it: `A(title) || A(aliases) || D(body)` (031's head)
+    or, `headed=False`, a D-only vector (a row 031 left at the size limit)."""
+    import json as _json
+
+    aliases = _fts().aliases_text(frontmatter)
+    head = (f"setweight(to_tsvector('{cfg}', $3::text), 'A') || "
+            f"setweight(to_tsvector('{cfg}', $7), 'A') || ") if headed else ""
+    args = [note_id, path, title, _json.dumps(frontmatter), tags, body]
+    if headed:
+        args.append(aliases)
+    sql(
+        url,
+        "INSERT INTO notes_metadata (id, user_id, file_path, title, frontmatter, tags, "
+        " content_hash, content_tsvector) "
+        f"VALUES ($1, NULL, $2, $3::text, $4::jsonb, $5::varchar[], 'h', "
+        f"        {head}to_tsvector('{cfg}', $6))",
+        *args,
+    )
+
+
+def expected_tagged(url, title, frontmatter, tags, body, cfg="english"):
+    """What the incremental writer builds for the same inputs."""
+    return fetchval(
+        url,
+        f"SELECT (setweight(to_tsvector('{cfg}', $1), 'A') || "
+        f"        setweight(to_tsvector('{cfg}', $2), 'A') || "
+        f"        setweight(to_tsvector('{cfg}', $3), 'B') || "
+        f"        to_tsvector('{cfg}', $4))::text",
+        title, _fts().aliases_text(frontmatter), _fts().tags_text(tags), body,
+    )
+
+
+def part_lexemes(url, note_id, weights):
+    return fetchval(
+        url,
+        f"SELECT tsvector_to_array(ts_filter(content_tsvector, '{weights}')) "
+        "FROM notes_metadata WHERE id = $1",
+        note_id,
+    )
+
+
+def all_vectors(url):
+    return {
+        r["id"]: r["v"]
+        for r in fetch(url, "SELECT id, content_tsvector::text AS v FROM notes_metadata")
+    }
+
+
+def refuse_035(url, *, must_mention):
+    before = all_vectors(url)
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    assert result.returncode != 0, "035 should have refused"
+    combined = result.stdout + result.stderr
+    for phrase in must_mention:
+        assert phrase in combined, f"refusal did not mention {phrase!r}:\n{combined}"
+    assert alembic_version(url) == "034", "nothing should have been recorded"
+    assert all_vectors(url) == before, "nothing should have been written"
+    return combined
+
+
+def near_limit_words(n):
+    """`n` distinct eight-character words: `S` = 12 bytes each (8 + 2 + 2)."""
+    return " ".join(f"w{i:07d}" for i in range(n))
+
+
+def size_of(url, vector_sql, *args):
+    """`S(v)` (migration 035's `size_sql`) of a SQL vector expression."""
+    import importlib.util
+
+    path = next((_harness.ROOT / "alembic" / "versions").glob("035_*.py"))
+    spec = importlib.util.spec_from_file_location("migration_035_gate", path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return fetchval(url, f"SELECT {m.size_sql(vector_sql)}", *args)
+
+
+def operator_statement():
+    """The read-only pre-merge statement, verbatim from `DEPLOYMENT.md`."""
+    import re
+    import textwrap
+
+    text_ = (_harness.ROOT / "DEPLOYMENT.md").read_text(encoding="utf-8")
+    section = text_[text_.index("## Upgrading across migration 035"):]
+    block = re.search(r"```sql\n(.*?)\n\s*```", section, re.S).group(1)
+    return textwrap.dedent(block)
+
+
+def test_035_chains_from_034():
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config()
+    config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+    assert script.get_revision("035").down_revision == "034"
+
+
+def test_035_adds_the_tags_part_to_tagged_rows_only():
+    with throwaway_db("schema_035_fresh", revision="034") as url:
+        body = "the siding complaint went in"
+        insert_tagged_note(url, 1, "t.md", "Neighborhood board", {"aliases": ["board"]},
+                           ["hoa", "ctx/phone"], body)
+        insert_tagged_note(url, 2, "u.md", "Untagged", {}, [], "plain words")
+        insert_tagged_note(url, 3, "s.md", "Stop", {}, ["the"], "stop tagged")
+        sql(url, "INSERT INTO notes_metadata (id, user_id, file_path, title, tags, content_hash) "
+                 "VALUES (4, NULL, 'n.md', 'never vectorised', '{hoa}', 'h')")
+        before = all_vectors(url)
+        before_d = part_lexemes(url, 1, "{d}")
+
+        result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert "1 re-headed, 0 already tagged, 2 without tag lexemes" in result.stdout + result.stderr
+        assert set(part_lexemes(url, 1, "{b}")) == {"hoa", "ctx/phone", "ctx", "phone"}
+        assert set(part_lexemes(url, 1, "{a}")) == {"neighborhood", "board"}
+        assert part_lexemes(url, 1, "{d}") == before_d
+        # Phrase search and relative positions within the body survive.
+        assert fetchval(url, "SELECT content_tsvector @@ phraseto_tsquery('english', $1) "
+                             "FROM notes_metadata WHERE id = 1", body) is True
+        after = all_vectors(url)
+        assert after[2] == before[2] and after[3] == before[3] and after[4] is None
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_035_re_heads_a_d_only_row_byte_exactly():
+    with throwaway_db("schema_035_d_only", revision="034") as url:
+        fm = {"aliases": "Q3 retro, retrospective"}
+        insert_tagged_note(url, 1, "q.md", "Quarterly Review", fm, ["hoa", "a/b"],
+                           "plain body text about the period", headed=False)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert all_vectors(url)[1] == expected_tagged(
+            url, "Quarterly Review", fm, ["hoa", "a/b"], "plain body text about the period")
+
+
+def test_035_stamp_back_rerun_is_byte_idempotent():
+    with throwaway_db("schema_035_rerun", revision="034") as url:
+        insert_tagged_note(url, 1, "a.md", "Alpha", {}, ["hoa"], "body words")
+        insert_tagged_note(url, 2, "b.md", "Beta", {}, ["x/y"], "more body", headed=False)
+        insert_tagged_note(url, 3, "c.md", "Gamma", {}, [], "untagged body")
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        first = all_vectors(url)
+        _harness.run_alembic(url, "stamp", "034", dimensions=DIM)
+        result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert "0 re-headed, 2 already tagged, 1 without tag lexemes" in result.stdout + result.stderr
+        assert all_vectors(url) == first
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_035_builds_the_tags_part_under_the_stored_fingerprints_configs():
+    with throwaway_db("schema_035_configs", revision="034") as url:
+        sql(url, "INSERT INTO indexer_state (key, value, updated_at) "
+                 "VALUES ('fts_fingerprint', '{\"configs\":[\"simple\"],\"v\":1}', now())")
+        insert_tagged_note(url, 1, "r.md", "Notes", {}, ["Running"], "runs fast", cfg="simple")
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert part_lexemes(url, 1, "{b}") == ["running"]  # simple, not 'run'
+
+
+def test_035_uses_the_environment_when_no_fingerprint_is_stored():
+    with throwaway_db("schema_035_absent", revision="034") as url:
+        insert_tagged_note(url, 1, "r.md", "Notes", {}, ["Running"], "runs fast")
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert part_lexemes(url, 1, "{b}") == ["run"]  # english stem
+
+
+@pytest.mark.parametrize("value", ["not json", '{"configs": ["english"], "v": 99}', '{"v": 1}'])
+def test_035_refuses_an_unreadable_fingerprint(value):
+    with throwaway_db("schema_035_unreadable", revision="034") as url:
+        sql(url, "INSERT INTO indexer_state (key, value, updated_at) VALUES ('fts_fingerprint', $1, now())", value)
+        insert_tagged_note(url, 1, "r.md", "Notes", {}, ["hoa"], "body")
+        refuse_035(url, must_mention=["fts_fingerprint", "Nothing has been changed"])
+
+
+def test_035_size_formula_tracks_postgresqls_own_count():
+    """`S` against the size PostgreSQL reports when a concatenation crosses
+    the limit (`string is too long for tsvector (N bytes, …)`): within the
+    64-byte margin, and the estimate is what 035 compares."""
+    import re
+
+    with throwaway_db("schema_035_size_formula", revision="034") as url:
+        words = near_limit_words(87_370)
+        tags = " ".join(f"{i:02d}" + "t" * 30 for i in range(40))
+        estimate = (
+            size_of(url, "to_tsvector('english', $1)", words)
+            + size_of(url, "setweight(to_tsvector('english', $1), 'B')", tags)
+        )
+        with pytest.raises(asyncpg.ProgramLimitExceededError) as raised:
+            fetchval(url, "SELECT length(to_tsvector('english', $1) || "
+                          "setweight(to_tsvector('english', $2), 'B'))", words, tags)
+        reported = int(re.search(r"\((\d+) bytes", str(raised.value)).group(1))
+        print(f"\n[035 size formula] S = {estimate}, PostgreSQL reported {reported}")
+        assert abs(reported - estimate) <= 8
+        # A storable vector's own S is below the limit.
+        assert size_of(url, "to_tsvector('english', $1)", words) == 12 * 87_370 < SIZE_LIMIT_035
+
+
+def test_035_preflight_aborts_on_a_near_limit_row_before_writing():
+    with throwaway_db("schema_035_preflight", revision="034") as url:
+        insert_tagged_note(url, 1, "ok.md", "Fine Note", {}, ["hoa"], "body one")
+        insert_tagged_note(url, 2, "big.md", "Big Note", {}, ["hoa"], near_limit_words(87_377))
+        stored = size_of(url, "(SELECT content_tsvector FROM notes_metadata WHERE id = 2)")
+        assert PREFLIGHT_MAX_035 < stored < SIZE_LIMIT_035
+        combined = refuse_035(url, must_mention=[
+            "035 size preflight: 1 tagged keyword vector(s)", "id(s) 2.",
+            "Nothing has been changed", "034",
+        ])
+        assert "big.md" not in combined and "w0000001" not in combined
+        # The remedy: shorten the note, let it be rewritten, deploy again.
+        sql(url, "UPDATE notes_metadata SET content_tsvector = "
+                 "setweight(to_tsvector('english', 'Big Note'), 'A') || "
+                 "to_tsvector('english', 'shortened') WHERE id = 2")
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert part_lexemes(url, 1, "{b}") == ["hoa"] and part_lexemes(url, 2, "{b}") == ["hoa"]
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_the_operator_statement_flags_a_d_only_row_the_stored_estimate_passes():
+    """Codex r2: a D-only row whose `S(v) + S(tags part)` is within the margin
+    but whose post-035 size `S(D) + S(A + B)` is not. The `DEPLOYMENT.md`
+    statement flags it (`d_only`), and 035 aborts naming the same id."""
+    with throwaway_db("schema_035_operator", revision="034") as url:
+        insert_tagged_note(url, 1, "ok.md", "Fine Note", {}, ["budget"], "body one")
+        insert_tagged_note(url, 7, "q.md", "Quarterly Review", {}, ["hoa"],
+                           near_limit_words(87_374), headed=False)
+        row = fetch(url, operator_statement())[0]
+        assert row["tagged_rows"] == 2
+        assert row["flagged"] == 1 and list(row["ids"]) == [7] and row["d_only"] == 1
+        # The stored-vector estimate alone would have passed it.
+        assert row["largest"] <= PREFLIGHT_MAX_035
+        refuse_035(url, must_mention=["id(s) 7.", "Nothing has been changed"])
+
+
+def test_the_operator_statement_passes_an_ordinary_database():
+    with throwaway_db("schema_035_operator_ok", revision="034") as url:
+        insert_tagged_note(url, 1, "a.md", "Alpha", {}, ["hoa", "x/y"], "body words")
+        insert_tagged_note(url, 2, "b.md", "Beta", {}, [], "untagged")
+        row = fetch(url, operator_statement())[0]
+        assert (row["tagged_rows"], row["flagged"], row["ids"], row["d_only"]) == (1, 0, None, 0)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+
+
+def test_035_a_54000_row_fails_the_whole_rewrite_with_the_preflight_bypassed():
+    """The rewrite's backstop: a real 54000 (the preflight bypassed by calling
+    035's `rewrite` directly, in one transaction) fails naming the id and the
+    SQLSTATE, and nothing is committed."""
+    import importlib.util
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    with throwaway_db("schema_035_54000", revision="034") as url:
+        insert_tagged_note(url, 1, "ok.md", "Fine Note", {}, ["hoa"], "body one")
+        insert_tagged_note(url, 2, "big.md", "Big Note", {},
+                           [f"{i:02d}" + "t" * 30 for i in range(12)], near_limit_words(87_377))
+        before = all_vectors(url)
+        path = next((_harness.ROOT / "alembic" / "versions").glob("035_*.py"))
+        spec = importlib.util.spec_from_file_location("migration_035_bypass", path)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+
+        async def attempt():
+            engine = create_async_engine(url)
+            try:
+                async with engine.connect() as conn:
+                    def _go(sync_conn):
+                        _total, rows = m._candidates(sync_conn)
+                        work = [m._binds(r, ["english"]) for r in rows]
+                        return m.rewrite(sync_conn, ["english"], work)
+
+                    try:
+                        await conn.run_sync(_go)
+                    finally:
+                        await conn.rollback()
+            finally:
+                await engine.dispose()
+
+        with pytest.raises(m.RowFailure) as raised:
+            asyncio.run(attempt())
+        message = str(raised.value)
+        assert "id=2" in message and "SQLSTATE 54000" in message and "034" in message
+        assert "big.md" not in message and "tttt" not in message
+        assert alembic_version(url) == "034"
+        assert all_vectors(url) == before
+
+
+def test_035_any_other_row_error_fails_the_whole_migration():
+    with throwaway_db("schema_035_row_error", revision="034") as url:
+        insert_tagged_note(url, 1, "a.md", "Alpha", {}, ["hoa"], "body one")
+        insert_tagged_note(url, 2, "b.md", "Beta", {}, ["hoa"], "body two")
+        sql(url, """
+            CREATE OR REPLACE FUNCTION refuse_beta() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+              IF NEW.id = 2 THEN
+                RAISE EXCEPTION 'synthetic failure' USING ERRCODE = 'P0001';
+              END IF;
+              RETURN NEW;
+            END $$
+        """)
+        sql(url, "CREATE TRIGGER refuse_beta BEFORE UPDATE ON notes_metadata "
+                 "FOR EACH ROW EXECUTE FUNCTION refuse_beta()")
+        refuse_035(url, must_mention=["035 failed during the rewrite at notes_metadata id=2",
+                                      "SQLSTATE P0001", "still at revision 034"])
+        sql(url, "DROP TRIGGER refuse_beta ON notes_metadata")
+
+
+def test_downgrade_035_strips_the_tags_part_and_keeps_the_rest():
+    with throwaway_db("schema_035_downgrade", revision="034") as url:
+        insert_tagged_note(url, 1, "a.md", "Alpha Note", {"aliases": ["nick"]}, ["hoa"],
+                           "the hoa siding complaint")
+        before_d = part_lexemes(url, 1, "{d}")
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert_alembic_check_clean(url, DIM)
+        assert "hoa" in part_lexemes(url, 1, "{b}")
+        result = _harness.run_alembic(url, "downgrade", "034", dimensions=DIM)
+        assert "stripped the weight-B tags part from 1 keyword vector(s)" in (
+            result.stdout + result.stderr)
+        assert alembic_version(url) == "034"
+        assert fetchval(url, "SELECT count(*) FROM notes_metadata "
+                             "WHERE length(ts_filter(content_tsvector, '{b}')) > 0") == 0
+        assert set(part_lexemes(url, 1, "{a}")) == {"alpha", "note", "nick"}
+        assert part_lexemes(url, 1, "{d}") == before_d
+        # `hoa` was in the tags and the body: it keeps its body position.
+        assert fetchval(url, "SELECT content_tsvector @@ phraseto_tsquery('english', "
+                             "'hoa siding complaint') FROM notes_metadata WHERE id = 1") is True
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert "hoa" in part_lexemes(url, 1, "{b}")
+        assert_alembic_check_clean(url, DIM)

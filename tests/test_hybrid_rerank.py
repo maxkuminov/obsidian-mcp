@@ -223,7 +223,7 @@ def test_the_fixed_bounds_with_rerank():
     worst_rows = [
         HybridRow(path=f"{i}.md", title="", tags=[], score=2 / 1050, keyword_rank=50,
                   semantic_rank=50, match="any", similarity=-0.123, stale=True,
-                  embedding_truncated=True, no_excerpt=True, matched_in=["title", "body"])
+                  embedding_truncated=True, no_excerpt=True, matched_in=["title+tags+body"])
         for i in range(50)
     ]
     result = HybridResult(
@@ -238,13 +238,18 @@ def test_the_fixed_bounds_with_rerank():
     structure = tools._hybrid_row_line(
         worst_rows[0], 1000, title="", path="", tags=[], preview=("none", ""), labels=labels,
         extra=(tools._rerank_score_field(-1.234e-100),))
-    assert len(structure) <= tools.HYBRID_RERANK_ROW_STRUCTURE_MAX == 362, len(structure)
+    assert len(structure) <= tools.HYBRID_RERANK_ROW_STRUCTURE_MAX == 367, len(structure)
+    print(f"\n[hybrid bound] rerank=true abbreviated structure: {len(structure)}")
     assert max(len(tools._rerank_cap_footer(n)) for n in range(1, 51)) <= 75
-    assert 431 + 362 + 25 + 25 + 75 + 75 + 5 == 998 <= 1000
+    # Since #391 the cut form's floor sum exceeds the cap in this one worst
+    # case, so the row continues to the labelled omitted form (≤ 984).
+    assert 431 + 367 + 25 + 25 + 75 + 75 + 5 == 1003 > 1000
+    assert 431 + 367 + 31 + 75 + 75 + 5 == 984 <= 1000
 
 
+@pytest.mark.parametrize("split", [False, True])
 @pytest.mark.parametrize("mode", ["correct", "not_json"])
-async def test_the_hybrid_worst_case_with_rerank(monkeypatch, captured, fake, mode):
+async def test_the_hybrid_worst_case_with_rerank(monkeypatch, captured, fake, mode, split):
     monkeypatch.setattr(settings, "max_read_response_chars", 1000, raising=False)
     monkeypatch.setattr(settings, "hybrid_rrf_k", 1000, raising=False)
     monkeypatch.setattr(settings, "keyword_snippet_rows", 20, raising=False)
@@ -262,7 +267,8 @@ async def test_the_hybrid_worst_case_with_rerank(monkeypatch, captured, fake, mo
     session = _ExcerptSession(
         excerpts={path: "e" * 3000},
         ranked=[keyword],
-        snippet=[[snip(1, hl="a \x02b\x03")] + [snip(10 + i) for i in range(19)]])
+        snippet=[[snip(1, hl="a \x02b\x03", title=False, body=not split)]
+                 + [snip(10 + i) for i in range(19)]])
     _serve(monkeypatch, session)
     fake.mode = mode
     fake.scorer = (lambda q, d: [-1.234e-05 if i == 0 else -9.0 for i in range(len(d))]) \
@@ -275,8 +281,17 @@ async def test_the_hybrid_worst_case_with_rerank(monkeypatch, captured, fake, mo
             else "reranked: false (malformed_response)") in lines[0]
     rows = [line for line in lines if line.startswith("- {")]
     assert len(rows) == 1
+    if split:
+        # `matched_in: title+tags+body` (#391): structure ≤ 367, and when the
+        # 20–25 cut form does not fit the row takes the labelled omitted form.
+        assert "matched_in: title+tags+body" in rows[0]
+        if '"title":""' in rows[0]:
+            for label in ("title omitted", "path omitted", "abbreviated"):
+                assert label in rows[0], label
     for key in ("title", "path"):
         lit = re.search(r'"%s":("(?:[^"\\]|\\.)*")' % key, rows[0]).group(1)
+        if split and lit == '""':
+            continue
         assert 20 <= len(lit) - 2 <= 25, (key, lit)
         assert {"title": title, "path": path}[key].startswith(json.loads(lit))
     assert lines[-1].startswith("Response cap: 49 omitted — more: true")

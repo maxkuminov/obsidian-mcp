@@ -31,7 +31,7 @@ from sqlalchemy.pool import NullPool
 
 import _harness
 from src.models.db import NoteEmbedding, NoteMetadata, UsageLog, User
-from src.services import embeddings, hybrid, search, timing, vector_index
+from src.services import embeddings, fts, hybrid, search, timing, vector_index
 from src.services.embeddings import semantic_search
 from src.services.fts import index_tsvector_sql
 from src.services.hybrid import fuse
@@ -68,7 +68,7 @@ async def maker(migrated_url):
 
 async def _add_note(session, *, path, body, vectors, user_id, title=None, tags=None,
                     frontmatter=None):
-    fragment, cfg_params = index_tsvector_sql()
+    fragment, cfg_params = index_tsvector_sql(tags_bind="tags_text")
     note = NoteMetadata(
         file_path=path, title=title or path.rsplit("/", 1)[-1].removesuffix(".md"),
         content_hash=path, embedded_content_hash=path, tags=tags or [],
@@ -82,7 +82,8 @@ async def _add_note(session, *, path, body, vectors, user_id, title=None, tags=N
     await session.flush()
     await session.execute(
         text(f"UPDATE notes_metadata SET content_tsvector = {fragment} WHERE id = :id"),
-        {"id": note.id, "content": body, "title": note.title, "aliases": "", **cfg_params},
+        {"id": note.id, "content": body, "title": note.title, "aliases": "",
+         "tags_text": fts.tags_text(tags), **cfg_params},
     )
     return note.id
 
@@ -516,4 +517,28 @@ async def test_a_same_path_note_of_another_tenant_never_supplies_the_excerpt(mak
         async with maker() as session:
             await session.execute(delete(NoteMetadata).where(
                 NoteMetadata.file_path == NO_VECTORS, NoteMetadata.user_id == u8))
+            await session.commit()
+
+
+async def test_the_keyword_arm_carries_a_tags_and_body_match(maker, corpus):
+    """#391 through hybrid: `HOA` only in the tags, `siding complaint` only in
+    the body — the keyword arm finds the note (`matched_in: tags+body`) and
+    its preview is the keyword `head`, under the existing preview rule."""
+    u8 = corpus["u8"]
+    async with maker() as session:
+        await _add_note(session, path="HOA/board.md", title="Neighborhood board",
+                        body="the siding complaint went in", vectors=[_unit((6, 1.0))],
+                        user_id=u8, tags=["HOA"])
+        await session.commit()
+    try:
+        async with maker() as session:
+            result = await hybrid.hybrid_search(
+                session, "HOA siding complaint", limit=10, folder="HOA/", user_id=u8)
+        row = next(r for r in result.rows if r.path == "HOA/board.md")
+        assert row.keyword_rank == 1 and row.match == "all"
+        assert row.matched_in == ["tags+body"]
+        assert row.snippet is None and row.head.startswith("the siding complaint")
+    finally:
+        async with maker() as session:
+            await session.execute(text("DELETE FROM notes_metadata WHERE file_path = 'HOA/board.md'"))
             await session.commit()
