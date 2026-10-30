@@ -40,7 +40,7 @@
   - CI reproducibility;
   - `assert_no_leak`
 - [ ] 4.4 Calibration:
-  - `mining.py` writes `confidence-rows.jsonl` (`tool`, `class`, `top_similarity`, `keyword_all`, `clicked`; no text, no path);
+  - `mining.py` writes `confidence-rows.jsonl`, one row per search usage row: `tool`, `class`, `confidence` (the recorded key, absent on a pre-change row), `created_at` (UTC, from the usage row), `top_similarity`, `keyword_all`, `clicked`; no text, no path. The tabulator computes each tool's span from `created_at`;
   - a new `scripts/search_eval/confidence.py` plus the `confidence` subcommand: post-change rows identified by the `confidence` key, keyword-only rows included; per tool and per class; one PASS/FAIL/INSUFFICIENT_DATA line per tool (≥ 14 days and ≥ 200 clicked-through pages, < 1/50), no aggregate; a JSON of counts and rates carrying provenance and `attachable`, with the `NOT ATTACHABLE` line for multi-user data;
   - fixture rows and tests: per-tool lines, a keyword-only false low, insufficient data (short span, zero denominator), pre-change rows excluded, the two-user fixture non-attachable and the `USER_ID=` fixture attachable, no leak
 - [ ] 4.5 Regenerate `tests/fixtures/search_eval/expected-report.json` once, with the reason in the commit message. The diff may contain only the new metric keys, `staged_depth`, depth, `schema_version` and the new deltas

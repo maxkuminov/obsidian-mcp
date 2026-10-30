@@ -117,7 +117,7 @@ Both tools record, through the timing holder, on every **page** (zero-result and
 - `top_similarity`: three decimals, whenever a candidate existed;
 - on `hybrid_search`, `keyword_all` (int).
 
-None of these is an `error` marker. Refusals carry none of them (D3). To make D2's tabulation possible, the miner writes a per-search-row artifact, `confidence-rows.jsonl`, under the data directory. It holds `tool`, `class`, `top_similarity`, `keyword_all` and `clicked` (whether the miner credited a judgment to that search row), with no query text and no path. The `confidence` subcommand reads it, connects to no database, writes counts and rates only, and carries the mine provenance and `attachable` flag (non-attachable output begins with the `NOT ATTACHABLE` line).
+None of these is an `error` marker. Refusals carry none of them (D3). To make D2's tabulation possible, the miner writes a per-search-row artifact, `confidence-rows.jsonl`, under the data directory. It holds `tool`, `class`, `confidence` (the recorded key; absent marks a pre-change row), `created_at` (UTC, from the usage row; the tabulator computes each tool's span from it), `top_similarity`, `keyword_all` and `clicked` (whether the miner credited a judgment to that search row), with no query text and no path. The `confidence` subcommand reads it, connects to no database, writes counts and rates only, and carries the mine provenance and `attachable` flag (non-attachable output begins with the `NOT ATTACHABLE` line).
 
 ### D8. Harness: recall@20 and recall@50
 
@@ -170,14 +170,14 @@ No row content, field, ordering, argument, annotation or tool changes; at the ca
 
 ## Risks
 
-- **A false `low` on a good page.** This is the expensive error. It is mitigated by the hard-off default, the measured acceptance line before a value is set, rows never dropped, and a hint that says "try". The adversarial pass is asked to attack this.
+- **A false `low` on a good page.** This is the expensive error. It is mitigated by the hard-off default, the per-tool measured acceptance lines before a value is set, the guarantee that no candidate is filtered or reordered (a token-displaced boundary row is reported by the cap footer, L14), and a hint that says "try". The adversarial pass is asked to attack this.
 - **A silent `ok` on noise.** This is today's behaviour, and it is guaranteed until calibration.
 - **A bound regression.** Every D5 case is a pinned test for both values of the token. The hint cannot enter the bound, and the new rung comes after every existing rung.
 - **A model change without a threshold change.** The docs say to re-calibrate, and 0 is the shipped value.
 
 ## Open questions (only Max can answer)
 
-- Q1. Is the recipe's N (14 days or ≥ 200 clicked-through searches per tool) right for the reference deployment's traffic?
+- Q1. (Decided in round 2, no longer open: accrual is at least 14 days **and** at least 200 clicked-through pages per tool, as the search-quality setting requirement and the search-evaluation tabulation requirement state.)
 - Q2. Is 1-in-50 the right false-low acceptance line, or should identifier queries have a stricter one?
 - Q3. Should the depth default of 50 apply now? Old `runfile:` baselines get a null recall@50.
 
@@ -185,7 +185,7 @@ No row content, field, ordering, argument, annotation or tool changes; at the ca
 
 Verdict FAIL (3 BLOCKER, 6 MAJOR), all accepted and folded in:
 
-- **B1, token/hint versus "no row dropped".** The token is on every page and is base budget. The hint is conditional and withdrawn before it changes the shown path list or any row line (D4). A cap-boundary scenario was added.
+- **B1, token/hint versus row preservation.** The token is on every page and is base budget. The hint is conditional and withdrawn before it changes the shown path list or any row line (D4). A cap-boundary scenario was added.
 - **B2, evidence.** Evidence is `keyword_all > 0`. The hint text is amended, the low-plus-`any` bounds were re-measured (equal to `ok`), and the rule table and the `xqzvplorth notes` case were added.
 - **B3, limit-invariance.** `top_similarity` is taken over the call's actual candidate set, the invariance claim is dropped, and L12 records the consequence.
 - **M1, uncalibrated default.** The default is 0. `top_similarity` and `keyword_all` are always recorded, and the DEPLOYMENT.md recipe adds the `confidence` tabulation and the 1-in-50 acceptance line.
@@ -202,3 +202,10 @@ B2, B3, M1 (default), M2–M6 verified. B1 not fixed, plus two new MAJORs, all f
 - **B1, the token can evict a boundary row.** No compaction is added. The "token drops no row" promise is removed: the token is a header token like `arm_depth`, and at the cap boundary a page may show one row fewer than before this change, disclosed by the existing cap footer (L14). A scenario now asserts the footer's count and `more: true`. The hint keeps its row-neutral rule.
 - **M1, calibration gate.** Accrual is at least 14 days **and** at least 200 token-bearing clicked-through pages per tool. The tabulation prints one line per tool, with no aggregate, and zero or insufficient denominators are `INSUFFICIENT_DATA`. Activation requires PASS on both lines (one setting enables both tools, L15). Post-change rows are identified by the recorded `confidence` key, so keyword-only pages with null `top_similarity` are included, and a clicked-through keyword-only `low` counts as a false low.
 - **M2, provenance.** The tabulation inherits the mine provenance and `attachable` flag and prints `NOT ATTACHABLE` for multi-user data. Only attachable output may leave `.search-eval/`. The tests cover the two-user fixture (not attachable) and the `USER_ID=` fixture (attachable).
+
+## Codex spec review, round 3 (2026-10-30)
+
+M2 verified. B1 and M1 were not fixed in text only, and this commit closes both. Verified by the supervisor; there is no round 4.
+
+- **B1.** The design's risk line no longer says rows are never dropped. It states the actual guarantee: no candidate is filtered or reordered, and a token-displaced boundary row is reported by the cap footer (L14). I aligned the rest of the change's phrasing to match.
+- **M1.** Each `confidence-rows.jsonl` line now carries `confidence` (absent on a pre-change row) and `created_at` (UTC) alongside `tool`, `class`, `top_similarity`, `keyword_all` and `clicked`. The 20-day-span and pre-change-row scenarios pin that both are preserved, and the tabulator computes each tool's span from `created_at`. Q1 now records the decided accrual rule.
