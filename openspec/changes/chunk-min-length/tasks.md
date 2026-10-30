@@ -32,6 +32,7 @@
   - **Codex M2.** A 300-character prefix and a group of `W + m − 1` characters of prose: every provider input is at most `302 + W`, the last two chunks both have `clen ≥ m`, and coverage is complete.
   - **Codex r2, W=400.** `A×161 + " " + B×239` yields exactly (raw 200, clen 200) and (raw 201, clen 201).
   - **Codex r2, default W.** `A×1800 + space×390 + B×10` yields exactly (raw 905, clen 905) and (raw 1,295, clen 906).
+  - **Codex r3, high overlap.** At `CHUNK_SIZE=100`, overlap 99, `A×599` yields exactly `[0, 299)` and `[199, 599)`. Both have raw length and `clen` of at most 400, every provider input is at most `W + 302`, and coverage is complete.
   - **Whitespace that defeats the raw bound.** `A×100 + space×3000 + B×100` yields one chunk with `clen` 201, raw length over `W`, and the excess made of whitespace only.
   - Sibling merge, which takes the parent or 0.
   - A backward tail.

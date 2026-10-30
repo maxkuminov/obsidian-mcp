@@ -25,6 +25,7 @@
 - **Tail balancing.** When the text after a window's cut has `clen < m`, the last two windows SHALL be re-decided over the span from that window's start to the end, with `S` the span's `clen`.
   - When `S ≥ 2m + 1`, the span SHALL be cut into two windows, each with `clen ≥ m`. The cut SHALL be the word start nearest the span's collapsed midpoint (the earlier on a tie) whose two sides both have `clen ≥ m` and raw length at most `W`. If there is none, the cut SHALL be the smallest position at which the left side's `clen` equals `⌊S/2⌋`.
   - When `S ≤ 2m`, the span SHALL be one window.
+  - With overlap above zero, the right window of a split SHALL start at `s = min(cut, max(cut − overlap × 4, end − W, a + 1))`, then move forward to the first word start in `[s, cut]`. It SHALL NOT start beyond the cut. It SHALL stay within `W` raw whenever the split itself was within `W` raw, and coverage SHALL hold.
 - **Bounds.** Every chunk SHALL have `clen ≤ W`. Its raw length SHALL be at most `W`, except where no choice above both meets the minimum and stays within `W` raw. In that case the excess SHALL be whitespace only.
 - **Minimum.** Every chunk SHALL have `clen ≥ m`, except the only chunk of a note whose whole cleaned body has `clen < m`.
 - **Coverage.** Every non-heading cleaned character of a section SHALL be inside at least one chunk.
@@ -95,6 +96,11 @@
 #### Scenario: Whitespace that defeats the raw bound yields to the minimum
 - **WHEN** at the default `CHUNK_SIZE` a group's text is 100 `A`, 3,000 spaces and 100 `B`
 - **THEN** no chunk SHALL have `clen` below 200, every chunk SHALL have `clen` of at most `W`, and any chunk longer than `W` raw SHALL exceed it by whitespace only
+
+#### Scenario: High overlap after tail balancing stays within the window (Codex r3)
+- **WHEN** `CHUNK_SIZE` is 100 (W = 400, m = 200), the overlap is 99, and a group's text is 599 `A`
+- **THEN** exactly two chunks SHALL be stored: `[0, 299)` (raw and `clen` 299) and `[199, 599)` (raw and `clen` 400)
+- **AND** every chunk SHALL have raw length and `clen` of at most 400, every provider input SHALL be at most `W + 302` characters, and every `A` SHALL be inside a chunk
 
 #### Scenario: A run without whitespace is cut hard
 - **WHEN** a section holds a 5,000-character run with no whitespace

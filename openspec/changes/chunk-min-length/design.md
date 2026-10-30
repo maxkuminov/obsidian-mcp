@@ -160,8 +160,11 @@ so it is a `CHUNKING_VERSION` bump, like the lookback constant (see
 embedding-providers). `CHUNK_SIZE` itself stays in the refusing fingerprint,
 so a change to it, and with it to `m`, is the existing declared reset.
 
-**Length** is `len(text.strip())` in code points, measured on cleaned text.
-It is never measured on the prefixed input.
+**Length** is always D1's `clen`: whitespace runs (the six ASCII characters)
+are collapsed to one space, and the result is stripped of spaces and counted
+in code points. It is measured on the cleaned chunk text, never on the
+prefixed input. For example, `A×1800 + space×390 + B×10` has `clen` 1,811,
+not 2,200 (Codex r3).
 
 **Why 200.**
 
@@ -180,7 +183,7 @@ It is never measured on the prefixed input.
 
 The sections come from `_note_sections`, unchanged. Section *i* has an
 own-text raw span `[s_i, e_i)` and cleaned text `c_i`. It is **non-empty**
-when `c_i.strip()` is non-empty. It is **short** when it is non-empty and
+when `clen(c_i) > 0`. It is **short** when it is non-empty and
 `clen(c_i) < m`. A group's text is the whole-body-fence-cleaned
 contiguous raw span `[s_first, e_last)`, so it includes the heading lines of
 absorbed sections and of any empty sections between them.
@@ -231,9 +234,20 @@ the last two windows are re-decided over the span `[a, end)`. Let
   through whitespace, and their collapsed length is always at most `W` (D7,
   L3).
 
-With overlap, the right window's start moves back by `overlap × 4`, clamped
-so the window stays within `W` raw, and never past the previous window's
-start.
+**Overlap after tail balancing (Codex r3, normative).** With overlap, the
+right window starts at `s = min(cut, max(cut − overlap × 4, end − W, a + 1))`.
+It then moves forward to the first word start in `[s, cut]`. So it stays
+within `W` raw whenever the split was in bound, it never passes the cut, and
+coverage holds (`s ≤ cut`). Pinned: `CHUNK_SIZE=100` (W=400), overlap 99,
+`A×599`:
+
+- The first window hard-cuts at 400 and leaves `A×199`, so `S = 599`.
+- The midpoint hard cut falls at 299, giving a left window `[0, 299)` (raw and
+  `clen` 299).
+- Unclamped, the right start would be 1, a raw length of 598. Clamped, it is
+  `max(−97, 199, 1) = 199`, so the right window is `[199, 599)` (raw and
+  `clen` 400).
+- The provider input is `len(P) + 402`, which is at most `W + 302`.
 
 **The two Codex inputs, pinned (task 2.6):**
 
@@ -597,6 +611,20 @@ reuse is sound. Both findings were accepted.
 | B1, B2, M1, M3, M5 | VERIFIED | — | — |
 | M2 | REGRESSED | The backward re-cut could strand a prose window below `m`. At W=400, `A×161 + " " + B×239` gave windows of (162, 161) and (239, 239). | **One length.** `clen` (whitespace runs collapsed, then stripped) governs every rule. A cut must be admissible, meaning the preceding window has `clen ≥ m`. Normative tail balancing: for `S ≥ 2m + 1`, both windows are at least `m`, preferring the admissible word start nearest the midpoint and falling back to a midpoint hard cut. For `S ≤ 2m`, one window. Pinned output: (raw 200, clen 200) and (raw 201, clen 201) (D1, D3). |
 | M4 | NOT_FIXED | The `W // 4` proxy hid the M2 window and flagged a conforming whitespace tail at the default W, `A×1800 + space×390 + B×10`. | `under_min` is now the single predicate `clen < m` in a note with more than one chunk, with no exception, and it must be 0. `whitespace_windows` and the old L3 are removed. The default-W case now yields (raw 905, clen 905) and (raw 1,295, clen 906), both pinned. The raw bound yields only to whitespace, and only when no in-bound choice meets the minimum. That is the new L3, reported as `raw_over_window` and proved unavoidable in D7 (D7, D8). |
+
+Declined: none.
+
+## Codex spec review, round 3 (2026-10-30)
+
+FAIL on eed99c9, verification round. Six items were VERIFIED: the round-2
+M2 and M4 fixes, the whitespace bound (D9), and the B1, B2 and M1 fixes they
+touched. Two text-level MAJORs remained. Both are closed in this commit and
+verified by the supervisor. There is no round 4.
+
+| # | Status | Finding | Resolution |
+|---|---|---|---|
+| r3-1 | Stale definition | D2 still defined length as `len(text.strip())`, which contradicts `clen`. For `A×1800 + space×390 + B×10` that gives 2,200, not 1,811. | D2 now uses D1's `clen`, measured on the cleaned chunk text and never on the prefixed input. D3's non-empty test uses `clen > 0` (D2, D3). |
+| r3-2 | REGRESSED | The overlap start after tail balancing could reach far before the cut. With `CHUNK_SIZE=100`, overlap 99 and `A×599`, the right window was 598 characters, breaking the provider-input bound. The clamp existed only in the design. | The clamp is now normative in index-integrity: `s = min(cut, max(cut − overlap × 4, end − W, a + 1))`, then a forward snap within `[s, cut]`. The high-overlap case is a scenario and a test. Its pinned output is `[0, 299)` and `[199, 599)`, and its input is at most `W + 302` (D3). |
 
 Declined: none.
 
