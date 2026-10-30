@@ -47,6 +47,12 @@ Both move paths SHALL leave `notes_metadata.title` exactly what a fresh index of
 - **WHEN** a note carrying the tag `hoa` (and no `hoa` in its title, aliases or body) is moved from `Alpha.md` to `Beta.md` by either move path
 - **THEN** `keyword_search("hoa")` SHALL return it at `Beta.md` with `matched_in: tags`, and its vector SHALL still hold `hoa` at weight `B`
 
+#### Scenario: move_note's stored-tags fallback keeps the tag searchable through the move and the next pass
+
+- **WHEN** in multi-user mode two users each hold `Alpha.md`, user 1's tagged `hoa` and user 2's tagged `other`, neither with `hoa` in its title, aliases or body; user 1 calls `move_note(Alpha.md → Beta.md)` and the destination read fails after the rename stands (forced by the test)
+- **THEN** the re-head SHALL bind the tags selected from user 1's own row (the owner predicate in the fallback statement), user 1's vector SHALL hold `hoa` and not `other` at weight `B`, and user 1's `keyword_search("hoa")` SHALL return `Beta.md` with `matched_in: tags`
+- **AND** after the next incremental pass, in which the note's content hash is unchanged and only its stat is refreshed, the vector SHALL still hold `hoa` at weight `B` and the search SHALL still return it
+
 ## ADDED Requirements
 
 ### Requirement: Tags enter the keyword vector by one shared rule, bounded, with nested tags expanded

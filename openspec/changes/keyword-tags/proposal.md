@@ -34,7 +34,8 @@ searching for a word its own notes are tagged with gets nothing from
   comma-joined in that order, and when no part alone matches, the first
   minimal split in a fixed order: `title+tags`, `title+body`,
   `tags+body`, else `title+tags+body`. A tags-only match renders `head:`
-  with `matched_in: tags` (tags are not in the excerpt). The issue's
+  with `matched_in: tags` (tags are not in the excerpt); on a note with
+  an empty body the row has no preview line at all. The issue's
   query renders `matched_in: tags+body` and `head:`.
 - **Migration 035 re-heads every tagged vector in SQL** under the index
   generation lock with the stored fingerprint's configs, from the stored
@@ -43,6 +44,9 @@ searching for a word its own notes are tagged with gets nothing from
   row whose tags produce no lexeme (nothing to add; an untagged row is
   already byte-equal to what the new builder writes). Downgrade strips
   every `B` lexeme. No schema object changes; `alembic check` stays clean.
+  035 is all-or-nothing: any row error, the 1 MiB tsvector limit (54000)
+  included, fails it with nothing committed and names the row id; the
+  upgrade note gives the remedy.
 - **Both move paths and the full rebuild bind the tags** through the same
   rule, so the move re-head keeps the tags part instead of dropping it.
   The AST guard that only the builders compose `to_tsvector(` stays, and
@@ -75,10 +79,17 @@ None.
 - `schema-integrity`: migration 035 (the in-SQL re-head, its skip
   predicates, its downgrade).
 
-`hybrid-search` is not modified: its requirements name `matched_in` only
-as a field carried "when computed", never its values. `search-evaluation`
-is not modified: the harness is unchanged, and this change is subject to
-its existing gate as a search-path change.
+- `search-quality` (also): the result-identity oracle exempts rows with a
+  tag contribution and keeps its guarantee over every other row.
+- `hybrid-search`: the response-bound proof uses `title+tags+body` as the
+  longest `matched_in` (abbreviated structure 345, floor sum 990).
+- `reranker`: `hybrid_search(rerank=true)`'s pinned structure becomes 367;
+  its worst case falls through to the omitted form (≤ 984).
+
+`search-evaluation` is not modified: the harness is unchanged, and this
+change is subject to its existing gate as a search-path change, run with
+the runfile workflow because 035 rewrites the incumbent's vectors (design
+D7).
 
 ## Impact
 

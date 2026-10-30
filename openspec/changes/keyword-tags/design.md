@@ -165,7 +165,7 @@ not in `body_excerpt`, so nothing in the excerpt is the match.
   absent → `settings.fts_configs`; unreadable → refuse naming the key,
   nothing changed);
 - per row `(id, title, frontmatter, tags)` with `content_tsvector IS NOT
-  NULL`, in id order, each UPDATE in its own savepoint:
+  NULL`, in id order:
   `content_tsvector = rehead(:title, :aliases, :tags)` where `aliases =
   aliases_text(frontmatter)` and `tags = tags_text(tags)`, **guarded by
   two predicates in the UPDATE's own `WHERE`**:
@@ -177,10 +177,25 @@ not in `body_excerpt`, so nothing in the excerpt is the match.
     lexeme (no tags, or only stop words). Such a row is already byte-equal
     to what the new builder writes (D1), and re-heading it would only
     shift its body.
-- SQLSTATE 54000 on one row leaves it unchanged, counted and logged by id
-  (its next edit or the rebuild writes it through the halving retreat);
-  any other error fails the migration with nothing committed;
-- one summary line: re-headed, already tagged, untagged, left at the limit.
+- **all-or-nothing** (Codex r1 B1): any error on any row — SQLSTATE 54000,
+  the 1 MiB tsvector limit, included — fails the whole migration with
+  nothing committed, naming the row's id and the SQLSTATE (never the path
+  or any text). A migration that succeeded leaves no tagged row untagged;
+- one summary line: re-headed, already tagged, without tag lexemes.
+
+**A 54000 failure and its remedy.** The tags text is at most 2,048
+characters, so only a vector already within a few KiB of 1 MiB can cross
+the limit. Nothing is committed, so the database is still at 034. On
+compose the app was stopped before migrating; start the previous image. On
+Kubernetes the new pod's `migrate` initContainer fails and, under
+`Recreate`, the old pod is already gone: revert the image digest so the
+previous image serves (an outage until then — the price of never shipping
+a silently untaggable note). Then shorten the named note's body or tags
+(the stored vector is reused by the re-head, so only an edit shrinks it),
+let the previous image re-index it, and deploy again. Lowering a tag cap
+would not help: one tag is enough to cross the limit for such a row, and
+the cap is a constant (OD4).
+
 
 A row 031 left at the size limit (no `A` part, #344 L10) that has tags is
 re-headed here with both its title and its tags — the first application
@@ -217,7 +232,7 @@ image. `DEPLOYMENT.md`'s 035 upgrade note says so for a hand-driven stack.
 **Cost.** 031 re-headed every row of the reference deployment in a few
 seconds. 035 rewrites only tagged rows of the 4,265 notes. A set-based
 probe over 4,265 synthetic rows with 1,800-word bodies and three tags each
-took 0.75 s on PostgreSQL 16; 035's per-row savepoints add a round trip
+took 0.75 s on PostgreSQL 16; 035's per-row UPDATEs add a round trip
 each, so seconds, holding the generation lock (no pass can run, which the
 deploy order guarantees anyway). Every rewritten row is a new tuple
 version; 027's vacuum thresholds handle it.
@@ -267,9 +282,41 @@ else. A tags-only keyword row's preview is the keyword `head` under the
 existing `preview_kind` rule.
 
 The search-evaluation harness is unchanged. This is a search-path change,
-so the existing gate applies: `make search-eval-snapshot`, then `make
-search-eval` against a restored copy with the incumbent as `BASELINE`; the
-keyword and hybrid arms are expected to move, the semantic arm not at all.
+so the existing gate applies — and because 035 rewrites the vectors in
+place, the incumbent keyword and hybrid arms cannot be run after the copy
+is migrated (Codex r1 M4). The recipe is the runfile workflow:
+
+1. restore a `BACKUP_FULL=1` copy at 034 and `make search-eval-snapshot`;
+2. at the incumbent commit (`origin/main` before the merge) run the
+   harness's `run` over that copy for `keyword`, `semantic` and the hybrid
+   arm, and keep that generation's complete manifest and staged arm files;
+3. migrate the copy to 035, and at the candidate commit run the same arms
+   with the same qrels, snapshot and selection;
+4. `score` the candidate generation with the step-2 files as
+   `runfile:<path>` arms (same qrels, snapshot and selection hashes) and the
+   incumbent keyword runfile as `BASELINE` (then the hybrid one).
+
+Keyword and hybrid are expected to move, semantic not at all;
+`CORPUS_LOSS` invalidates, and `report.json` is attached only when
+`attachable: true`.
+
+**The response bounds (Codex r1 M2).** The hybrid and reranker bounds were
+proved with `matched_in: title+body` as the longest value; `title+tags+body`
+is five characters longer. At `rerank=false` the abbreviated structure
+becomes ≤ 345 and the floor sum 990 ≤ 1,000, so the 40–45 cut is still
+guaranteed. At `rerank=true` the structure becomes ≤ 367 and the cut-form
+sum 431 + 367 + 25 + 25 + 75 + 75 + 5 = 1,003 > 1,000: that one worst case
+continues to the labelled omitted form (≤ 984), as the reranker design
+already records for the transition-line case. `HYBRID_ROW_STRUCTURE_MAX`
+and `HYBRID_RERANK_ROW_STRUCTURE_MAX` move to 345 and 367; the semantic
+`rerank=true` bounds carry no `matched_in` and do not move.
+
+**An empty body (Codex r1 m1).** A note with no body stores an empty
+excerpt; its headline is empty. Such a row renders no second line at all
+(never a fabricated `head:`), keeps `matched_in` (`tags` for the tags-only
+case) and is not counted as missing an excerpt. The renderer must tell a
+computed empty headline from one not computed and from a NULL excerpt
+without relying on truthiness.
 
 The `keyword_search` docstring (≤ 4,000 characters, #343) says that tags
 are indexed between title and body and lists `tags` among `matched_in`'s
@@ -309,8 +356,8 @@ parts; the server instructions are untouched (they do not gloss
 - **L6** 035 uses the stored `tags`; a row last upserted under an older
   extraction version keeps the tags that version extracted until its next
   re-upsert, which rewrites both.
-- **L7** A row whose re-head hits SQLSTATE 54000 in 035 keeps its untagged
-  vector (logged by id) until its next edit or the rebuild.
+- **L7** *Withdrawn* (Codex r1 B1): 035 is all-or-nothing; a 54000 row
+  fails the migration instead of staying untagged.
 - **L8** A tag that stems to nothing (`#the`) contributes no lexeme; tags
   are stemmed by each configured config like the body (`#running` matches
   `run` under `english`).
@@ -339,3 +386,40 @@ parts; the server instructions are untouched (they do not gloss
   (byte-exact vectors, L1) or merely mention it? Default: mention.
 - Is weight `B` right for tags, or should a deliberate label tie the title
   (`A`)? The issue's wording suggests the latter; the brief chose `B`.
+- A 54000 abort on k8s is an outage until the digest is reverted (D5). Is
+  that acceptable, or should a pre-flight (`make` target or Job) report
+  rows within 4 KiB of the limit before the merge?
+
+## Codex spec review, round 1 (2026-10-30)
+
+Verdict on 4bbb51f: FAIL — 1 BLOCKER, 4 MAJOR, 1 MINOR, all accepted and
+folded.
+
+1. **BLOCKER — 035 could skip a 54000 row and commit**, leaving a tagged
+   note unsearchable by its tag for ever. → 035 is all-or-nothing; the
+   error names the row id and SQLSTATE; L7 withdrawn; D5 states the remedy
+   and the k8s outage it implies; the schema delta and the `DEPLOYMENT.md`
+   task follow.
+2. **MAJOR — the result-identity requirement contradicted the change.** →
+   MODIFIED in `search-quality`: rows with a *tag contribution* (any
+   lexeme, positive or negated, of any config's parse present in
+   `ts_filter(v, '{b}')`) are exempt; the old guarantee holds over every
+   other row, with an oracle scenario that pins the definition.
+3. **MAJOR — hybrid/reranker bounds assumed `title+body` was the longest
+   `matched_in`.** → MODIFIED `hybrid-search` (structure 345, sum 990,
+   cut form kept) and `reranker` (structure 367, cut-form sum 1,003, the
+   omitted form in that one case, ≤ 984); minimum-cap scenarios for
+   `rerank=false` and `rerank=true`.
+4. **MAJOR — `move_note`'s stored-tags fallback untested.** → index-integrity
+   scenario and integration test: destination read forced to fail after
+   the rename, two tenants with the same path, owner-scoped stored tags,
+   the `B` lexeme and the tag search surviving the move and the following
+   stat-only pass.
+5. **MAJOR — the eval recipe had no incumbent after 035.** → the runfile
+   workflow in D7: incumbent generation on the 034 copy first, retained;
+   then migrate, run the candidate, score against the same hashes with the
+   incumbent runfile as `BASELINE`.
+6. **MINOR — tags-only match on an empty body.** → no preview line, never
+   a fabricated `head:`, `matched_in: tags`, not counted as a missing
+   excerpt; the renderer distinguishes an empty headline from none.
+
