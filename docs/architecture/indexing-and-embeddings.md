@@ -299,7 +299,11 @@ in `indexer_health` (process memory). `/health` exposes only
 `indexer.rechunk: "in_progress" | "complete"`, process-wide — beside the
 "counts only, no path/error/user id" rule, this field carries **no number at
 all**, because the endpoint is unauthenticated and a count would be
-tenant-derived. It never affects `status` or the HTTP code, and no counter
+tenant-derived. "Not yet counted" is not "zero pending": after a process
+start the state reads `in_progress` until every known scope's embed stage
+has counted (production read `complete` over 4,206 pre-034 notes for the
+minutes before the first embed stage); a disabled indexer
+(`MCP_SANDBOX_MODE`) reads `complete`. It never affects `status` or the HTTP code, and no counter
 keys on backlog size or pass length. Exact per-owner counts live on the panel
 and in the owner-scoped `index_transition:` line.
 

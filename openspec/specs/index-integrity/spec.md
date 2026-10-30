@@ -2334,7 +2334,7 @@ The ranking itself remains mixed during the transition. That is a declared limit
 
 **Two predicates, each expressed once.** The embed backlog, the dashboard pending count and the re-embedding progress endpoint SHALL use the owner-scoped predicate `embedded_chunking_version IS DISTINCT FROM :CHUNKING_VERSION`. The response marker and the `/health` state SHALL use the narrower `EXISTS (SELECT 1 FROM note_embeddings e WHERE e.note_id = n.id) AND n.embedded_chunking_version IS DISTINCT FROM :CHUNKING_VERSION` — notes that hold vectors of another generation, the definition the evaluation harness's `legacy_chunked_notes` uses. Each SHALL be expressed once, as paired SQL text and expression. None of them SHALL compare with `<` or `>`.
 
-The length of the re-embed SHALL NOT by itself increment any indexer health counter or degrade `/health`. `/health` is unauthenticated, so it SHALL NOT carry any count derived from the transition. It SHALL carry only `indexer.rechunk`, a process-wide state of `"in_progress"` or `"complete"`, held in process memory and set by the embed stages. It reads `"in_progress"` while the most recent embed stage of any scope observed a non-zero count under the marker's predicate, and `"complete"` otherwise. It SHALL NOT affect `status` or the HTTP status code, and it SHALL NOT name a scope, a path or a number. The exact per-owner counts SHALL be available only on the authenticated surfaces: the dashboard pending count, the progress endpoint, and the owner-scoped `index_transition:` line.
+The length of the re-embed SHALL NOT by itself increment any indexer health counter or degrade `/health`. `/health` is unauthenticated, so it SHALL NOT carry any count derived from the transition. It SHALL carry only `indexer.rechunk`, a process-wide state of `"in_progress"` or `"complete"`, held in process memory and set by the embed stages. It reads `"in_progress"` while the most recent embed stage of any scope observed a non-zero count under the marker's predicate, and while any known scope — or, before any embed stage has run, every scope — has not yet been counted by an embed stage of the current process; it reads `"complete"` only when every known scope has been counted with a zero count. When indexing is disabled (`MCP_SANDBOX_MODE`) it reads `"complete"`. It SHALL NOT affect `status` or the HTTP status code, and it SHALL NOT name a scope, a path or a number. The exact per-owner counts SHALL be available only on the authenticated surfaces: the dashboard pending count, the progress endpoint, and the owner-scoped `index_transition:` line.
 
 #### Scenario: First passes after deploy
 - **WHEN** the 034 build starts over a fully embedded pre-034 index
@@ -2353,6 +2353,11 @@ The length of the re-embed SHALL NOT by itself increment any indexer health coun
 - **THEN** the version-1 build's responses SHALL carry the `index_transition:` line, counting B and C
 - **AND** the line SHALL remain until every note in the scope is stamped 1
 - **AND** the embed backlog SHALL re-select B and C and re-embed them under version 1, with no reuse from their version-2 rows
+
+#### Scenario: Before the first embed stage after a process start
+- **WHEN** the process has started over an index with notes holding vectors of another generation and no embed stage has yet completed its count
+- **THEN** `/health` SHALL report `indexer.rechunk` `"in_progress"`, with `status` unaffected
+- **AND** a scope known to the indexer but not yet counted SHALL keep the state `"in_progress"` even when every counted scope reported zero
 
 #### Scenario: /health discloses no count
 - **WHEN** any scope has notes pending re-chunking
