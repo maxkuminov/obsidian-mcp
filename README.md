@@ -301,6 +301,8 @@ the wire, so none is cut off by a client's description limit.
   A single arm can beat the fusion on its own kind of query. If the
   embedding provider is down, `hybrid_search` returns the keyword ranking
   marked `arms: keyword-only (semantic unavailable: …)`, never silently
+  degraded: the marker is on every return path, so a keyword-only page
+  cannot pass for a fused one.
 - `list_notes(folder?, limit=50, since?, until?, order_by?, cursor?)`,
   sorted by modified time
 - `get_recent(folder?, limit=20, since?, until?, order_by?, cursor?)`,
