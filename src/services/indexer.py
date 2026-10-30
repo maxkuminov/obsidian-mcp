@@ -5787,6 +5787,9 @@ async def _embed_vault_pinned(
         else:
             logger.info(f"Embedding {len(unembedded)} notes...{log_suffix}")
         total_chunks = 0
+        #: Of `total_chunks`, how many were sent to the provider; the rest
+        #: reused a stored vector (#390, design D8). Counts only.
+        total_submitted = 0
         skipped_excluded = 0
         # Notes this pass embedded and certified, plus the failures it
         # swallowed. `embedded` is incremented only after the per-note commit
@@ -5968,6 +5971,7 @@ async def _embed_vault_pinned(
                     NoteEmbedOutcome.CERTIFIED_EMPTY,
                 ):
                     total_chunks += result.chunks_embedded
+                    total_submitted += result.chunks_submitted
                     # `CERTIFIED_EMPTY` leaves the note with no vectors at all,
                     # so its marker is cleared for the exclusion branch's
                     # reason; `EMBEDDED` sets it from what the chunker actually
@@ -6064,7 +6068,8 @@ async def _embed_vault_pinned(
         if unembedded:
             logger.info(
                 f"Embedding complete{log_suffix}: {len(unembedded)} notes, "
-                f"{total_chunks} chunks"
+                f"{total_chunks} chunks ({total_submitted} submitted, "
+                f"{total_chunks - total_submitted} reused)"
                 + (
                     f", {skipped_excluded} skipped by exclude patterns"
                     if skipped_excluded else ""

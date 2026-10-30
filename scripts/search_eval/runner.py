@@ -249,6 +249,7 @@ async def run_generation(
                     # Whatever the staging harness recorded, or null (#355).
                     meta["retrieval_fingerprint"] = src_meta.get("retrieval_fingerprint")
                     meta["legacy_chunked_notes"] = src_meta.get("legacy_chunked_notes")
+                    meta["chunk_lengths"] = src_meta.get("chunk_lengths")
                 meta.update({
                     "source": "runfile",
                     "source_generation": src_meta.get("generation"),
@@ -266,16 +267,25 @@ async def run_generation(
                     # of the provenance owner's notes are still on a legacy
                     # chunking version (must be 0 for the report to be
                     # evidence). No query text, no path, no instruction text.
-                    from scripts.search_eval.db import legacy_chunked_notes
+                    # #390 (D8): the stored chunks' length distribution, with
+                    # `under_min` (must be 0). Counts and percentiles only.
+                    from scripts.search_eval.db import chunk_lengths, legacy_chunked_notes
+                    from src.config import settings as _settings
+                    from src.services.embeddings import effective_min_chars
                     from src.services.index_state import retrieval_fingerprint
 
                     meta["retrieval_fingerprint"] = retrieval_fingerprint()
                     if owner is None:
                         meta["legacy_chunked_notes"] = None
+                        meta["chunk_lengths"] = None
                     else:
+                        window = int(_settings.chunk_size) * 4
                         async with maker() as session:
                             meta["legacy_chunked_notes"] = await legacy_chunked_notes(
                                 session, owner
+                            )
+                            meta["chunk_lengths"] = await chunk_lengths(
+                                session, owner, effective_min_chars(window), window
                             )
                 fn = arm.factory(ctx)
                 runs = {}
