@@ -639,6 +639,18 @@ Ambiguity stays an error that names the resolving ordinals; it never silently pi
 
 Helpers: `_resolve_section_index` (selector → index), `_section_body_span` (index → body span), `extract_section_parts` (heading line and body **separately** — what `read_note` returns as its `heading` and `content` fields), `extract_section` (the same two concatenated, for callers that want one string), `replace_section` (body only, for writes), `outline_sections` (depth/text/size/ordinal per section).
 
+**The chunker is a consumer of `_scan_headings` (#355).** `embed_note`
+splits a note at the headings this scanner finds, over the same
+frontmatter-stripped body, and records each chunk's ordinal so
+`semantic_search` / `find_related` can print `§ "…" (#N)` and the agent can
+call `read_note(path, section="#N")`. The guarantee is **containment**: a
+chunk with ordinal N is a substring of section N's body (as `read_note`
+returns it) with the whole-body fence spans removed — the chunk covers only
+heading N's own text, while the section also holds its subsections. **A change
+to the heading scan (or to `_section_body_span`'s body-start step) is now also
+a `CHUNKING_VERSION` bump** in `src/services/embeddings.py`, or every stored
+ordinal silently names the wrong section.
+
 **Selector parity is about resolution on writes this tool admits, not about
 admission.** Two shapes read fine by section and refuse every section write —
 a defective frontmatter block, and the unmatched indented fence opener below.

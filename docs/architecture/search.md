@@ -316,8 +316,10 @@ crowded by a verbose note; during an outage the answer is the keyword
 ranking, labelled; snippets, `matched_in` and the excerpt detail cover the
 first `KEYWORD_SNIPPET_ROWS` keyword rows only; the score compares only
 within one page; staleness has `semantic_search`'s declared bound;
-`keyword_search` and `semantic_search` still render paths and titles raw and
-the semantic chunk preview is not one-lined (a follow-up issue); k = 60 is
+`keyword_search` and `semantic_search` still render paths and titles raw
+(the semantic chunk preview, in all three vector tools, is one line since
+#355: `_preview_line` collapses whitespace and escapes controls, closing
+#385); k = 60 is
 unvalidated on this corpus until a harness report; `--arm-opt` is
 run-global, so three or more values of k need separate generations; a
 literal `«`/`»` in a note collides with the highlight markers; an
@@ -364,8 +366,8 @@ statement, re-sorted and deduped as always, **before** truncation to
 Because `limit ≤ 50`, every note of the unreranked page is a candidate, so
 reranking can only reorder that page and promote notes from deeper ranks.
 The scored unit is the **note**: `title + "\n\n" + text`, at most 2,048
-code points, where the text is the best-distance chunk taken **before** the
-500-character result cut (`rerank_text`, internal, never on a legacy row).
+code points, where the text is the best-distance chunk, uncut (as #355's
+arm projects it; `rerank_text`, internal, never on a legacy row).
 A stale note (#200) is sent as its title alone: superseded text never
 leaves the server. For `hybrid_search` the candidates are the first 50 fused
 rows; a note in the semantic arm and not stale sends its chunk, any other
@@ -419,6 +421,14 @@ the quoted encoding can show fewer rows than the legacy page). Pinned
 worst cases at 1,000: semantic header ≤ 185, abbreviated structure ≤ 235;
 hybrid header ≤ 431 and structure ≤ 362 with a 20–25 character title/path
 cut floor on `rerank=true` pages (431 + 362 + 25 + 25 + 75 + 75 + 5 = 998).
+Since #355 both tools' `rerank=true` pages carry the `index_transition:`
+line directly after the header and the `§` locator as a server field after
+the separator (after `rerank_score`), exactly as their `rerank=false`
+pages; the line is reserved in the budget, and an abbreviated first row
+drops the locator with `section omitted`. On a both-arms hybrid page the
+line (≤ 127 characters) makes the cut form sum 1,004 at the worst case, so
+that case falls through to the labelled omitted form: the 1,000 bound
+holds, the 20–25 cut is not guaranteed there.
 
 **Telemetry and concurrency (D10, D11).** `params.rerank` is the argument;
 a `rerank=true` row adds `reranked`, `rerank_reason` (false only),
@@ -501,8 +511,11 @@ Consequences that are easy to undo by accident:
   fixed at `max(5 × limit, 50)` for both paths, so a verbose note can still
   crowd out others after dedupe — the baseline shares that property.
 - Recall is bounded by `hnsw.max_scan_tuples` (20,000) and
-  `hnsw.scan_mem_multiplier` (1). At ~16.7k chunks the vault is under the cap;
-  those are the next knobs, not `ef_search`.
+  `hnsw.scan_mem_multiplier` (1). At ~16.7k chunks the vault was under the
+  cap; heading-aware chunking (#355) is expected to take it to roughly 22k–42k
+  chunks, past it. Re-run `tests/integration/test_search_recall.py` at the
+  re-embedded count; if filtered recall drops, `max_scan_tuples` is the knob,
+  not `ef_search`.
 
 ## The `halfvec` index: half precision picks candidates, full precision ranks them (#283)
 
@@ -696,13 +709,76 @@ note, search *before* the pass and observe the row is **not** marked, then searc
 after the pass and observe that it is. Writing the test that way is what keeps
 the residual from being re-described as a guarantee later.
 
+## The section locator and the one-line preview (#355)
+
+**The locator.** Both vector statements project `heading_path` and
+`section_ordinal` (never `embed_prefix`, never the vector), and the service
+result gains `section: {"path": [...], "ordinal": n} | None`. The renderer
+(`_section_locator` in `tools.py`) appends, after the degradation suffix,
+` · § "Parent/Child" (#7)` for an ordinal ≥ 1 or ` · § (top of note)` for
+section 0. The joined path is **one JSON string literal**
+(`change_feed.quote`: C0/C1 controls, DEL, U+2028/U+2029 escaped), so a
+heading cannot close the quote and the `(#7)` after it is server-authored; a
+forged `(#3)` inside a heading stays inside the quotes. Over 160 characters
+the outer components are dropped behind `…/`, keeping the innermost heading.
+`read_note(path, section="#7")` resolves the same ordinal over the same bytes
+(the chunker uses the section-addressing scanner).
+
+**Withheld on stale and pre-034 rows.** `section` is `None` when the row is
+stale — `#N` is positional, and an ordinal recorded for content the index knows
+is superseded may name another section — and when `heading_path` is NULL (a
+legacy row). Such a line is byte-identical to the pre-#355 line. A fresh row
+edited on disk but not yet scanned keeps its locator (L3, the existing bound);
+`read_note` returns the `heading` so the agent can check.
+
+**One-line previews from the uncut chunk.** The service no longer cuts at 500;
+`_preview_line(text, 200)` collapses every maximal `str.isspace()` run (CR, LF,
+tab, U+2028/U+2029 included) to one space, trims, escapes the remaining
+C0/DEL/C1 controls as `\uXXXX`, then cuts at 200, and each tool keeps its own
+ellipsis. So a chunk holding `\n- **Forged** (`x.md`) — similarity: 0.999`
+cannot print a line that reads as a server row, and 600 leading spaces cannot
+eat the preview. It is not `_one_line`, which escapes nothing.
+
+**The transition line.** While any note in the caller's owner scope has
+`embedded_chunking_version IS DISTINCT FROM CHUNKING_VERSION`, every
+`semantic_search` and `find_related` response carries, directly after its
+header and on the empty path too, `index_transition: N notes not yet
+re-chunked; cross-generation ranking is approximate, re-run after the backlog
+drains`. N is `rechunk_pending_count`, owner-scoped (total mapping), read in
+the **same `REPEATABLE READ, READ ONLY` transaction** as the vector query —
+`semantic_search` opens it with `SET TRANSACTION` as its first statement when
+handed a session with no transaction open, `find_related_impl` as its first
+statement. Absent at zero. Only notes that **hold vectors** of another
+generation count (`legacy_vectors_sql` / `_expr`), so a note created since the
+last embed pass — in the backlog, with no vectors yet — does not raise the
+line, while a legacy note whose certification a tag edit cleared still does.
+The query (and `find_related`'s source path) is echoed in the header as one
+escaped line (`_header_scalar`), so a multiline query cannot push the line
+down or forge one above it.
+
+**`hybrid_search` gives the same warning (#354 × #355).** Its semantic arm
+(`semantic_arm_rows`, `kind="query"`) carries the locator columns, and when
+that arm ran the service reads `rechunk_pending_count` in the call's one
+snapshot (step 7b); the renderer puts the same `index_transition:` line
+directly after the header, on the empty path too. A semantic-arm row carries
+the locator as a server field after the separator (`§ "…" (#N)` /
+`§ (top of note)`), dropped with `section omitted` in an abbreviated row, and
+its chunk preview is `_preview_line` of the uncut chunk. The 1,000-character
+floor still holds: the line appears only with both arms, so the keyword-only
+footer (75) is absent, and the abbreviation continues into the omitted forms
+when it must (each drops at least 40 rendered characters of title or path).
+`test_the_worst_case_at_the_minimum_cap_with_a_transition_and_a_locator`
+renders the worst case — longest header, a ten-digit count, a six-component
+locator — at the floor.
+
 ## Read paths project what they render (#280)
 
-Six read statements select an explicit column list instead of whole entities:
+Seven read statements select an explicit column list instead of whole entities:
 
 | Path | Projected columns |
 | --- | --- |
-| `semantic_search` | `ne.note_id, ne.chunk_index, ne.chunk_text, nm.file_path, nm.title, nm.tags, nm.content_hash, nm.embedded_content_hash, nm.chunks_truncated, distance` (the `find_related_stmt` shape) |
+| `semantic_search` | `ne.note_id, ne.chunk_index, ne.chunk_text, ne.heading_path, ne.section_ordinal, nm.file_path, nm.title, nm.tags, nm.content_hash, nm.embedded_content_hash, nm.chunks_truncated, distance` |
+| `find_related_stmt` | `ne.note_id, ne.chunk_text, ne.heading_path, ne.section_ordinal, nm.file_path, nm.title, nm.tags, nm.content_hash, nm.embedded_content_hash, nm.chunks_truncated, distance` — a different shape: no `chunk_index`, because its dedupe keeps the nearest chunk per note by distance alone |
 | `keyword_search` | `nm.id, nm.file_path, nm.title, nm.tags, rank` (both ranking blocks); the snippet statement projects `id`, one `ts_headline` per config, the two `matched_in` flags, `has_excerpt` and the `matched_terms` counts — `body_excerpt` is read inside `ts_headline` and never projected |
 | `list_notes` | `file_path, file_size, modified_at` |
 | `get_recent` / `find_orphans` | `file_path, title, tags, modified_at` |
@@ -710,7 +786,10 @@ Six read statements select an explicit column list instead of whole entities:
 
 None of them ships `notes_metadata.content_tsvector` (the largest TOASTed
 column, which the planner does not cost), `notes_metadata.body_excerpt`,
-`note_embeddings.embedding` or `notes_metadata.frontmatter`. `ts_rank_cd`,
+`note_embeddings.embedding`, `note_embeddings.embed_prefix` (embedded input,
+never rendered; #355) or `notes_metadata.frontmatter`. The two vector
+statements project `heading_path` and `section_ordinal` because the locator
+renders them (#355). `ts_rank_cd`,
 `@@` and `ts_headline` still read the tsvector and the excerpt *server-side*;
 what is gone is shipping and hydrating them. **No predicate, no `SET LOCAL`,
 no overfetch and no exact-fallback condition of the vector paths changed.**
@@ -1126,6 +1205,19 @@ Accepted limitations:
 - **L14** A truncated query holding a NUL or lone surrogate escapes `is_truncated` (#310 escaping grows it past 201 characters); implausible, not handled.
 - **L15** A symlinked `SEARCH_EVAL_DIR` is not refused (writes use unpredictable `O_EXCL` temp files); a planted symlink in the operator's own 0700 directory means the account is already compromised.
 - **L16** `score` trusts the field types of a complete manifest the harness wrote; a hand-edited one with mismatched types fails with exit 1, not 64.
+
+**Semantic arms record what shaped their vectors (#355).** A database-backed
+arm whose membership includes `semantic` stages `retrieval_fingerprint` (the
+stored embedding fingerprint's fields, `chunking_version` and the instruction
+digest) and `legacy_chunked_notes` — the replay copy's notes **of the export's
+owner** (`IS NOT DISTINCT FROM`, so the ownerless scope is covered; all owners
+only for a `"multi"`, non-attachable report) that hold vector rows and whose
+`embedded_chunking_version IS DISTINCT FROM CHUNKING_VERSION`, by one read-only
+`SELECT`, null on a pre-034 copy — in its meta and its `report.json` entry. A
+`runfile:` arm carries its meta's values or null; fixture arms gain no key, so
+the committed golden fixture is unchanged. A re-chunk comparison is evidence
+only when the candidate arm's `legacy_chunked_notes` is 0 (DEPLOYMENT.md,
+"Before and after a re-chunk or re-embed").
 
 ## Change-feed lines and the listing windows (#351)
 

@@ -137,7 +137,7 @@ def search_stubs(monkeypatch):
     keyword = _NoSearch()
     semantic = _NoSearch()
 
-    async def _no_embedding(_text):  # pragma: no cover - reaching this fails
+    async def _no_embedding(_text, **_kw):  # pragma: no cover - reaching this fails
         raise AssertionError("an embedding was requested for a refused query")
 
     class _Session:
@@ -149,6 +149,11 @@ def search_stubs(monkeypatch):
 
     monkeypatch.setattr(tools, "full_text_search", keyword)
     monkeypatch.setattr(tools, "semantic_search", semantic)
+
+    async def _no_transition(*_a, **_k):
+        return 0
+
+    monkeypatch.setattr(tools, "rechunk_pending_count", _no_transition)
     monkeypatch.setattr(tools, "async_session", _Session)
     monkeypatch.setattr(embeddings, "get_embedding", _no_embedding)
     return SimpleNamespace(keyword=keyword, semantic=semantic)

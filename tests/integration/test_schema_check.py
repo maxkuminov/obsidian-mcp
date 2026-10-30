@@ -60,7 +60,7 @@ DIM = 64  # irrelevant here; keeps the migration cheap.
 # The current head. Every case that migrates forward asserts it, so adding a
 # revision without teaching this module about it fails loudly rather than
 # leaving the new migration unexercised.
-HEAD_REVISION = "033"
+HEAD_REVISION = "034"
 
 CONSTRAINT = "ck_oauth_clients_auth_method_secret"
 MARKER = "created by 013_schema_reconciliation"
@@ -7195,7 +7195,7 @@ def test_033_chains_from_032():
     config = Config()
     config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_current_head() == HEAD_REVISION == "033"
+    assert script.get_current_head() == HEAD_REVISION
     assert script.get_revision("033").down_revision == "032"
 
 
@@ -7352,3 +7352,302 @@ def test_downgrade_033_leaves_units_it_did_not_create():
         assert "033 downgrade: leaving note_event_gaps in place" in combined
         assert fetchval(url, "SELECT to_regclass('public.note_event_gaps')") is not None
         assert fetchval(url, "SELECT to_regclass('public.note_events')") is None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 034 — heading-aware chunks: locator, prefix, chunking version (#355)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Five nullable, marked columns with no default and no backfill, and two
+# CHECKs added NOT VALID then validated. Alembic compares the types,
+# nullability and comments; the CHECK definitions, their validation and
+# markers, the absence of a backfill and the downgrade's delete-and-uncertify
+# are asserted here.
+
+COLUMNS_034 = {
+    ("note_embeddings", "heading_path"): ("text[]", "chunk section locator (034_heading_chunks)"),
+    ("note_embeddings", "section_ordinal"): ("integer", "chunk section locator (034_heading_chunks)"),
+    ("note_embeddings", "embed_prefix"): ("text", "embedded context prefix (034_heading_chunks)"),
+    ("notes_metadata", "embedded_chunking_version"): (
+        "smallint", "chunking version of the stored vectors (034_heading_chunks)",
+    ),
+    ("notes_metadata", "embedded_input_digest"): (
+        "character varying(64)", "digest of the embedded provider inputs (034_heading_chunks)",
+    ),
+}
+CHECKS_034 = {
+    "ck_note_embeddings_heading_meta": (
+        "note_embeddings", "all-or-none chunk locator (034_heading_chunks)",
+    ),
+    "ck_notes_metadata_embedded_chunking_version": (
+        "notes_metadata", "chunking version floor (034_heading_chunks)",
+    ),
+}
+VECTOR_034 = "[" + ",".join(["0.1"] * DIM) + "]"
+
+
+def checks_034(url):
+    return {
+        r["conname"]: (r["def"], r["convalidated"], r["comment"])
+        for r in fetch(
+            url,
+            "SELECT conname, pg_get_constraintdef(oid) AS def, convalidated, "
+            "       obj_description(oid, 'pg_constraint') AS comment "
+            "FROM pg_constraint WHERE contype = 'c' AND conname = ANY($1::text[])",
+            list(CHECKS_034),
+        )
+    }
+
+
+def assert_034_shape(url):
+    for (table, column), (coltype, marker) in COLUMNS_034.items():
+        assert column_state_029(url, table, column) == (coltype, False, None, marker), (
+            table, column,
+        )
+    checks = checks_034(url)
+    assert set(checks) == set(CHECKS_034)
+    for name, (_table, marker) in CHECKS_034.items():
+        definition, validated, comment = checks[name]
+        assert validated is True, name
+        assert comment == marker, name
+    heading = checks["ck_note_embeddings_heading_meta"][0]
+    for fragment in ("heading_path IS NULL", "section_ordinal >= 0", "cardinality(heading_path)"):
+        assert fragment in heading, heading
+    assert "embedded_chunking_version >= 1" in checks[
+        "ck_notes_metadata_embedded_chunking_version"
+    ][0]
+
+
+def insert_embedding_034(url, row_id, note_id, chunk, *, prefix=None, path=None, ordinal=None):
+    if prefix is None:
+        sql(
+            url,
+            "INSERT INTO note_embeddings (id, note_id, chunk_index, chunk_text, embedding) "
+            f"VALUES ($1, $2, 0, $3, '{VECTOR_034}')",
+            row_id, note_id, chunk,
+        )
+    else:
+        sql(
+            url,
+            "INSERT INTO note_embeddings (id, note_id, chunk_index, chunk_text, embedding, "
+            " heading_path, section_ordinal, embed_prefix) "
+            f"VALUES ($1, $2, 0, $3, '{VECTOR_034}', $4, $5, $6)",
+            row_id, note_id, chunk, path, ordinal, prefix,
+        )
+
+
+def refuse_034(url, *, must_mention):
+    _harness.run_alembic(url, "stamp", "033", dimensions=DIM)
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    assert result.returncode != 0, "034 should have refused"
+    combined = result.stdout + result.stderr
+    for phrase in must_mention:
+        assert phrase in combined, f"refusal did not mention {phrase!r}:\n{combined}"
+    assert alembic_version(url) == "033", "nothing should have been recorded"
+    return combined
+
+
+def test_034_chains_from_033():
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config()
+    config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+    assert script.get_current_head() == HEAD_REVISION == "034"
+    assert script.get_revision("034").down_revision == "033"
+
+
+def test_034_fresh_shape_is_marked_validated_and_clean():
+    with throwaway_db("schema_034_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION
+        assert_034_shape(url)
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_034_from_033_with_rows_backfills_nothing_and_leaves_vectors_alone():
+    with throwaway_db("schema_034_chain", revision="033") as url:
+        insert_stat_note(url, 1, "a.md", (1, 2, 3, 4))
+        insert_stat_note(url, 2, "b.md", (None, None, None, None))
+        sql(url, "UPDATE notes_metadata SET embedded_content_hash = content_hash")
+        insert_embedding_034(url, 10, 1, "alpha")
+        insert_embedding_034(url, 11, 2, "beta")
+        before = fetch(url, "SELECT id, chunk_text, embedding::text AS v FROM note_embeddings ORDER BY id")
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(
+            url,
+            "SELECT count(*) FROM note_embeddings WHERE heading_path IS NOT NULL "
+            "OR section_ordinal IS NOT NULL OR embed_prefix IS NOT NULL",
+        ) == 0
+        assert fetchval(
+            url,
+            "SELECT count(*) FROM notes_metadata WHERE embedded_chunking_version IS NOT NULL "
+            "OR embedded_input_digest IS NOT NULL",
+        ) == 0
+        assert fetchval(
+            url, "SELECT count(*) FROM notes_metadata WHERE embedded_content_hash = content_hash"
+        ) == 2, "the upgrade must not un-certify anything"
+        after = fetch(url, "SELECT id, chunk_text, embedding::text AS v FROM note_embeddings ORDER BY id")
+        assert [tuple(r) for r in after] == [tuple(r) for r in before]
+        assert_034_shape(url)
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_034_checks_are_enforced():
+    with throwaway_db("schema_034_enforced") as url:
+        insert_stat_note(url, 1, "a.md", (1, 2, 3, 4))
+        insert_embedding_034(url, 1, 1, "legacy")
+        insert_embedding_034(url, 2, 1, "top", prefix="T", path=[], ordinal=0)
+        insert_embedding_034(url, 3, 1, "sec", prefix="T > A", path=["A"], ordinal=1)
+        for i, (prefix, path, ordinal) in enumerate(
+            [
+                ("T", None, 0),            # partial
+                (None, ["A"], 1),          # partial
+                ("T", ["A"], -1),          # negative ordinal
+                ("T", ["A"], 0),           # ordinal 0 with a path
+                ("T", [], 2),              # ordinal >= 1 with no path
+            ],
+            start=10,
+        ):
+            with pytest.raises(asyncpg.CheckViolationError):
+                sql(
+                    url,
+                    "INSERT INTO note_embeddings (id, note_id, chunk_index, chunk_text, "
+                    " embedding, heading_path, section_ordinal, embed_prefix) "
+                    f"VALUES ($1, 1, 0, 'x', '{VECTOR_034}', $2, $3, $4)",
+                    i, path, ordinal, prefix,
+                )
+        sql(url, "UPDATE notes_metadata SET embedded_chunking_version = 1")
+        with pytest.raises(asyncpg.CheckViolationError):
+            sql(url, "UPDATE notes_metadata SET embedded_chunking_version = 0")
+
+
+def test_034_stamp_back_rerun_keeps_rows():
+    with throwaway_db("schema_034_rerun") as url:
+        insert_stat_note(url, 1, "a.md", (1, 2, 3, 4))
+        insert_embedding_034(url, 1, 1, "sec", prefix="T > A", path=["A"], ordinal=1)
+        sql(url, "UPDATE notes_metadata SET embedded_chunking_version = 1, "
+                 "embedded_input_digest = $1", "d" * 64)
+        _harness.run_alembic(url, "stamp", "033", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(url, "SELECT embed_prefix FROM note_embeddings") == "T > A"
+        assert fetchval(url, "SELECT embedded_input_digest FROM notes_metadata") == "d" * 64
+        assert_034_shape(url)
+        assert_alembic_check_clean(url, DIM)
+
+
+@pytest.mark.parametrize(
+    "label,ddl,fragment",
+    [
+        (
+            "prefix_wrong_type",
+            ["ALTER TABLE note_embeddings ALTER COLUMN embed_prefix TYPE varchar(300)"],
+            "note_embeddings.embed_prefix is character varying(300), not text",
+        ),
+        (
+            "ordinal_wrong_type",
+            ["ALTER TABLE note_embeddings DROP CONSTRAINT ck_note_embeddings_heading_meta",
+             "ALTER TABLE note_embeddings ALTER COLUMN section_ordinal TYPE smallint"],
+            "note_embeddings.section_ordinal is smallint, not integer",
+        ),
+        (
+            "path_unmarked",
+            ["COMMENT ON COLUMN note_embeddings.heading_path IS NULL"],
+            "note_embeddings.heading_path does not carry 034's comment marker",
+        ),
+        (
+            "version_defaulted",
+            ["ALTER TABLE notes_metadata ALTER COLUMN embedded_chunking_version SET DEFAULT 1"],
+            "notes_metadata.embedded_chunking_version has a server default",
+        ),
+        (
+            "digest_not_null",
+            ["UPDATE notes_metadata SET embedded_input_digest = 'x'",
+             "ALTER TABLE notes_metadata ALTER COLUMN embedded_input_digest SET NOT NULL"],
+            "notes_metadata.embedded_input_digest is NOT NULL",
+        ),
+        (
+            "heading_check_impostor",
+            ["ALTER TABLE note_embeddings DROP CONSTRAINT ck_note_embeddings_heading_meta",
+             "ALTER TABLE note_embeddings ADD CONSTRAINT ck_note_embeddings_heading_meta CHECK (true)"],
+            "a CHECK named ck_note_embeddings_heading_meta already exists",
+        ),
+        (
+            "version_check_impostor",
+            ["ALTER TABLE notes_metadata DROP CONSTRAINT ck_notes_metadata_embedded_chunking_version",
+             "ALTER TABLE notes_metadata ADD CONSTRAINT ck_notes_metadata_embedded_chunking_version "
+             "CHECK (embedded_chunking_version IS NULL OR embedded_chunking_version >= 0)"],
+            "a CHECK named ck_notes_metadata_embedded_chunking_version already exists",
+        ),
+        (
+            "heading_check_unmarked",
+            ["COMMENT ON CONSTRAINT ck_note_embeddings_heading_meta ON note_embeddings IS NULL"],
+            "does not carry 034's constraint marker",
+        ),
+    ],
+)
+def test_034_refuses_a_unit_of_another_shape(label, ddl, fragment):
+    with throwaway_db(f"schema_034_foreign_{label}") as url:
+        for statement in ddl:
+            sql(url, statement)
+        refuse_034(url, must_mention=[fragment, "Nothing has been changed"])
+
+
+def test_034_refuses_an_impostor_column_before_033_head():
+    """An impostor that predates 034 on a 033 database is refused too."""
+    with throwaway_db("schema_034_foreign_pre", revision="033") as url:
+        sql(url, "ALTER TABLE notes_metadata ADD COLUMN embedded_chunking_version integer")
+        result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+        assert result.returncode != 0
+        combined = result.stdout + result.stderr
+        assert "notes_metadata.embedded_chunking_version is integer, not smallint" in combined
+        assert alembic_version(url) == "033"
+        assert column_state_029(url, "note_embeddings", "embed_prefix") is None
+
+
+def test_downgrade_034_deletes_prefixed_rows_and_uncertifies_their_notes():
+    with throwaway_db("schema_034_downgrade") as url:
+        insert_stat_note(url, 1, "legacy.md", (1, 2, 3, 4))
+        insert_stat_note(url, 2, "mixed.md", (1, 2, 3, 4))
+        insert_stat_note(url, 3, "new.md", (1, 2, 3, 4))
+        sql(url, "UPDATE notes_metadata SET embedded_content_hash = content_hash")
+        insert_embedding_034(url, 1, 1, "legacy only")
+        insert_embedding_034(url, 2, 2, "legacy half")
+        insert_embedding_034(url, 3, 2, "new half", prefix="t > A", path=["A"], ordinal=1)
+        insert_embedding_034(url, 4, 3, "top", prefix="t", path=[], ordinal=0)
+        _harness.run_alembic(url, "downgrade", "033", dimensions=DIM)
+        assert alembic_version(url) == "033"
+        assert [r["id"] for r in fetch(url, "SELECT id FROM note_embeddings ORDER BY id")] == [1, 2]
+        certified = {
+            r["id"]: r["c"]
+            for r in fetch(
+                url,
+                "SELECT id, embedded_content_hash IS NOT DISTINCT FROM content_hash AS c "
+                "FROM notes_metadata",
+            )
+        }
+        assert certified == {1: True, 2: False, 3: False}
+        for table, column in COLUMNS_034:
+            assert column_state_029(url, table, column) is None, (table, column)
+        assert checks_034(url) == {}
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert_034_shape(url)
+        assert fetchval(
+            url, "SELECT count(*) FROM note_embeddings WHERE embed_prefix IS NOT NULL"
+        ) == 0
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_downgrade_034_leaves_units_it_did_not_create():
+    with throwaway_db("schema_034_downgrade_foreign") as url:
+        sql(url, "COMMENT ON COLUMN notes_metadata.embedded_input_digest IS 'somebody else'")
+        result = _harness.run_alembic(url, "downgrade", "033", dimensions=DIM)
+        assert "034 downgrade: leaving notes_metadata.embedded_input_digest" in (
+            result.stdout + result.stderr
+        )
+        assert alembic_version(url) == "033"
+        assert column_state_029(url, "notes_metadata", "embedded_input_digest") is not None
+        assert column_state_029(url, "notes_metadata", "embedded_chunking_version") is None

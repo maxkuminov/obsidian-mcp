@@ -396,6 +396,29 @@ update it in the same change.** What stays here is the short list:
   full-precision distance. Recall measured 1.00 → 1.00; ~146 MB → 45 MB.
   Embedding reuses a stored vector only on exact chunk text and a matching
   model fingerprint, re-verified under the generation lock (#281).
+- **Chunks are heading-aware, and the chunking format is per note, not in
+  the fingerprint** (#355, #367, migration 034). `chunk_note_bounded` splits
+  at ATX headings with `vault._scan_headings` itself (each heading's own text;
+  heading lines excluded; a no-heading note chunks byte-identically; a
+  headings-only note falls back to whole-body chunking), so a chunk's
+  `section_ordinal` is the `#N` `read_note(section=…)` resolves. The provider
+  input is `embed_prefix + "\n\n" + chunk_text` (`Title > H > H`, tags line
+  if ≤ 300 chars); `chunk_text` stays un-prefixed. Reuse keys on
+  `(embed_prefix, chunk_text)` under the note's `embedded_chunking_version ==
+  CHUNKING_VERSION`. `certify_embedded` stamps that version and
+  `embedded_input_digest`; the upsert clears certification on a changed
+  title/tags and the full-hash pass re-checks the digest. A version change
+  re-selects notes through the backlog (budgeted in **every** mode, after
+  real edits) under `IS DISTINCT FROM CHUNKING_VERSION`, never `<`/`>`;
+  vector responses carry `index_transition: N …` while the caller's scope
+  has notes **holding vectors** of another generation (the query is echoed
+  as one escaped line), and `/health` only `indexer.rechunk:
+  in_progress|complete`, never a number. Rows print `§ "<path>" (#N)` /
+  `§ (top of note)`, withheld on stale and pre-034 rows; previews are one
+  line from the uncut chunk. Every embedding call passes `kind=query|
+  document`; `EMBEDDING_QUERY_INSTRUCTION` is queries-only and outside the
+  stored fingerprint (in the logged retrieval fingerprint). A heading-scan
+  change bumps `CHUNKING_VERSION`. See [indexing and embeddings](docs/architecture/indexing-and-embeddings.md).
 - **A pass does not prune what it could not see** (#309). Rows at or beneath
   a directory the walk could not list (or type) are neither pruned nor
   move-paired, and the run is recorded `walk incomplete` (failed); under a

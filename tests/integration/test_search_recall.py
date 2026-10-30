@@ -676,7 +676,7 @@ async def test_returned_distances_are_monotone(sessionmaker, corpus, queries):
 
 
 async def test_semantic_search_output_is_monotone(sessionmaker, corpus, queries, monkeypatch):
-    async def _fake(_text):
+    async def _fake(_text, **_kw):
         return queries[0]
 
     monkeypatch.setattr("src.services.embeddings.get_embedding", _fake)
@@ -713,7 +713,7 @@ async def test_zero_row_filtered_result_falls_back_to_exact(
     `tests/test_vector_iterative_scan.py`, where the empty first result is
     given rather than gambled on.
     """
-    async def _fake(_text):
+    async def _fake(_text, **_kw):
         return queries[0]
 
     monkeypatch.setattr("src.services.embeddings.get_embedding", _fake)
@@ -750,7 +750,7 @@ async def test_a_non_empty_result_does_not_pay_for_a_fallback(
     here, since every benchmark row belongs to `alice` or `bob`. The property
     worth keeping is the cost one, so it is asserted on a scope that matches.
     """
-    async def _fake(_text):
+    async def _fake(_text, **_kw):
         return queries[0]
 
     monkeypatch.setattr("src.services.embeddings.get_embedding", _fake)
@@ -775,7 +775,7 @@ async def test_an_ownerless_scope_on_an_owned_corpus_falls_back(
     whose vectors all belong to named users. Under the old eligibility rule
     this counted as *unfiltered*, so the empty result was believed — while the
     predicate it carried was precisely the one discarding the HNSW window."""
-    async def _fake(_text):
+    async def _fake(_text, **_kw):
         return queries[0]
 
     monkeypatch.setattr("src.services.embeddings.get_embedding", _fake)

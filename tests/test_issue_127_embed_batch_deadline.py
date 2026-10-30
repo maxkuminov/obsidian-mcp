@@ -35,10 +35,11 @@ def test_embed_batch_takes_no_timeout_argument():
     import inspect
 
     params = inspect.signature(embeddings.OllamaProvider.embed_batch).parameters
-    assert list(params) == ["self", "texts"], params
+    # `kind` (#367) is the only addition: still no deadline parameter.
+    assert list(params) == ["self", "texts", "kind"], params
     assert list(
         inspect.signature(embeddings.get_embeddings_batch).parameters
-    ) == ["texts"]
+    ) == ["texts", "kind"]
 
 
 @pytest.mark.asyncio
@@ -62,7 +63,7 @@ async def test_a_batch_past_the_old_aggregate_budget_completes(monkeypatch):
     provider = embeddings.OllamaProvider()
     monkeypatch.setattr(provider, "_embed_inputs", _request)
 
-    out = await provider.embed_batch([f"chunk {i}" for i in range(400)])
+    out = await provider.embed_batch([f"chunk {i}" for i in range(400)], kind="document")
 
     assert len(out) == 400
     assert calls["n"] == 400
@@ -90,7 +91,7 @@ async def test_a_hung_chunk_still_fails_at_the_per_call_timeout(monkeypatch):
     monkeypatch.setattr(embeddings.asyncio, "wait_for", _spy)
 
     with pytest.raises((asyncio.TimeoutError, TimeoutError)):
-        await provider.embed_batch(["a"])
+        await provider.embed_batch(["a"], kind="document")
 
     assert seen == [30.0], "the per-request timeout must stay at 30 s"
 
@@ -141,7 +142,7 @@ async def test_partial_coverage_is_not_certified_on_the_certified_path(monkeypat
     monkeypatch.setattr(embeddings.settings, "chunk_size", 1)
     monkeypatch.setattr(embeddings.settings, "chunk_overlap", 0)
 
-    async def _short(chunks):
+    async def _short(chunks, **_kw):
         return [[0.0, 1.0]] * (len(chunks) - 1)
 
     monkeypatch.setattr(embeddings, "get_embeddings_batch", _short)

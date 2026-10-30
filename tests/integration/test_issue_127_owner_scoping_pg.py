@@ -84,7 +84,7 @@ async def corpus(sessionmaker, monkeypatch, tmp_path):
     monkeypatch.setattr(src.database, "async_session", sessionmaker)
     monkeypatch.setattr(embeddings_service, "async_session", sessionmaker, raising=False)
 
-    async def _fake_embedding(_text):
+    async def _fake_embedding(_text, **_kw):
         return list(UNIT)
 
     monkeypatch.setattr(embeddings_service, "get_embedding", _fake_embedding)

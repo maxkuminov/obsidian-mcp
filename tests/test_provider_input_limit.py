@@ -163,7 +163,7 @@ async def test_openai_input_limit_shapes_raise_the_typed_exception(
     with respx.mock(base_url="https://api.openai.com/v1") as mock:
         route = mock.post("/embeddings").mock(return_value=Response(400, json=body))
         with pytest.raises(refusals.ProviderInputTooLarge) as excinfo:
-            await provider.embed_one("a query in a densely tokenizing script")
+            await provider.embed_one("a query in a densely tokenizing script", kind="query")
 
     exc = excinfo.value
     assert exc.provider == "openai"
@@ -191,7 +191,7 @@ async def test_openai_gateway_without_a_code_is_matched_on_its_message(
     with respx.mock(base_url="https://api.openai.com/v1") as mock:
         mock.post("/embeddings").mock(return_value=Response(422, json=body))
         with pytest.raises(refusals.ProviderInputTooLarge) as excinfo:
-            await provider.embed_one("hello")
+            await provider.embed_one("hello", kind="query")
 
     assert excinfo.value.reason.startswith("input is too long")
 
@@ -216,7 +216,7 @@ async def test_openai_generic_400_still_propagates_as_today(
     with respx.mock(base_url="https://api.openai.com/v1") as mock:
         route = mock.post("/embeddings").mock(return_value=Response(400, json=body))
         with pytest.raises(httpx.HTTPStatusError):
-            await provider.embed_one("hello")
+            await provider.embed_one("hello", kind="query")
     assert route.call_count == 1
     assert no_sleep == []
 
@@ -240,7 +240,7 @@ async def test_openai_429_is_retried_and_never_translated(openai_settings, no_sl
         route = mock.post("/embeddings")
         route.side_effect = [Response(429, json=body)] * 3
         with pytest.raises(httpx.HTTPStatusError):
-            await provider.embed_one("hello")
+            await provider.embed_one("hello", kind="query")
     assert route.call_count == 3, "the 429 backoff is untouched"
     assert len(no_sleep) == 2
 
@@ -252,7 +252,7 @@ async def test_openai_5xx_still_exhausts_its_retries(openai_settings, no_sleep):
         route = mock.post("/embeddings")
         route.side_effect = [Response(503, json={"error": "down"})] * 3
         with pytest.raises(httpx.HTTPStatusError):
-            await provider.embed_one("hello")
+            await provider.embed_one("hello", kind="query")
     assert route.call_count == 3
     assert len(no_sleep) == 2
 
@@ -264,7 +264,7 @@ async def test_openai_transport_error_still_propagates(openai_settings, no_sleep
     with respx.mock(base_url="https://api.openai.com/v1") as mock:
         mock.post("/embeddings").mock(side_effect=httpx.ConnectError("refused"))
         with pytest.raises(httpx.ConnectError):
-            await provider.embed_one("hello")
+            await provider.embed_one("hello", kind="query")
 
 
 @pytest.mark.asyncio
@@ -281,7 +281,7 @@ async def test_openai_rejection_in_a_later_subbatch_propagates(
             Response(400, json=OPENAI_CONTEXT_LENGTH),
         ]
         with pytest.raises(refusals.ProviderInputTooLarge):
-            await provider.embed_batch([f"chunk-{i}" for i in range(97)])
+            await provider.embed_batch([f"chunk-{i}" for i in range(97)], kind="document")
     assert route.call_count == 2
 
 
@@ -305,7 +305,7 @@ async def test_the_reason_is_bounded_at_capture(openai_settings, no_sleep):
     with respx.mock(base_url="https://api.openai.com/v1") as mock:
         mock.post("/embeddings").mock(return_value=Response(400, json=body))
         with pytest.raises(refusals.ProviderInputTooLarge) as excinfo:
-            await provider.embed_one("hello")
+            await provider.embed_one("hello", kind="query")
 
     reason = excinfo.value.reason
     assert len(reason) <= MAX_PROVIDER_REASON_CHARS
@@ -326,7 +326,7 @@ async def test_ollama_input_length_error_raises_the_typed_exception(ollama_setti
             return_value=Response(400, json=OLLAMA_INPUT_LENGTH)
         )
         with pytest.raises(refusals.ProviderInputTooLarge) as excinfo:
-            await provider.embed_one("a very long query")
+            await provider.embed_one("a very long query", kind="query")
 
     exc = excinfo.value
     assert exc.provider == "ollama"
@@ -342,7 +342,7 @@ async def test_ollama_generic_400_still_propagates_as_today(ollama_settings):
             return_value=Response(400, json={"error": "model 'bge-m3' not found"})
         )
         with pytest.raises(httpx.HTTPStatusError):
-            await provider.embed_one("hello")
+            await provider.embed_one("hello", kind="query")
 
 
 @pytest.mark.asyncio
@@ -353,7 +353,7 @@ async def test_ollama_5xx_still_propagates_as_today(ollama_settings):
             return_value=Response(500, json={"error": "internal error"})
         )
         with pytest.raises(httpx.HTTPStatusError):
-            await provider.embed_one("hello")
+            await provider.embed_one("hello", kind="query")
 
 
 @pytest.mark.asyncio
@@ -372,7 +372,7 @@ async def test_ollama_batch_propagates_the_typed_exception(
             Response(400, json=OLLAMA_INPUT_LENGTH),
         ]
         with pytest.raises(refusals.ProviderInputTooLarge):
-            await provider.embed_batch(["short", "very long"])
+            await provider.embed_batch(["short", "very long"], kind="document")
     assert route.call_count == 2
 
 
@@ -386,7 +386,7 @@ async def test_ollama_truncation_is_still_the_ordinary_path(ollama_settings):
         mock.post("/api/embed").mock(
             return_value=Response(200, json={"embeddings": [[0.5] * 3]})
         )
-        out = await provider.embed_one("字" * 20_000)
+        out = await provider.embed_one("字" * 20_000, kind="query")
     assert out == [0.5, 0.5, 0.5]
 
 
@@ -411,7 +411,7 @@ async def test_a_dense_non_ascii_query_under_the_cap_reaches_the_provider(
         route = mock.post("/api/embed").mock(
             return_value=Response(200, json={"embeddings": [[0.1]]})
         )
-        out = await provider.embed_one(query)
+        out = await provider.embed_one(query, kind="query")
 
     assert out == [0.1]
     body = json.loads(route.calls[0].request.read())
@@ -624,7 +624,7 @@ async def test_embed_note_records_provider_failed_with_the_class_name(monkeypatc
     session = _RecordingSession()
     note = _FakeNote()
 
-    async def _reject(_chunks):
+    async def _reject(_chunks, **_kw):
         raise refusals.ProviderInputTooLarge(
             "input length exceeds maximum context length", provider="ollama"
         )

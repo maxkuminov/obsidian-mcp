@@ -556,3 +556,24 @@ def test_the_hybrid_additions_entry_carries_rerank():
     assert "rerank" not in schema.get("required", [])
     assert set(schema["properties"]) == {"query", "limit", "folder", "tags", "frontmatter",
                                          "rerank"}
+
+
+@pytest.mark.parametrize("name", ["semantic_search", "find_related"])
+def test_both_vector_tools_describe_the_section_locator_as_peers(name):
+    """#355 (D6): both describe the locator, its omission and the follow-up,
+    in the same words, within the wire cap."""
+    text = description(name)
+    assert len(text) <= 4000
+    assert '§ "<heading path>" (#N)' in text
+    assert "§ (top of note)" in text
+    assert 'section="#N"' in text
+    assert "index_transition:" in text
+
+
+def test_the_two_locator_paragraphs_are_identical():
+    def paragraph(name):
+        text = description(name)
+        start = text.index("**Section locator.**")
+        return " ".join(text[start:text.index("Previews are one line.", start)].split())
+
+    assert paragraph("semantic_search") == paragraph("find_related")

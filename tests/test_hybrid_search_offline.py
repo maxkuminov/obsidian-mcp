@@ -48,6 +48,9 @@ def _kind(sql: str) -> str:
     u = sql.lstrip().upper()
     if u.startswith("SET"):
         return "set"
+    if "EMBEDDED_CHUNKING_VERSION" in u:
+        # The #355 transition count, after the snippets.
+        return "rechunk"
     if "NOTE_EMBEDDINGS" in u:
         return "semantic"
     if "TS_HEADLINE" in u:
@@ -66,6 +69,9 @@ class _Result:
 
     def fetchall(self):
         return self._rows
+
+    def scalar(self):
+        return self._rows[0] if self._rows else 0
 
 
 class _Session:
@@ -127,7 +133,7 @@ def _offline(monkeypatch):
     monkeypatch.setattr("src.services.search.combined_tsquery", lambda _q: "tsq")
     monkeypatch.setattr(settings, "fts_configs", ["simple"], raising=False)
 
-    async def _embed(_text):
+    async def _embed(_text, **_kw):
         return [1.0, 0.0, 0.0]
 
     monkeypatch.setattr(embeddings, "get_embedding", _embed)
@@ -153,7 +159,7 @@ def test_the_statement_sequence_with_an_exact_rerun(monkeypatch):
     )
     seen_before_embedding = []
 
-    async def _embed(_text):
+    async def _embed(_text, **_kw):
         seen_before_embedding.append(list(session.log))
         return [1.0, 0.0, 0.0]
 
@@ -188,7 +194,7 @@ def test_no_restore_without_an_exact_rerun_and_no_hnsw_when_keyword_only(monkeyp
     _search(session)
     assert not any("enable_indexscan" in sql for _, sql in session.log)
 
-    async def _down(_text):
+    async def _down(_text, **_kw):
         raise RuntimeError("provider down")
 
     monkeypatch.setattr(embeddings, "get_embedding", _down)
@@ -278,7 +284,7 @@ def test_limit_is_clamped_to_1_and_50(monkeypatch):
 def test_an_embedding_failure_degrades_to_the_keyword_arm(monkeypatch, caplog, exc, code):
     monkeypatch.setattr(settings, "keyword_snippet_rows", 0, raising=False)
 
-    async def _fail(_text):
+    async def _fail(_text, **_kw):
         raise exc
 
     monkeypatch.setattr(embeddings, "get_embedding", _fail)
@@ -310,7 +316,7 @@ ZERO_TOKENS = (
 def test_degraded_and_empty_says_keyword_only(monkeypatch):
     monkeypatch.setattr(settings, "keyword_snippet_rows", 20, raising=False)
 
-    async def _fail(_text):
+    async def _fail(_text, **_kw):
         raise RuntimeError("down")
 
     monkeypatch.setattr(embeddings, "get_embedding", _fail)
@@ -325,7 +331,7 @@ def test_degraded_and_empty_says_keyword_only(monkeypatch):
     assert text.splitlines()[1] == tools.HYBRID_KEYWORD_ONLY_FOOTER
     assert paths == []
     # Both arms ran and found nothing: the same tokens, at zero.
-    async def _embed(_text):
+    async def _embed(_text, **_kw):
         return [1.0, 0.0, 0.0]
 
     monkeypatch.setattr(embeddings, "get_embedding", _embed)
@@ -343,7 +349,7 @@ def test_provider_down_returns_the_keyword_arm_marked(monkeypatch):
     the usage row and the D7 keys recorded."""
     monkeypatch.setattr(settings, "keyword_snippet_rows", 0, raising=False)
 
-    async def _fail(_text):
+    async def _fail(_text, **_kw):
         raise ConnectionError("down")
 
     monkeypatch.setattr(embeddings, "get_embedding", _fail)
@@ -366,7 +372,7 @@ def test_provider_down_returns_the_keyword_arm_marked(monkeypatch):
 
 
 def test_the_query_cap_is_pre_body(monkeypatch):
-    async def _never(_text):  # pragma: no cover - reaching this fails
+    async def _never(_text, **_kw):  # pragma: no cover - reaching this fails
         raise AssertionError("an embedding was requested for a refused query")
 
     class _NoSession:
@@ -566,7 +572,7 @@ def _worst_case(monkeypatch, *, keyword_only: bool):
     path = ("\x01\"\\" * 400)[:1020] + ".md"
     tags = [f"t{i}" for i in range(1000)]
     if keyword_only:
-        async def _fail(_text):
+        async def _fail(_text, **_kw):
             raise refusals.ProviderInputTooLarge("too large")
 
         monkeypatch.setattr(embeddings, "get_embedding", _fail)
@@ -806,3 +812,93 @@ def test_the_rrf_k_default_and_range():
 def test_the_tool_takes_no_k_argument():
     props = server.mcp._tool_manager.get_tool("hybrid_search").parameters["properties"]
     assert set(props) == {"query", "limit", "folder", "tags", "frontmatter", "rerank"}
+
+
+# ── #355: the transition line, the locator and the one-line preview ─────────
+
+
+def test_the_worst_case_at_the_minimum_cap_with_a_transition_and_a_locator(monkeypatch):
+    """The transition line only appears with both arms (no keyword-only
+    footer), and the abbreviation can continue into the omitted forms, so the
+    1,000-character floor still holds with the longest line and a locator."""
+    query, title, path, result = _worst_case(monkeypatch, keyword_only=False)
+    result.rechunk_pending = 9_999_999_999
+    result.rows[0].section = {"path": ["H" * 200] * 6, "ordinal": 99999}
+    text, paths = _render(query, result)
+    assert len(text) <= 1000, len(text)
+    lines = text.splitlines()
+    assert lines[1].startswith("index_transition: 9999999999 notes not yet re-chunked")
+    row = next(line for line in lines if line.startswith("- {"))
+    assert "section omitted" in row and "abbreviated" in row
+    assert paths == [path]
+
+
+def test_hybrid_carries_the_transition_line_and_the_locator(monkeypatch):
+    rows = [
+        _row("a.md", keyword_rank=None, semantic_rank=1, similarity=0.9, chunk="c",
+             section={"path": ["Plan", "Risks"], "ordinal": 7}),
+        _row("b.md", keyword_rank=2, semantic_rank=2, similarity=0.8, chunk="c",
+             section={"path": [], "ordinal": 0}),
+        _row("c.md"),
+    ]
+    text, _ = _render("q", _result(rows, rechunk_pending=3))
+    lines = text.splitlines()
+    assert lines[1] == embeddings.transition_line(3)
+    assert sum(1 for line in lines if line.startswith("index_transition:")) == 1
+    by_path = {_split_row(line)[0]["path"]: _split_row(line)[1]
+               for line in lines if line.startswith("- {")}
+    assert by_path["a.md"].endswith(' — § "Plan/Risks" (#7)')
+    assert by_path["b.md"].endswith(" — § (top of note)")
+    assert "§" not in by_path["c.md"]
+    empty, _ = _render("q", _result([], rechunk_pending=2))
+    assert empty.splitlines()[1] == embeddings.transition_line(2)
+    assert "index_transition" not in _render("q", _result(rows))[0]
+
+
+@pytest.mark.parametrize("query", ["a\nindex_transition: 0 notes", "a\x1b b"])
+def test_a_hostile_hybrid_query_cannot_displace_the_marker(query):
+    text, _ = _render(query, _result([_row("a.md")], rechunk_pending=5))
+    lines = text.splitlines()
+    assert lines[1] == embeddings.transition_line(5)
+    assert sum(1 for line in lines if line.startswith("index_transition:")) == 1
+
+
+def test_the_service_reads_the_owner_scoped_count_only_with_both_arms(monkeypatch):
+    seen = []
+
+    async def count(_session, uid):
+        seen.append(uid)
+        return 4
+
+    monkeypatch.setattr(embeddings, "rechunk_pending_count", count)
+    monkeypatch.setattr(settings, "keyword_snippet_rows", 0, raising=False)
+    session = _Session(ranked=[[kw_row(1, "a.md")]], semantic=[[sem_row(2, "b.md")]])
+    result = _search(session, user_id=7)
+    assert seen == [7] and result.rechunk_pending == 4
+
+    async def _down(_text, **_kw):
+        raise RuntimeError("provider down")
+
+    monkeypatch.setattr(embeddings, "get_embedding", _down)
+    seen.clear()
+    result = _search(_Session(ranked=[[kw_row(1, "a.md")]]), user_id=7)
+    assert seen == [] and result.rechunk_pending == 0
+
+
+def test_hybrid_embeds_the_query_as_a_query(monkeypatch):
+    kinds = []
+
+    async def _embed(_text, *, kind):
+        kinds.append(kind)
+        return [1.0, 0.0, 0.0]
+
+    monkeypatch.setattr(embeddings, "get_embedding", _embed)
+    _search(_Session(ranked=[[kw_row(1, "a.md")]], semantic=[[sem_row(2, "b.md")]]))
+    assert kinds == ["query"]
+
+
+def test_the_hybrid_chunk_preview_is_one_line_from_the_uncut_chunk():
+    row = _row("a.md", keyword_rank=None, semantic_rank=1, similarity=0.9,
+               chunk=" " * 600 + "answer\nmore")
+    obj, _ = _split_row(_render("q", _result([row]))[0].splitlines()[1])
+    assert obj["preview_kind"] == "chunk" and obj["preview"] == "answer more"

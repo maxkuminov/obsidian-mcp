@@ -107,7 +107,7 @@ async def test_candidate_text_by_arm(monkeypatch):
         ranked=[keyword], semantic=[semantic], snippet=[[]])
     result = await hybrid.hybrid_search(session, "q", limit=10, rerank_candidates=True)
     by = {r.path: r for r in result.rows}
-    assert "PAST-500" in by["both.md"].rerank_text and by["both.md"].chunk == long_chunk[:500]
+    assert "PAST-500" in by["both.md"].rerank_text and by["both.md"].chunk == long_chunk
     assert by["kw.md"].rerank_text == "keyword excerpt"
     assert by["stale.md"].rerank_text == "current excerpt"
     assert by["null.md"].rerank_text is None
@@ -194,7 +194,7 @@ async def test_rerank_false_is_unchanged(monkeypatch, captured):
 
 
 async def test_a_keyword_only_call_still_reranks_with_both_markers(monkeypatch, captured, fake):
-    async def _down(_t):
+    async def _down(_t, **_kw):
         raise RuntimeError("provider down")
 
     monkeypatch.setattr(embeddings, "get_embedding", _down)
@@ -253,7 +253,7 @@ async def test_the_hybrid_worst_case_with_rerank(monkeypatch, captured, fake, mo
     path = ("\x01\"\\" * 400)[:1020] + ".md"
     tags = [f"t{i}" for i in range(1000)]
 
-    async def _fail(_text):
+    async def _fail(_text, **_kw):
         raise refusals.ProviderInputTooLarge("too large")
 
     monkeypatch.setattr(embeddings, "get_embedding", _fail)
@@ -281,3 +281,92 @@ async def test_the_hybrid_worst_case_with_rerank(monkeypatch, captured, fake, mo
         assert {"title": title, "path": path}[key].startswith(json.loads(lit))
     assert lines[-1].startswith("Response cap: 49 omitted — more: true")
     assert tools.HYBRID_KEYWORD_ONLY_FOOTER in lines
+
+
+# ── #355 merge: the transition line and the locator on rerank=true pages ───
+
+
+def _outcome(reranked, n):
+    if reranked:
+        return rerank.RerankOutcome(True, list(range(n)), n, scores=[1.0] * n, ms=1)
+    return rerank.RerankOutcome(False, list(range(n)), n, reason="malformed_response")
+
+
+@pytest.mark.parametrize("reranked", [True, False])
+def test_rerank_true_carries_the_transition_line_and_locators(reranked):
+    from tests.test_hybrid_search_offline import _result, _row
+
+    rows = [
+        _row("a.md", keyword_rank=None, semantic_rank=1, similarity=0.9, chunk="c",
+             section={"path": ["Plan", "Risks"], "ordinal": 7}),
+        _row("b.md", keyword_rank=2, semantic_rank=2, similarity=0.8, chunk="c",
+             section={"path": [], "ordinal": 0}),
+        _row("c.md"),
+    ]
+    plain, _ = tools.render_hybrid_results("q", _result(rows, rechunk_pending=3))
+    scores = {r.path: 1.0 for r in rows} if reranked else None
+    text, _ = tools.render_hybrid_results("q", _result(rows, rechunk_pending=3),
+                                          rerank=_outcome(reranked, 3), rerank_scores=scores)
+    lines = text.splitlines()
+    assert lines[1] == plain.splitlines()[1] == embeddings.transition_line(3)
+    tails = {_split_row(line)[0]["path"]: _split_row(line)[1]
+             for line in lines if line.startswith("- {")}
+    assert tails["a.md"].endswith(' — § "Plan/Risks" (#7)')
+    assert tails["b.md"].endswith(" — § (top of note)")
+    assert "§" not in tails["c.md"]
+    if reranked:
+        fields = tails["a.md"].split(" — ")
+        assert fields.index("rerank_score: 1") < fields.index('§ "Plan/Risks" (#7)')
+
+
+@pytest.mark.parametrize("reranked", [True, False])
+def test_the_hybrid_worst_case_with_a_transition_line_and_a_locator(monkeypatch, reranked):
+    """Both arms (so the transition line, no keyword-only footer), the
+    longest transition line and locator: still ≤ 1,000 with rerank=true."""
+    from tests.test_hybrid_search_offline import _worst_case
+
+    query, title, path, result = _worst_case(monkeypatch, keyword_only=False)
+    result.rechunk_pending = 9_999_999_999
+    result.rows[0].section = {"path": ["H" * 200] * 6, "ordinal": 99999}
+    n = len(result.rows)
+    scores = {r.path: -1.234e-05 for r in result.rows} if reranked else None
+    text, paths = tools.render_hybrid_results(query, result, rerank=_outcome(reranked, n),
+                                              rerank_scores=scores)
+    assert len(text) <= 1000, len(text)
+    lines = text.splitlines()
+    assert lines[1].startswith("index_transition: 9999999999 notes not yet re-chunked")
+    row = next(line for line in lines if line.startswith("- {"))
+    assert "section omitted" in row and "abbreviated" in row
+    assert paths == [path]
+
+
+def test_the_floor_arithmetic_with_the_transition_line():
+    """After #355 a both-arms page reserves the `index_transition:` line
+    (≤ 127 characters at a ten-digit count). With it the cut form sums to
+    1,004 at the worst case, so that case falls through to the labelled
+    omitted form, which fits: the 1,000 bound holds, the 20–25 cut does not
+    always survive (recorded in the archived design's implementation notes)."""
+    from src.services.embeddings import transition_line
+
+    rows = [HybridRow(path=f"{i}.md", title="", tags=[], score=2 / 1050, keyword_rank=50,
+                      semantic_rank=50, match="any", similarity=-0.123, stale=True,
+                      embedding_truncated=True, no_excerpt=True, matched_in=["title", "body"])
+            for i in range(50)]
+    result = HybridResult(rows=rows, arms="both", rrf_k=1000, keyword_rows=50, keyword_all=50,
+                          keyword_any=50, semantic_rows=50, semantic_chunks=50, overlap=50,
+                          snippet_cap=49)
+    q_lit, query_cut = tools._hybrid_query_echo("\x01" * 8192)
+    header = len(tools._hybrid_header(q_lit, query_cut, result, rows, 50,
+                                      "reranked: false (malformed_response)"))
+    line = len(transition_line(9_999_999_999))
+    score = (tools._rerank_score_field(-1.234e-100),)
+    base = ["section omitted", "tags omitted", "preview omitted", "title_cut", "path_cut"]
+    cut_form = len(tools._hybrid_row_line(rows[0], 1000, title="", path="", tags=[],
+                                          preview=("none", ""), labels=[*base, "abbreviated"],
+                                          extra=score))
+    omitted = len(tools._hybrid_row_line(
+        rows[0], 1000, title="", path="", tags=[], preview=("none", ""),
+        labels=[*base, "title omitted", "path omitted", "abbreviated"], extra=score))
+    assert (header, line, cut_form) == (371, 127, 378)
+    assert header + 1 + line + 1 + cut_form + 25 + 25 + 1 + 75 == 1004
+    assert header + 1 + line + 1 + omitted + 1 + 75 <= 1000

@@ -104,7 +104,7 @@ async def test_provider_failure_does_not_delete_existing_embeddings(monkeypatch)
     session = _RecordingSession()
     note = _FakeNote()
 
-    async def boom(_chunks):
+    async def boom(_chunks, **_kw):
         raise RuntimeError("ollama down")
 
     monkeypatch.setattr(embeddings, "get_embeddings_batch", boom)
@@ -132,7 +132,7 @@ async def test_provider_success_replaces_embeddings(monkeypatch):
     session = _RecordingSession()
     note = _FakeNote()
 
-    async def ok(chunks):
+    async def ok(chunks, **_kw):
         return [[0.0, 1.0, 2.0] for _ in chunks]
 
     monkeypatch.setattr(embeddings, "get_embeddings_batch", ok)
@@ -191,7 +191,7 @@ async def test_partial_provider_response_preserves_existing_embeddings(monkeypat
     monkeypatch.setattr(embeddings.settings, "chunk_size", 1)
     monkeypatch.setattr(embeddings.settings, "chunk_overlap", 0)
 
-    async def partial(_chunks):
+    async def partial(_chunks, **_kw):
         return [[0.0, 1.0, 2.0]]
 
     monkeypatch.setattr(embeddings, "get_embeddings_batch", partial)

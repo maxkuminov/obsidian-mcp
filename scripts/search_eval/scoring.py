@@ -427,6 +427,9 @@ def score(data_dir: Path, arms: list[str] | None = None, *, baseline: str | None
             "unsearchable_before": before,
             "missing_queries": len([q for q in tolerated if q in selected]),
             "metrics": metrics,
+            # #355 (D8): semantic arms only; fixture arms gain no key.
+            **{k: meta.get(k) for k in ("retrieval_fingerprint", "legacy_chunked_notes")
+               if k in meta},
         })
 
     label_of = {spec: rep["arm"] for spec, rep in zip(arms, arm_reports)}

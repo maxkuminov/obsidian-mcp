@@ -34,7 +34,7 @@ def reranker(fake_server, monkeypatch):
     monkeypatch.setattr(rerank, "_client", None)
     rerank._reset_state_for_tests()
 
-    async def _embed(_t):
+    async def _embed(_t, **_kw):
         return [1.0, 0.0, 0.0]
 
     monkeypatch.setattr(embeddings, "get_embedding", _embed)

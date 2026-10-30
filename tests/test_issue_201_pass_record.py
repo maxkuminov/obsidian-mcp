@@ -512,7 +512,8 @@ def test_a_capped_note_is_marked_certified_and_logged_after_the_commit(
     # assertion to the embed result so only its publishing commit can satisfy
     # the ordering; the watch records completion, not merely commit entry.
     assert order.count("embed returned") == 1
-    assert order[order.index("embed returned"):] == [
+    # (#355 adds one later commit: the end-of-stage rechunk count.)
+    assert order[order.index("embed returned"):][:3] == [
         "embed returned", "commit", "error line"
     ], (
         "the truncation was logged before the transaction that carries it "

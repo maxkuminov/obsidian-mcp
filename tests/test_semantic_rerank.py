@@ -32,11 +32,16 @@ class _Result:
     def all(self):
         return self._rows
 
+    def scalar(self):
+        return self._rows[0] if self._rows else None
+
 
 class _Session:
     """Answers the vector statement with `rows`; records every statement."""
 
     instances: list["_Session"] = []
+    #: What the owner-scoped transition count (#355) answers.
+    pending = 0
 
     def __init__(self, rows):
         self.rows = rows
@@ -49,6 +54,8 @@ class _Session:
         self.log.append(sql)
         if sql.lstrip().upper().startswith("SET"):
             return _Result()
+        if "count(" in sql.lower():
+            return _Result([_Session.pending])
         return _Result(self.rows)
 
     async def __aenter__(self):
@@ -61,7 +68,7 @@ class _Session:
 
 
 def row(i, path=None, *, distance=None, chunk="chunk text", stale=False, truncated=False,
-        title=None, tags=("topic",), chunk_index=0):
+        title=None, tags=("topic",), chunk_index=0, heading_path=None, ordinal=None):
     path = path or f"Notes/n{i:02d}.md"
     return SimpleNamespace(
         note_id=i, chunk_index=chunk_index, chunk_text=chunk, file_path=path,
@@ -69,6 +76,7 @@ def row(i, path=None, *, distance=None, chunk="chunk text", stale=False, truncat
         tags=list(tags) if tags is not None else None, content_hash="h",
         embedded_content_hash="old" if stale else "h", chunks_truncated=truncated,
         distance=distance if distance is not None else 0.01 * i,
+        heading_path=heading_path, section_ordinal=ordinal,
     )
 
 
@@ -92,7 +100,7 @@ def captured(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _offline(monkeypatch):
-    async def _embed(_text):
+    async def _embed(_text, **_kw):
         return [1.0, 0.0, 0.0]
 
     monkeypatch.setattr(embeddings, "get_embedding", _embed)
@@ -125,16 +133,19 @@ def _decoded(text: str):
 
 # ── rerank=false: byte-identical to the render before #367 ──────────────────
 
-#: Produced by the render on origin/main at 1b82c8a for `_GOLDEN_ROWS` with
-#: query "consensus" and limit 3 (verified against that tree, not this one).
+#: Produced by the render on origin/main at c571f56 (heading-chunks, #355) for
+#: `_GOLDEN_ROWS` with query "consensus", limit 3 and a transition count of 3,
+#: verified against that tree's `src/`, not this one. It carries the
+#: `index_transition:` line, both locator forms and a one-lined preview.
 _GOLDEN = (
     "Found 3 semantic matches for 'consensus' — 1 stale, 1 truncated:\n"
+    'index_transition: 3 notes not yet re-chunked; cross-generation ranking is approximate, re-run after the backlog drains\n'
     '\n'
-    '- **Paxos** (`Projects/Paxos.md`) [topic, db] — similarity: 0.900\n'
+    '- **Paxos** (`Projects/Paxos.md`) [topic, db] — similarity: 0.900 · § "Plan/Risks" (#7)\n'
     '  > Paxos reaches consensus among replicas...\n'
     '- **Raft** (`Projects/Raft.md`) — similarity: 0.800 — stale: true\n'
     '  > (preview withheld — this note changed after it was embedded, so the stored excerpt is superseded text. Call `read_note` for the current content.)\n'
-    '- **Zab** (`Projects/Zab.md`) [topic] — similarity: 0.700 — embedding_truncated: true\n'
+    '- **Zab** (`Projects/Zab.md`) [topic] — similarity: 0.700 — embedding_truncated: true · § (top of note)\n'
     "  > Zab is ZooKeeper's atomic broadcast...\n"
     '\n'
     '**One of these notes changed after it was embedded.** Its preview is withheld and its ranking reflects its previous content; its path and title are current. Read it with `read_note`.\n'
@@ -143,16 +154,17 @@ _GOLDEN = (
 )
 
 _GOLDEN_ROWS = [
-    row(1, "Projects/Paxos.md", distance=0.1, chunk="Paxos reaches consensus among replicas",
-        tags=("topic", "db")),
-    row(2, "Projects/Raft.md", distance=0.2, stale=True, tags=None),
+    row(1, "Projects/Paxos.md", distance=0.1, chunk="  Paxos reaches\nconsensus among replicas",
+        tags=("topic", "db"), heading_path=["Plan", "Risks"], ordinal=7),
+    row(2, "Projects/Raft.md", distance=0.2, stale=True, tags=None, heading_path=["X"], ordinal=2),
     row(3, "Projects/Zab.md", distance=0.3, chunk="Zab is ZooKeeper's atomic broadcast",
-        truncated=True),
+        truncated=True, heading_path=[], ordinal=0),
     row(4, "Projects/Extra.md", distance=0.4),
 ]
 
 
 async def test_rerank_false_is_byte_identical_to_the_render_before(monkeypatch, captured):
+    monkeypatch.setattr(_Session, "pending", 3)
     _serve(monkeypatch, _GOLDEN_ROWS)
     omitted = await tools.semantic_search_impl("consensus", limit=3)
     explicit = await tools.semantic_search_impl("consensus", limit=3, rerank=False)
@@ -206,10 +218,10 @@ async def test_a_passage_past_the_500_character_cut_is_sent(monkeypatch, capture
     await tools.semantic_search_impl("q", limit=5, rerank=True)
     doc = fake.requests[-1]["documents"][0]
     assert "THE-PASSAGE" in doc and doc == f"{title}\n\n{chunk}"
-    # The legacy result's chunk is still its first 500 characters.
+    # The legacy result carries the uncut chunk (#355) and no rerank_text.
     async with _Session([row(1, title=title, chunk=chunk)]) as s:
         legacy = await embeddings.semantic_search(s, "q", limit=5)
-    assert legacy[0]["chunk"] == chunk[:500] and "rerank_text" not in legacy[0]
+    assert legacy[0]["chunk"] == chunk and "rerank_text" not in legacy[0]
 
 
 async def test_the_document_bound_includes_the_title(monkeypatch, captured, fake):
@@ -476,7 +488,8 @@ async def test_a_chunk_cannot_forge_a_row_or_a_header_token(monkeypatch, capture
     header = lines[0]
     assert header.count("reranked: false (http_error)") == 1
     assert " — reranked: true (" not in header.replace(change_feed.quote("reranked: true"), "")
-    assert _split_row(lines[1])[0]["preview"] == chunk
+    # One line from the uncut chunk, exactly as the rerank=false page (#355).
+    assert _split_row(lines[1])[0]["preview"] == tools._preview_line(chunk, 200)
 
 
 async def test_the_query_echo_is_a_literal(monkeypatch, captured, fake):
@@ -519,7 +532,7 @@ async def test_reranked_telemetry(monkeypatch, captured, fake):
 async def test_provider_input_too_large_stays_the_refusal(monkeypatch, captured, fake):
     from src.services import refusals
 
-    async def _too_large(_t):
+    async def _too_large(_t, **_kw):
         raise refusals.ProviderInputTooLarge("too many tokens")
 
     monkeypatch.setattr(embeddings, "get_embedding", _too_large)
@@ -557,3 +570,57 @@ def test_the_concurrency_class_is_unchanged():
     assert concurrency.TOOL_CLASSES["semantic_search"] == "embedding"
     assert concurrency.TOOL_CLASSES["hybrid_search"] == "embedding"
     assert concurrency.CLASS_MAPPING_VERSION == 5
+
+
+# ── #355 merge: the transition line and the locator on rerank=true pages ───
+
+
+async def test_rerank_true_carries_the_transition_line_and_locators_as_rerank_false(
+        monkeypatch, captured, fake):
+    monkeypatch.setattr(_Session, "pending", 3)
+    _serve(monkeypatch, _GOLDEN_ROWS)
+    legacy = (await tools.semantic_search_impl("consensus", limit=3)).splitlines()
+    for mode in ("correct", "status:500"):
+        fake.mode = mode
+        lines = (await tools.semantic_search_impl("consensus", limit=3, rerank=True)).splitlines()
+        assert lines[1] == legacy[1] == embeddings.transition_line(3)
+        assert sum(1 for line in lines if line.startswith("index_transition:")) == 1
+        tails = {_split_row(line)[0]["path"]: _split_row(line)[1]
+                 for line in lines if line.startswith("- {")}
+        assert tails["Projects/Paxos.md"].endswith(' — § "Plan/Risks" (#7)')
+        assert tails["Projects/Zab.md"].endswith(" — § (top of note)")
+        assert "§" not in tails["Projects/Raft.md"], "a stale row carries no locator"
+        for line in legacy:
+            if "§" in line:
+                assert line.split(" · ", 1)[1] in "\n".join(lines)
+    monkeypatch.setattr(_Session, "pending", 0)
+    out = await tools.semantic_search_impl("consensus", limit=3, rerank=True)
+    assert "index_transition" not in out
+
+
+async def test_the_zero_result_line_carries_the_transition_line(monkeypatch, captured, fake):
+    monkeypatch.setattr(_Session, "pending", 2)
+    _serve(monkeypatch, [])
+    lines = (await tools.semantic_search_impl("q", rerank=True)).splitlines()
+    assert "reranked: false (no_candidates)" in lines[0]
+    assert lines[1] == embeddings.transition_line(2)
+
+
+async def test_the_worst_case_with_a_transition_line_and_a_locator(monkeypatch, captured, fake):
+    monkeypatch.setattr(settings, "max_read_response_chars", 1000, raising=False)
+    monkeypatch.setattr(_Session, "pending", 9_999_999_999)
+    query = (CONTROLS * 1000)[:8192]
+    title = (CONTROLS * 100)[:512]
+    path = ("\x01\"\\" * 400)[:1020] + ".md"
+    rows = [row(1, path, title=title, tags=[f"t{i}" for i in range(1000)], chunk="x" * 500,
+                truncated=True, heading_path=["H" * 200] * 6, ordinal=99999)] + [
+        row(10 + i) for i in range(49)]
+    _serve(monkeypatch, rows)
+    for mode in ("correct", "not_json"):
+        fake.mode = mode
+        text = await tools.semantic_search_impl(query, limit=50, rerank=True)
+        assert len(text) <= 1000, (mode, len(text))
+        lines = text.splitlines()
+        assert lines[1].startswith("index_transition: 9999999999 notes")
+        line = next(x for x in lines if x.startswith("- {"))
+        assert "section omitted" in line and "abbreviated" in line and "§" not in line

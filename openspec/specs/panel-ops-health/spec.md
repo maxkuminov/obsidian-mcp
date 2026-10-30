@@ -1,7 +1,7 @@
 # panel-ops-health Specification
 
 ## Purpose
-TBD - created by archiving change panel-ops-health. Update Purpose after archive.
+The control panel's operator views of the index's health: the health page (indexer run history, recent application errors, backup age), the dashboard's embedding coverage beside the count of notes whose vectors are not current — never embedded, embedded before their indexed content, or under another chunking version (#355) — and the truncated-embedding count, each scoped to the viewer like its neighbours.
 ## Requirements
 ### Requirement: Health page
 The panel SHALL provide a health page showing indexer run history (most recent 50 runs with start, duration, trigger, counts, and error), the most recent application errors (up to 100, ERROR level and above, since process start, with the observation window stated), and the age of the most recent recorded backup. The run history SHALL be scoped as the performance page scopes it; the error and backup sections SHALL be shown to administrators only, because neither has an owner to scope by — the error buffer holds whatever the process logged and a backup covers the whole database.
@@ -115,19 +115,25 @@ The condition SHALL be read from the published snapshot, not recomputed by the r
 - **THEN** the handler SHALL read the published snapshot and SHALL NOT itself open, stat or resolve any vault root, nor re-read the `users` rows to name the accounts the snapshot records
 
 ### Requirement: The dashboard reports embedding currency beside coverage
-The dashboard SHALL show, next to the embedding coverage bar, the number of notes whose vectors are **not current** — never embedded, or embedded before the note's indexed content — and the number of notes whose embedding was truncated at the per-note chunk cap. Both counts SHALL be scoped to the viewer exactly as the coverage numbers beside them are, so that a non-admin never reads another tenant's backlog as their own.
+The dashboard SHALL show, next to the embedding coverage bar, the number of notes whose vectors are **not current** — never embedded, embedded before the note's indexed content, or embedded under a chunking version other than the current one — and the number of notes whose embedding was truncated at the per-note chunk cap. Both counts SHALL be scoped to the viewer exactly as the coverage numbers beside them are, so that a non-admin never reads another tenant's backlog as their own.
 
 The existing coverage bar SHALL keep its present meaning — the proportion of notes holding at least one vector row — and SHALL NOT be redefined. Coverage answers "is this note represented at all" and the pending count answers "is that representation current"; they are different questions, they disagree during every embed backlog, and collapsing them would silently change what every previously recorded coverage figure meant.
 
-The predicate behind the pending count SHALL be the same one the re-embedding progress endpoint uses, expressed once and called from both, so the page and the poller cannot come to disagree about what "pending" means. The progress endpoint SHALL keep its existing admin-only, whole-database behaviour.
+The predicate behind the pending count SHALL be the same one the re-embedding progress endpoint and the embed backlog use, expressed once and called from all three, so the page, the poller and the indexer cannot come to disagree about what "pending" means. The progress endpoint SHALL keep its existing admin-only, whole-database behaviour.
 
-The pending count is the operator-visible consequence of two things nothing else surfaces on this page: a provider outage, which now marks the pass record but leaves coverage reading whatever it read yesterday; and a tenant whose embedding is repeatedly stopped at its per-pass budget, which is deliberately not recorded as a pass error. A backlog that does not shrink across passes is the signal, and it is a property of the index rather than of any one pass.
+The pending count is the operator-visible consequence of three things nothing else surfaces on this page: a provider outage, which now marks the pass record but leaves coverage reading whatever it read yesterday; a tenant whose embedding is repeatedly stopped at its per-pass budget, which is deliberately not recorded as a pass error; and a chunking-version transition, which re-embeds every note in the background. A backlog that does not shrink across passes is the signal, and it is a property of the index rather than of any one pass.
 
 #### Scenario: A stale vault reads as fully covered and not current
 
 - **WHEN** every note has vectors and every note has been edited since it was last embedded
 - **THEN** the coverage bar SHALL read 100%
 - **AND** the pending count beside it SHALL equal the number of notes
+
+#### Scenario: A chunking transition is counted as pending
+
+- **WHEN** every note has vectors certified for its current content under an older chunking version
+- **THEN** the coverage bar SHALL read 100%
+- **AND** the pending count SHALL equal the number of notes and SHALL fall as each note is re-embedded
 
 #### Scenario: The counts are scoped like their neighbours
 
@@ -141,13 +147,13 @@ The pending count is the operator-visible consequence of two things nothing else
 
 #### Scenario: A healthy vault reports zero pending
 
-- **WHEN** every note's stored vectors match its indexed content
+- **WHEN** every note's stored vectors match its indexed content and the current chunking version
 - **THEN** the pending count SHALL be zero and SHALL still be rendered
 
 #### Scenario: The progress endpoint is unchanged
 
 - **WHEN** an administrator polls the re-embedding progress endpoint
-- **THEN** it SHALL return the same whole-database counts under the same keys as before this change
+- **THEN** it SHALL return whole-database counts under the same keys as before this change
 
 ### Requirement: `/health` SHALL report indexer degradation without disclosing paths or tenants
 
@@ -207,4 +213,3 @@ The control panel SHALL offer administrators a "Confirm vault is empty" action �
 
 - **WHEN** one scope's only degraded counter is `walk_incomplete` at the threshold
 - **THEN** `/health` SHALL report `degraded` with `failing_scopes` equal to 1
-

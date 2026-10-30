@@ -105,6 +105,28 @@ def _loss(arm_membership: str, selected: list[str], data: DataDir, judged: dict[
     return loss, before
 
 
+def _is_semantic(membership: str | None) -> bool:
+    return membership in ("semantic", "keyword_and_semantic", "keyword_or_semantic")
+
+
+def _provenance_owner(data) -> "tuple[bool, int | None] | None":
+    """`(scoped, user_id)` for `legacy_chunked_notes` (#355, Codex r1 B2).
+
+    Single-user provenance scopes to that owner — every query of such a
+    report belongs to it (the miner enforces it), NULL included — and a
+    `"multi"` report, never attachable, covers all owners. `None` when a
+    single-user report has no query to name its owner.
+    """
+    provenance = (data.mine_report or {}).get("provenance") or {"users": "multi"}
+    if provenance.get("users") != 1:
+        return (False, None)
+    owners = {q.get("user_id") for q in data.queries.values()}
+    if len(owners) != 1:
+        return None
+    (only,) = owners
+    return (True, only)
+
+
 async def run_generation(
     data_dir: Path,
     arm_specs: list[str],
@@ -207,6 +229,7 @@ async def run_generation(
             maker = None
             replay = replay_corpus or (Corpus.load(fixture_corpus) if fixture_corpus else data.snapshot)
         ctx = ArmContext(session_factory=maker, corpus=replay, options=options)
+        owner = _provenance_owner(data)
         files: dict[str, dict] = {}
         #: Per arm, the queries an arm reported as having nothing to score
         #: (#367's rerank arms: `no_candidates`), when the arm reports any.
@@ -222,6 +245,10 @@ async def run_generation(
             if arm.kind == "runfile":
                 src_meta, src_runs = arm.runfile["meta"], arm.runfile["runs"]
                 runs = {qid: dedup(src_runs[qid])[:depth] for qid in selected if qid in src_runs}
+                if _is_semantic(arm.membership):
+                    # Whatever the staging harness recorded, or null (#355).
+                    meta["retrieval_fingerprint"] = src_meta.get("retrieval_fingerprint")
+                    meta["legacy_chunked_notes"] = src_meta.get("legacy_chunked_notes")
                 meta.update({
                     "source": "runfile",
                     "source_generation": src_meta.get("generation"),
@@ -234,6 +261,22 @@ async def run_generation(
                     "missing_queries": [qid for qid in selected if qid not in src_runs],
                 })
             else:
+                if arm.requires_db and _is_semantic(arm.membership):
+                    # #355 (D8): what shaped this arm's vectors, and how many
+                    # of the provenance owner's notes are still on a legacy
+                    # chunking version (must be 0 for the report to be
+                    # evidence). No query text, no path, no instruction text.
+                    from scripts.search_eval.db import legacy_chunked_notes
+                    from src.services.index_state import retrieval_fingerprint
+
+                    meta["retrieval_fingerprint"] = retrieval_fingerprint()
+                    if owner is None:
+                        meta["legacy_chunked_notes"] = None
+                    else:
+                        async with maker() as session:
+                            meta["legacy_chunked_notes"] = await legacy_chunked_notes(
+                                session, owner
+                            )
                 fn = arm.factory(ctx)
                 runs = {}
                 for qid in selected:

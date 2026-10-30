@@ -142,7 +142,7 @@ async def corpus(maker, migrated_url):
 
 @pytest.fixture(autouse=True)
 def _fixed_embedding(monkeypatch):
-    async def _embed(_text):
+    async def _embed(_text, **_kw):
         return list(Q)
 
     monkeypatch.setattr(embeddings, "get_embedding", _embed)
@@ -250,7 +250,7 @@ async def test_the_exact_fallback_is_restored_before_correct_snippets(maker, cor
 
 
 async def test_keyword_only_with_a_raising_provider(maker, corpus, monkeypatch):
-    async def _down(_text):
+    async def _down(_text, **_kw):
         raise ConnectionError("provider unreachable")
 
     monkeypatch.setattr(embeddings, "get_embedding", _down)
@@ -472,7 +472,7 @@ async def test_a_keyword_only_call_still_reranks(maker, corpus, monkeypatch):
     from src.services import rerank
     from tests.fixtures.fake_reranker import FakeReranker
 
-    async def _down(_text):
+    async def _down(_text, **_kw):
         raise ConnectionError("provider unreachable")
 
     monkeypatch.setattr(embeddings, "get_embedding", _down)

@@ -154,7 +154,7 @@ async def test_a_reset_committing_during_the_provider_call_is_not_overwritten(
     config_b = _fingerprint_with_model(OTHER_MODEL)
     observed = {}
 
-    async def _provider_call(chunks):
+    async def _provider_call(chunks, **_kw):
         # The reset lands here, on its own connection, mid-call.
         async with maker_b() as sb:
             observed["lock_free"] = (await sb.execute(
@@ -218,7 +218,7 @@ async def test_a_later_pass_under_the_new_configuration_embeds_the_note(
         raising=False,
     )
 
-    async def _provider_call(chunks):
+    async def _provider_call(chunks, **_kw):
         return [[0.2] * DIM for _ in chunks]
 
     monkeypatch.setattr(
@@ -570,7 +570,7 @@ async def test_real_reset_ddl_during_provider_has_no_discovery_lock_cycle(
 
     event.listen(reset_engine.sync_engine, "before_cursor_execute", before_statement)
 
-    async def provider(chunks):
+    async def provider(chunks, **_kw):
         nonlocal reset_task
         assert reset_task is None, "one note should issue one provider call"
         reset_task = asyncio.create_task(reset_embeddings.reset())

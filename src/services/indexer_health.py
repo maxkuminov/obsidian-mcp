@@ -18,7 +18,10 @@ can read it.
   stamp; reset by one that recorded it, or by a pass that was not a re-derive;
 - `walk_incomplete`: a committed pass that could not list one or more
   directories beneath the root (#309, D4); reset by one that listed them all;
-- `last_success_at` / `last_failure_at` of the index stage.
+- `last_success_at` / `last_failure_at` of the index stage;
+- `rechunk_pending`: the notes the scope's last embed stage counted as not yet
+  re-chunked (#355). Published only as the process-wide, non-volumetric
+  `rechunk: "in_progress" | "complete"` — never a number, never in `status`.
 
 **Process-wide**: consecutive tick-level failures not attributable to a scope
 (user enumeration, root-overlap detection, a tick that raised outside any
@@ -100,6 +103,11 @@ class ScopeHealth:
     last_failure_at: datetime | None = None
     #: Counters whose CRITICAL line has fired this episode.
     alerted: set[str] = field(default_factory=set)
+    #: Notes of this scope not yet re-chunked (#355, D4), as the scope's most
+    #: recent embed stage counted them under the one predicate. In process
+    #: memory only, and **never** exposed: `/health` publishes only whether
+    #: any scope's count is non-zero.
+    rechunk_pending: int = 0
 
 
 _scopes: dict[Scope, ScopeHealth] = {}
@@ -194,6 +202,16 @@ def record_walk(scope: Scope, incomplete: bool) -> None:
         _bump(scope, state, _WALK, "walk_incomplete", "walk")
     else:
         _reset(state, _WALK, "walk_incomplete")
+
+
+def record_rechunk(scope: Scope, pending: int) -> None:
+    """The scope's embed stage counted `pending` notes whose
+    `embedded_chunking_version IS DISTINCT FROM CHUNKING_VERSION` (#355).
+
+    Not a failure counter: a long re-embed degrades nothing, alerts nothing
+    and never changes `status` or the HTTP code.
+    """
+    _scope(scope).rechunk_pending = max(0, int(pending))
 
 
 def record_enumeration(ok: bool) -> None:
@@ -309,6 +327,15 @@ def snapshot() -> dict:
         "max_consecutive_failures": max_failures,
         "quarantined_notes": quarantined,
         "last_success_at": last_success,
+        # #355, D4: process-wide and **non-volumetric**, because `/health` is
+        # unauthenticated and a count would be tenant-derived (Codex r2 B1).
+        # Exact per-owner counts live on the panel and in the owner-scoped
+        # `index_transition:` line. Never part of `status`.
+        "rechunk": (
+            "in_progress"
+            if any(s.rechunk_pending > 0 for s in states)
+            else "complete"
+        ),
     }
 
 

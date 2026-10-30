@@ -290,6 +290,7 @@ Choices the spec left open, one line each (recorded during implementation, 2026-
 - `RERANK_MODEL`'s control-character rule lives in the `_validate_rerank_transport` model validator; its length bound is `Field(max_length=200)`.
 - `check_embedding_url_policy` gained `allow_setting` and `what` parameters; the embedding message is byte-identical (a test pins its wording).
 - The rerank WARNING carries `suppressed_since_last`, the number of records the previous window withheld for that code.
+- Merged after #395 (heading-chunks, c571f56): candidates now come through the arm core that projects the uncut chunk and the section locator under `ensure_search_snapshot`, embedded with `kind="query"`; `rerank_text` is that uncut chunk; both `rerank=true` renderers carry the `index_transition:` line (reserved) and the `§` locator (dropped as `section omitted` when abbreviated) exactly as `rerank=false`; `_GOLDEN` re-pinned against c571f56's `src/`; bounds unchanged except that a both-arms hybrid worst case with the transition line uses the omitted form (cut-form sum 1,004, total ≤ 1,000).
 
 ## Codex implementation review, round 1 (2026-10-30)
 

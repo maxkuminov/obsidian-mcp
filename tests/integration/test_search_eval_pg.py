@@ -520,7 +520,7 @@ def test_a_deleted_row_is_corpus_loss(loss_db, tmp_path):
 def test_deleted_embeddings_are_loss_for_the_semantic_arm_only(loss_db, tmp_path, monkeypatch):
     users = arun(seed_notes(loss_db))
 
-    async def fake_get_embedding(text_: str):
+    async def fake_get_embedding(text_: str, **_kw):
         return [0.01] * DIM
 
     monkeypatch.setattr("src.services.embeddings.get_embedding", fake_get_embedding)
@@ -539,6 +539,50 @@ def test_deleted_embeddings_are_loss_for_the_semantic_arm_only(loss_db, tmp_path
     assert res.exit_code == EXIT_INSUFFICIENT and res.report["verdict"] == "CORPUS_LOSS"
 
 
+def test_legacy_chunked_notes_is_scoped_to_the_exports_owner(loss_db, tmp_path, monkeypatch):
+    """#355 (Codex r1 B2): a `USER_ID=` (single-user) report counts its own
+    owner's legacy-chunked notes only. Another tenant's rows cannot change a
+    byte of the staged meta or the report; a `"multi"` report counts all."""
+    users = arun(seed_notes(loss_db))
+
+    async def fake_get_embedding(text_: str, **_kw):
+        return [0.01] * DIM
+
+    monkeypatch.setattr("src.services.embeddings.get_embedding", fake_get_embedding)
+    # User 1 re-embedded (current version); user 2 still legacy.
+    arun(_exec(loss_db, "UPDATE notes_metadata SET embedded_chunking_version = 1 "
+                        "WHERE user_id = :u", u=users["u1"]))
+    d = tmp_path / "d"
+    arun(write_snapshot(data=d, database_url=loss_db))
+    write_data(d, [{"user_id": users["u1"], "text": "runbook", "relevant": ["Ops/Runbook.md"]}])
+
+    def staged_meta(gen):
+        out = arun(run_generation(d, ["semantic"], generation=gen, database_url=loss_db))
+        assert out.exit_code == EXIT_OK, out.manifest
+        meta = json.loads((d / "runs" / out.manifest["files"]["semantic"]["path"]).read_text())["meta"]
+        return {k: v for k, v in meta.items() if k != "generation"}
+
+    first = staged_meta("G1")
+    assert first["legacy_chunked_notes"] == 0
+    assert json.loads(first["retrieval_fingerprint"])["chunking_version"] == 1
+    report = score(d, ["semantic"], min_queries=1).report
+    assert report["arms"][0]["legacy_chunked_notes"] == 0
+    # Another tenant's legacy rows multiply; nothing of user 1's report moves.
+    for i in range(37):
+        arun(_exec(loss_db,
+                   "WITH n AS (INSERT INTO notes_metadata (user_id, file_path, title, content_hash) "
+                   "VALUES (:u, :p, 't', 'h') RETURNING id) "
+                   f"INSERT INTO note_embeddings (note_id, chunk_index, chunk_text, embedding) "
+                   f"SELECT id, 0, 'x', CAST(:v AS vector) FROM n",
+                   u=users["u2"], p=f"Legacy/{i}.md", v=str([0.01] * DIM)))
+    assert staged_meta("G2") == first
+
+    # A multi-user (never attachable) report covers every owner.
+    (d / "mine-report.json").write_text(pretty_json(
+        {"window_seconds": 120, "provenance": {"users": "multi", "basis": "mixed"}}))
+    assert staged_meta("G3")["legacy_chunked_notes"] == 1 + 37
+
+
 def test_the_hybrid_arm_replays_the_service_and_writes_nothing(main_db, tmp_path, monkeypatch):
     """#354: `scripts.search_eval_arms.hybrid:make_arm` answers with exactly the
     fused paths `hybrid_search` returns for the same query, owner, filters and
@@ -548,7 +592,7 @@ def test_the_hybrid_arm_replays_the_service_and_writes_nothing(main_db, tmp_path
     url, users = main_db
     monkeypatch.delenv("DATABASE_URL", raising=False)
 
-    async def fake_get_embedding(text_: str):
+    async def fake_get_embedding(text_: str, **_kw):
         return [0.01] * DIM
 
     monkeypatch.setattr("src.services.embeddings.get_embedding", fake_get_embedding)
@@ -599,7 +643,7 @@ def test_the_semantic_rerank_arm_dials_only_the_reranker_and_writes_nothing(
     url, users = main_db
     monkeypatch.delenv("DATABASE_URL", raising=False)
 
-    async def fake_get_embedding(text_: str):
+    async def fake_get_embedding(text_: str, **_kw):
         return [0.01] * DIM
 
     monkeypatch.setattr("src.services.embeddings.get_embedding", fake_get_embedding)

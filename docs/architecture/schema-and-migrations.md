@@ -997,3 +997,41 @@ sequence counters and watermarks cannot be rebuilt from the vault, and a
 cursor stays valid across a restore only if events and counters come back
 together (L8: a restore rolls `last_seq` back, so a later cursor is refused
 and the agent restarts from a date).
+
+## 034: the chunk locator, the prefix and the chunking version (#355)
+
+034 adds five nullable, marked columns with no default, **no backfill** and no
+index: `note_embeddings.heading_path text[]` (`{}` for section 0),
+`section_ordinal integer` (integer, because a 10 MiB note can hold more than
+32,767 headings) and `embed_prefix text` (≤ 300 characters, app-enforced), and
+`notes_metadata.embedded_chunking_version smallint` and
+`embedded_input_digest varchar(64)`. NULL is the truthful pre-034 value
+everywhere: a legacy chunk with no section, a note certified under the old
+chunker. The embed backlog re-selects such notes per note (see
+indexing-and-embeddings.md, "Heading-aware chunks"); the stored embedding
+fingerprint is untouched, so nothing refuses at startup.
+
+Two CHECKs, added `NOT VALID` then `VALIDATE`d so the scan of
+`note_embeddings` holds only `SHARE UPDATE EXCLUSIVE`:
+`ck_note_embeddings_heading_meta` (the three row columns all NULL, or all set
+with `section_ordinal >= 0` and `(section_ordinal = 0) = (cardinality(
+heading_path) = 0)`) and `ck_notes_metadata_embedded_chunking_version` (NULL
+or `>= 1`). Both are resolved through `pg_constraint` by definition, measured
+off a TEMP twin, and carry constraint markers (not compared by `alembic
+check`); the schema gate asserts them.
+
+**Reconcile or refuse.** On a re-run a same-named column must have the exact
+type, be nullable, carry no default and 034's marker, and a CHECK of 034's
+name must have 034's definition, be validated and be marked; anything else is
+refused by name before anything changes. `search_path` is pinned and
+asserted; `lock_timeout` / `statement_timeout` are set and `RESET`. Only table
+ownership is needed (`test_nonsuperuser_migrations_pg.py`).
+
+**The downgrade deletes and un-certifies.** In one transaction holding the
+generation lock (`pg_advisory_xact_lock(8029183045093649969)`, written
+literally): `embedded_content_hash = NULL` for every note holding a row with a
+non-NULL `embed_prefix`, delete those rows, then drop only the marked
+constraints and columns. The 033 build reuses a vector on exact `chunk_text`
+alone, so a vector of a prefixed input left behind would be reused as the bare
+chunk's. Those notes are absent from semantic search until the old build
+re-embeds them (L7). Both tables stay **derived** for backups (#348).

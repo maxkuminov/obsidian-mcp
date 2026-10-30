@@ -67,7 +67,12 @@ from src.mcp_server.read_result import (
 from src.models.db import UsageLog
 from src.services import concurrency, rate_limits, refusals, security_events, timing
 from src.services.tool_outcomes import BodyOutcome, body_refusal as _body_refusal
-from src.services.embeddings import semantic_search
+from src.services.embeddings import (
+    rechunk_pending_count,
+    section_of,
+    semantic_search,
+    transition_line,
+)
 from src.services import hybrid as hybrid_service
 from src.services import rerank as rerank_service
 from src.services.embeddings import semantic_candidates
@@ -690,6 +695,80 @@ def _degradation_suffix(stale: bool, truncated: bool) -> str:
     return "".join(parts)
 
 
+# ── The section locator and the one-line preview (#355, design D6) ────────
+
+#: A joined heading path longer than this keeps its innermost components.
+_LOCATOR_PATH_MAX_CHARS = 160
+
+
+def _section_locator(section: dict | None) -> str:
+    """` · § "Parent/Child" (#7)`, ` · § (top of note)`, or `""`.
+
+    The path is one JSON string literal (`change_feed.quote`: C0/C1 controls,
+    DEL, U+2028/U+2029 escaped), so note text cannot close the quote and the
+    `(#N)` after it is server-authored. Over 160 characters, outer components
+    are dropped behind `…/` so the innermost heading is kept. `None` — a stale
+    row or a pre-034 row — renders nothing, i.e. exactly the pre-#355 line.
+    """
+    if not section:
+        return ""
+    ordinal = int(section.get("ordinal") or 0)
+    if ordinal <= 0:
+        return " · § (top of note)"
+    parts = [str(p) for p in section.get("path") or []]
+    joined = "/".join(parts)
+    if len(joined) > _LOCATOR_PATH_MAX_CHARS:
+        kept = parts[:]
+        while len(kept) > 1 and len("…/" + "/".join(kept)) > _LOCATOR_PATH_MAX_CHARS:
+            kept.pop(0)
+        joined = "…/" + "/".join(kept)
+        if len(joined) > _LOCATOR_PATH_MAX_CHARS:
+            joined = joined[: _LOCATOR_PATH_MAX_CHARS - 1] + "…"
+    return f" · § {change_feed.quote(joined)} (#{ordinal})"
+
+
+_CONTROL_RE = re.compile("[\x00-\x1f\x7f-\x9f]")
+
+
+def _preview_line(text: str, limit: int = 200) -> str:
+    """A stored chunk as one preview line, from the **uncut** text (D6).
+
+    1. every maximal run of `str.isspace()` characters (CR, LF, tab, U+2028,
+       U+2029 included) becomes one space;
+    2. leading and trailing spaces are trimmed;
+    3. the remaining C0 controls, DEL and C1 controls are escaped as `\\uXXXX`;
+    4. the result is cut at `limit` characters.
+
+    Not `_one_line`, which escapes nothing. The caller appends its ellipsis.
+    """
+    spaced = "".join(" " if ch.isspace() else ch for ch in (text or ""))
+    collapsed = re.sub(" +", " ", spaced).strip(" ")
+    escaped = _CONTROL_RE.sub(lambda m: f"\\u{ord(m.group(0)):04x}", collapsed)
+    return escaped[:limit]
+
+
+def _header_scalar(value: str) -> str:
+    """A caller- or note-supplied string echoed inside a result header, as
+    one escaped line (#355, Codex impl r1 M1): the inside of one JSON string
+    literal (`change_feed.quote` — newlines, C0/C1, DEL, U+2028/U+2029 and
+    `"` escaped), without its outer quotes. So a multiline query cannot push
+    the `index_transition:` line off the line after the header, or forge one
+    above it. The argument caps already bound its length."""
+    return change_feed.quote(value)[1:-1]
+
+
+def _with_transition(lines: list[str], pending: int) -> list[str]:
+    """`lines` with the `index_transition:` line directly after the header
+    (the first line), or unchanged at zero (#355, D4)."""
+    line = transition_line(pending)
+    if line is None:
+        return lines
+    header = lines[0]
+    if header.endswith("\n"):
+        return [header[:-1], line + "\n", *lines[1:]]
+    return [header, line, *lines[1:]]
+
+
 def _stale_source_line(path: str) -> str:
     """`find_related`'s one extra fact, which no per-row marker can express.
 
@@ -704,7 +783,7 @@ def _stale_source_line(path: str) -> str:
     # emitted on both: "these neighbours were computed from…" is nonsense above
     # an empty list, and the empty list is where this line does the most work.
     return (
-        f"**`{path}` changed after it was embedded**, so this search ran "
+        f"**`{_header_scalar(path)}` changed after it was embedded**, so this search ran "
         "against the vector of its previous content and answers a superseded "
         "question. The next embed pass repairs this on its own."
     )
@@ -2791,14 +2870,21 @@ async def semantic_search_impl(
                 frontmatter=frontmatter,
                 user_id=uid,
             )
+            # Same `REPEATABLE READ, READ ONLY` transaction as the vector
+            # query, so the transition count describes the index this page
+            # was ranked against (#355, D4). Owner-scoped.
+            pending = await rechunk_pending_count(session, uid)
     except refusals.ProviderInputTooLarge as exc:
         return _semantic_provider_refusal(exc)
     if not results:
-        return f"No semantic results for '{query}' (embeddings may still be building)"
+        return "\n".join(_with_transition(
+            [f"No semantic results for '{_header_scalar(query)}' (embeddings may still be building)"],
+            pending,
+        ))
     stale_count = sum(1 for r in results if r["stale"])
     truncated_count = sum(1 for r in results if r["embedding_truncated"])
     lines = [
-        f"Found {len(results)} semantic matches for '{query}' — "
+        f"Found {len(results)} semantic matches for '{_header_scalar(query)}' — "
         f"{stale_count} stale, {truncated_count} truncated:\n"
     ]
     for r in results:
@@ -2807,6 +2893,7 @@ async def semantic_search_impl(
             f"- **{r['title']}** (`{r['path']}`){tags_str} — "
             f"similarity: {r['similarity']:.3f}"
             f"{_degradation_suffix(r['stale'], r['embedding_truncated'])}"
+            f"{_section_locator(r.get('section'))}"
         )
         # `chunk` is `None` for a stale row — the service withholds it there,
         # so no caller can obtain the superseded text at all. The substitute is
@@ -2817,9 +2904,9 @@ async def semantic_search_impl(
         if r["chunk"] is None:
             lines.append(f"  > {_STALE_PREVIEW_NOTICE}")
         else:
-            lines.append(f"  > {r['chunk'][:200]}...")
+            lines.append(f"  > {_preview_line(r['chunk'], 200)}...")
     lines.extend(_degradation_footer(stale_count, truncated_count))
-    return "\n".join(lines)
+    return "\n".join(_with_transition(lines, pending))
 
 
 async def _semantic_search_reranked(query, limit, folder, tags, frontmatter, uid):
@@ -2839,6 +2926,9 @@ async def _semantic_search_reranked(query, limit, folder, tags, frontmatter, uid
                 frontmatter=frontmatter,
                 user_id=uid,
             )
+            # The same snapshot as the vector query (#355, D4), owner-scoped,
+            # read before the session closes and the rerank hop begins.
+            pending = await rechunk_pending_count(session, uid)
     except refusals.ProviderInputTooLarge as exc:
         # Nothing was searched, so there is no reason code and no candidate
         # count; the row still says the page was not reranked (verifier V4),
@@ -2851,7 +2941,8 @@ async def _semantic_search_reranked(query, limit, folder, tags, frontmatter, uid
     )
     page = [candidates[i] for i in outcome.order][:limit]
     scores = [outcome.scores[i] for i in outcome.order][:limit] if outcome.reranked else None
-    rendered, paths = render_semantic_rerank_results(query, page, outcome, scores=scores)
+    rendered, paths = render_semantic_rerank_results(query, page, outcome, scores=scores,
+                                                     pending=pending)
     _record_rerank(outcome)
     timing.record_results(paths)
     return rendered
@@ -3005,7 +3096,9 @@ def _hybrid_preview(r) -> tuple[str, str]:
         if r.stale or r.chunk is None:
             sem = ("stale_notice", _STALE_PREVIEW_NOTICE)
         else:
-            sem = ("chunk", r.chunk[:HYBRID_CHUNK_PREVIEW_CHARS])
+            # One line from the uncut chunk, as the other vector tools
+            # (#355, D6); the literal then escapes it again.
+            sem = ("chunk", _preview_line(r.chunk, HYBRID_CHUNK_PREVIEW_CHARS))
     kr, sr = r.keyword_rank, r.semantic_rank
     if kr is not None and (sr is None or kr < sr):
         order = [kw, sem]
@@ -3047,6 +3140,14 @@ def _hybrid_server_fields(r, k: int) -> list[str]:
     return fields
 
 
+def _hybrid_locator(r) -> list[str]:
+    """The semantic arm's section locator as one server field (#355): the
+    path is one JSON literal, the `(#N)` after it the server's. Full rows
+    only — an abbreviated row drops it and says `section omitted`."""
+    loc = _section_locator(r.section)
+    return [loc[len(" · "):]] if loc else []
+
+
 def _object_row_line(*, title: str, path: str, tags: list[str],
                      preview: tuple[str, str], fields: list[str]) -> str:
     """One row: the fixed-key quoted object, `preview` last, then the
@@ -3075,7 +3176,7 @@ def _hybrid_row_line(r, k: int, *, title: str, path: str, tags: list[str],
 def _hybrid_full_row(r, k: int, extra: tuple[str, ...] = ()) -> str:
     return _hybrid_row_line(
         r, k, title=r.title or "", path=r.path, tags=list(r.tags or []),
-        preview=_hybrid_preview(r), labels=[], extra=extra,
+        preview=_hybrid_preview(r), labels=_hybrid_locator(r), extra=extra,
     )
 
 
@@ -3089,15 +3190,18 @@ def _hybrid_abbreviated_row(r, k: int, room: int, *, extra: tuple[str, ...] = ()
         lambda **kw: _hybrid_row_line(r, k, extra=extra, **kw),
         title=r.title or "", path=r.path, tags=list(r.tags or []),
         preview=_hybrid_preview(r), room=room, cut=cut,
+        labels=["section omitted"] if _hybrid_locator(r) else [],
     )
 
 
 def _abbreviated_row(line_for, *, title: str, path: str, tags: list[str],
-                     preview: tuple[str, str], room: int, cut) -> str:
+                     preview: tuple[str, str], room: int, cut,
+                     labels: list[str] | None = None) -> str:
     """The abbreviation ladder shared by `hybrid_search` and
     `semantic_search(rerank=true)`; `line_for(title=, path=, tags=, preview=,
-    labels=)` renders one candidate line."""
-    labels: list[str] = []
+    labels=)` renders one candidate line. `labels` are the ones the row
+    starts with (`section omitted` when a locator is dropped, #355)."""
+    labels = list(labels or [])
 
     def line() -> str:
         return line_for(title=title, path=path, tags=tags,
@@ -3206,6 +3310,9 @@ def render_hybrid_results(query: str, result, *, budget: int | None = None,
             return ()
         return (_rerank_score_field(rerank_scores[r.path]),)
 
+    # The mixed-generation warning, exactly as the other vector tools give it
+    # (#355, D4): directly after the header, only when the semantic arm ran.
+    transition = transition_line(getattr(result, "rechunk_pending", 0) or 0)
     if not result.rows:
         # The same provenance tokens as a non-empty header, all at zero where
         # nothing was found: an absent token is not evidence of absence.
@@ -3213,6 +3320,8 @@ def render_hybrid_results(query: str, result, *, budget: int | None = None,
             f"No hybrid results for {q_lit}",
             *_hybrid_provenance_tokens(query_cut, result, [], token),
         ])
+        if transition:
+            line += "\n" + transition
         if keyword_only:
             line += "\n" + HYBRID_KEYWORD_ONLY_FOOTER
         return line, []
@@ -3224,6 +3333,8 @@ def render_hybrid_results(query: str, result, *, budget: int | None = None,
     reserved = len(_hybrid_header(q_lit, query_cut, result, page, len(page), token))
     if keyword_only:
         reserved += 1 + len(HYBRID_KEYWORD_ONLY_FOOTER)
+    if transition:
+        reserved += 1 + len(transition)
     reserved += 1 + HYBRID_FOOTER_MAX
     room = limit_chars - reserved
     lines: list[str] = []
@@ -3238,7 +3349,8 @@ def render_hybrid_results(query: str, result, *, budget: int | None = None,
                                              cut=cut))
     shown = page[: len(lines)]
 
-    out = [_hybrid_header(q_lit, query_cut, result, shown, len(page), token), *lines]
+    out = [_hybrid_header(q_lit, query_cut, result, shown, len(page), token),
+           *([transition] if transition else []), *lines]
     if keyword_only:
         out.append(HYBRID_KEYWORD_ONLY_FOOTER)
     omitted = len(page) - len(shown)
@@ -3287,12 +3399,21 @@ def _rerank_score_field(score: float) -> str:
 
 
 def _semantic_rerank_preview(r: dict) -> tuple[str, str]:
-    """`chunk` (the first 200 characters of the stored chunk), the stale
+    """`chunk` (one line of the uncut stored chunk, at most 200 characters,
+    by `_preview_line` as on the `rerank=false` page, #355 D6), the stale
     notice (a stale row's chunk is withheld by the service), or `none`."""
     if r["chunk"] is None:
         return ("stale_notice", _STALE_PREVIEW_NOTICE)
-    chunk = r["chunk"][:HYBRID_CHUNK_PREVIEW_CHARS]
+    chunk = _preview_line(r["chunk"], HYBRID_CHUNK_PREVIEW_CHARS)
     return ("chunk", chunk) if chunk else ("none", "")
+
+
+def _semantic_locator(r: dict) -> list[str]:
+    """The row's section locator as one server field after the markers, as on
+    `hybrid_search` (#355); an abbreviated row drops it with `section
+    omitted`."""
+    loc = _section_locator(r.get("section"))
+    return [loc[len(" · "):]] if loc else []
 
 
 def _semantic_rerank_fields(r: dict, score: float | None) -> list[str]:
@@ -3327,7 +3448,7 @@ def _semantic_rerank_header(q_lit: str, query_cut: bool, rows: list[dict], found
 
 def render_semantic_rerank_results(
     query: str, rows: list[dict], outcome, *, scores: list[float] | None = None,
-    budget: int | None = None,
+    budget: int | None = None, pending: int = 0,
 ) -> tuple[str, list[str]]:
     """`semantic_search(rerank=true)`: the page `rows` (already in final
     order and truncated to `limit`) in the quoted-object encoding, bounded by
@@ -3337,26 +3458,33 @@ def render_semantic_rerank_results(
     limit_chars = settings.max_read_response_chars if budget is None else budget
     q_lit, query_cut = _hybrid_query_echo(query)
     token = outcome.token
+    # The `index_transition:` line directly after the header, as on the
+    # `rerank=false` page (#355, D4), reserved in the budget.
+    transition = transition_line(pending)
     if not rows:
-        return _HYBRID_SEP.join([
+        zero = _HYBRID_SEP.join([
             f"No semantic results for {q_lit} (embeddings may still be building)",
             *(["query_cut"] if query_cut else []),
             "0 stale, 0 truncated",
             token,
             "shown: 0",
-        ]), []
+        ])
+        return zero + ("\n" + transition if transition else ""), []
 
     def score_of(i: int) -> float | None:
         return scores[i] if scores is not None else None
 
     reserved = len(_semantic_rerank_header(q_lit, query_cut, rows, len(rows), token))
+    if transition:
+        reserved += 1 + len(transition)
     reserved += 1 + HYBRID_FOOTER_MAX
     room = limit_chars - reserved
     lines: list[str] = []
     for i, r in enumerate(rows):
         line = _semantic_rerank_line(
             r, score_of(i), title=r["title"] or "", path=r["path"],
-            tags=list(r.get("tags") or []), preview=_semantic_rerank_preview(r), labels=[],
+            tags=list(r.get("tags") or []), preview=_semantic_rerank_preview(r),
+            labels=_semantic_locator(r),
         )
         if 1 + len(line) > room:
             break
@@ -3369,9 +3497,11 @@ def render_semantic_rerank_results(
             title=first["title"] or "", path=first["path"],
             tags=list(first.get("tags") or []), preview=_semantic_rerank_preview(first),
             room=room - 1, cut=_hybrid_cut,
+            labels=["section omitted"] if _semantic_locator(first) else [],
         ))
     shown = rows[: len(lines)]
-    out = [_semantic_rerank_header(q_lit, query_cut, shown, len(rows), token), *lines]
+    out = [_semantic_rerank_header(q_lit, query_cut, shown, len(rows), token),
+           *([transition] if transition else []), *lines]
     omitted = len(rows) - len(shown)
     if omitted:
         out.append(_rerank_cap_footer(omitted))
@@ -4674,6 +4804,9 @@ def find_related_stmt(source_id: int, avg_embedding: list[float], user_id: int |
         select(
             NoteEmbedding.note_id,
             NoteEmbedding.chunk_text,
+            # The locator (#355, D6). Never `embed_prefix`, never the vector.
+            NoteEmbedding.heading_path,
+            NoteEmbedding.section_ordinal,
             NoteMetadata.file_path,
             NoteMetadata.title,
             NoteMetadata.tags,
@@ -4719,6 +4852,11 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
     timing.record_source_path(path)
 
     async with async_session() as session:
+        # One `REPEATABLE READ, READ ONLY` snapshot for the source read, the
+        # vector query and the transition count (#355, D4). First statement.
+        await session.execute(
+            text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        )
         # `db_ms` covers every database phase of this tool, the source-chunk
         # fetch included — it is accumulated, so the early returns below still
         # report the work they actually did.
@@ -4802,6 +4940,8 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
         # dedupe, so the nearest chunk per note and the presented order are
         # both full precision.
         rows = sorted(rows, key=lambda r: r.distance)
+        # The owner-scoped transition count, in the vector query's snapshot.
+        pending = await rechunk_pending_count(session, uid)
 
     if not rows:
         # A **true** zero-result: the source exists, it is embedded, the exact
@@ -4815,10 +4955,10 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
         # the vector searched with describes content the note no longer has.
         # A first draft put this line only above a non-empty list, which loses
         # it exactly where it explains the most.
-        empty = [f"No related notes for `{path}`"]
+        empty = [f"No related notes for `{_header_scalar(path)}`"]
         if source_stale:
             empty.append(_stale_source_line(path))
-        return "\n".join(empty)
+        return "\n".join(_with_transition(empty, pending))
 
     # Dedupe by note_id, keeping the nearest chunk — ranked by the
     # full-precision cosine distance the database selected (#283: the scan
@@ -4846,6 +4986,8 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
                 # remedy depends on which tool the caller happened to reach
                 # for.
                 "chunk": None if stale else r.chunk_text,
+                # Withheld on a stale row, absent on a pre-034 one (D6).
+                "section": section_of(r, stale),
                 "stale": stale,
                 # From the durable column, never inferred from the number of
                 # chunk rows: a capped note holds exactly the cap.
@@ -4859,7 +5001,7 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
     stale_count = sum(1 for r in ranked if r["stale"])
     truncated_count = sum(1 for r in ranked if r["embedding_truncated"])
     lines = [
-        f"Top {len(ranked)} related notes for `{path}` — "
+        f"Top {len(ranked)} related notes for `{_header_scalar(path)}` — "
         f"{stale_count} stale, {truncated_count} truncated:\n"
     ]
     if source_stale:
@@ -4870,14 +5012,14 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
             f"- **{r['title']}** (`{r['path']}`){tags_str} — "
             f"sim: {1 - r['distance']:.3f}"
             f"{_degradation_suffix(r['stale'], r['embedding_truncated'])}"
+            f"{_section_locator(r.get('section'))}"
         )
         if r["chunk"] is None:
             lines.append(f"  > {_STALE_PREVIEW_NOTICE}")
         else:
-            snippet = r["chunk"].replace("\n", " ")[:200]
-            lines.append(f"  > {snippet}…")
+            lines.append(f"  > {_preview_line(r['chunk'], 200)}…")
     lines.extend(_degradation_footer(stale_count, truncated_count))
-    return "\n".join(lines)
+    return "\n".join(_with_transition(lines, pending))
 
 
 @_tracked("find_orphans", ["folder", "limit"])

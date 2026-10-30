@@ -198,6 +198,9 @@ class _Result:
     def scalar_one_or_none(self):
         return self._rows[0] if self._rows else None
 
+    def scalar(self):
+        # The transition count (#355): an empty batch is zero.
+        return self._rows[0] if self._rows else 0
 
 class _Session:
     """Serves one batch per non-`SET LOCAL` statement, recording each."""
@@ -207,7 +210,7 @@ class _Session:
         self.statements: list = []
 
     async def execute(self, clause, *_a, **_k):
-        if str(clause).lstrip().upper().startswith("SET LOCAL"):
+        if str(clause).lstrip().upper().startswith(("SET LOCAL", "SET TRANSACTION")):
             return _Result()
         self.statements.append(clause)
         return _Result(self._batches.pop(0) if self._batches else [])
@@ -228,7 +231,7 @@ def _quiet_usage(monkeypatch):
 
 
 def _embedding(monkeypatch, dim):
-    async def _fake(_text):
+    async def _fake(_text, **_kw):
         return [1.0] + [0.0] * (dim - 1)
 
     monkeypatch.setattr("src.services.embeddings.get_embedding", _fake)
@@ -319,7 +322,7 @@ class _FindRelatedSession(_Session):
         self._preamble = [[source], [[1.0] + [0.0] * 1023]]
 
     async def execute(self, clause, *_a, **_k):
-        if not str(clause).lstrip().upper().startswith("SET LOCAL") and self._preamble:
+        if not str(clause).lstrip().upper().startswith(("SET LOCAL", "SET TRANSACTION")) and self._preamble:
             return _Result(self._preamble.pop(0))
         return await super().execute(clause, *_a, **_k)
 

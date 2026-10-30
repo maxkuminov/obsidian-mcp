@@ -1007,6 +1007,39 @@ and needs nothing; the real run is this path, from a checkout with
 
 Drop the scratch container afterwards (`docker rm -f omcp-eval`).
 
+#### Before and after a re-chunk or re-embed
+
+A change that alters what is embedded (the chunking format, the context
+prefix, the embedding model) needs the incumbent code on the pre-change copy
+for the baseline and the new code on the *same* copy after a re-embed. The
+harness's `runfile:` arms carry the baseline across:
+
+1. Steps 1–4 above: export, `BACKUP_FULL=1` backup, restore into a scratch
+   copy, snapshot.
+2. **Baseline generation**, from a checkout of the incumbent release:
+   `make search-eval … ARMS="keyword semantic"`. Keep that generation's
+   staged `semantic` arm file (`.search-eval/runs/<generation>/semantic.json`).
+3. **Upgrade and re-embed the copy** with the candidate image, as a one-off
+   container: `DATABASE_URL` is the scratch copy, the vault is mounted
+   **read-only** at the path the copy's `users.vault_path` names, no port is
+   published, and the provider settings are production's. Its startup runs
+   the migrations and its indexer re-embeds. To finish in one sitting, set
+   `EMBED_TIME_BUDGET_SECONDS_PER_USER=0` and `EMBED_CHUNK_BUDGET_PER_USER=0`
+   **on that container only**. Wait until
+   `SELECT count(*) FROM notes_metadata WHERE embedded_content_hash IS DISTINCT FROM content_hash OR embedded_chunking_version IS DISTINCT FROM 1`
+   reads 0, then stop it. A residue that does not drain is notes whose bytes
+   changed since the backup: report it, do not chase it. Record
+   `SELECT count(*) FROM note_embeddings` and the pass durations in
+   `indexer_runs`; that is your production estimate.
+4. **Candidate generation**, from the candidate checkout:
+   `make search-eval … ARMS="keyword semantic runfile:<baseline semantic file>" BASELINE=runfile:<baseline semantic file>`.
+   Each semantic arm in `report.json` carries its `retrieval_fingerprint`
+   (the embedding settings, the chunking version and a digest of
+   `EMBEDDING_QUERY_INSTRUCTION`, never the text) and the copy's
+   `legacy_chunked_notes`, counted for the export's owner. That count must
+   be 0 for the report to be evidence.
+5. Attach `report.json` only if `attachable: true`, as above.
+
 ### Reranker (optional)
 
 `semantic_search` and `hybrid_search` accept `rerank=true`, which asks a
@@ -1057,6 +1090,42 @@ authentication header.
 argument is new and optional. Rolling back is a redeploy of the previous
 image; a client still sending `rerank` is then refused by the
 unknown-argument rule.
+
+## Upgrading to migration 034 (heading-aware chunks)
+
+Migration 034 adds five nullable columns (the chunk's heading path, section
+ordinal and context prefix on `note_embeddings`; the chunking version and an
+input digest on `notes_metadata`) and two CHECKs. It is metadata-only plus one
+constraint validation over the embedding table, which takes seconds. Nothing
+is backfilled.
+
+- **Startup does not refuse.** The stored embedding fingerprint is
+  unchanged, so there is no `make reset-embeddings`. The startup log gains an
+  `Embedding retrieval: {…}` line.
+- **The vault is re-embedded in the background.** Every note embedded before
+  034 is selected again, note by note, after any real edit, and the work is
+  held to `EMBED_TIME_BUDGET_SECONDS_PER_USER` / `EMBED_CHUNK_BUDGET_PER_USER`
+  per pass **in every mode, single-user included**. Heading-aware chunking
+  makes more, smaller chunks (expect roughly 1.3× to 2.5× the old count), so
+  on a vault of a few thousand notes and a GPU Ollama this is tens of minutes
+  of provider time spread over a few hours of passes. Measure it on a
+  restored copy first (above) if you want a number.
+- **What you see meanwhile.** Search keeps answering from the old vectors
+  until each note's new ones land. Old rows have previews but no `§`
+  locator. Every `semantic_search` / `find_related` response carries an
+  `index_transition: N notes not yet re-chunked; …` line until your notes have
+  drained, because ranking across the two generations is approximate. The
+  dashboard's pending count starts near your note count and falls each pass;
+  a budget stop logs one WARNING per tenant per pass and is not a run error.
+  `/health` stays `ok`; its `indexer.rechunk` field reads `"in_progress"`
+  and then `"complete"` (a state, never a count). Queries share Ollama with
+  the re-embed batches, so a search can wait up to one batch (2–3 s).
+- **Rollback.** Roll forward if you can. Otherwise run `alembic downgrade 033`
+  with the **new** image first: it deletes the heading-era vector rows and
+  un-certifies their notes (the old build would otherwise reuse vectors of
+  prefixed input as if they were the bare chunk's), then deploy the old
+  image, which re-embeds those notes. Until it does, they are missing from
+  semantic search.
 
 ## Upgrading: split database roles
 

@@ -57,6 +57,9 @@ class _Result:
     def scalar_one_or_none(self):
         return self._rows[0] if self._rows else None
 
+    def scalar(self):
+        # The transition count (#355): an empty batch is zero.
+        return self._rows[0] if self._rows else 0
 
 class _Session:
     def __init__(self, batches=()):
@@ -165,7 +168,7 @@ def captured(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _fake_embedding(monkeypatch):
-    async def _fake(_text):
+    async def _fake(_text, **_kw):
         return [1.0, 0.0, 0.0]
 
     monkeypatch.setattr("src.services.embeddings.get_embedding", _fake)

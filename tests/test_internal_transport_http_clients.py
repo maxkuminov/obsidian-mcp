@@ -167,7 +167,7 @@ async def test_ollama_does_not_follow_a_redirect(monkeypatch):
         return_value=httpx.Response(200, json={"embeddings": [[0.1]]})
     )
     with pytest.raises(httpx.HTTPStatusError):
-        await embeddings.OllamaProvider().embed_one("text")
+        await embeddings.OllamaProvider().embed_one("text", kind="query")
     assert target.call_count == 0
 
 

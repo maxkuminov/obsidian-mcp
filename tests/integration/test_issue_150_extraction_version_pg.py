@@ -110,6 +110,16 @@ async def seed_pre_150(sessionmaker, root, notes):
                 content_hash=h,
                 embedded_content_hash=h,
                 extraction_version=0,
+                # A post-034 database with a stale extraction marker (#355):
+                # certified under the current chunking version, with the
+                # digest of what the current code sends for these title and
+                # tags, so only the grammar decides what is invalidated.
+                embedded_chunking_version=embeddings_service.CHUNKING_VERSION,
+                embedded_input_digest=embeddings_service.input_digest(
+                    embeddings_service.note_provider_inputs(
+                        body, rel.removesuffix(".md"), tags
+                    )
+                ),
             )
             session.add(note)
             await session.flush()
@@ -120,6 +130,9 @@ async def seed_pre_150(sessionmaker, root, notes):
                     chunk_index=0,
                     chunk_text="stale chunk",
                     embedding=[1.0] + [0.0] * (DIM - 1),
+                    heading_path=[],
+                    section_ordinal=0,
+                    embed_prefix=rel.removesuffix(".md"),
                 )
             )
         await session.commit()
@@ -151,7 +164,10 @@ async def link_targets(sessionmaker, note_id):
 
 CORPUS = [
     ("Spans.md", SPANS_CHANGE, ["stale-tag"]),
-    ("Plain.md", PLAIN, ["P"]),
+    # No tags under either grammar: since #355 a tag difference alone
+    # invalidates (the tags are in the embedded prefix), so the seed carries
+    # exactly what extraction yields.
+    ("Plain.md", PLAIN, []),
     ("Buried.md", BURIED, ["buried", "visible"]),
 ]
 
@@ -176,7 +192,7 @@ async def test_version_two_mask_decided_rows_are_repaired_without_reembedding(
         )).one()
     before = (await rows(sessionmaker))["Source.md"]
 
-    async def unexpected_provider_call(chunks):
+    async def unexpected_provider_call(chunks, **_kw):
         pytest.fail("A link-only version bump must not call the embedding provider")
 
     monkeypatch.setattr(embeddings_service, "get_embeddings_batch", unexpected_provider_call)
@@ -267,7 +283,7 @@ async def test_the_embed_pass_rebuilds_exactly_the_invalidated_notes(
 
     embedded: list[str] = []
 
-    async def counting_batch(chunks):
+    async def counting_batch(chunks, **_kw):
         embedded.extend(chunks)
         return [[1.0] + [0.0] * (DIM - 1) for _ in chunks]
 

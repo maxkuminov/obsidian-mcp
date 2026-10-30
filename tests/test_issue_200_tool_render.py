@@ -56,13 +56,16 @@ class _Result:
     def scalar_one_or_none(self):
         return self._rows[0] if self._rows else None
 
+    def scalar(self):
+        # The transition count (#355): an empty batch is zero.
+        return self._rows[0] if self._rows else 0
 
 class _Session:
     def __init__(self, batches=()):
         self._batches = list(batches)
 
     async def execute(self, clause, *_a, **_k):
-        if str(clause).lstrip().upper().startswith("SET LOCAL"):
+        if str(clause).lstrip().upper().startswith(("SET LOCAL", "SET TRANSACTION")):
             return _Result()
         return _Result(self._batches.pop(0) if self._batches else [])
 
@@ -82,7 +85,7 @@ class _FindRelatedSession(_Session):
         self._preamble = [[source] if source else [], chunks]
 
     async def execute(self, clause, *_a, **_k):
-        if not str(clause).lstrip().upper().startswith("SET LOCAL") and self._preamble:
+        if not str(clause).lstrip().upper().startswith(("SET LOCAL", "SET TRANSACTION")) and self._preamble:
             return _Result(self._preamble.pop(0))
         return await super().execute(clause, *_a, **_k)
 
@@ -166,7 +169,7 @@ def captured(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _no_provider(monkeypatch):
-    async def fake_get_embedding(_text):
+    async def fake_get_embedding(_text, **_kw):
         return [1.0, 0.0, 0.0]
 
     monkeypatch.setattr(embeddings, "get_embedding", fake_get_embedding)

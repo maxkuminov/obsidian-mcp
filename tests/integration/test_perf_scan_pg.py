@@ -99,7 +99,7 @@ async def world(engine, monkeypatch, tmp_path):
 
     provider = {"n": 0, "fail": False}
 
-    async def fake_batch(chunks):
+    async def fake_batch(chunks, **_kw):
         provider["n"] += 1
         if provider["fail"]:
             raise RuntimeError("provider down")
@@ -508,6 +508,11 @@ async def test_an_edit_undone_between_scan_and_sweep_does_not_hide_a_note(
     patterns.set([])
     indexer._last_full_hash.clear()
     indexer.clear_sweep_state()
+    # Not the full-hash pass: since #355 that pass's input-digest backstop
+    # would itself clear this certification (the excluded note's digest is of
+    # `[]`, and it is now included), which repairs the note through the
+    # backlog and takes the sweep out of the race this test is about.
+    indexer._last_full_hash[None] = time.monotonic()
     await indexer.index_vault()  # reads A: the row is unchanged
 
     real = indexer.read_note_beneath

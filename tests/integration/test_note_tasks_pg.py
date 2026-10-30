@@ -81,10 +81,10 @@ async def vault(sessionmaker, monkeypatch, tmp_path):
     monkeypatch.setattr(embeddings_service, "async_session", sessionmaker, raising=False)
     monkeypatch.setattr(indexer, "_is_paused", lambda: False)
 
-    async def fake_batch(chunks):
+    async def fake_batch(chunks, **_kw):
         return [list(VECTOR) for _ in chunks]
 
-    async def fake_one(_text):
+    async def fake_one(_text, **_kw):
         return list(VECTOR)
 
     async def noop(*_a, **_k):
@@ -307,7 +307,7 @@ async def test_the_v3_to_v4_backfill_stamps_4_and_re_embeds_nothing(
         await session.commit()
     assert "not yet scanned for tasks: 1 notes" in await tools.list_tasks_impl()
 
-    async def unexpected(_chunks):
+    async def unexpected(_chunks, **_kw):
         pytest.fail("the version-4 bump must not call the embedding provider")
 
     monkeypatch.setattr(embeddings_service, "get_embeddings_batch", unexpected)

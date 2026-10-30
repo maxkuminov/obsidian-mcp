@@ -237,7 +237,7 @@ async def seeded(sessionmaker, monkeypatch):
 
 
 async def test_semantic_search_orders_dedupes_and_scores(sessionmaker, seeded, monkeypatch):
-    async def fake_get_embedding(text_: str):
+    async def fake_get_embedding(text_: str, **_kw):
         return QUERY
 
     monkeypatch.setattr(
@@ -256,7 +256,7 @@ async def test_semantic_search_orders_dedupes_and_scores(sessionmaker, seeded, m
     # they read false and the chunk preview is present.
     assert set(results[0]) == {
         "path", "title", "tags", "chunk", "chunk_index", "similarity",
-        "stale", "embedding_truncated",
+        "stale", "embedding_truncated", "section",
     }
     assert all(r["stale"] is False for r in results)
     assert all(r["embedding_truncated"] is False for r in results)

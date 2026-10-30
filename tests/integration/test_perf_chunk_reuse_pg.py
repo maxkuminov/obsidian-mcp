@@ -101,8 +101,17 @@ class _Provider:
         self.sent: list[list[str]] = []
         self._during = during
 
-    async def __call__(self, chunks):
-        self.sent.append(list(chunks))
+    async def __call__(self, inputs, *, kind):
+        # #355: every input is `prefix + "\n\n" + chunk`; this note has no
+        # headings, so the prefix is its title alone. Record and "embed" the
+        # bare chunk so the reuse assertions below read in chunk terms.
+        assert kind == "document"
+        chunks = []
+        for item in inputs:
+            prefix, chunk = item.split("\n\n", 1)
+            assert prefix == "Note", item
+            chunks.append(chunk)
+        self.sent.append(chunks)
         if self._during is not None:
             await self._during()
         return [vector_of(c) for c in chunks]
