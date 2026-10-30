@@ -283,10 +283,13 @@ the wire, so none is cut off by a client's description limit.
 - `keyword_search(query, folder?, tags?, frontmatter?, limit=20)`,
   full-text via PostgreSQL `tsvector`. A note's title and frontmatter
   `aliases` rank above its body, so a query that is a note's title finds
-  that note first; bare terms are ANDed, and when the full matches do not
+  that note first; its tags (frontmatter and inline `#tags`, a nested
+  `#a/b` also as `a` and `b`) are indexed below the title and above the
+  body, and `matched_in` names which of `title`, `tags` and `body`
+  matched; bare terms are ANDed, and when the full matches do not
   fill the page, partial matches follow tagged `match: any`; every row
   carries a `snippet:` with the matches highlighted (or `head:`, the
-  note's opening words, for a title match). The text-search config(s) are
+  note's opening words, for a title or tags match). The text-search config(s) are
   configurable via `FTS_CONFIGS` (see
   [Full-text search language(s)](#full-text-search-languages))
 - `semantic_search(query, folder?, tags?, frontmatter?, limit=15, rerank=false)`,
@@ -963,7 +966,24 @@ naming conventions, and YAML schema before it writes anything.
 ## Upgrading
 
 Pull, then `make deploy` (or rebuild your compose stack); migrations
-run on start. Across the reranker release (#367):
+run on start. Across the keyword-tags release (migration 035, #391):
+
+- **Tags become searchable at once.** Migration 035 adds each note's tags
+  to its keyword vector in place, in SQL, under the index generation lock
+  (tens of seconds on a few thousand notes); nothing is re-embedded or
+  re-derived and no setting is new. `make deploy` stops the app before
+  the migration; on a hand-driven compose stack: stop → `alembic upgrade
+  head` → start.
+- **Run the read-only check first.** 035 aborts with nothing written if a
+  tagged vector would cross PostgreSQL's 1 MiB tsvector limit; under
+  Kubernetes `Recreate` that is downtime until the digest is reverted.
+  [DEPLOYMENT.md, "Upgrading across migration 035"](./DEPLOYMENT.md#upgrading-across-migration-035-tags-in-keyword-search-391)
+  has the statement to run against the live database before merging and
+  the remedy.
+- **Rollback**: `alembic downgrade 034` with the new image strips the
+  tags part, then deploy the previous image.
+
+Across the reranker release (#367):
 
 - **No migration, nothing re-derived or re-embedded.** `semantic_search`
   and `hybrid_search` gain an optional `rerank` argument (default false,
@@ -1307,7 +1327,7 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `MAX_FILE_WRITE_BYTES` | `26214400` | `write_file` cap (25 MB), decoded byte length |
 | `MAX_READ_RESPONSE_CHARS` | `40000` | `read_note` / `read_file` cap on what is returned to the caller (≈10K tokens). See [Response size limits](#response-size-limits). |
 | `FTS_CONFIGS` | `english` | Keyword-search text-search config(s). JSON or CSV. See [Full-text search language(s)](#full-text-search-languages). |
-| `RANK_WEIGHTS` | `{0.02, 0.2, 0.4, 1.0}` | `keyword_search`'s `ts_rank_cd` weight array `{D, C, B, A}`: the title and aliases are indexed at `A`, the body at `D`. At the default one two-word title match outweighs fifty body repetitions; PostgreSQL's own `D=0.1` lets ten tie it. Four finite numbers, each in [1e-6, 1]; only title-versus-body order moves. |
+| `RANK_WEIGHTS` | `{0.02, 0.2, 0.4, 1.0}` | `keyword_search`'s `ts_rank_cd` weight array `{D, C, B, A}`: the title and aliases are indexed at `A`, the tags at `B`, the body at `D` (`C` is unused). At the default one two-word title match outweighs fifty body repetitions, and one tag match ranks below a title match and equals twenty body matches; PostgreSQL's own `D=0.1` lets ten body repetitions tie the title. Four finite numbers, each in [1e-6, 1]; body-only order never moves. |
 | `KEYWORD_EXCERPT_CHARS` | `20000` | Leading characters of each note's indexed text stored for `keyword_search` snippets (1000–100000). Applies to notes indexed afterwards; `make rebuild-tsvectors` rewrites the rest. The snippet cost grows roughly linearly with this; the 300 ms budget was measured at the defaults. |
 | `KEYWORD_SNIPPET_ROWS` | `20` | Rows per `keyword_search` page that get a snippet, whatever `limit` is (0–100; 0 turns snippets off). Bounds the per-call `ts_headline` cost, which grows roughly linearly with this; the 300 ms budget was measured at the defaults. |
 | `HYBRID_RRF_K` | `60` | `hybrid_search`'s reciprocal-rank-fusion constant (1–1000; out of range refuses to start): a note scores the sum over the two arms of `1/(k + rank)`. Smaller lets each arm's top ranks dominate; larger flattens toward counting votes. Measure a change with the harness arms `scripts.search_eval_arms.hybrid:make_arm` / `make_arm_alt` (`ARM_OPTS="hybrid_k=60 hybrid_alt_k=20"`, see `DEPLOYMENT.md`, "Measuring search quality"); there is no per-call argument. |
@@ -1475,9 +1495,12 @@ controlled by `FTS_CONFIGS`. It defaults to `english`, which reproduces
 the historical behavior exactly, so existing deployments need no action.
 
 The vector holds the note's **title and frontmatter `aliases` at weight
-`A`** and its body at weight `D`, per configured config, and ranking
+`A`**, its **tags at weight `B`** (frontmatter `tags` and inline `#tags`;
+a nested tag also as each `/`-segment, so `#ctx/phone` is found by
+`phone`) and its body at weight `D`, per configured config, and ranking
 uses `RANK_WEIGHTS` — so a query that is a note's title ranks that note
-first, where it used to lose to a long note repeating the words. Bare
+first, where it used to lose to a long note repeating the words, and a
+note tagged with a word ranks above one that only mentions it. Bare
 terms are ANDed; when the full matches do not fill the page, the same
 terms OR-ed fill the rest, tagged `match: any`. Each row carries a
 `snippet:` built from a stored excerpt of the indexed text

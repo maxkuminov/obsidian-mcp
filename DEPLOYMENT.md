@@ -750,7 +750,7 @@ deployment; on a compose-file deployment the equivalents are plain
   `docker compose -f docker-compose.simple.yml run --rm obsidian-mcp alembic upgrade head`,
   then `up -d` (the Makefile's `make deploy` does this by itself when
   `alembic current` is behind `alembic heads`). A migration that rewrites
-  rows in place — 031 below is one — must not race an old-image process
+  rows in place — 031 below and 035 are two — must not race an old-image process
   that still writes them. After a release that carries one, confirm the
   schema agrees with the models:
   `docker compose -f docker-compose.simple.yml exec obsidian-mcp alembic check`
@@ -1090,6 +1090,95 @@ authentication header.
 argument is new and optional. Rolling back is a redeploy of the previous
 image; a client still sending `rerank` is then refused by the
 unknown-argument rule.
+
+## Upgrading across migration 035 (tags in keyword search, #391)
+
+Migration 035 puts a note's tags into its keyword vector, so
+`keyword_search` (and `hybrid_search`'s keyword arm) finds a note by a word it
+carries only as a tag — frontmatter `tags` or an inline `#tag`, and for a
+nested `#a/b` also `a` and `b`. The vector becomes `A(title) || A(aliases)
+|| B(tags) || D(body)`: a tag hit ranks below a title hit and above a body
+hit under the unchanged `RANK_WEIGHTS` default. `matched_in` gains `tags`.
+No new setting, no schema object, nothing re-embedded, no extraction-version
+bump.
+
+- **What it does.** Under the index generation lock, in SQL from the stored
+  `title`, `frontmatter` and `tags` columns (no file access), it adds the
+  tags part to every vector that has none yet and whose tags produce a word.
+  Untagged notes are not touched. It rewrites each tagged vector once:
+  measured at about 30–40 seconds for 4,265 synthetic notes of 1,800 words
+  with three tags each on a local PostgreSQL 16 (most of it the rewrite, the
+  rest the preflight); shorter notes take less. On Kubernetes that time is
+  added to the `Recreate` gap.
+- **Stop the app before migrating** (stop → migrate → start). An old-image
+  process that writes a vector after 035 commits writes it without tags, and
+  035 never runs again. `make deploy` stops the app by itself when a
+  migration is pending; Kubernetes `Recreate`s. If you migrate a compose
+  stack by hand and get this wrong, `make rebuild-tsvectors` repairs it.
+- **All or nothing, with a size preflight.** Before writing anything, 035
+  estimates every rewritten vector against PostgreSQL's 1 MiB tsvector limit
+  and aborts, naming the row ids, if any would exceed it; any error during
+  the rewrite also fails the whole migration naming the row id and SQLSTATE.
+  Nothing is committed, so the database is still at 034. **Under Kubernetes
+  `Recreate` an abort is downtime**: the old pod is already gone and the new
+  pod's `migrate` initContainer fails, so nothing serves until you revert the
+  image digest.
+- **Check before merging.** Run this read-only statement against the live
+  database (034) first. It reports counts and ids only. It shows one FTS
+  config (`english`); with several, add one `to_tsvector` per config to `b`.
+  `flagged` must be `0` before you upgrade.
+
+  ```sql
+  WITH tagged AS (
+    SELECT id, content_tsvector AS v,
+           setweight(to_tsvector('english',
+             array_to_string(tags, E'\n') || E'\n' ||
+             replace(array_to_string(tags, E'\n'), '/', ' ')), 'B') AS b
+    FROM notes_metadata
+    WHERE content_tsvector IS NOT NULL AND cardinality(tags) > 0
+      AND length(ts_filter(content_tsvector, '{b}')) = 0
+  ), est AS (
+    SELECT id,
+      (SELECT coalesce(sum((octet_length(lexeme) + 1) / 2 * 2
+         + CASE WHEN cardinality(positions) > 0 THEN 2 + 2 * cardinality(positions) ELSE 0 END), 0)
+       FROM unnest(v))
+    + (SELECT coalesce(sum((octet_length(lexeme) + 1) / 2 * 2
+         + CASE WHEN cardinality(positions) > 0 THEN 2 + 2 * cardinality(positions) ELSE 0 END), 0)
+       FROM unnest(b)) AS bytes
+      , length(ts_filter(v, '{a}')) = 0 AS d_only
+    FROM tagged WHERE length(b) > 0
+  )
+  SELECT count(*) AS tagged_rows,
+         count(*) FILTER (WHERE bytes > 1048511 OR d_only) AS flagged,
+         array_agg(id ORDER BY id) FILTER (WHERE bytes > 1048511 OR d_only) AS ids,
+         count(*) FILTER (WHERE d_only) AS d_only,
+         max(bytes) AS largest
+  FROM est;
+  ```
+
+  A row is flagged when its estimate is over the limit, **or** when its
+  vector has no title part at all (`d_only`: a note 031 left at the size
+  limit). 035 builds such a row's whole title-and-aliases head, which the
+  stored vector does not show, so the statement flags every one of them
+  rather than guess. A flag on a short note whose title is only stop words
+  (`The`) is harmless. Fix a flagged row before upgrading: shorten the note
+  (its body or its tags), or let the current image rewrite it through its
+  size retreat — edit the note, or run `make rebuild-tsvectors` — after which
+  it has a title part and the size check applies to it; then run the
+  statement again.
+- **If 035 fails anyway.** The database is still at 034: serve the previous
+  image (on Kubernetes, revert the digest), shorten the named note's body or
+  tags so that its vector is smaller, let the previous image re-index it,
+  and deploy again.
+- **Optional afterwards.** A tagged note that already had a title part keeps
+  its body positions shifted by the old head's length; matching and
+  single-part ranking are exact, and a cover spanning the tags and the body
+  scores marginally lower until the note is next written. `make
+  rebuild-tsvectors` makes every vector byte-exact; it is not required.
+- **Rollback.** `alembic downgrade 034` (with the new image) strips every tags
+  part, then deploy the previous image.
+- Afterwards, `alembic check` should print "No new upgrade operations
+  detected."
 
 ## Upgrading to migration 034 (heading-aware chunks)
 

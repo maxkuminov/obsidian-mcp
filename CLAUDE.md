@@ -368,9 +368,11 @@ update it in the same change.** What stays here is the short list:
   the stamp records only when an in-transaction re-read finds every surviving
   row current, after re-resolving every link target. A skip (including an
   unlisted directory) withholds only over a row that is not current.
-- **The keyword vector is `A(title) || A(aliases) || D(body)`** (#344,
-  migration 031), built by the one builder in `src/services/fts.py` for every
-  writer, ranked with `ts_rank_cd(RANK_WEIGHTS, …)` (`{0.02,0.2,0.4,1.0}`, a
+- **The keyword vector is `A(title) || A(aliases) || B(tags) || D(body)`**
+  (#344, #391, migrations 031/035), built by the one builder in
+  `src/services/fts.py` for every writer — a required `tags_bind` that every
+  `src/` writer passes (`fts.tags_text`: each tag plus its `/`-segments,
+  2,048 chars on whole tags) and only 031 passes `None` (AST-pinned) — ranked with `ts_rank_cd(RANK_WEIGHTS, …)` (`{0.02,0.2,0.4,1.0}`, a
   bound `float4[]`) so one title cover outweighs fifty body covers.
   `keyword_search` runs the conjunction first (`match: all`) and, when it
   under-fills the page, a disjunction **derived per config from PostgreSQL's
@@ -386,7 +388,11 @@ update it in the same change.** What stays here is the short list:
   `make rebuild-tsvectors`. 031 re-heads in SQL under the generation lock
   with the **stored fingerprint's** configs and skips rows already headed
   (`rehead` is not position-idempotent); its downgrade strips every `A`
-  lexeme. **Both move paths re-head under the generation lock with the
+  lexeme. 035 does the same for tags after a read-only size preflight
+  (abort above 1,048,511 bytes, naming ids), all-or-nothing, skipping rows
+  already carrying a `B` lexeme or whose tags yield none; downgrade keeps
+  `{a,d}`. `matched_in` is six `ts_filter` flags → eleven values (`title`,
+  `tags`, `body`, comma-joined, or the first `+` split). **Both move paths re-head under the generation lock with the
   fingerprint re-read** — the title is inside the vector — and `make deploy`
   stops the app before a pending migration. See
   [search](docs/architecture/search.md).

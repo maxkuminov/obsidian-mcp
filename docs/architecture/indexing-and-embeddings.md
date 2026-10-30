@@ -428,7 +428,8 @@ reused) until its next edit or the next full-hash backstop.
   bytes through `set_frontmatter`. One shared token helper, `.nan` / `.inf` /
   `-.inf`, keys included — see [the section below](#non-finite-frontmatter-numbers-and-the-one-title-rule-154),
   which also names the one title rule every surface shares.
-- **The keyword vector is `A(title) || A(aliases) || D(body)` and stores its
+- **The keyword vector is `A(title) || A(aliases) || D(body)` (since 035 with
+  `B(tags)` before the body, below) and stores its
   excerpt** (#344, migration 031). One builder, `fts.index_tsvector_sql`,
   produces the fragment for every writer — title parts for every config, then
   aliases parts, then the pre-031 content parts byte for byte — and the same
@@ -458,6 +459,36 @@ reused) until its next edit or the next full-hash backstop.
   fingerprint it records still certifies configs only (weights are not
   configuration, and a `FINGERPRINT_VERSION` bump would invalidate the
   embedding fingerprint too). See [search](search.md#keyword-ranking-the-disjunctive-fill-and-the-snippet-344).
+- **Tags enter the vector at weight `B`, between the head and the body**
+  (#391, migration 035): `A(title) || A(aliases) || B(tags) || D(body)`.
+  The tags text is `fts.tags_text` over the list `vault.extract_tags`
+  returns — exactly what `notes_metadata.tags` stores — one line per tag
+  with a nested tag's `/`-segments appended (`ctx/phone ctx phone`), cut at
+  2,048 characters on a whole line (the head stays small against the 1 MiB
+  limit; the halving retreat shrinks only the body). Every builder takes a
+  required `tags_bind`, and every writer passes one: the **incremental
+  pass** binds `tags_text(entry["tags"])`, the same entry whose `tags`
+  column the upsert wrote in that transaction (bind name `tags_text`, so it
+  cannot collide with the `tags` column bind); the **indexer move-pair**
+  binds the entry parsed for the new path (`head_tags`); **`move_note`**
+  derives the tags from the destination read through `extract_tags(body,
+  frontmatter)` and, when that read or parse fails, falls back to the
+  caller's **own** row's stored `tags`, selected with the stored frontmatter
+  in the one owner-predicated statement (best-effort, self-healing at the
+  next content change, like the title fallback); the **rebuild** binds
+  `extract_tags` over the bytes it verified (off the loop). Only migration
+  031 builds without tags (`tags_bind=None`), so an upgrade from 030 runs
+  031's A-only re-head and then 035. **A tag edit rewrites the vector**: tags
+  come from the note's bytes, so a frontmatter or inline tag change changes
+  `content_hash`, the note enters `to_upsert`, and the tsvector UPDATE runs
+  for it in the same pass — no extraction-version bump. #355's rule (the
+  upsert clears `embedded_content_hash` when title or tags change) is
+  independent: it governs re-embedding, not the keyword vector. Migration
+  035 re-heads the stored vectors in SQL (see [schema and
+  migrations](schema-and-migrations.md#035-tags-in-the-keyword-vector-391));
+  both move paths' re-head replaces the tags part along with the title and
+  aliases (`head(title, aliases, tags) || ts_filter(v, '{d}')`). See
+  [search](search.md#tags-in-the-keyword-vector-391).
 - **The keyword vector attempts the full note and retreats per note** (#127).
   Both writers bound `content[:100000]`, so every term past that was invisible
   to `keyword_search` on a note the tool still reported. `write_tsvector_bounded`

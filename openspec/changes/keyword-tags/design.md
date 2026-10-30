@@ -503,3 +503,69 @@ Verdict on 83b7c75: all six round-1 fixes VERIFIED; one new MAJOR, folded.
 Codex spec review, round 3 (2026-10-30): PASS — the round-2 fix VERIFIED,
 no findings. The `d_only` flag in the operator statement catches the D-only
 row that passed `S(v) + S(B)`, and every round-1 fix stands.
+
+## Implementation notes (2026-10-30)
+
+Choices made while implementing, and where the code meets the spec at an
+angle. Nothing here changes a requirement.
+
+1. **`head` is tri-state in the service.** `None` = no head computed (a
+   snippet was shown, the row is beyond the cap, or the excerpt is NULL); a
+   string = computed, the **empty string** for an empty excerpt (a note with
+   no body). `render_keyword_results` decides by `is None` / `!= ""`, never
+   truthiness; `has_excerpt` (`body_excerpt IS NOT NULL`) still drives the
+   no-excerpt count, so an empty-body row is not counted.
+2. **`matched_in` is a pure function** (`search.matched_in_from_flags`) over
+   the six labels of `search.MATCHED_IN_FLAGS`; a missing flag reads as false.
+   A table test over every consistent assignment (three terms over three
+   parts) reaches all eleven values.
+3. **`move_note`'s head falls back as one unit.** The destination read sets
+   title, frontmatter and tags together or not at all; on any failure the
+   one owner-predicated statement selects `frontmatter, tags` and the title
+   is derived from that frontmatter (previously title and aliases already
+   fell back together).
+4. **035's error text carries no note data.** `RowFailure` and the preflight
+   refusal are raised `from None`, because SQLAlchemy's wrapped error prints
+   the bound parameters (title, aliases and tags text) into the deploy log.
+   The SQLSTATE is read by 031's chain walk before the original is dropped.
+5. **035's preflight skips rows with an empty tags text without a
+   statement** and counts them, with rows whose tags text yields no lexeme,
+   as "without tag lexemes"; the summary line is `N re-headed, N already
+   tagged, N without tag lexemes`. `preflight` and `rewrite` take a bind so
+   the gate can call `rewrite` directly (the "preflight bypassed" scenario)
+   without an environment switch in the migration.
+6. **The rebuild extracts tags off the loop** (`asyncio.to_thread`), like
+   the incremental pass, since `extract_tags` scans the whole body.
+7. **`tags_text` drops a tag that is empty after sentinel removal**
+   (unspecified; an empty line contributes nothing).
+8. **Spec tension — nested inline tag.** The search-quality scenario says an
+   inline `#ctx/phone` is found by `phone`, `ctx` and `ctx/phone`, each with
+   `matched_in: tags`. For `phone` and `ctx` that holds. For `ctx/phone` the
+   inline tag's own text is also body text, which PostgreSQL parses as the
+   `file` token `ctx/phone`, so the row honestly renders `tags,body`. The
+   integration test pins that, and pins `tags` for all three queries when
+   the same tag is in frontmatter.
+9. **Spec tension — `alembic check` after a downgrade.** `alembic check`
+   refuses at a non-head revision ("Target database is not up to date"), so
+   the gate asserts it after the upgrade and after the re-upgrade (031's
+   test does the same) and, after the preflight abort, after the remedy and
+   the upgrade.
+10. **The identity-oracle exemption** is exercised in
+    `test_keyword_ranking_pg.py` (the "pre-change corpus" is the same rows
+    with the tags part stripped inside a rolled-back transaction, the
+    pre-#344 statement over it); the projection-identity corpus now binds
+    its tags, and none of its queries reaches a tag.
+
+Measurements (gate container, PostgreSQL 16, local):
+
+- **`S` against PostgreSQL**: a concatenation crossing the limit, `S` =
+  1,049,880, PostgreSQL reported 1,049,880 (exact for positional lexemes).
+- **035 cost**: 4,265 synthetic rows, 1,800-word bodies, three tags each —
+  candidates 0.3 s, preflight 9.7 s, rewrite 26.7 s; the alembic run 28–41 s
+  end to end. The design's "seconds" was a set-based probe; per-row UPDATEs
+  over TOASTed vectors cost ≈ 6 ms each. `DEPLOYMENT.md` and README say
+  "tens of seconds"; under `Recreate` it is added to the deploy gap.
+- **Snippet gate** with five title-only and five tags-only head rows of
+  twenty, `english,simple`: 128 ms best of three (161, 147, 128), under 300.
+- **Hybrid bounds**: worst abbreviated structure 337 at `rerank=false`
+  (pinned 345) and 365 at `rerank=true` (pinned 367).
