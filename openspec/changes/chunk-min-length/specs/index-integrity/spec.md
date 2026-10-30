@@ -8,7 +8,7 @@
 - Section 0 SHALL be the text before the first heading, or the whole body when there is none.
 - Each section SHALL be cleaned by removing the fence spans the shared recognizer finds over the **whole** body.
 - Let `W = CHUNK_SIZE × 4`. The effective minimum SHALL be `m = min(CHUNK_MIN_CHARS, W // 2)`. `CHUNK_MIN_CHARS` is the module constant 200. It is not a setting and not a fingerprint field, so every previously valid `CHUNK_SIZE` remains valid. A change to the constant is a change of chunking format and SHALL bump `CHUNKING_VERSION`.
-- A section is *non-empty* when its cleaned text, stripped, is not empty. It is *short* when it is non-empty and its stripped length in code points is below `m`.
+- A section is *non-empty* when its cleaned text, stripped, is not empty. It is *short* when it is non-empty and its `clen` is below `m`.
 
 **Grouping.** Non-empty sections SHALL be grouped in document order.
 - A group opens at a non-empty section. While its text is short and another non-empty section follows, it SHALL extend to that section, and it closes once it reaches `m`.
@@ -17,13 +17,17 @@
 - If no closed group exists, the short group SHALL stand alone only when the note's whole cleaned body, heading lines included, is also short. Otherwise the note SHALL be chunked as one group of its whole cleaned body at ordinal 0.
 - Heading lines SHALL NOT be part of the text of a group that holds one section.
 
-**Windowing.** Each group's text SHALL be windowed with `L = min(200, W // 10)`. A *word start* is a non-whitespace character at the start of the text or after a whitespace character. A *line start* is a word start whose preceding whitespace contains a line break.
-- **Cut.** A window starting at `a` whose limit `a + W` falls before the end of the text SHALL be cut at the last line start in `(a + W − L, a + W]`. Failing that, it SHALL be cut at the last word start in that range. Failing that, it SHALL be cut at `a + W`. The next window SHALL start at the cut.
-- **Overlap.** With overlap above zero, the next start SHALL be `max(cut − overlap × 4, a + 1)`, moved forward to the first word start at or before the cut, and SHALL NOT be moved beyond the cut.
-- **Tail.** When the text after a cut would have a stripped length below `m`, the cut SHALL be recomputed by the same rule with the limit `n − m`, where `n` is the length of the text with trailing whitespace removed. The re-cut SHALL only move a cut earlier.
-- A window SHALL be stored as its raw text, unstripped, and only when its stripped text is non-empty.
-- No chunk's text SHALL be longer than `W`.
-- Every non-heading cleaned character of a section SHALL be inside at least one chunk.
+**One length.** Every length in this requirement SHALL be the *collapsed length* `clen(t)`. That is the code-point length of `t` after every maximal run of the whitespace characters U+0009–U+000D and U+0020 is replaced by one space and leading and trailing spaces are removed. This applies to the minimum, section shortness, cut admissibility, tail balancing and the evaluation harness's `under_min`. The stored `chunk_text` SHALL be the raw window, unstripped, so reuse keys and previews are unaffected. A window SHALL be stored only when its `clen` is non-zero.
+
+**Windowing.** Each group's text SHALL be windowed with `L = min(200, W // 10)`. A *word start* is a non-whitespace character at the start of the text or after a whitespace character. A *line start* is a word start whose preceding whitespace contains a line break. A cut `c` for a window starting at `a` is *admissible* when `clen(text[a:c]) ≥ m`.
+- **Cut.** A window starting at `a` whose limit `a + W` falls before the end of the text SHALL be cut at the first admissible choice of these, in order: the last line start in `(a + W − L, a + W]`; the last word start in that range; `a + W`. Only when `clen(text[a:a+W]) < m`, it SHALL be cut at the first word start after `a + W` that is admissible, or else at the first admissible position. The next window SHALL start at the cut.
+- **Overlap.** With overlap above zero, the next start SHALL be `max(cut − overlap × 4, a + 1)`, moved forward to the first word start at or before the cut. It SHALL NOT be moved beyond the cut.
+- **Tail balancing.** When the text after a window's cut has `clen < m`, the last two windows SHALL be re-decided over the span from that window's start to the end, with `S` the span's `clen`.
+  - When `S ≥ 2m + 1`, the span SHALL be cut into two windows, each with `clen ≥ m`. The cut SHALL be the word start nearest the span's collapsed midpoint (the earlier on a tie) whose two sides both have `clen ≥ m` and raw length at most `W`. If there is none, the cut SHALL be the smallest position at which the left side's `clen` equals `⌊S/2⌋`.
+  - When `S ≤ 2m`, the span SHALL be one window.
+- **Bounds.** Every chunk SHALL have `clen ≤ W`. Its raw length SHALL be at most `W`, except where no choice above both meets the minimum and stays within `W` raw. In that case the excess SHALL be whitespace only.
+- **Minimum.** Every chunk SHALL have `clen ≥ m`, except the only chunk of a note whose whole cleaned body has `clen < m`.
+- **Coverage.** Every non-heading cleaned character of a section SHALL be inside at least one chunk.
 
 **Locator.** Each chunk's `section_ordinal` SHALL be the deepest heading ordinal N whose `read_note(section="#N")` body span contains the chunk's raw span, or 0 when none does.
 - Its `heading_path` SHALL be that section's enclosing headings, outermost first, each component trimmed and cut at 200 characters with a marked cut. The path is empty for 0.
@@ -49,7 +53,7 @@
 
 #### Scenario: A short lead merges into its first subsection under its own locator
 - **WHEN** a note holds `## Email Triage`, then the single line `See entries in the Email Triage log`, then `### 2026-10-01` followed by 300 characters of text, at the default `CHUNK_SIZE`
-- **THEN** no chunk's stripped text SHALL be shorter than 200
+- **THEN** no chunk SHALL have `clen` below 200
 - **AND** the first chunk SHALL contain the short line and the `### 2026-10-01` heading line, and SHALL record the ordinal and path of `## Email Triage`
 
 #### Scenario: A short section merges into a following sibling under their common parent
@@ -70,7 +74,7 @@
 
 #### Scenario: No four-character tail and no mid-word cut
 - **WHEN** a section's cleaned text is 2,048 × 2 + 4 characters of prose ending in `themselves`, at the default `CHUNK_SIZE`
-- **THEN** no chunk SHALL equal `lves`, the final chunk's stripped text SHALL be at least 200, and no cut SHALL fall inside a word when a word start exists in its lookback
+- **THEN** no chunk SHALL equal `lves`, every chunk SHALL have `clen` of at least 200, and no cut SHALL fall inside a word when an admissible word start exists in its lookback
 
 #### Scenario: A hard cut with overlap skips nothing
 - **WHEN** `CHUNK_SIZE` is 100 (W = 400), the overlap is 1, and a section's cleaned text is 400 `A`, 20 `B`, one space and 500 `C`
@@ -78,7 +82,19 @@
 
 #### Scenario: A merged tail never makes a chunk longer than a window
 - **WHEN** a group's text is `W + m − 1` characters and its chunks are embedded under a 300-character prefix
-- **THEN** no chunk text SHALL exceed `W` characters, every provider input SHALL be at most `W + 302` characters, and the final chunk's stripped text SHALL be at least `m`
+- **THEN** no chunk text SHALL exceed `W` characters, every provider input SHALL be at most `W + 302` characters, and both of the last two chunks SHALL have `clen` of at least `m`
+
+#### Scenario: Tail balancing never strands a prose window (Codex r2, W = 400)
+- **WHEN** `CHUNK_SIZE` is 100 (W = 400, m = 200) and a group's text is 161 `A`, one space and 239 `B`
+- **THEN** exactly two chunks SHALL be stored: 161 `A`, a space and 38 `B` (raw 200, `clen` 200), then 201 `B` (raw 201, `clen` 201)
+
+#### Scenario: A whitespace-heavy tail at the default window (Codex r2)
+- **WHEN** at the default `CHUNK_SIZE` a group's text is 1,800 `A`, 390 spaces and 10 `B`
+- **THEN** exactly two chunks SHALL be stored: 905 `A` (raw 905, `clen` 905), then 895 `A`, the 390 spaces and 10 `B` (raw 1,295, `clen` 906)
+
+#### Scenario: Whitespace that defeats the raw bound yields to the minimum
+- **WHEN** at the default `CHUNK_SIZE` a group's text is 100 `A`, 3,000 spaces and 100 `B`
+- **THEN** no chunk SHALL have `clen` below 200, every chunk SHALL have `clen` of at most `W`, and any chunk longer than `W` raw SHALL exceed it by whitespace only
 
 #### Scenario: A run without whitespace is cut hard
 - **WHEN** a section holds a 5,000-character run with no whitespace
@@ -93,7 +109,7 @@
 - **THEN** no group SHALL open at `## Parent`, and the child's chunks SHALL record the path `["Parent", "Child"]`
 
 #### Scenario: A long section
-- **WHEN** a single section's cleaned text spans three windows and its remainder after the second cut is at least `m` stripped
+- **WHEN** a single section's cleaned text spans three windows and its remainder after the second cut has `clen` of at least `m`
 - **THEN** three chunks SHALL be stored, with the same ordinal and heading path and consecutive chunk indexes
 
 #### Scenario: A note of headings only

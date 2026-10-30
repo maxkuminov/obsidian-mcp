@@ -33,12 +33,16 @@ of a second disruption later.
   - A short group at the end of the note joins the previous group. A sole
     short group in a note that is not itself short becomes one whole-body
     group.
-  - The final window of a group is never shorter than the minimum: its cut is
-    moved back.
+  - Every length is the **collapsed length**: whitespace runs are collapsed
+    to one space, then the text is stripped. A cut is only taken if the window
+    before it reaches the minimum. Tail balancing splits the last two windows
+    so that each reaches the minimum, or merges them into one window.
   - A note whose whole cleaned text is short keeps one chunk. It never has
-    zero.
-- **No provider input grows.** No chunk text is longer than one window, so no
-  input is longer than #355 could already send.
+    zero, and no other chunk is ever below the minimum.
+- **No provider input grows for ordinary text.** No chunk's collapsed length
+  exceeds one window. The raw length goes over one window only by whitespace,
+  and only when the whitespace makes the minimum impossible otherwise
+  (counted as `raw_over_window`).
 - **The locator of a chunk is the deepest heading whose
   `read_note(section="#N")` contains it**, or 0. Containment parity with
   `read_note` holds by construction. An unmerged chunk keeps #355's locator

@@ -5,11 +5,13 @@ For every database-backed arm whose membership includes `semantic`, the harness'
 
 - **`retrieval_fingerprint()`**, as the producing process computed it.
 - **`legacy_chunked_notes`**: the number of the replay copy's notes, **within the arm's provenance owner**, that hold vector rows and whose `embedded_chunking_version` is not the current `CHUNKING_VERSION`.
-- **`chunk_lengths`**: `{chunks, p10, p50, p90, whole_short, whitespace_windows, under_min}` over the provenance owner's stored chunks. It SHALL be null when the owner has no chunks or the copy predates migration 034. `m` is the running effective minimum and `W` the running window in characters. A chunk is *below the minimum* when `length(btrim(chunk_text)) < m`.
-  - The percentiles SHALL be discrete percentiles of `length(btrim(chunk_text))`.
-  - `whole_short` SHALL count chunks below the minimum whose note holds exactly one chunk.
-  - `whitespace_windows` SHALL count chunks below the minimum whose raw `length(chunk_text)` is at least `W / 4`, counted with integer division.
-  - `under_min` SHALL count chunks below the minimum whose note holds more than one chunk and whose raw length is below `W / 4`, counted with integer division. A conforming chunker yields `under_min = 0`. The predicate SHALL be one SQL text that the operator recipe and the tests share.
+- **`chunk_lengths`**: `{chunks, p10, p50, p90, whole_short, under_min, raw_over_window}` over the provenance owner's stored chunks, or null when the owner has no chunks or the copy predates migration 034.
+  - `clen` SHALL be the index-integrity collapsed length, computed in SQL as `length(btrim(regexp_replace(chunk_text, '[\t\n\v\f\r ]+', ' ', 'g')))`. That expression and the chunker's Python function SHALL be kept as one pair and tested for agreement.
+  - `m` SHALL be the running effective minimum and `W` the running window in characters.
+  - The percentiles SHALL be discrete percentiles of `clen`.
+  - `whole_short` SHALL count chunks with `clen < m` whose note holds exactly one chunk.
+  - `under_min` SHALL count chunks with `clen < m` whose note holds more than one chunk, with no other exception, and SHALL be 0 for a conforming chunker.
+  - `raw_over_window` SHALL count chunks whose raw `length(chunk_text)` exceeds `W`.
 
 **Provenance owner.** It is the `user_id` the export was filtered to (`USER_ID=` or `mine --user-id`), read from the `user_id` of the report's queries. The miner guarantees one owner for a single-user report. It SHALL be compared NULL-safe, so the ownerless scope is covered. A single-user report with no queries records null for both counts. Only when the report's provenance is `"multi"`, and the report is therefore not attachable, SHALL the counts cover all owners.
 

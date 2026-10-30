@@ -46,11 +46,12 @@ to outweigh its own prefix.
 
 **Goals**
 
-- No stored chunk's stripped text is shorter than the effective minimum. The
-  only exceptions are the single chunk of a note whose whole cleaned text is
-  shorter (L7) and a whitespace-dominated window (L3).
-- No chunk text is longer than one window, so no provider input is longer than
-  #355 could already produce (D7).
+- No stored chunk's **collapsed length** (D1) is shorter than the effective
+  minimum. The one exception is the single chunk of a note whose whole
+  cleaned text is shorter (L7).
+- No chunk's collapsed length exceeds one window. Its raw length exceeds one
+  window only when the text's whitespace leaves no other way to meet the
+  minimum (D7, L3).
 - No window boundary falls inside a word, unless the lookback holds no
   whitespace.
 - Every non-heading cleaned character of a section is in at least one chunk.
@@ -74,16 +75,38 @@ to outweigh its own prefix.
 ## D1: Word-boundary windows, raw window text, and coverage
 
 `W = CHUNK_SIZE × 4` and `L = min(CHUNK_BOUNDARY_LOOKBACK_CHARS, W // 10)`,
-where the module constant is 200. A **word start** is a non-whitespace
-character at index 0 or preceded by a `str.isspace()` character. A **line
-start** is a word start whose preceding whitespace run contains `\n` or `\r`.
+where the module constant is 200.
+
+**One length (Codex r2).** Every rule in this change uses one length: the
+minimum, admissibility, tail balancing, `under_min` and the window bound. For
+a text `t`, **`clen(t)`** is the code-point length of `t` after every maximal
+run of **whitespace** is replaced by one space and the result is stripped of
+spaces. Whitespace means exactly the six ASCII characters U+0009–U+000D and
+U+0020. Python and SQL then agree: Python uses
+`re.sub(r"[\t\n\v\f\r ]+", " ", t).strip(" ")`, and SQL uses
+`length(btrim(regexp_replace(t, '[\t\n\v\f\r ]+', ' ', 'g')))`, as one
+shared constant.
+
+A **word start** is a non-whitespace character at index 0, or one preceded by
+whitespace. A **line start** is a word start whose preceding whitespace run
+contains `\n` or `\r`. A cut `c` for a window starting at `a` is
+**admissible** when `clen(content[a:c]) ≥ m`. The stored `chunk_text` stays
+the raw window, so reuse keys and previews are unaffected.
 
 For a window starting at `a` whose limit `a + W` falls before the end of the
-text, the cut is chosen in this order:
+text, the cut is the first admissible one in this order:
 
 1. the last line start in `(a + W − L, a + W]`;
-2. otherwise, the last word start in that range;
-3. otherwise, a hard cut at `a + W`.
+2. the last word start in that range;
+3. a hard cut at `a + W`;
+4. **only if `clen(content[a:a + W]) < m`**, meaning the window is mostly
+   whitespace: the first word start after `a + W` at which
+   `clen(content[a:c]) ≥ m`, or failing that the first position at which it
+   holds. This is the only way a window's raw length can exceed `W` outside
+   tail balancing (L3).
+
+Boundary preference therefore never picks a cut that leaves the preceding
+window below `m`.
 
 The window is `content[a:cut]`, and the next window starts at `cut`. Because
 the cut lands on the first character of a word, a window ends with the
@@ -116,8 +139,8 @@ the old snap did wrong. With `W = 400`, overlap 1, and the text `A×400 + B×20 
 The old, unbounded snap skipped all twenty. This case is a scenario and a
 test.
 
-**Termination.** A window holds at least `W − L` characters, or, with overlap,
-the next start is at least `a + 1`. So the loop advances. The cap still stops
+**Termination.** Every cut is admissible, so it lies beyond `a`, and with
+overlap the next start is at least `a + 1`. The loop therefore advances. The cap still stops
 one chunk past `MAX_CHUNKS_PER_NOTE`.
 
 Why line start, then word start, and nothing smarter: markdown makes a line
@@ -157,8 +180,8 @@ It is never measured on the prefixed input.
 
 The sections come from `_note_sections`, unchanged. Section *i* has an
 own-text raw span `[s_i, e_i)` and cleaned text `c_i`. It is **non-empty**
-when `c_i.strip()` is non-empty and **short** when it is non-empty with a
-stripped length below `m`. A group's text is the whole-body-fence-cleaned
+when `c_i.strip()` is non-empty. It is **short** when it is non-empty and
+`clen(c_i) < m`. A group's text is the whole-body-fence-cleaned
 contiguous raw span `[s_first, e_last)`, so it includes the heading lines of
 absorbed sections and of any empty sections between them.
 
@@ -187,14 +210,51 @@ A short section never stands alone while a neighbour exists. The forward
 extension already covers the "short group with no previous group" case
 whenever a later non-empty section exists.
 
-**Windowing a group.** D1 applies, plus the **tail rule**. If the text left
-after a cut would have a stripped length below `m`, the cut is recomputed
-with the limit `p = n − m`, where `n = len(text.rstrip())`. The cut is the
-last line start, else the last word start, in `(p − L, p]`, else a hard cut at
-`p`. The final window therefore starts on a non-whitespace character and its
-stripped length is at least `m`. The re-cut only moves a cut **back**, so no
-window is ever longer than `W` (D7). At the default sizes the shortened
-preceding window keeps at least `W − m − L` (about 1,650) characters.
+**Windowing a group.** D1 applies, plus **tail balancing** (Codex r2, which
+replaces r1's backward re-cut). Suppose that, after the cut `c` of a window
+starting at `a`, the rest of the text has `clen(content[c:end]) < m`. Then
+the last two windows are re-decided over the span `[a, end)`. Let
+`S = clen(content[a:end])`.
+
+- **`S ≥ 2m + 1`: two windows, each at least `m`.** The cut is the
+  admissible split nearest the collapsed midpoint. An admissible split is a
+  word start `c'` with `clen(left) ≥ m`, `clen(right) ≥ m`, and both raw
+  lengths at most `W`. Ties go to the earlier split. If no word start
+  qualifies, the cut is a **midpoint hard cut**: the smallest `c'` with
+  `clen(content[a:c']) = ⌊S/2⌋`. The left side is then exactly `⌊S/2⌋ ≥ m`.
+  The right side is at least `⌈S/2⌉ − 1 ≥ m`, minus one if a collapsed space
+  falls at the boundary, which is why the threshold is `2m + 1` and not `2m`.
+- **`S ≤ 2m`: one window `[a, end)`.** Its collapsed length is at most
+  `2m ≤ W`.
+- **Raw bound.** Raw lengths at most `W` are kept whenever a qualifying cut
+  exists. The midpoint hard cut and the one-window merge exceed `W` raw only
+  through whitespace, and their collapsed length is always at most `W` (D7,
+  L3).
+
+With overlap, the right window's start moves back by `overlap × 4`, clamped
+so the window stays within `W` raw, and never past the previous window's
+start.
+
+**The two Codex inputs, pinned (task 2.6):**
+
+- **W = 400, m = 200,** text `A×161 + " " + B×239` (raw 401). The first cut
+  is a hard cut at 400 (no word start lies in `(360, 400]`), and it leaves
+  `B`, so `clen = 1`. The span gives `S = 401 ≥ 401`. The only word start, 162,
+  leaves the left side at 161 < m, so the cut is the midpoint hard cut at
+  `clen = 200`, which is raw index 200. The output is two windows,
+  `A×161 + " " + B×38` (raw 200, clen 200) and `B×201` (raw 201, clen 201).
+- **Default W = 2048, m = 200,** text `A×1800 + space×390 + B×10` (raw
+  2,200). The lookback `(1848, 2048]` holds only spaces, so the cut is a hard
+  cut at 2,048, admissible with clen 1,800. The rest has clen 10, so the span
+  gives `S = 1,811`. Word start 2,190 leaves the right side at 10, so the cut is
+  the midpoint hard cut at `⌊1811/2⌋ = 905`. The output is two windows,
+  `A×905` (raw 905, clen 905) and `A×895 + space×390 + B×10` (raw 1,295,
+  clen 906).
+
+**Property:** for every group, every window except the only chunk of a
+whole-short note has `clen ≥ m` and `clen ≤ W`. Its raw length is at most
+`W` unless step 4 of D1 or a tail-balancing case above had no in-bound
+choice. Every non-heading cleaned character is in some window.
 
 **Why the span keeps heading lines.** A merged chunk must still be one
 substring of the note. Concatenating the cleaned texts without the heading
@@ -310,24 +370,38 @@ characters. A provider that silently truncates at its token limit could then
 drop the merged tail while the row was certified and previewed in full.
 **That is not accepted.**
 
-**The bound:** every stored chunk's text is at most `W` characters, so every
-provider input is at most `EMBED_PREFIX_MAX_CHARS + 2 + W`. That is the
-maximum #355's version 1 already sends for an unmerged full window, so a
-deployment whose provider accepted version 1's inputs accepts every version 2
-input. Three facts give the bound:
+**The bound (amended after Codex r2):** every stored chunk has
+`clen ≤ W`. Its raw length is also at most `W`, except where the text's
+whitespace makes that incompatible with the minimum.
 
-- Windows are cut at no more than `W` (D1).
-- The tail rule only moves cuts back (D3).
-- Merging joins *sections* into a group, which is then windowed. It never
-  appends text to an already-cut chunk.
+- **Ordinary text.** Every provider input is at most
+  `EMBED_PREFIX_MAX_CHARS + 2 + W` characters. That is the maximum #355's
+  version 1 already sends for a full window, so a provider that accepted
+  version 1 accepts version 2.
+- **Why ordinary text stays in bound.** D1's steps 1 to 3 cut at or before
+  `a + W`. Tail balancing prefers in-bound splits. Merging joins *sections*
+  into a group, which is then windowed, so it never appends text to an
+  already-cut chunk.
+- **The exception.** A window goes over `W` raw only through D1 step 4, a
+  midpoint hard cut, or the one-window merge when no in-bound choice meets
+  the minimum. In each case the excess is whitespace only, because collapsed
+  content stays at most `W`.
+- **The exception is unavoidable.** Take `A×100 + space×3000 + B×100`. Any
+  window of at most `W` raw that holds the `A`s has `clen ≤ 101 < m`. So
+  either the minimum or the raw bound must give way. This change gives up the
+  raw bound, for whitespace only (L3), and reports how often that happens as
+  `raw_over_window`.
 
-So a short neighbour can always be absorbed, because the group is re-windowed
-under the bound. There is no case in which a tiny chunk must remain because no
-neighbour can take it. The only short chunks are L7 (the whole note is short)
-and L3 (whitespace-dominated windows). A test builds the maximum: a
-300-character prefix, a group of exactly `W + m − 1` characters, and the tail
-rule. It asserts that every provider input is at most `302 + W` characters,
-that the final chunk is at least `m`, and that every character is covered.
+The only chunks under `m` are therefore those of L7, a note whose whole text
+is short. There is no case in which a tiny chunk must remain because no
+neighbour can take it.
+
+A test builds the maximum case: a 300-character prefix, a group of
+`W + m − 1` characters of prose, and tail balancing. It asserts:
+
+- every provider input is at most `302 + W` characters;
+- both of the last two windows have `clen ≥ m`;
+- every character is covered.
 
 Rejected: the brief's "merge backward if it fits, else leave the short section
 as its own chunk". Under group windowing that fallback never triggers, and it
@@ -363,31 +437,24 @@ costs.
 4. **Candidate run** as in #355's step 5, with a `runfile:` baseline. It
    requires `legacy_chunked_notes: 0` and `chunk_lengths.under_min: 0`.
 
-**`chunk_lengths` and a deterministic `under_min` (Codex r1 M4).** I chose to
-keep the chunker simple and leave L3 in place, with an exact SQL predicate
-that matches the normative exceptions. Removing L3 would need whitespace-aware
-window widths, which complicates both the chunker and D7's bound. Storing the
-raw window (D1) makes the window's length observable. One read-only `SELECT`
-under `legacy_chunked_notes`' owner predicate returns:
+**`chunk_lengths` and a single `under_min` (Codex r1 M4, r2).** Every count
+uses D1's one length, `clen`. The SQL `clen` expression and the Python
+`clen` function are one pair, kept together in `scripts/search_eval/db.py`
+and `embeddings.py`, and a test checks that they agree. One read-only
+`SELECT` under `legacy_chunked_notes`' owner predicate returns:
 
-- `chunks`
-- `p10`, `p50`, `p90` of `length(btrim(chunk_text))`
-- `whole_short`: chunks of notes that hold exactly one chunk whose stripped
-  length is below `m` (L7)
-- `whitespace_windows`: chunks whose stripped length is below `m` and whose
-  raw `length(chunk_text) >= W // 4` (L3)
-- `under_min`: chunks whose stripped length is below `m`, whose note holds
-  more than one chunk, and whose raw length is below `W // 4`
+- `chunks`: the number of chunks.
+- `p10`, `p50`, `p90`: percentiles of `clen(chunk_text)`.
+- `whole_short`: chunks with `clen < m` whose note holds exactly one chunk
+  (L7).
+- `under_min`: chunks with `clen < m` whose note holds more than one chunk.
+  There is no other exception.
+- `raw_over_window`: chunks with `length(chunk_text) > W` (L3, observation
+  only).
 
-A conforming chunker gives `under_min = 0`:
-
-- Any window of a multi-chunk note that is not the final window of its group
-  is at least `W − L − m − L ≥ 0.3·W` characters raw.
-- A final window has stripped length at least `m` by the tail rule.
-- Every group reaches `m`, except a sole group in a short note.
-
-`m` and `W` are the running configuration's. The SQL text lives in
-`scripts/search_eval/db.py`, and both the recipe and a test use it.
+`under_min` SHALL be 0 for a conforming chunker. By D1's admissibility rule
+and D3's tail balancing, every window except a whole-short note's only chunk
+has `clen ≥ m`. `m` and `W` are the running configuration's.
 
 **The release bar (Codex r1 M5).** From the candidate run's `report.json`,
 for the candidate arm's label, read
@@ -469,8 +536,23 @@ folded in. Codex confirmed the compatible-version reuse key is sound.
 | M1 | MAJOR | A sole short group surrounded by empty sections stood alone even though the note was not short (sixty empty headings, then `x`). | The no-previous-group case is defined. Forward extension covers any later non-empty section. With none, the group stands alone only if the whole cleaned note is short. Otherwise the note becomes one whole-body group at ordinal 0. The outline case is a scenario and a test (D3). |
 | M2 | MAJOR | L2 accepted silent provider truncation of a window plus a merged tail. | Not accepted. The tail rule moves cuts back instead of extending windows, and merging re-windows groups, so no chunk exceeds `W` and no input exceeds version 1's maximum. No tiny-chunk fallback is needed. A maximum-prefix, maximum-tail test is added. L2 is removed (D7). |
 | M3 | MAJOR | The savings measurement had no data source: `indexer_runs` has no submitted-chunk count. | The embed stage's completion line gains `(S submitted, R reused)` from the existing `chunks_submitted` / `chunks_embedded`. These are counts only, with nothing new on the panel. The recipe sums them. A task and a test are added (D8). |
-| M4 | MAJOR | The `under_min` assertion contradicted L3. | Chunker kept simple, L3 kept. The predicate is exact SQL: stripped length below `m`, in a note with more than one chunk, with raw length below `W // 4`. It is made observable by storing the raw window. It equals 0 for a conforming chunker. `whole_short` and `whitespace_windows` are reported separately (D1, D8). |
+| M4 | MAJOR | The `under_min` assertion contradicted L3. | Chunker kept simple, L3 kept. The predicate is exact SQL: stripped length below `m`, in a note with more than one chunk, with raw length below `W // 4`. It is made observable by storing the raw window. It equals 0 for a conforming chunker. `whole_short` and `whitespace_windows` are reported separately (D1, D8). Superseded in round 2. |
 | M5 | MAJOR | The "noise band" was undefined. | The rule is now `deltas[<label>][overall, class:prose][recall@10, ndcg@10].ci95`. Accept when every upper bound is ≥ 0. Reject when any is below 0. `INSUFFICIENT_DATA`, a null CI or `CORPUS_LOSS` means re-measure (D8). |
+
+Declined: none.
+
+## Codex spec review, round 2 (2026-10-30)
+
+FAIL on a3d4c36. B1, B2, M1, M3 and M5 were VERIFIED. M2 REGRESSED and M4
+was NOT_FIXED. Both had one root cause: the tail rule and `under_min`
+measured length in different ways. Codex reconfirmed that compatible-version
+reuse is sound. Both findings were accepted.
+
+| # | Status | Finding | Resolution |
+|---|---|---|---|
+| B1, B2, M1, M3, M5 | VERIFIED | — | — |
+| M2 | REGRESSED | The backward re-cut could strand a prose window below `m`. At W=400, `A×161 + " " + B×239` gave windows of (162, 161) and (239, 239). | **One length.** `clen` (whitespace runs collapsed, then stripped) governs every rule. A cut must be admissible, meaning the preceding window has `clen ≥ m`. Normative tail balancing: for `S ≥ 2m + 1`, both windows are at least `m`, preferring the admissible word start nearest the midpoint and falling back to a midpoint hard cut. For `S ≤ 2m`, one window. Pinned output: (raw 200, clen 200) and (raw 201, clen 201) (D1, D3). |
+| M4 | NOT_FIXED | The `W // 4` proxy hid the M2 window and flagged a conforming whitespace tail at the default W, `A×1800 + space×390 + B×10`. | `under_min` is now the single predicate `clen < m` in a note with more than one chunk, with no exception, and it must be 0. `whitespace_windows` and the old L3 are removed. The default-W case now yields (raw 905, clen 905) and (raw 1,295, clen 906), both pinned. The raw bound yields only to whitespace, and only when no in-bound choice meets the minimum. That is the new L3, reported as `raw_over_window` and proved unavoidable in D7 (D7, D8). |
 
 Declined: none.
 
@@ -480,10 +562,13 @@ Declined: none.
   merges backward, the chunk takes the common parent's locator or
   `(top of note)`. The short section's own ordinal is not the locator of any
   chunk, but `read_note` at the reported ordinal still contains it.
-- **L3** — A window can hold little text and be mostly whitespace when the
-  text has a whitespace run longer than about `W − m − L`. It is reported
-  as `whitespace_windows` and excluded from `under_min` by its raw length.
-  A third merge rule was not added for it.
+- **L3** (replaces round 1's whitespace-window exception). The minimum is
+  never waived. When whitespace makes the minimum incompatible with a raw
+  length of at most `W`, a window may exceed `W` raw, by whitespace only. Its
+  `clen` stays at most `W`. A tokenizer that charges per whitespace character
+  could see such an input longer than version 1's maximum. These windows are
+  counted as `raw_over_window`, and the proof that the exception is
+  unavoidable is in D7.
 - **L4** — A run with no whitespace in the lookback, such as base64, a long
   URL or CJK text without spaces, is still cut hard.
 - **L5** — Lengths are counted in code points, not tokens. The rule is

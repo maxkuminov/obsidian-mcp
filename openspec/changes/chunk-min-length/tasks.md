@@ -11,7 +11,9 @@
   - Cut at the last line start, then the last word start, within the lookback; otherwise cut hard (D1).
   - Store the raw window, unstripped. Emit a window only if its stripped text is non-empty.
   - With overlap, snap forward only within `[s, cut]`.
-  - Apply the tail re-cut at `n − m` (D3).
+  - Add `clen` (D1's one length, ASCII whitespace) beside its SQL twin.
+  - Accept a cut only if it is admissible (`clen` of the preceding window ≥ m). Fall back to step 4 for windows that are mostly whitespace.
+  - Apply D3's tail balancing: split at `S ≥ 2m + 1` (the admissible word start nearest the midpoint, otherwise the midpoint hard cut), or merge into one window at `S ≤ 2m`.
   - Keep the termination guard and the one-past-the-cap rule.
 - [ ] 2.2 `chunk_note_bounded`, using D3 grouping over the unchanged `_note_sections`:
   - Extend a group forward over short sections.
@@ -27,7 +29,10 @@
   - **Live fixture 2.** A section of 2,048·2 + 4 characters ending `…themselves`: no chunk is `lves`, and no cut falls inside a word that has whitespace in its lookback.
   - **Codex B2.** At W=400 with overlap 1, `A×400 + B×20 + " " + C×500`: every `B` is in a chunk.
   - **Codex M1.** Sixty empty-bodied headings, then a heading whose body is `x`: one whole-body chunk at ordinal 0, containing `x`.
-  - **Codex M2.** A 300-character prefix and a group of `W + m − 1` characters: every provider input is at most `302 + W`, the final chunk is at least `m`, and coverage is complete.
+  - **Codex M2.** A 300-character prefix and a group of `W + m − 1` characters of prose: every provider input is at most `302 + W`, the last two chunks both have `clen ≥ m`, and coverage is complete.
+  - **Codex r2, W=400.** `A×161 + " " + B×239` yields exactly (raw 200, clen 200) and (raw 201, clen 201).
+  - **Codex r2, default W.** `A×1800 + space×390 + B×10` yields exactly (raw 905, clen 905) and (raw 1,295, clen 906).
+  - **Whitespace that defeats the raw bound.** `A×100 + space×3000 + B×100` yields one chunk with `clen` 201, raw length over `W`, and the excess made of whitespace only.
   - Sibling merge, which takes the parent or 0.
   - A backward tail.
   - A whole-short note, which yields one chunk.
@@ -41,8 +46,9 @@
 - [ ] 2.7 Property test over generated notes (random heading depths, short and long sections, empty sections, fences, frontmatter, three terminators, overlap 0 and above 0, small and default `CHUNK_SIZE`):
   - For every chunk, `read_note(section="#N")` resolves and the chunk is a substring of that body after the whole-body fence spans are removed.
   - Every non-heading cleaned character is in some chunk.
-  - No chunk text is longer than `W`.
-  - D8's `under_min` predicate, evaluated in Python, is 0.
+  - Every window except a whole-short note's only chunk has `clen ≥ m` and `clen ≤ W`.
+  - The raw length is at most `W` whenever the generated text has no whitespace run longer than `W − 2m`. Otherwise any excess is whitespace only.
+  - D8's `under_min` (`clen < m` in a note with more than one chunk) is 0.
   - A note has zero chunks exactly when `chunk_text_bounded(clean_for_embedding(body))` has zero.
 - [ ] 2.8 Golden formatter test: `embedding_input` and `build_embed_prefix` on fixed inputs match committed outputs. On mismatch, fail with "formatter changed: reset INPUT_COMPATIBLE_CHUNKING_VERSIONS".
 - [ ] 2.9 Update the version literals in `test_heading_chunks.py`, `test_heading_chunks_reuse.py`, `test_heading_chunks_pg.py` and `test_search_eval_pg.py`. Reuse cases:
@@ -55,13 +61,14 @@
 ## 3. Observation
 
 - [ ] 3.1 `src/services/indexer.py`: sum `result.chunks_submitted` beside `total_chunks`, and extend the completion line to `…: N notes, X chunks (S submitted, R reused)`, counts only. Test with a mocked pass: one note fully reused and one fresh, and assert the line's numbers.
-- [ ] 3.2 `scripts/search_eval/db.chunk_lengths(session, owner, m, W)`: one read-only `SELECT` under `legacy_chunked_notes`' owner predicate. It returns `{chunks, p10, p50, p90, whole_short, whitespace_windows, under_min}` per D8, or null for an empty set or a pre-034 copy. Keep the SQL text in one module-level constant.
+- [ ] 3.2 `scripts/search_eval/db.chunk_lengths(session, owner, m, W)`: one read-only `SELECT` under `legacy_chunked_notes`' owner predicate. It returns `{chunks, p10, p50, p90, whole_short, under_min, raw_over_window}` per D8, or null for an empty set or a pre-034 copy. The SQL `clen` expression is a module-level constant paired with the chunker's Python `clen`.
 - [ ] 3.3 `runner.py` / `scoring.py`: record it for DB-backed semantic arms. A `runfile:` arm carries its staged value or null. Fixture arms gain nothing.
 - [ ] 3.4 Tests:
   - Two tenants: the other tenant's rows change no byte.
   - The fixture's golden projection is unchanged.
   - An older runfile yields null.
-  - The SQL predicate agrees with the Python predicate from 2.7 on a seeded copy that holds a whole-short note, a whitespace window and normal chunks, and `under_min` is 0.
+  - SQL `clen` equals Python `clen` on strings mixing tabs, CRs, NBSP (not whitespace in either) and runs.
+  - On a seeded copy holding a whole-short note, an over-window whitespace chunk and normal chunks, `under_min` is 0, `whole_short` is 1 and `raw_over_window` is 1.
 
 ## 4. Docs (same PR)
 
