@@ -478,3 +478,22 @@ Fixed (2026-10-31):
   directory afterwards changes `report.json` and the digest no longer
   matches.
 
+## Adversarial Codex — implementation round 3
+
+Verdict, verbatim:
+
+PASS. The round-2 blocker is fixed: baseline identity is checked before source inspection, and runfile evidence is bound to the exact staged source-report bytes, generation, and hashes. Refusals preserve existing output.
+
+A deliberately forged, internally consistent report pair can still pass because the operator controls both files and digest metadata. That is outside the trusted-operator model; normal harness output cannot do this silently. The single-user invariant is pinned across multi-user exports, inconsistent filters, other-owner manual judgments, scoring, and gate checks.
+
+Focused verification: 147 tests passed; strict OpenSpec validation passed.
+
+```json
+{"verdict":"PASS","round1":[{"claim":"A runfile baseline report must be bound to the generation that produced the baseline so unrelated safe evidence cannot authorize multi-user deltas.","status":"VERIFIED"}],"round2":[{"claim":"The candidate baseline must identify exactly one actual arm and be bound to the exact staged source-report bytes so relabeled or substituted evidence is refused.","status":"VERIFIED"}],"findings":[]}
+```
+
+No change. Accepted limitation L4 (Codex round 3): an operator who forges
+both report files and the digest metadata can still pass the gate. That is
+outside the trusted-operator model, and normal harness output cannot do it
+silently.
+
