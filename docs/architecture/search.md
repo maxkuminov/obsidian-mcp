@@ -258,11 +258,12 @@ which an AST test enforces. Weight `C` is unused.
   `keyword_snippets`; the only visible difference is the new `matched_in`
   values in `keyword_rank (…)`. The longest value grew from `title+body` to
   `title+tags+body` (five characters), so the pinned bounds moved:
-  `HYBRID_ROW_STRUCTURE_MAX` 340 → 345 (floor sum 990, the 40–45 cut still
-  guaranteed at `rerank=false`; measured worst structure 337) and
-  `HYBRID_RERANK_ROW_STRUCTURE_MAX` 362 → 367 (measured 365), where the
-  cut-form sum `431 + 367 + 25 + 25 + 75 + 75 + 5 = 1,003` exceeds 1,000 and
-  that one worst case continues to the labelled omitted form (≤ 984).
+  `HYBRID_ROW_STRUCTURE_MAX` 340 → 345 (with #389's 405-character header the
+  floor sum is 995, the 40–45 cut still guaranteed at `rerank=false`) and
+  `HYBRID_RERANK_ROW_STRUCTURE_MAX` 362 → 367, where the cut-form sum
+  `444 + 367 + 25 + 25 + 75 + 75 + 5 = 1,016` exceeds 1,000 and that worst
+  case continues to the labelled omitted form (≤ 997). The per-case sums,
+  re-measured with both #389 and #391, are under "Bounds (D5)" below.
 - **The identity oracle** additionally exempts rows with a *tag
   contribution* — any lexeme of any config's parse of the query, positive or
   negated, present in `ts_filter(v, '{b}')` — and keeps (a) conjunctive
@@ -379,20 +380,24 @@ one has none. The echoed query is a literal too.
 
 **The response bound (D7)** is on **rendered** length (`\u00XX` is six
 characters). The query echo is the longest whole-character prefix rendering
-to ≤ 64 (`query_cut` when shorter). The header (≤ 400), the keyword-only
+to ≤ 64 (`query_cut` when shorter). The header (≤ 405 since the #389
+`confidence` token; 400 before), the keyword-only
 footer (71) and the cap footer (≤ 75) are reserved; rows are appended while
 each fits and the first that does not ends the page (whole-row drop, the
 omitted count in the footer, `shown:` in the header). A first row that does
 not fit is abbreviated in order — `tags omitted`, `preview omitted`,
 `title_cut`, `path_cut` (each the shortest whole-character prefix rendering
 to ≥ 40, i.e. 40–45; a value ≤ 45 is not cut), then the empty omitted forms
-— and marked `abbreviated`. The cut-form structure is ≤ 345 (340 before
-#391, whose longest `matched_in` is `title+tags+body`), so the floor is
-400 + 345 + 45 + 45 + 75 + 75 + 5 = 990 ≤ 1,000.
+— then, last (#389), `explain omitted` in place of the `explain` field (its
+terms follow from the ranks and `rrf_k`) — and marked `abbreviated`. The
+cut-form structure is ≤ 345 (340 before #391, whose longest `matched_in` is
+`title+tags+body`), so the floor is
+405 + 345 + 45 + 45 + 75 + 75 + 5 = 995 ≤ 1,000.
 
 **Telemetry and class (D5, D7).** `embed_ms`, `db_ms`, `exact_fallback`,
 `fallback`, `any_rows`, `snippet_ms`, `arms`, `semantic_unavailable`,
-`keyword_rows`, `semantic_rows`, `overlap`, `rrf_k`; `result_count` /
+`keyword_rows`, `semantic_rows`, `overlap`, `rrf_k`, and since #389
+`keyword_all`, `confidence` and `top_similarity`; `result_count` /
 `result_paths` are recorded by the tool **from the rendered rows**, so the
 harness credits only what the caller saw. Concurrency class `embedding`,
 shared with `semantic_search` (one provider, one slot); `CLASS_MAPPING_VERSION`
@@ -514,19 +519,30 @@ encoding (the counts and row markers carry it). The response is bounded on
 rendered length by hybrid's rules; when the cap drops rows, the footer is
 `Response cap: N omitted — more: true; narrow with limit= or folder=.` (L14:
 the quoted encoding can show fewer rows than the legacy page). Pinned
-worst cases at 1,000: semantic header ≤ 185, abbreviated structure ≤ 235;
-hybrid header ≤ 431 and structure ≤ 367 (362 before #391) with a 20–25
-character title/path cut floor on `rerank=true` pages; since #391 the
-cut-form sum is 431 + 367 + 25 + 25 + 75 + 75 + 5 = 1,003 > 1,000, so that
-one worst case continues to the omitted form (≤ 984).
+worst cases at 1,000: semantic header ≤ 199 (185 before the #389
+`confidence` token), abbreviated structure ≤ 235; hybrid header ≤ 444 (431
+before #389) and structure ≤ 367 (362 before #391's longest `matched_in`,
+`title+tags+body`) with a 20–25 character title/path cut floor on
+`rerank=true` pages. Before #389 and #391 that summed 431 + 362 + 25 + 25 +
+75 + 75 + 5 = 998; with both the cut form sums to 444 + 367 + 25 + 25 + 75 +
+75 + 5 = 1,016 (the keyword-only case measures 1,008), so that case falls
+through to the labelled omitted form (≤ 997, measured 989): the bound
+holds, the 20–25 cut is not guaranteed there (#389 L6). The both-arms
+rerank=true case with the transition line measures 1,026 cut, 1,007
+omitted and 988 at the last rung, `explain omitted`.
 Since #355 both tools' `rerank=true` pages carry the `index_transition:`
 line directly after the header and the `§` locator as a server field after
 the separator (after `rerank_score`), exactly as their `rerank=false`
 pages; the line is reserved in the budget, and an abbreviated first row
 drops the locator with `section omitted`. On a both-arms hybrid page the
-line (≤ 127 characters) makes the cut form sum 1,004 at the worst case, so
-that case falls through to the labelled omitted form: the 1,000 bound
-holds, the 20–25 cut is not guaranteed there.
+line (≤ 127 characters) makes the cut form sum 1,004 at the worst case
+(1,021 with the #389 token), so that case falls through to the labelled
+omitted form (1,002 with the token) and then to `explain omitted` (983):
+the 1,000 bound holds, the 20–25 cut is not guaranteed there. The
+`rerank=false` byte-identity baseline is the search-confidence page since
+#389: the pre-#389 page plus ` — confidence: ok` before the header's
+closing `:` (or `low` and the hint line), pinned in
+`tests/test_semantic_rerank.py` against the render of the tree before it.
 
 **Telemetry and concurrency (D10, D11).** `params.rerank` is the argument;
 a `rerank=true` row adds `reranked`, `rerank_reason` (false only),
@@ -558,6 +574,117 @@ slow reranker needs a larger `RERANK_TIMEOUT_MS` for replay; L12 no auth
 header; L13 the reranker sees the caller's note text; L14 a capped
 `rerank=true` page can show fewer rows than the `rerank=false` page, always
 disclosed by the footer.
+
+## Confidence (#389)
+
+`semantic_search` and `hybrid_search` always return a full page: the semantic
+arm returns its nearest neighbours however distant they are. Before #389
+nothing on the page said when that list was noise — `hybrid_search("xqzvplorth")`
+returned five `arms: both` rows at similarity 0.36–0.49 with no warning. Every
+**page** of both tools now carries one header token, `confidence: ok` or
+`confidence: low`. Nothing is filtered, reordered or added to a row.
+
+**The rule (D1)**, one pure function in `src/services/search_confidence.py`:
+`low` ⇔ `SEARCH_LOW_CONFIDENCE_SIMILARITY > 0` ∧ `keyword_all == 0` ∧
+(`top_similarity` is none ∨ `top_similarity < T`). `keyword_all` is the
+`match: all` keyword note count: a disjunctive `match: any` fill on one common
+word is filler, not evidence (`xqzvplorth notes` reads `low`).
+`semantic_search` has no keyword arm and passes 0. The boundary is strict (a
+similarity exactly at `T` reads `ok`) and 0 is a hard off, so a negative
+cosine cannot fire it.
+
+**`top_similarity` is the call's actual candidate set, before rerank and the
+cap**, with no new statement and no service return-type change:
+`semantic_search` reads the first row of the ordered, deduplicated list it
+already fetched (`results[0]`, or `candidates[0]` before the rerank hop —
+the `max(5 × limit, 50)`-chunk overfetch, so a larger `limit` can flip the
+token at the margin, L12); `hybrid_search` takes the max over its semantic
+arm's deduped notes (the 50-chunk overfetch, independent of `limit`) into
+`HybridResult.top_similarity`. Both are fixed before rerank, so `rerank=true`
+and `rerank=false` carry the same value (D6). Filters are part of the
+question: a folder scope holding only weak matches reads `low`.
+`keyword_search` (lexical evidence, no similarity) and `find_related`
+(note-to-note similarity) carry no token.
+
+**Placement (D3).** Hybrid: after `arms:` and, on `rerank=true`, after
+`reranked:` — on every page, the zero-result line and the keyword-only path
+included. Semantic `rerank=false`: `… — S stale, T truncated — confidence:
+ok:` and `No semantic results for '…' (embeddings may still be building) —
+confidence: …`; `rerank=true`: after the counts, before `reranked:`. **A
+refusal is not a page**: `semantic_search`'s provider-input rejection and
+every pre-body refusal carry no token, no hint and no usage key. The token is
+server text in the header line, which no note text precedes.
+
+**The hint (D4)** is one fixed line per tool after the header and the
+`index_transition:` line (on a zero-result page after both, and before
+hybrid's keyword-only footer). It never begins with `- ` and says "try",
+never "ignore". It is **conditional**: the renderer renders the page without
+it, then with it reserved, and keeps it only if the shown paths and every row
+line are byte-identical; otherwise it is withdrawn before the abbreviation
+ladder or a row drop could change anything. So the hint never costs a row
+(L7: on a tightly capped page it is often withdrawn; the token stays). The
+legacy `semantic_search(rerank=false)` page has no character budget, so its
+hint is unconditional. Both hints are at most 140 characters (semantic 132,
+hybrid 140).
+
+**The token is a header token like `arm_depth` (L14).** It is part of every
+page's base budget with no compaction: on a capped page whose last row fitted
+before #389 with fewer than 17–18 characters to spare, that row is now
+omitted, and the existing cap footer states the count (`more: true` on
+`rerank=true`). Under the default 40,000-character cap that needs a page
+within 18 characters of the cap.
+
+**Bounds (D5)**, re-measured and pinned for both `confidence: ok` and the
+low-plus-`any` case (no `all` row, 50 `any` rows — `all 0` is one character
+shorter than `all 50`, `low` one longer than `ok`, so the two headers are
+equal): hybrid header 405 (`rerank=false`) and 444 (`rerank=true`),
+`semantic_search(rerank=true)` header 199, floor arithmetic
+405 + 345 + 45 + 45 + 75 + 75 + 5 = 995 (340 and 990 before #391's longest
+`matched_in`, `title+tags+body`). Measured worst cases at the floor
+(8,192-control query, `HYBRID_RRF_K=1000`, the ten-digit transition line
+where both arms ran, `matched_in: title+tags+body`; each five more than
+#389 measured with `title,body`): keyword-only `rerank=false` cut form 981;
+keyword-only `rerank=true` cut 1,008 → omitted 989; both arms
+`rerank=false` cut 999; both arms `rerank=true` omitted 1,007 → `explain
+omitted` 988. These are the structural sums the tests pin; a page actually
+rendered from the worst-case fixtures fits in an earlier form (the sum mixes
+the fallback token with a `rerank_score`, and the reserved header's
+full-page counts with the shown header's), so the new rung is a guarantee
+for the arithmetic, exercised directly by the tests.
+
+**The threshold ships at 0 (D2).** The asymmetry is the reason for a
+calibration rather than a guess: a false `low` pushes an agent away from the
+right notes, a missing `low` is merely the behaviour before #389. Live
+bge-m3 numbers (2026-10-30, mid-rechunk): gibberish best similarity
+0.36–0.49, real paraphrases 0.61–0.67 — evidence for a **candidate** value of
+0.50, not a calibration, and none of the probes was a short identifier with
+no all-terms match, which is the false-`low` case that matters.
+`SEARCH_LOW_CONFIDENCE_SIMILARITY` is a float in [0, 1], non-finite refused,
+read at startup, never an argument. `ok` at 0 means "not judged". It changes
+no ranking, so it is **not part of `retrieval_fingerprint()`** — but it is
+model-dependent (OpenAI `text-embedding-3-*` cosines run well below bge-m3's)
+and must be re-chosen whenever the embedding model in the fingerprint
+changes. It is tuned with the harness's `confidence` tabulation
+(DEPLOYMENT.md, "Calibrating search confidence"): both tools' lines must PASS.
+
+**Usage keys (D7).** On every page of both tools, whatever the threshold:
+`confidence`, `top_similarity` (three decimals, when a candidate existed)
+and, on `hybrid_search`, `keyword_all`. None is an `error` marker; refusals
+record none. The search-eval export carries the three keys, and `mine`
+writes them per search row into `confidence-rows.jsonl`.
+
+Accepted limitations (the change's design): L1 the candidate 0.50 rests on a
+handful of probes; L2 an all-terms match can be lexical coincidence; L3
+`semantic_search` judges on similarity alone (a topic covered only in short
+or foreign-language notes can read `low`); L4 one global threshold; L5 a
+stale best row counts; L6 at the 1,000 floor the 20–25 `rerank=true` cut is
+not guaranteed on two worst cases; L7 the hint is often withdrawn on a tight
+page; L8 the keyword-only empty page's hint names a similarity that was
+never measured; L9 the false-low rate is not in the search-eval report; L10
+old shallow runfiles get null recall@50; L11 `confidence` is not part of the
+miner's query identity; L12 `limit` can flip `semantic_search`'s token at
+the margin; L13 the miner has two query classes; L14 the token can cost a
+boundary row; L15 one setting enables both tools.
 
 ## Filtered vector search — the SET LOCALs are correctness, not tuning
 
@@ -1118,7 +1245,8 @@ down there and in [usage attribution](usage-attribution.md).
 Retrieval quality is measured offline, on judgments mined from the
 operator's own `usage_logs`, by `scripts/search_eval/` (`python -m
 scripts.search_eval mine | snapshot | run | score`, wrapped by `make
-search-eval-export`, `make search-eval-snapshot` and `make search-eval`).
+search-eval-export`, `make search-eval-snapshot` and `make search-eval`;
+`confidence` since #389).
 It reads only what the "Search result telemetry (#161)" contract above
 already writes, and changes no search tool, no telemetry key, no panel and
 no schema. The step-by-step operator path is DEPLOYMENT.md, "Measuring
@@ -1242,10 +1370,21 @@ never an earlier generation, and exits 64 unless it is complete and its
 selected-qid hash, qrels hash, snapshot hash and file hashes all match. A
 `runfile:` arm's missing queries are the one tolerated omission, scored empty
 and counted as `missing_queries`. Answers are deduplicated to first rank and
-truncated to `--depth` (20), and ranked exactly as returned.
+truncated to `--depth` (50 since #389: the tools' largest `limit` and
+`hybrid_search`'s arm depth, so recall@50 is the ceiling of one page; 20
+before), and ranked exactly as returned. Each arm's staged meta and report
+entry carry `staged_depth`: the generation's depth, or for a `runfile:` arm
+the minimum of that and the source file's own recorded `depth` (its
+`staged_depth` when shallower), which the run validates — a missing,
+non-integer or non-positive source depth is exit 64 before anything is
+reserved. Scoring reports every recall@k with k above an arm's
+`staged_depth` as null, with a null delta and interval (L10 of #389: an old
+shallow runfile gets a null recall@50 and must be re-run for a delta).
 
 **Metrics** (`metrics.py`, standard library only, E1): binary gains over
-`dedup(run)`; recall@k = |relevant ∩ top k| / |relevant|; reciprocal rank =
+`dedup(run)`; recall@k = |relevant ∩ top k| / |relevant|, reported at k =
+5, 10, 20 and 50 (the last two since #389: an agent investigating reads past
+rank ten); reciprocal rank =
 1 / rank of the first relevant item (MRR its mean); nDCG@10 = DCG / IDCG,
 DCG = Σ rel_i / log2(i + 1), IDCG over min(|relevant|, 10) items; `novel@10`
 = the mean share of an arm's top ten outside the query's pool, i.e. results
@@ -1256,7 +1395,8 @@ bootstrap 95 % interval on the mean: 1,000 resamples with replacement from
 `random.Random(seed)` over the deltas in qid order, linear-interpolated
 2.5th / 97.5th percentiles. The interval is reported and never gates.
 
-**The report and the gate.** `report.json` holds the metrics, counts (per
+**The report and the gate.** `report.json` (`schema_version` 2 since #389)
+holds the metrics, counts (per
 class, per source, `n_both_sources`, drift, `ownerless_queries`), each arm's
 label, options, membership, `corpus_loss`, `unsearchable_before` and
 `missing_queries`, the window, the seed, the qrels / snapshot / selection
@@ -1269,7 +1409,37 @@ with; `commit_sha` is asserted separately against `git rev-parse HEAD`.
 Exit codes: 0 `OK`, 2 `INSUFFICIENT_DATA` (fewer than `--min-queries`,
 default 50) or `CORPUS_LOSS`, 64 usage error or an incomplete or mismatched
 run, 1 anything else. **There is no metric threshold** (E2): the gate is a
-report the reviewer judges, with the incumbent as `--baseline`.
+report the reviewer judges, with the incumbent as `--baseline`. The golden
+was regenerated once by #389 (the new metric keys, `staged_depth`, depth 50,
+`schema_version` 2).
+
+**The confidence tabulation (#389).** `python -m scripts.search_eval
+confidence --data DIR --threshold T` reads `confidence-rows.jsonl` (one line
+per non-refusal `semantic_search` / `hybrid_search` row with a resolved
+principal — a query the 200-character telemetry cap cut is kept, unlike for
+replay, and clicks are attributed over these rows plus the replay-usable
+searches: `tool`, `class`,
+`confidence` when the usage row recorded one, `created_at` in UTC epoch
+microseconds, `top_similarity`, `keyword_all`, `clicked` — no text, no path)
+and `mine-report.json`, connects to no database, and prints one
+`<tool>: false-low <rate> (<n>/<m> clicked-through pages, <d> days) —
+PASS|FAIL|INSUFFICIENT_DATA at < 1/50` line per tool, then per-class counts
+and the `top_similarity` deciles of clicked and unclicked pages. A row is
+post-change exactly when it carries `confidence`; earlier rows are counted
+as excluded and contribute to no rate and no span. A keyword-only page (null
+`top_similarity`) is included, so a clicked-through keyword-only `low` is a
+false low. A tool's line is `INSUFFICIENT_DATA` under 14 days of post-change
+rows (by `created_at`) or under 200 clicked-through pages (zero included),
+otherwise PASS exactly when the rate is below 1/50 (the span is judged
+unrounded); there is no aggregate. `mine` publishes the rows first and the
+report last with the rows' SHA-256 and count, and the tabulation refuses
+(exit 64) a pair that does not match, so one run's rows never tabulate under
+another run's provenance.
+`confidence-report.json` (counts and rates, checked by `assert_no_leak`)
+carries the mine run's `provenance` and `attachable`, and a non-attachable
+table begins with the `NOT ATTACHABLE` line; only attachable output leaves
+`.search-eval/`. The rule is restated in `scripts/search_eval/confidence.py`
+because the harness imports nothing from `src`.
 
 **Provenance: only a single-tenant report is attachable** (D10). Removing
 text, paths and ids does not make a multi-user report safe to publish:
@@ -1313,7 +1483,10 @@ only for a `"multi"`, non-attachable report) that hold vector rows and whose
 `embedded_chunking_version IS DISTINCT FROM CHUNKING_VERSION`, by one read-only
 `SELECT`, null on a pre-034 copy — in its meta and its `report.json` entry. A
 `runfile:` arm carries its meta's values or null; fixture arms gain no key, so
-the committed golden fixture is unchanged. A re-chunk comparison is evidence
+the committed golden fixture is unchanged. `SEARCH_LOW_CONFIDENCE_SIMILARITY`
+(#389) is deliberately not in the fingerprint — it ranks nothing — but it is
+model-dependent and is re-calibrated whenever the fingerprint's model
+changes. A re-chunk comparison is evidence
 only when the candidate arm's `legacy_chunked_notes` is 0 (DEPLOYMENT.md,
 "Before and after a re-chunk or re-embed").
 

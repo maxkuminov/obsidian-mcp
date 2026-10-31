@@ -75,6 +75,7 @@ from src.services.embeddings import (
 )
 from src.services import hybrid as hybrid_service
 from src.services import rerank as rerank_service
+from src.services import search_confidence
 from src.services.embeddings import semantic_candidates
 from src.services.filters import apply_note_filters
 from src.services.quotas import admit as _admit_quota, quota_refusal_message
@@ -2887,17 +2888,27 @@ async def semantic_search_impl(
             pending = await rechunk_pending_count(session, uid)
     except refusals.ProviderInputTooLarge as exc:
         return _semantic_provider_refusal(exc)
+    # #389 (D1): the first row of the ordered, deduplicated candidate list
+    # (`results[0]` is the overfetch's first row; the cut to `limit` keeps it).
+    confidence = _semantic_confidence(results[0]["similarity"] if results else None)
+    conf_token = search_confidence.token(confidence)
+    # The legacy page has no character budget, so the hint is unconditional
+    # here (D4): it can cost no row. Directly after the header — and after the
+    # `index_transition:` line, which `_with_transition` puts after line 0.
+    hint = [search_confidence.SEMANTIC_LOW_CONFIDENCE_HINT] if confidence == "low" else []
     if not results:
         return "\n".join(_with_transition(
-            [f"No semantic results for '{_header_scalar(query)}' (embeddings may still be building)"],
+            [f"No semantic results for '{_header_scalar(query)}' (embeddings may still be "
+             f"building) — {conf_token}", *hint],
             pending,
         ))
     stale_count = sum(1 for r in results if r["stale"])
     truncated_count = sum(1 for r in results if r["embedding_truncated"])
-    lines = [
+    header = (
         f"Found {len(results)} semantic matches for '{_header_scalar(query)}' — "
-        f"{stale_count} stale, {truncated_count} truncated:\n"
-    ]
+        f"{stale_count} stale, {truncated_count} truncated — {conf_token}:"
+    )
+    lines = [header, hint[0] + "\n"] if hint else [header + "\n"]
     for r in results:
         tags_str = f" [{', '.join(r['tags'])}]" if r.get("tags") else ""
         lines.append(
@@ -2947,16 +2958,37 @@ async def _semantic_search_reranked(query, limit, folder, tags, frontmatter, uid
         timing.record("reranked", False)
         return _semantic_provider_refusal(exc)
     candidates = found.rows
+    # #389 (D1, D6): taken from the candidate list before rerank, so
+    # `rerank=true` and `rerank=false` carry the same value.
+    confidence = _semantic_confidence(candidates[0]["similarity"] if candidates else None)
     outcome = await rerank_service.rerank_candidates(
         query, [(r["title"], r.get("rerank_text")) for r in candidates]
     )
     page = [candidates[i] for i in outcome.order][:limit]
     scores = [outcome.scores[i] for i in outcome.order][:limit] if outcome.reranked else None
     rendered, paths = render_semantic_rerank_results(query, page, outcome, scores=scores,
-                                                     pending=pending)
+                                                     pending=pending, confidence=confidence)
     _record_rerank(outcome)
     timing.record_results(paths)
     return rendered
+
+
+def _record_confidence(confidence: str, top_similarity: float | None) -> None:
+    """#389 (D7): on every page of both tools, whatever the threshold —
+    `confidence`, and `top_similarity` (three decimals) when a candidate
+    existed. Neither is an `error` marker; a refusal records neither."""
+    timing.record("confidence", confidence)
+    if top_similarity is not None:
+        timing.record("top_similarity", round(float(top_similarity), 3))
+
+
+def _semantic_confidence(top_similarity: float | None) -> str:
+    """`semantic_search`'s token (#389, D1): no keyword arm, so
+    `keyword_all` is 0. Records the usage keys as a side effect."""
+    value = search_confidence.confidence(
+        0, top_similarity, settings.search_low_confidence_similarity)
+    _record_confidence(value, top_similarity)
+    return value
 
 
 def _record_rerank(outcome) -> None:
@@ -3038,7 +3070,7 @@ HYBRID_KEYWORD_ONLY_FOOTER = (
     "Keyword arm only: the semantic arm was unavailable; see keyword_search."
 )
 #: The fixed bounds the floor arithmetic (D7) rests on, pinned by the tests.
-HYBRID_HEADER_MAX = 400
+HYBRID_HEADER_MAX = 405
 HYBRID_ROW_STRUCTURE_MAX = 345
 HYBRID_FOOTER_MAX = 75
 _HYBRID_SEP = " — "
@@ -3123,7 +3155,7 @@ def _hybrid_preview(r) -> tuple[str, str]:
     return ("none", "")
 
 
-def _hybrid_server_fields(r, k: int) -> list[str]:
+def _hybrid_server_fields(r, k: int, *, omit_explain: bool = False) -> list[str]:
     fields = [f"score: {r.score:.4g}"]
     if r.semantic_rank is not None:
         fields.append(f"semantic_rank: {r.semantic_rank} (similarity {r.similarity:.3f})")
@@ -3138,7 +3170,11 @@ def _hybrid_server_fields(r, k: int) -> list[str]:
         fields.append("keyword_rank: -")
     terms = [f"1/({k}+{rank})" for rank in (r.semantic_rank, r.keyword_rank)
              if rank is not None]
-    if len(terms) == 2:
+    if omit_explain:
+        # The last rung of the first-row ladder (#389, D5): the terms follow
+        # from the row's ranks and the header's `rrf_k`, so nothing is lost.
+        fields.append("explain omitted")
+    elif len(terms) == 2:
         fields.append(f"explain: {terms[0]} + {terms[1]}")
     elif r.semantic_rank is not None:
         fields.append(f"explain: {terms[0]}, semantic only")
@@ -3177,10 +3213,10 @@ def _object_row_line(*, title: str, path: str, tags: list[str],
 
 def _hybrid_row_line(r, k: int, *, title: str, path: str, tags: list[str],
                      preview: tuple[str, str], labels: list[str],
-                     extra: tuple[str, ...] = ()) -> str:
+                     extra: tuple[str, ...] = (), omit_explain: bool = False) -> str:
     return _object_row_line(
         title=title, path=path, tags=tags, preview=preview,
-        fields=[*_hybrid_server_fields(r, k), *extra, *labels],
+        fields=[*_hybrid_server_fields(r, k, omit_explain=omit_explain), *extra, *labels],
     )
 
 
@@ -3202,21 +3238,28 @@ def _hybrid_abbreviated_row(r, k: int, room: int, *, extra: tuple[str, ...] = ()
         title=r.title or "", path=r.path, tags=list(r.tags or []),
         preview=_hybrid_preview(r), room=room, cut=cut,
         labels=["section omitted"] if _hybrid_locator(r) else [],
+        explain_rung=True,
     )
 
 
 def _abbreviated_row(line_for, *, title: str, path: str, tags: list[str],
                      preview: tuple[str, str], room: int, cut,
-                     labels: list[str] | None = None) -> str:
+                     labels: list[str] | None = None,
+                     explain_rung: bool = False) -> str:
     """The abbreviation ladder shared by `hybrid_search` and
     `semantic_search(rerank=true)`; `line_for(title=, path=, tags=, preview=,
     labels=)` renders one candidate line. `labels` are the ones the row
-    starts with (`section omitted` when a locator is dropped, #355)."""
+    starts with (`section omitted` when a locator is dropped, #355).
+    `explain_rung` (hybrid only, #389 D5) appends a last step after the
+    omitted forms: `line_for(..., omit_explain=True)` replaces the row's
+    `explain` field by the label `explain omitted`."""
     labels = list(labels or [])
+    omit_explain = False
 
     def line() -> str:
+        kw = {"omit_explain": True} if omit_explain else {}
         return line_for(title=title, path=path, tags=tags,
-                        preview=preview, labels=[*labels, "abbreviated"])
+                        preview=preview, labels=[*labels, "abbreviated"], **kw)
 
     steps = []
     if tags:
@@ -3224,6 +3267,8 @@ def _abbreviated_row(line_for, *, title: str, path: str, tags: list[str],
     if preview != ("none", ""):
         steps.append("preview")
     steps += ["title_cut", "path_cut", "title_omit", "path_omit"]
+    if explain_rung:
+        steps.append("explain_omit")
     for step in steps:
         if step == "tags":
             tags = []
@@ -3251,23 +3296,41 @@ def _abbreviated_row(line_for, *, title: str, path: str, tags: list[str],
             if "path_cut" not in labels:
                 labels.append("path_cut")
             labels.append("path omitted")
+        elif step == "explain_omit":
+            omit_explain = True
         if len(line()) <= room:
             break
     return line()
 
 
+def hybrid_confidence(result) -> "search_confidence.Confidence":
+    """The `confidence` value of a hybrid page (#389, D1): the shared rule
+    over `keyword_all` and the semantic arm's best similarity, at the
+    configured threshold. The same value for `rerank` true and false — both
+    inputs are fixed before rerank."""
+    return search_confidence.confidence(
+        result.keyword_all, getattr(result, "top_similarity", None),
+        settings.search_low_confidence_similarity,
+    )
+
+
 def _hybrid_provenance_tokens(query_cut: bool, result, rows,
-                              rerank_token: str | None = None) -> list[str]:
+                              rerank_token: str | None = None,
+                              confidence: str | None = None) -> list[str]:
     """The provenance tokens every hybrid response carries, the zero-result
     line included (each stated even when zero): `query_cut` when cut, `arms`,
-    `rrf_k`, `arm_depth`, the per-arm counts, stale/truncated, `without
-    excerpt`, `shown`, and the snippet-cap token."""
+    the rerank token on a rerank=true call, `confidence` (#389), `rrf_k`,
+    `arm_depth`, the per-arm counts, stale/truncated, `without excerpt`,
+    `shown`, and the snippet-cap token."""
     keyword_rows = [r for r in rows if r.keyword_rank is not None]
     parts = ["query_cut"] if query_cut else []
     parts.append(_hybrid_arms_token(result))
     if rerank_token is not None:
         # #367 (D9): after `arms:`, on every return path of a rerank=true call.
         parts.append(rerank_token)
+    # #389 (D3): after `arms:` and the rerank token, on every page. Base
+    # budget, like `arm_depth`: no compaction absorbs it (L14).
+    parts.append(search_confidence.token(confidence or hybrid_confidence(result)))
     parts += [
         f"rrf_k: {result.rrf_k}",
         f"arm_depth: keyword {result.keyword_rows}/{hybrid_service.HYBRID_ARM_DEPTH}, "
@@ -3287,11 +3350,27 @@ def _hybrid_provenance_tokens(query_cut: bool, result, rows,
 
 
 def _hybrid_header(q_lit: str, query_cut: bool, result, rows, found: int,
-                   rerank_token: str | None = None) -> str:
+                   rerank_token: str | None = None, confidence: str | None = None) -> str:
     return _HYBRID_SEP.join([
         f"Found {found} hybrid results for {q_lit}",
-        *_hybrid_provenance_tokens(query_cut, result, rows, rerank_token),
+        *_hybrid_provenance_tokens(query_cut, result, rows, rerank_token, confidence),
     ]) + ":"
+
+
+def _with_conditional_hint(render, hint: str | None):
+    """D4 (#389): `render(hint)` returns `(text, row_lines, paths)`. The page
+    is rendered without the hint; when there is one, again with it reserved,
+    and the hint is kept only when that rendering shows the same paths in
+    the same order with byte-identical row lines. Otherwise it is withdrawn
+    **before** the abbreviation ladder or any row drop could change a row:
+    the hint never costs a row."""
+    text, row_lines, paths = render(None)
+    if hint is None:
+        return text, paths
+    hinted, hinted_lines, hinted_paths = render(hint)
+    if hinted_paths == paths and hinted_lines == row_lines:
+        return hinted, hinted_paths
+    return text, paths
 
 
 def render_hybrid_results(query: str, result, *, budget: int | None = None,
@@ -3304,8 +3383,26 @@ def render_hybrid_results(query: str, result, *, budget: int | None = None,
     length: the header and both footers are reserved, rows are appended in
     fused order while each fits, the first that does not ends the page, and
     later rows are dropped whole. A first row that does not fit is abbreviated
-    instead, so the page always makes progress.
+    instead, so the page always makes progress. On a `confidence: low` page
+    the hint line is kept only when it costs no row (#389, D4).
     """
+    confidence = hybrid_confidence(result)
+    hint = (search_confidence.HYBRID_LOW_CONFIDENCE_HINT
+            if confidence == "low" else None)
+    return _with_conditional_hint(
+        lambda h: _render_hybrid_page(query, result, budget=budget, rerank=rerank,
+                                      rerank_scores=rerank_scores,
+                                      confidence=confidence, hint=h),
+        hint,
+    )
+
+
+def _render_hybrid_page(query: str, result, *, budget: int | None,
+                        rerank, rerank_scores, confidence: str,
+                        hint: str | None) -> tuple[str, list[str], list[str]]:
+    """One rendering of the hybrid page, with `hint` reserved and placed
+    after the header and the transition line when given. Returns the text,
+    the row lines and the paths."""
     limit_chars = settings.max_read_response_chars if budget is None else budget
     q_lit, query_cut = _hybrid_query_echo(query)
     keyword_only = result.arms != hybrid_service.ARMS_BOTH
@@ -3329,23 +3426,30 @@ def render_hybrid_results(query: str, result, *, budget: int | None = None,
         # nothing was found: an absent token is not evidence of absence.
         line = _HYBRID_SEP.join([
             f"No hybrid results for {q_lit}",
-            *_hybrid_provenance_tokens(query_cut, result, [], token),
+            *_hybrid_provenance_tokens(query_cut, result, [], token, confidence),
         ])
         if transition:
             line += "\n" + transition
+        if hint:
+            # After the zero-result line and the transition line, before the
+            # keyword-only footer (#389, D4).
+            line += "\n" + hint
         if keyword_only:
             line += "\n" + HYBRID_KEYWORD_ONLY_FOOTER
-        return line, []
+        return line, [], []
 
     page = result.rows
     k = result.rrf_k
     # Counts over the whole page bound the counts over any prefix of it, so
     # this header is never shorter than the one finally rendered.
-    reserved = len(_hybrid_header(q_lit, query_cut, result, page, len(page), token))
+    reserved = len(_hybrid_header(q_lit, query_cut, result, page, len(page), token,
+                                  confidence))
     if keyword_only:
         reserved += 1 + len(HYBRID_KEYWORD_ONLY_FOOTER)
     if transition:
         reserved += 1 + len(transition)
+    if hint:
+        reserved += 1 + len(hint)
     reserved += 1 + HYBRID_FOOTER_MAX
     room = limit_chars - reserved
     lines: list[str] = []
@@ -3360,14 +3464,14 @@ def render_hybrid_results(query: str, result, *, budget: int | None = None,
                                              cut=cut))
     shown = page[: len(lines)]
 
-    out = [_hybrid_header(q_lit, query_cut, result, shown, len(page), token),
-           *([transition] if transition else []), *lines]
+    out = [_hybrid_header(q_lit, query_cut, result, shown, len(page), token, confidence),
+           *([transition] if transition else []), *([hint] if hint else []), *lines]
     if keyword_only:
         out.append(HYBRID_KEYWORD_ONLY_FOOTER)
     omitted = len(page) - len(shown)
     if omitted:
         out.append(cap_footer(omitted))
-    return "\n".join(out), [r.path for r in shown]
+    return "\n".join(out), lines, [r.path for r in shown]
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -3387,10 +3491,10 @@ HYBRID_RERANK_CUT_MIN = 20
 HYBRID_RERANK_CUT_KEEP_WHOLE = 25
 #: Pinned by the tests (D9): the semantic rerank=true header and the
 #: abbreviated row's structure at their worst case.
-SEMANTIC_RERANK_HEADER_MAX = 185
+SEMANTIC_RERANK_HEADER_MAX = 199
 SEMANTIC_RERANK_ROW_STRUCTURE_MAX = 235
 #: The hybrid rerank=true header and structure worst cases (D9).
-HYBRID_RERANK_HEADER_MAX = 431
+HYBRID_RERANK_HEADER_MAX = 444
 HYBRID_RERANK_ROW_STRUCTURE_MAX = 367
 
 
@@ -3446,12 +3550,14 @@ def _semantic_rerank_line(r: dict, score: float | None, *, title: str, path: str
 
 
 def _semantic_rerank_header(q_lit: str, query_cut: bool, rows: list[dict], found: int,
-                            token: str) -> str:
+                            token: str, confidence: str = "ok") -> str:
     return _HYBRID_SEP.join([
         f"Found {found} semantic matches for {q_lit}",
         *(["query_cut"] if query_cut else []),
         f"{sum(1 for r in rows if r['stale'])} stale, "
         f"{sum(1 for r in rows if r['embedding_truncated'])} truncated",
+        # #389 (D3): after the counts, before the rerank token.
+        search_confidence.token(confidence),
         token,
         f"shown: {len(rows)}",
     ]) + ":"
@@ -3459,35 +3565,58 @@ def _semantic_rerank_header(q_lit: str, query_cut: bool, rows: list[dict], found
 
 def render_semantic_rerank_results(
     query: str, rows: list[dict], outcome, *, scores: list[float] | None = None,
-    budget: int | None = None, pending: int = 0,
+    budget: int | None = None, pending: int = 0, confidence: str = "ok",
 ) -> tuple[str, list[str]]:
     """`semantic_search(rerank=true)`: the page `rows` (already in final
     order and truncated to `limit`) in the quoted-object encoding, bounded by
     `budget` (default `MAX_READ_RESPONSE_CHARS`) on rendered length under
     hybrid's rules. `scores[i]` is row `i`'s rerank score, only when the page
-    was reranked. Returns the text and the paths rendered, in order."""
+    was reranked. `confidence` is computed by the caller from the candidate
+    list before rerank (#389, D1); on `low` the semantic hint is kept only
+    when it costs no row (D4). Returns the text and the paths rendered, in
+    order."""
+    hint = (search_confidence.SEMANTIC_LOW_CONFIDENCE_HINT
+            if confidence == "low" else None)
+    return _with_conditional_hint(
+        lambda h: _render_semantic_rerank_page(query, rows, outcome, scores=scores,
+                                               budget=budget, pending=pending,
+                                               confidence=confidence, hint=h),
+        hint,
+    )
+
+
+def _render_semantic_rerank_page(
+    query: str, rows: list[dict], outcome, *, scores: list[float] | None,
+    budget: int | None, pending: int, confidence: str, hint: str | None,
+) -> tuple[str, list[str], list[str]]:
     limit_chars = settings.max_read_response_chars if budget is None else budget
     q_lit, query_cut = _hybrid_query_echo(query)
     token = outcome.token
     # The `index_transition:` line directly after the header, as on the
-    # `rerank=false` page (#355, D4), reserved in the budget.
+    # `rerank=false` page (#355, D4), reserved in the budget; the hint
+    # (#389) after it.
     transition = transition_line(pending)
     if not rows:
         zero = _HYBRID_SEP.join([
             f"No semantic results for {q_lit} (embeddings may still be building)",
             *(["query_cut"] if query_cut else []),
             "0 stale, 0 truncated",
+            search_confidence.token(confidence),
             token,
             "shown: 0",
         ])
-        return zero + ("\n" + transition if transition else ""), []
+        return (zero + ("\n" + transition if transition else "")
+                + ("\n" + hint if hint else "")), [], []
 
     def score_of(i: int) -> float | None:
         return scores[i] if scores is not None else None
 
-    reserved = len(_semantic_rerank_header(q_lit, query_cut, rows, len(rows), token))
+    reserved = len(_semantic_rerank_header(q_lit, query_cut, rows, len(rows), token,
+                                           confidence))
     if transition:
         reserved += 1 + len(transition)
+    if hint:
+        reserved += 1 + len(hint)
     reserved += 1 + HYBRID_FOOTER_MAX
     room = limit_chars - reserved
     lines: list[str] = []
@@ -3511,12 +3640,12 @@ def render_semantic_rerank_results(
             labels=["section omitted"] if _semantic_locator(first) else [],
         ))
     shown = rows[: len(lines)]
-    out = [_semantic_rerank_header(q_lit, query_cut, shown, len(rows), token),
-           *([transition] if transition else []), *lines]
+    out = [_semantic_rerank_header(q_lit, query_cut, shown, len(rows), token, confidence),
+           *([transition] if transition else []), *([hint] if hint else []), *lines]
     omitted = len(rows) - len(shown)
     if omitted:
         out.append(_rerank_cap_footer(omitted))
-    return "\n".join(out), [r["path"] for r in shown]
+    return "\n".join(out), lines, [r["path"] for r in shown]
 
 
 @_tracked(
@@ -3553,6 +3682,7 @@ async def hybrid_search_impl(
             frontmatter=frontmatter,
             user_id=uid,
         )
+    _record_confidence(hybrid_confidence(result), result.top_similarity)
     rendered, paths = render_hybrid_results(query, result)
     timing.record_results(paths)
     return rendered
@@ -3574,6 +3704,7 @@ async def _hybrid_search_reranked(query, limit, folder, tags, frontmatter, uid) 
             rerank_candidates=True,
         )
     candidates = result.rows
+    _record_confidence(hybrid_confidence(result), result.top_similarity)
     outcome = await rerank_service.rerank_candidates(
         query, [(r.title, r.rerank_text) for r in candidates]
     )

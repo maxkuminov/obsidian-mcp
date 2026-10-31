@@ -559,6 +559,18 @@ class Settings(BaseSettings):
     # count. Operator configuration, measured with the harness arm
     # (`scripts/search_eval_arms/hybrid.py`); there is no per-call argument.
     hybrid_rrf_k: int = Field(60, ge=1, le=1000)
+    # Where `semantic_search` and `hybrid_search` start reading
+    # `confidence: low` (#389): no `match: all` keyword note and the best
+    # similarity of the call's candidate set strictly below this value.
+    # **0 is hard off** (the shipped default): the token is still on every
+    # page and reads `ok`, and the usage rows still record the evidence.
+    # Model-dependent (bge-m3's candidate value is 0.50; OpenAI
+    # `text-embedding-3-*` cosines run lower), so it is chosen by the
+    # calibration recipe in DEPLOYMENT.md and re-chosen when the embedding
+    # model changes. It ranks nothing, so it is not in
+    # `retrieval_fingerprint()`. See "Confidence (#389)" in
+    # docs/architecture/search.md.
+    search_low_confidence_similarity: float = Field(0.0, ge=0.0, le=1.0, allow_inf_nan=False)
 
     embedding_provider: Literal["ollama", "openai"] = "ollama"
     openai_api_key: str | None = None

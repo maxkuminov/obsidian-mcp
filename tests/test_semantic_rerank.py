@@ -137,7 +137,8 @@ def _decoded(text: str):
 #: `_GOLDEN_ROWS` with query "consensus", limit 3 and a transition count of 3,
 #: verified against that tree's `src/`, not this one. It carries the
 #: `index_transition:` line, both locator forms and a one-lined preview.
-_GOLDEN = (
+#: Re-verified unchanged against d56444b's `src/` (the tree before #389).
+_GOLDEN_PRE_389 = (
     "Found 3 semantic matches for 'consensus' — 1 stale, 1 truncated:\n"
     'index_transition: 3 notes not yet re-chunked; cross-generation ranking is approximate, re-run after the backlog drains\n'
     '\n'
@@ -152,6 +153,21 @@ _GOLDEN = (
     '\n'
     '**One of these notes was embedded only up to the first 1000 chunks.** A match against it is a match against its head — its tail is not reachable by semantic search at all, though `keyword_search` still covers the whole note.'
 )
+
+#: The search-confidence contract's `rerank=false` page (#389; reranker spec,
+#: MODIFIED byte-identity): rendered from d56444b's `src/` and from this tree
+#: with the same rows, the only difference is ` — confidence: ok` before the
+#: header's closing `:` at the default threshold 0 — and, at a threshold above
+#: the best similarity (0.95 here), ` — confidence: low` plus the semantic hint
+#: line after the `index_transition:` line.
+_GOLDEN = _GOLDEN_PRE_389.replace(
+    "1 truncated:\n", "1 truncated — confidence: ok:\n", 1)
+_GOLDEN_LOW = _GOLDEN_PRE_389.replace(
+    "1 truncated:\n", "1 truncated — confidence: low:\n", 1).replace(
+    "after the backlog drains\n",
+    "after the backlog drains\n"
+    "low confidence: weak similarity and no keyword arm; try `keyword_search` with an "
+    "identifier, or `get_neighborhood` from a known note\n", 1)
 
 _GOLDEN_ROWS = [
     row(1, "Projects/Paxos.md", distance=0.1, chunk="  Paxos reaches\nconsensus among replicas",
@@ -175,6 +191,28 @@ async def test_rerank_false_is_byte_identical_to_the_render_before(monkeypatch, 
     for key in ("reranked", "rerank_reason", "rerank_ms", "rerank_candidates"):
         assert key not in params
     assert params["result_paths"] == ["Projects/Paxos.md", "Projects/Raft.md", "Projects/Zab.md"]
+    assert params["confidence"] == "ok" and params["top_similarity"] == 0.9
+
+
+def test_the_golden_differs_from_the_pre_389_render_by_the_token_alone():
+    """The re-based baseline (#389): exactly one inserted token, and when
+    `low` the token and the one hint line — no other byte."""
+    assert _GOLDEN.count(" — confidence: ok") == 1
+    assert _GOLDEN.replace(" — confidence: ok", "", 1) == _GOLDEN_PRE_389
+    hint = ("low confidence: weak similarity and no keyword arm; try `keyword_search` with "
+            "an identifier, or `get_neighborhood` from a known note\n")
+    assert _GOLDEN_LOW.replace(" — confidence: low", "", 1).replace(hint, "", 1) == (
+        _GOLDEN_PRE_389)
+
+
+async def test_rerank_false_low_is_the_golden_plus_token_and_hint(monkeypatch, captured):
+    monkeypatch.setattr(settings, "search_low_confidence_similarity", 0.95)
+    monkeypatch.setattr(_Session, "pending", 3)
+    _serve(monkeypatch, _GOLDEN_ROWS)
+    assert await tools.semantic_search_impl("consensus", limit=3) == _GOLDEN_LOW
+    _, params, _ = captured.last()
+    assert params["confidence"] == "low" and params["top_similarity"] == 0.9
+    assert "error" not in params
 
 
 async def test_rerank_false_issues_the_same_statements_as_rerank_true(monkeypatch, captured,

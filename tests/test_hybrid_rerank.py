@@ -139,7 +139,8 @@ async def test_reranked_rows_carry_the_score_after_hybrids_fields(monkeypatch, c
     out = await tools.hybrid_search_impl("q", limit=10, rerank=True)
     assert len(fake.requests[-1]["documents"]) == 50
     header = out.splitlines()[0]
-    assert re.search(r" — arms: both — reranked: true \(candidates: 50\) — rrf_k: ", header)
+    assert re.search(r" — arms: both — reranked: true \(candidates: 50\) — confidence: ok — rrf_k: ",
+                     header)
     rows = [_split_row(line) for line in out.splitlines() if line.startswith("- {")]
     assert rows[0][0]["path"] == "s20.md"
     for obj, tail in rows:
@@ -233,7 +234,7 @@ def test_the_fixed_bounds_with_rerank():
     q_lit, query_cut = tools._hybrid_query_echo("\x01" * 8192)
     token = "reranked: false (malformed_response)"
     header = tools._hybrid_header(q_lit, query_cut, result, worst_rows, 50, token)
-    assert len(header) <= tools.HYBRID_RERANK_HEADER_MAX == 431, len(header)
+    assert len(header) <= tools.HYBRID_RERANK_HEADER_MAX == 444, len(header)
     labels = ["tags omitted", "preview omitted", "title_cut", "path_cut", "abbreviated"]
     structure = tools._hybrid_row_line(
         worst_rows[0], 1000, title="", path="", tags=[], preview=("none", ""), labels=labels,
@@ -241,10 +242,14 @@ def test_the_fixed_bounds_with_rerank():
     assert len(structure) <= tools.HYBRID_RERANK_ROW_STRUCTURE_MAX == 367, len(structure)
     print(f"\n[hybrid bound] rerank=true abbreviated structure: {len(structure)}")
     assert max(len(tools._rerank_cap_footer(n)) for n in range(1, 51)) <= 75
-    # Since #391 the cut form's floor sum exceeds the cap in this one worst
-    # case, so the row continues to the labelled omitted form (≤ 984).
-    assert 431 + 367 + 25 + 25 + 75 + 75 + 5 == 1003 > 1000
-    assert 431 + 367 + 31 + 75 + 75 + 5 == 984 <= 1000
+    # Before #389 and #391 the cut form summed 431 + 362 + 25 + 25 + 75 + 75 +
+    # 5 = 998. The `confidence` token (13 more header characters) and the
+    # longest `matched_in` (`title+tags+body`, 5 more) take it to 1,016, so
+    # the keyword-only rerank=true worst case falls through to the labelled
+    # omitted form (L6), 444 + 367 + 31 + 75 + 75 + 5 = 997; the per-case
+    # sums are pinned in `tests/test_search_confidence.py`.
+    assert 444 + 367 + 25 + 25 + 75 + 75 + 5 == 1016 > 1000
+    assert 444 + 367 + 31 + 75 + 75 + 5 == 997 <= 1000
 
 
 @pytest.mark.parametrize("split", [False, True])
@@ -284,8 +289,8 @@ async def test_the_hybrid_worst_case_with_rerank(monkeypatch, captured, fake, mo
     assert len(rows) == 1
     if split:
         # `matched_in: title+tags+body` (#391). These inputs' real header is
-        # shorter than the 431 worst case, so the 20–25 cut form fits here
-        # (pinned); the arithmetic worst case (1,003 > 1,000) takes the
+        # shorter than the 444 worst case, so the 20–25 cut form fits here
+        # (pinned); the arithmetic worst case (1,016 > 1,000) takes the
         # omitted form, pinned by the direct-render test below.
         assert "matched_in: title+tags+body" in rows[0]
         assert '"title":""' not in rows[0] and '"path":""' not in rows[0]
@@ -357,14 +362,15 @@ def test_the_hybrid_worst_case_with_a_transition_line_and_a_locator(monkeypatch,
 def test_the_floor_arithmetic_with_the_transition_line():
     """After #355 a both-arms page reserves the `index_transition:` line
     (≤ 127 characters at a ten-digit count). With it the cut form sums to
-    1,004 at the worst case, so that case falls through to the labelled
-    omitted form, which fits: the 1,000 bound holds, the 20–25 cut does not
-    always survive (recorded in the archived design's implementation notes)."""
+    1,026 at the worst case (1,004 before #389 and #391), and the omitted
+    form to 1,007, so that case falls through to the last rung, `explain
+    omitted` (#389, D5), which fits: the 1,000 bound holds, the 20–25 cut
+    does not always survive (L6)."""
     from src.services.embeddings import transition_line
 
     rows = [HybridRow(path=f"{i}.md", title="", tags=[], score=2 / 1050, keyword_rank=50,
                       semantic_rank=50, match="any", similarity=-0.123, stale=True,
-                      embedding_truncated=True, no_excerpt=True, matched_in=["title", "body"])
+                      embedding_truncated=True, no_excerpt=True, matched_in=["title+tags+body"])
             for i in range(50)]
     result = HybridResult(rows=rows, arms="both", rrf_k=1000, keyword_rows=50, keyword_all=50,
                           keyword_any=50, semantic_rows=50, semantic_chunks=50, overlap=50,
@@ -381,14 +387,23 @@ def test_the_floor_arithmetic_with_the_transition_line():
     omitted = len(tools._hybrid_row_line(
         rows[0], 1000, title="", path="", tags=[], preview=("none", ""),
         labels=[*base, "title omitted", "path omitted", "abbreviated"], extra=score))
-    assert (header, line, cut_form) == (371, 127, 378)
-    assert header + 1 + line + 1 + cut_form + 25 + 25 + 1 + 75 == 1004
-    assert header + 1 + line + 1 + omitted + 1 + 75 <= 1000
+    explain_omitted = len(tools._hybrid_row_line(
+        rows[0], 1000, title="", path="", tags=[], preview=("none", ""),
+        labels=[*base, "title omitted", "path omitted", "abbreviated"], extra=score,
+        omit_explain=True))
+    # With #391's longest `matched_in` (`title+tags+body`, five characters
+    # more than `title,body`) every row form is five longer.
+    assert (header, line, cut_form, omitted) == (388, 127, 383, 414)
+    assert header + 1 + line + 1 + cut_form + 25 + 25 + 1 + 75 == 1026
+    assert header + 1 + line + 1 + omitted + 1 + 75 == 1007
+    assert omitted - explain_omitted == 19
+    assert header + 1 + line + 1 + explain_omitted + 1 + 75 == 988 <= 1000
 
 
 def test_the_rerank_worst_case_takes_the_omitted_form_when_the_cut_cannot_fit(monkeypatch):
     """#391 V6: with `matched_in: title+tags+body` the cut-form floor sum is
-    431 + 367 + 25 + 25 + 75 + 75 + 5 = 1,003 > 1,000, so at the arithmetic
+    444 + 367 + 25 + 25 + 75 + 75 + 5 = 1,016 > 1,000 (#389's
+    token and #391's `matched_in` together), so at the arithmetic
     worst case the first row must take the labelled omitted form. Pinned by
     rendering at the budget the omitted form needs, which the cut form
     exceeds."""

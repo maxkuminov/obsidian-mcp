@@ -10,11 +10,14 @@ from scripts.search_eval.mining import DEFAULT_WINDOW_SECONDS, MineResult, load_
 QUERIES_FILE = "queries.jsonl"
 QRELS_FILE = "qrels.json"
 MINE_REPORT_FILE = "mine-report.json"
+#: #389: one line per usable semantic/hybrid search row, for `confidence`.
+CONFIDENCE_ROWS_FILE = "confidence-rows.jsonl"
 
 
 def write_mine(*, export: Path, out: Path, window_seconds: float = DEFAULT_WINDOW_SECONDS,
                manual: Path | None = None, user_id: int | None = None) -> MineResult:
-    """`mine`: export → queries.jsonl, qrels.json, mine-report.json (all 0600)."""
+    """`mine`: export → queries.jsonl, qrels.json, mine-report.json and
+    confidence-rows.jsonl (#389), all 0600."""
     if not export.is_file():
         raise UsageError(f"no export file at {export}")
     if manual is not None and not manual.is_file():
@@ -26,6 +29,17 @@ def write_mine(*, export: Path, out: Path, window_seconds: float = DEFAULT_WINDO
     ensure_private_dir(out)
     atomic_write(out / QUERIES_FILE, "".join(canonical_json(q) + "\n" for q in result.queries))
     atomic_write(out / QRELS_FILE, canonical_json(result.qrels))
+    # #389 (Codex impl r1 B1): the confidence rows are published first and
+    # bound to the report by digest; the report, which carries the
+    # provenance, is published last. An interrupted or interleaved `mine`
+    # leaves a report whose digest does not match the rows beside it, and
+    # `confidence` refuses that pair instead of tabulating another run's
+    # rows under this run's provenance.
+    rows_digest = atomic_write(
+        out / CONFIDENCE_ROWS_FILE,
+        "".join(canonical_json(r) + "\n" for r in result.confidence_rows))
+    result.report["confidence_rows_sha256"] = rows_digest
+    result.report["confidence_rows"] = len(result.confidence_rows)
     atomic_write(out / MINE_REPORT_FILE, pretty_json(result.report))
     return result
 

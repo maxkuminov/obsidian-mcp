@@ -85,6 +85,14 @@ def _cmd_score(args) -> int:
     return result.exit_code
 
 
+def _cmd_confidence(args) -> int:
+    from scripts.search_eval.confidence import run_confidence
+
+    result = run_confidence(Path(args.data), args.threshold)
+    sys.stdout.write(result.table)
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(prog="python -m scripts.search_eval",
                      description="Search evaluation harness (#356).")
@@ -110,7 +118,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--data", required=True)
     p.add_argument("--arm", action="extend", nargs="+", required=True)
     p.add_argument("--generation", default=None, help="generation id (default: a UTC stamp)")
-    p.add_argument("--depth", type=int, default=20)
+    p.add_argument("--depth", type=int, default=50)
     p.add_argument("--limit-queries", type=int, default=None)
     p.add_argument("--database-url", default=None,
                    help="the restored copy (default: $SEARCH_EVAL_DATABASE_URL)")
@@ -126,6 +134,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-queries", type=int, default=50)
     p.add_argument("--seed", type=int, default=0)
     p.set_defaults(func=_cmd_score)
+
+    p = sub.add_parser("confidence",
+                       help="tabulate SEARCH_LOW_CONFIDENCE_SIMILARITY calibration evidence (#389)")
+    p.add_argument("--data", required=True, help="the data directory `mine` wrote")
+    p.add_argument("--threshold", type=_positive_float, required=True,
+                   help="the candidate threshold T, in (0, 1]")
+    p.set_defaults(func=_cmd_confidence)
     return parser
 
 

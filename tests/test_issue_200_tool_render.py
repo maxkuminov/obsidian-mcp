@@ -345,6 +345,8 @@ async def test_semantic_search_adds_no_usage_params_key(monkeypatch, captured):
         # #367: the logged argument (false here); the rerank keys only ride
         # a rerank=true call.
         "rerank",
+        # #389: the confidence evidence, on every page whatever the threshold.
+        "confidence", "top_similarity",
     }
 
 

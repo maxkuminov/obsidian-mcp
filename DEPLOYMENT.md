@@ -1040,6 +1040,53 @@ harness's `runfile:` arms carry the baseline across:
    be 0 for the report to be evidence.
 5. Attach `report.json` only if `attachable: true`, as above.
 
+### Calibrating search confidence
+
+`semantic_search` and `hybrid_search` put `confidence: ok | low` on every
+page (#389). `low` means no keyword note matched all the terms and the best
+similarity of the call's candidates is strictly below
+`SEARCH_LOW_CONFIDENCE_SIMILARITY`. The setting ships at **0, which is off**
+(every page reads `ok`). A false `low` on a good page pushes an agent away
+from the right notes, so the value is chosen from your own usage, not
+guessed. bge-m3's candidate is 0.50; another model needs its own number.
+
+1. **Accrue evidence at 0.** Run the release with the threshold at 0 for at
+   least **14 days and** until **each** tool has at least **200**
+   clicked-through pages (a page one of whose notes the agent then read).
+   Every page's usage row records `confidence`, `top_similarity` and, on
+   `hybrid_search`, `keyword_all`, whatever the threshold.
+2. **Tabulate a single-user export.**
+   `make search-eval-export USER_ID=<your user id>` (step 1 of "Measuring
+   search quality" above), then
+   `python -m scripts.search_eval mine --export .search-eval/usage-export.jsonl --out .search-eval`
+   (it writes `confidence-rows.jsonl` beside the judgments) and
+   `python -m scripts.search_eval confidence --data .search-eval --threshold 0.50`.
+   It reads only the mined files and connects to no database. It prints one
+   line per tool,
+   `<tool>: false-low <rate> (<n>/<m> clicked-through pages, <d> days) — PASS|FAIL|INSUFFICIENT_DATA at < 1/50`,
+   then counts per query class and the `top_similarity` deciles of clicked
+   and unclicked pages. Rows logged before the release carry no
+   `confidence` and are excluded; keyword-only pages are included.
+3. **Pick and accept.** Pick the threshold at the noise ceiling of the
+   unclicked distribution and re-run step 2 at that value. **Accept it only
+   if both lines read PASS**: under 1 in 50 clicked-through pages would
+   read `low`. Fewer than 14 days or 200 clicked-through pages (zero
+   included) is `INSUFFICIENT_DATA`, never a pass. One setting enables both
+   tools, so both lines must pass; a deployment that rarely uses one tool
+   cannot enable either until it does.
+4. **Set it** (`SEARCH_LOW_CONFIDENCE_SIMILARITY=<value>` in `.env`),
+   recreate the container, and re-run the tabulation after a further
+   period. Re-calibrate from step 1 whenever the embedding model changes.
+
+The output (`.search-eval/confidence-report.json` and the table) carries
+the mine run's `provenance` and `attachable`. **Only attachable output may
+leave `.search-eval/`**: a multi-user tabulation begins with `NOT
+ATTACHABLE (multi-user provenance)` and stays private. The reference
+deployment sets a non-zero value only after both lines pass. `mine` binds the rows to
+its report by digest, so `confidence` refuses (exit 64) when
+`confidence-rows.jsonl` and `mine-report.json` come from different `mine`
+runs — re-run `mine` instead of mixing files.
+
 ### Reranker (optional)
 
 `semantic_search` and `hybrid_search` accept `rerank=true`, which asks a

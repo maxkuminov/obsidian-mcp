@@ -53,6 +53,9 @@ from scripts.search_eval._io import canonical_json
 from scripts.search_eval.classify import CLASSES, classify
 
 SEARCH_TOOLS = ("keyword_search", "semantic_search", "hybrid_search")
+#: The tools whose pages carry the `confidence` token (#389).
+CONFIDENCE_TOOLS = ("semantic_search", "hybrid_search")
+CONFIDENCE_VALUES = ("ok", "low")
 READ_TOOL = "read_note"
 EXPORT_TOOLS = (*SEARCH_TOOLS, READ_TOOL)
 
@@ -322,6 +325,82 @@ class MineResult:
     queries: list[dict]
     qrels: dict[str, dict[str, int]]
     report: dict = field(default_factory=dict)
+    #: One row per usable `semantic_search` / `hybrid_search` search row
+    #: (#389, D7): the `confidence` subcommand's calibration evidence. No text, no path.
+    confidence_rows: list[dict] = field(default_factory=list)
+
+
+def _number_or_none(v: Any) -> float | None:
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return float(v)
+
+
+def confidence_evidence_search(row: dict) -> bool:
+    """A `semantic_search` / `hybrid_search` row that is calibration
+    evidence (#389, Codex impl r1 M1): not a refusal, a resolved principal
+    and a well-typed `result_paths`. Unlike `usable_search`, a query or
+    folder the telemetry cap truncated does **not** exclude it — that rule
+    exists because a cut query cannot be replayed, and the tabulation
+    replays nothing. Dropping such pages could let the false-low gate PASS
+    on incomplete evidence."""
+    if row.get("tool") not in CONFIDENCE_TOOLS:
+        return False
+    params = row.get("params") or {}
+    if _refusal_reason(params) is not None or principal_of(row) is None:
+        return False
+    paths = params.get("result_paths")
+    return isinstance(paths, list) and all(isinstance(x, str) for x in paths)
+
+
+def _confidence_evidence(rows: list[dict], searches: list[dict], reads: list[dict],
+                         window_us: int) -> list[dict]:
+    """One confidence row per evidence search, with its own click
+    attribution: a usable read credits the latest search by the same
+    principal within the window whose `result_paths` holds the path, over
+    the union of the replay-usable searches and the evidence searches (so a
+    read still credits at most one search). The judgments are unaffected."""
+    evidence = [r for r in rows if confidence_evidence_search(r)]
+    pool = {r["id"]: r for r in (*searches, *evidence)}
+    index: dict[tuple, list[tuple[int, int]]] = defaultdict(list)
+    for r in pool.values():
+        principal = (r.get("user_id"), *principal_of(r))
+        for path in set(r["params"]["result_paths"]):
+            index[(principal, path)].append((r["created_at"], r["id"]))
+    for entries in index.values():
+        entries.sort()
+    clicked: set[int] = set()
+    for r in reads:
+        entries = index.get(((r.get("user_id"), *principal_of(r)), r["params"]["path"]))
+        if not entries:
+            continue
+        i = bisect.bisect_left(entries, (r["created_at"], -1)) - 1
+        if i >= 0 and entries[i][0] > r["created_at"] - window_us:
+            clicked.add(entries[i][1])
+    return [confidence_row(r, r["id"] in clicked) for r in evidence]
+
+
+def confidence_row(s: dict, clicked: bool) -> dict:
+    """The calibration evidence of one search row (#389, D7): `tool`, the
+    miner's query `class`, `created_at` (the export's UTC epoch
+    microseconds, unchanged), `top_similarity`, `keyword_all`, `clicked`
+    and — only when the usage row recorded one — `confidence`. A row
+    without the key predates the token and is excluded by the tabulator."""
+    p = s["params"]
+    row = {
+        "tool": s["tool"],
+        # A query the 200-character telemetry cap cut is still classed by
+        # what was logged (#389, Codex impl r1 M1): the row stays evidence.
+        "class": classify(normalize_text(p["query"])) if isinstance(p.get("query"), str)
+        and normalize_text(p["query"]) else "prose",
+        "created_at": s["created_at"],
+        "top_similarity": _number_or_none(p.get("top_similarity")),
+        "keyword_all": p.get("keyword_all") if _is_int(p.get("keyword_all")) else None,
+        "clicked": clicked,
+    }
+    if p.get("confidence") in CONFIDENCE_VALUES:
+        row["confidence"] = p["confidence"]
+    return row
 
 
 @dataclass
@@ -503,7 +582,10 @@ def mine(rows: list[dict], *, window_seconds: float = DEFAULT_WINDOW_SECONDS,
         "manual_excluded_other_owner": n_manual_other_owner,
         "provenance": provenance,
     }
-    return MineResult(queries=out_queries, qrels=qrels, report=report)
+    confidence_rows = _confidence_evidence(rows, searches, reads, window_us)
+    report["confidence_rows"] = len(confidence_rows)
+    return MineResult(queries=out_queries, qrels=qrels, report=report,
+                      confidence_rows=confidence_rows)
 
 
 # --------------------------------------------------------------------------

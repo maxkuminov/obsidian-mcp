@@ -461,6 +461,9 @@ async def semantic_search(
     order; `reranked: false (not_configured)` means this deployment has no
     reranker.
 
+    The header also carries `confidence: ok` or `confidence: low` (the
+    closest match is under the deployment's threshold; `ok` when none is set).
+
     Args:
         query: Natural language description of what you're looking for.
         limit: Maximum number of distinct notes to return (default 15).
@@ -1446,6 +1449,13 @@ async def hybrid_search(
     `reranked: true` or `reranked: false (<reason>)`, and an unreranked page
     keeps the unreranked order; `reranked: false (not_configured)` means
     this deployment has no reranker.
+
+    Every page's header also says `confidence: ok` or `confidence: low`:
+    `low` means no note matched all the keyword terms and the closest
+    semantic candidate is under this deployment's similarity threshold (a
+    line then suggests `keyword_search` or `get_neighborhood`), and `ok` is
+    also what a deployment that set no threshold says, so it is not a
+    quality claim.
 
     Args:
         query: What you are looking for — words, a phrase or a question.

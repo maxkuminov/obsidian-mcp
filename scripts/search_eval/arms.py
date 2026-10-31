@@ -229,7 +229,21 @@ def _load_runfile(spec: str, path: Path, *, qrels_sha256: str, snapshot_sha256: 
             raise UsageError(f"{spec}: {key} differs from the current data directory")
     if meta.get("membership") not in MEMBERSHIPS:
         raise UsageError(f"{spec}: the file declares no membership")
+    # #389 (D8): the depth the source was staged at bounds what it can be
+    # scored at. A file whose depth is missing, not an integer or not
+    # positive is refused here, before the generation is reserved (exit 64).
+    for key in ("depth", *(("staged_depth",) if "staged_depth" in meta else ())):
+        value = meta.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise UsageError(f"{spec}: the file records no usable {key} ({value!r})")
     return content
+
+
+def runfile_source_depth(meta: dict) -> int:
+    """The depth a validated `runfile:` source was actually staged at: its
+    own `depth`, or its `staged_depth` when that is shallower (a source that
+    was itself imported from a shallower file, #389)."""
+    return min(meta["depth"], meta.get("staged_depth", meta["depth"]))
 
 
 def resolve_arm(spec: str, *, qrels_sha256: str, snapshot_sha256: str,
