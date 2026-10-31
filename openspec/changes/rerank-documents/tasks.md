@@ -58,7 +58,7 @@ Refs #402. Read `proposal.md`, `design.md` (D1–D10, the owner decisions, L1–
   - **one-chunk both-arms**: a both-arms row whose incumbent preview is the keyword snippet and whose single (primary) chunk wins shows that chunk as `preview_kind: chunk` with its locator, and the fallback page shows the snippet (D5 oracle 4);
   - the security scenarios (a forged title, tag or chunk) still pass with the swapped preview.
 - [x] 4.6 Update the existing tests whose one-document-per-note assumption changes (`tests/test_rerank_exchange.py`, `tests/test_hybrid_rerank.py`, `tests/test_semantic_rerank.py`, `tests/test_rerank_eval.py`, `tests/_rerank_support.py`). Justify each change against a spec scenario and weaken no assertion. Settings tests: `RERANK_TIMEOUT_MS=20000` accepted and `30001` refused; `RERANK_MAX_DOCUMENTS` defaults to 100, and 49 and 201 are refused.
-- [ ] 4.7 `pytest tests` and `make test-integration` (real Postgres; the statement-capture and snapshot tests must actually run).
+- [x] 4.7 `pytest tests` and `make test-integration` (real Postgres; the statement-capture and snapshot tests must actually run).
 
 ## 5. Settings
 
