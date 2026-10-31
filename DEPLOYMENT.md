@@ -999,6 +999,24 @@ and needs nothing; the real run is this path, from a checkout with
    included (a query whose search finds nothing is scored as empty and
    counted per arm as `empty_candidates` in the manifest): raise `RERANK_TIMEOUT_MS` for replay if the reranker is slow,
    and say so next to the report.
+   **A change with a mechanical bar adds the `gate` step.** After `make
+   search-eval` has written `.search-eval/report.json` with the incumbent
+   as `BASELINE`, run `python -m scripts.search_eval gate --report
+   .search-eval/report.json --arm <candidate arm> --metrics
+   recall@10,recall@20,recall@50,ndcg@10 --slices overall,class:identifier
+   --min-ci-lower -0.01 --out .search-eval/gate.md` (the metrics, slices
+   and bound are the change's own bar). It prints PASS or FAIL per
+   (metric × slice) and exits 0 (all pass), 1 (a cell's CI95 lower bound is
+   below the bound, or its interval is null) or 64. It exits 64, printing
+   nothing and writing no file, when the report is not `OK`, `attachable:
+   true` and `provenance.users == 1`. On a multi-user deployment, export
+   with `USER_ID=` first. The two paths are the scored `report.json` and
+   the gate's Markdown table `gate.md`, and the PR body carries only a
+   table from a successful run. With a `runfile:` baseline, also pass
+   `--baseline-report` with the source generation's `report.json`.
+   **Score the source generation before staging the runfile**, and do not
+   re-score it afterwards: the gate checks that file against the digest
+   `run` recorded when it staged the runfile.
 7. **Attach `report.json` to the PR only if it says `attachable: true`.** It
    carries metrics, counts and hashes, no query text and no note paths. A
    `CORPUS_LOSS` verdict means the candidate lost searchable notes for that
@@ -1226,6 +1244,57 @@ authentication header.
 argument is new and optional. Rolling back is a redeploy of the previous
 image; a client still sending `rerank` is then refused by the
 unknown-argument rule.
+
+## OAuth CIMD and the resource gate (#357)
+
+**Migration 036** adds `oauth_clients.client_id_metadata_url` (nullable) and
+the CHECK `ck_oauth_clients_cimd_shape`. There is no backfill and no rewrite,
+and it runs in seconds. Run `make test-schema` before merging, as for every
+migration, and `alembic check` must be clean afterwards. The downgrade
+(`alembic downgrade 035`) **refuses while any CIMD client row exists**. Delete
+those clients on the panel's OAuth page first; their grants go with them, and
+their users reconnect.
+
+**What changes on the first request.** The AS metadata advertises
+`client_id_metadata_document_supported: true`. On their next fresh connection
+Claude, Claude Code and ChatGPT send an `https` `client_id` instead of calling
+`/register`. Existing DCR grants are untouched. The rollback lever is
+`OAUTH_CIMD_ENABLED=false` plus a recreate (no rebuild). Clients then fall back
+to DCR, and CIMD grants keep refreshing.
+
+**Outbound access.** The server fetches each client's metadata document over
+`https` from the pod/container (Claude's documents are on `claude.ai`). The
+fetch uses the `import_from_url` SSRF policy, so an egress policy that blocks
+public HTTPS breaks CIMD. Clients then see `invalid_client`, and the log shows
+`oauth_authorize_refused reason=client_metadata.fetch_failed` or
+`client_metadata.ssrf_refused`.
+
+**Verifying a connection took the CIMD path.** Look for one record per approval:
+
+```bash
+kubectl logs deploy/obsidian-mcp | grep '"msg": "oauth_consent_granted"' \
+  | jq -c '{registration_kind, cimd_host, outcome}'
+# {"registration_kind":"cimd","cimd_host":"claude.ai","outcome":"created"}
+```
+
+A DCR registration shows `oauth_client_registered` with
+`registration_kind: dcr`. On a compose host use `docker logs obsidian-mcp`.
+
+**The 14-day `resource` gate (follow-up #404).** RFC 8707 `resource` is classified on every
+`/authorize` and `/token` request and never refused in this release. A later
+change may refuse a foreign value with `invalid_target`, but only after **14
+consecutive days with no `resource_class: unexpected`** on any record. The
+`unclassified_rate_limited` and `unclassified_malformed` classes are excluded.
+Count per day:
+
+```bash
+kubectl logs deploy/obsidian-mcp --since=24h \
+  | jq -r 'select(.resource_class != null) | [.resource_class, (.resource_host // "")] | @tsv' \
+  | sort | uniq -c
+```
+
+Any `unexpected` line names only the host the client sent. Record it in
+#404 before anything is enforced.
 
 ## Upgrading across migration 035 (tags in keyword search, #391)
 

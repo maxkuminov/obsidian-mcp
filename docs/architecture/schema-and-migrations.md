@@ -1091,3 +1091,28 @@ synthetic rows of 1,800 words and three tags each — preflight ≈ 10 s,
 rewrite ≈ 27 s, the alembic run 28–41 s. Every rewritten row is a new tuple
 version (027's vacuum thresholds). Only table ownership is needed
 (`test_nonsuperuser_migrations_pg.py`).
+
+## 036: `oauth_clients.client_id_metadata_url` (#357)
+
+One nullable `VARCHAR(2048)` and one CHECK, `ck_oauth_clients_cimd_shape`.
+The URL is present exactly when `client_id LIKE 'cimd\_%'`, and such a row is
+`token_endpoint_auth_method = 'none'` with no secret hash. There is no backfill:
+every existing row is a DCR registration and already satisfies it.
+`client_id` is **not** widened. The synthetic id is `cimd_` + 59 hex of an
+HMAC, so `oauth_codes.client_id`, `oauth_tokens.client_id` and both
+`actor_ref` columns keep `VARCHAR(64)`.
+
+**Re-runnable by reconciliation**, 025's rule. The column carries a comment
+marker mirrored in `src/models/db.py`
+(`_OAUTH_CLIENT_CIMD_URL_COLUMN_MARKER`), so `alembic check` compares it. A
+re-run adopts the column only when its type, nullability, default and marker
+are its own. It adopts the CHECK only when `pg_get_constraintdef` equals what
+PostgreSQL prints for 036's own definition, which it reads from a `NOT VALID`
+probe created and dropped in the same transaction. Otherwise it refuses and
+names the difference.
+
+**The downgrade refuses while any CIMD row exists**, naming the count. Dropping
+the column would leave rows no URL can reach, and deleting them would cascade
+their grants. Delete those clients in the panel first.
+`tests/integration/test_oauth_cimd_migration_pg.py` pins the refusal and the
+CHECK.

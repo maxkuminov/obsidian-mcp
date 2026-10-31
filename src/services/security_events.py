@@ -180,10 +180,12 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
     ),
     # ── OAuth (Slice B) ──
     "oauth_token_issued": frozenset(
-        {"client_id", "user_id", "grant_id", "scope", "client_ip", "reason"}
+        {"cimd_host", "cimd_ref", "client_id", "user_id", "grant_id", "scope", "client_ip", "reason",
+         "resource_class", "resource_host"}
     ),
     "oauth_token_refreshed": frozenset(
-        {"client_id", "user_id", "grant_id", "scope", "client_ip"}
+        {"cimd_host", "cimd_ref", "client_id", "user_id", "grant_id", "scope", "client_ip",
+         "resource_class", "resource_host"}
     ),
     "oauth_token_refused": frozenset(
         {
@@ -193,51 +195,71 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
             "user_id",
             "grant_id",
             "client_ip",
+            "cimd_host",
+            "cimd_ref",
+            "resource_class",
+            "resource_host",
         }
     ),
     "oauth_token_rotation_failed": frozenset(
-        {"client_id", "grant_id", "client_ip", "error_type"}
+        {"cimd_host", "cimd_ref", "client_id", "grant_id", "client_ip", "error_type",
+         "resource_class", "resource_host"}
     ),
     # The #182 refresh-reuse alarm, migrated onto the suppressor by Slice B: a
     # replayed refresh token is caller-driven and repeatable, so a bare
     # `logger.warning` was an unbounded flood channel beside the bounded one.
     "oauth_refresh_reuse_detected": frozenset(
-        {"client_id", "grant_id", "user_id", "revoked_tokens", "client_ip"}
+        {"cimd_host", "cimd_ref", "client_id", "grant_id", "user_id", "revoked_tokens", "client_ip",
+         "resource_class", "resource_host"}
     ),
     # No `exc_info` and no `stack` on this one, deliberately: a SQLAlchemy
     # error renders the failing statement *and its bound parameters*, one of
     # which is the token hash. Only the exception's class name is recorded.
     "oauth_refresh_reuse_revocation_failed": frozenset(
-        {"client_id", "grant_id", "user_id", "client_ip", "error_type"}
+        {"cimd_host", "cimd_ref", "client_id", "grant_id", "user_id", "client_ip", "error_type",
+         "resource_class", "resource_host"}
     ),
     # The #325 authorization-code replay alarm: a spent code presented again
     # *after* full revalidation (client, redirect URI, PKCE), which revoked the
     # family its first exchange issued. Same fields and same reasoning as the
     # refresh-reuse pair above; never a code, verifier, challenge or hash.
     "oauth_code_replay_detected": frozenset(
-        {"client_id", "grant_id", "user_id", "revoked_tokens", "client_ip"}
+        {"cimd_host", "cimd_ref", "client_id", "grant_id", "user_id", "revoked_tokens", "client_ip",
+         "resource_class", "resource_host"}
     ),
     # Class name only, no `exc_info`: the failing statement's bound parameters
     # include the code hash.
     "oauth_code_replay_revocation_failed": frozenset(
-        {"client_id", "grant_id", "user_id", "client_ip", "error_type"}
+        {"cimd_host", "cimd_ref", "client_id", "grant_id", "user_id", "client_ip", "error_type",
+         "resource_class", "resource_host"}
     ),
-    "oauth_consent_granted": frozenset({"client_id", "user_id", "scope", "client_ip"}),
+    # `registration_kind` (#357): `dcr` or `cimd` on every approval; a CIMD
+    # approval adds `cimd_host`, `cimd_ref` and `outcome` (created /
+    # refreshed / unchanged, from the synthetic row's upsert). One emission
+    # per approval, as before — there is no separate registration-path event.
+    "oauth_consent_granted": frozenset(
+        {"client_id", "user_id", "scope", "client_ip", "registration_kind",
+         "cimd_host", "cimd_ref", "outcome", "resource_class", "resource_host"}
+    ),
     "oauth_consent_denied": frozenset(
-        {"client_id", "client_id_submitted", "user_id", "client_ip"}
+        {"client_id", "client_id_submitted", "user_id", "client_ip",
+         "cimd_host", "cimd_ref", "resource_class", "resource_host"}
     ),
     "oauth_authorize_refused": frozenset(
-        {"reason", "client_id", "client_id_submitted", "user_id", "client_ip"}
+        {"reason", "client_id", "client_id_submitted", "user_id", "client_ip",
+         "cimd_host", "cimd_ref", "resource_class", "resource_host"}
     ),
     "oauth_cross_user_client_refused": frozenset(
-        {"client_id", "actor_user_id", "user_id", "route", "client_ip"}
+        {"client_id", "actor_user_id", "user_id", "route", "client_ip",
+         "resource_class", "resource_host"}
     ),
     "oauth_client_registered": frozenset(
-        {"client_id", "client_name_submitted", "scope", "count", "client_ip"}
+        {"client_id", "client_name_submitted", "scope", "count", "client_ip",
+         "registration_kind"}
     ),
     "oauth_client_registration_refused": frozenset({"reason", "client_ip"}),
     "oauth_grant_revoked": frozenset(
-        {
+        {"cimd_host", "cimd_ref", 
             "client_id",
             "user_id",
             "actor_user_id",
@@ -247,11 +269,22 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
             "route",
         }
     ),
-    "oauth_revoke_noop": frozenset({"reason", "client_id_submitted", "client_ip"}),
-    "oauth_revoke_refused": frozenset({"reason", "client_id", "client_ip"}),
+    "oauth_revoke_noop": frozenset(
+        {"reason", "client_id_submitted", "client_ip", "cimd_host", "cimd_ref"}
+    ),
+    # The RFC 8707 classification-only record (#357): emitted only on an
+    # /authorize or /token terminal path with no required outcome event
+    # (consent render, login redirect, unhandled exception, framework 422).
+    "oauth_resource_classified": frozenset(
+        {"resource_class", "resource_host", "route"}
+    ),
+    "oauth_revoke_refused": frozenset(
+        {"reason", "client_id", "client_ip", "cimd_host", "cimd_ref"}
+    ),
     # ── The request boundary (Slice A) ──
     "rate_limit_exceeded": frozenset(
-        {"route", "method", "client_ip", "limit_count", "window_seconds"}
+        {"route", "method", "client_ip", "limit_count", "window_seconds",
+         "resource_class"}
     ),
     "auth_failure": frozenset(
         {"reason", "token_tag", "key_id", "oauth_token_id", "client_ip", "route"}

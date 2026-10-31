@@ -2380,11 +2380,54 @@ class PinnedTransport(httpx.AsyncHTTPTransport):
         return await super().handle_async_request(request)
 
 
+_MAX_AGE_CEILING = 2**31 - 1
+
+
+@dataclass(frozen=True)
+class CacheDirective:
+    """The one piece of a response's `Cache-Control` a caller may see (#357).
+
+    Deliberately narrow: a parsed non-negative `max-age` (clamped) and whether
+    the response forbids reuse (`no-store` or `no-cache`). The raw header
+    string, and every other response header, never leave this module — a
+    caller that wants caching semantics gets semantics, not a header it could
+    log or forward.
+    """
+
+    max_age: int | None
+    no_store: bool
+
+
+def parse_cache_control(value: str | None) -> CacheDirective | None:
+    """`CacheDirective` from a `Cache-Control` value, or None when absent.
+
+    Unknown directives are ignored; a malformed or negative `max-age` is
+    treated as absent (the caller's default applies, never "cache forever").
+    """
+    if value is None:
+        return None
+    max_age: int | None = None
+    no_store = False
+    for part in value.split(","):
+        name, _, arg = part.strip().partition("=")
+        name = name.strip().lower()
+        if name in ("no-store", "no-cache"):
+            no_store = True
+        elif name == "max-age":
+            arg = arg.strip().strip('"')
+            if arg.isascii() and arg.isdigit():
+                max_age = min(int(arg), _MAX_AGE_CEILING)
+    return CacheDirective(max_age=max_age, no_store=no_store)
+
+
 @dataclass
 class FetchResult:
     chunks: AsyncIterator[bytes]
     final_url: str
     content_type: str | None
+    # Parsed caching semantics only (see `CacheDirective`); `import_from_url`
+    # ignores it. Defaulted so existing fakes that build a result keep working.
+    cache_control: CacheDirective | None = None
 
 
 @asynccontextmanager
@@ -2508,6 +2551,9 @@ async def _fetch_hops(
                 chunks=response.aiter_bytes(),
                 final_url=parts.url,
                 content_type=response.headers.get("content-type"),
+                cache_control=parse_cache_control(
+                    response.headers.get("cache-control")
+                ),
             )
             return
         finally:

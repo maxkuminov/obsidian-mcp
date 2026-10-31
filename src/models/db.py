@@ -322,6 +322,12 @@ _OAUTH_CLIENT_LAST_USED_COLUMN_MARKER = (
     "(025_oauth_client_last_used)"
 )
 
+# Byte-identical to `COLUMN_MARKER` in 036_oauth_cimd.py, so `alembic check`
+# compares it and a re-run of 036 can recognise its own column (#357).
+_OAUTH_CLIENT_CIMD_URL_COLUMN_MARKER = (
+    "created by 036_oauth_cimd: Client ID Metadata Document URL (#357)"
+)
+
 # Same device, same rule: byte identical to `CODE_GRANT_MARKER` and
 # `ISSUED_AT_MARKER` in `alembic/versions/029_oauth_grant_lifetime.py`.
 _OAUTH_CODE_GRANT_ID_COLUMN_MARKER = (
@@ -1050,6 +1056,12 @@ class OAuthClient(Base):
         nullable=True,
         comment=_OAUTH_CLIENT_LAST_USED_COLUMN_MARKER,
     )
+    # A Client ID Metadata Document client's URL (#357, migration 036). Set
+    # exactly when `client_id` starts `cimd_` (the synthetic, per-(URL, user)
+    # row); NULL for every RFC 7591 registration. The CHECK below enforces it.
+    client_id_metadata_url: Mapped[str | None] = mapped_column(
+        String(2048), nullable=True, comment=_OAUTH_CLIENT_CIMD_URL_COLUMN_MARKER
+    )
 
     user: Mapped["User | None"] = relationship(back_populates="oauth_clients")
 
@@ -1058,6 +1070,12 @@ class OAuthClient(Base):
             "(token_endpoint_auth_method = 'none' AND client_secret_hash IS NULL) OR "
             "(token_endpoint_auth_method = 'client_secret_post' AND client_secret_hash IS NOT NULL)",
             name="ck_oauth_clients_auth_method_secret",
+        ),
+        CheckConstraint(
+            "((client_id LIKE 'cimd\\_%') = (client_id_metadata_url IS NOT NULL)) AND "
+            "(client_id_metadata_url IS NULL OR "
+            "(token_endpoint_auth_method = 'none' AND client_secret_hash IS NULL))",
+            name="ck_oauth_clients_cimd_shape",
         ),
     )
 

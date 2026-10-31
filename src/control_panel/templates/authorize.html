@@ -377,11 +377,22 @@
                `hostname`, never its `netloc`, and never Unicode-decoded — is
                the value that cannot be dressed up, so it gets its own
                labelled row well away from the name. Nothing here is `|safe`. #}
+            {# A Client ID Metadata Document client (#357) is identified by the
+               HOST of its client identifier URL — the server fetched the
+               document from it, which is the one thing it can vouch for. The
+               document's self-declared name is deliberately not rendered. #}
             <div class="identity">
+                {% if client_kind == "cimd" %}
+                <div class="identity-row">
+                    <div class="identity-label">Application</div>
+                    <div class="identity-value host">{{ client_host }}</div>
+                </div>
+                {% else %}
                 <div class="identity-row">
                     <div class="identity-label">Application</div>
                     <div class="identity-value">{{ client_name }}</div>
                 </div>
+                {% endif %}
                 <div class="identity-row">
                     <div class="identity-label">Destination</div>
                     {% if redirect_host %}
@@ -390,6 +401,16 @@
                     <div class="identity-value undetermined">Destination could not be determined</div>
                     {% endif %}
                 </div>
+                {% if client_kind == "cimd" %}
+                <div class="identity-row">
+                    <div class="identity-label">Client ID</div>
+                    <div class="identity-value mono">{{ client_id_url }}</div>
+                </div>
+                <div class="identity-row">
+                    <div class="identity-label">First approved</div>
+                    <div class="identity-value mono">{% if first_approved_at %}{{ first_approved_at }} UTC{% else %}first time{% endif %}</div>
+                </div>
+                {% else %}
                 <div class="identity-row">
                     <div class="identity-label">Client ID</div>
                     <div class="identity-value mono">{{ client_id }}</div>
@@ -398,17 +419,34 @@
                     <div class="identity-label">Registered</div>
                     <div class="identity-value mono">{% if client_registered_at %}{{ client_registered_at }} UTC{% else %}unknown{% endif %}</div>
                 </div>
+                {% endif %}
             </div>
 
             {# Unconditional, on every render, allow-listed or not (D17).
                Nothing on this server verifies an application; suppressing the
                notice for a recognised destination would restore exactly the
                page #183 was filed about. #}
+            {% if client_kind == "cimd" %}
+            <div class="self-registered">
+                This application identified itself with a document published at
+                <strong>{{ client_host }}</strong>. This server fetched that document; it does
+                not verify who operates {{ client_host }}.
+            </div>
+            {% if loopback_only %}
+            <div class="trust unverified">
+                <strong>Code goes to a program on this computer.</strong>
+                This application only receives authorizations on a local address. Any program
+                running on this computer can claim that address. Approve only if you started
+                this yourself from a program you trust.
+            </div>
+            {% endif %}
+            {% else %}
             <div class="self-registered">
                 This application registered itself with this server. Registration is open to
                 anyone, and the name shown above was chosen by the application — it is not
                 verified by this server.
             </div>
+            {% endif %}
 
             {# The badge is a statement about the *destination*, never about
                the application: the only thing behind it is the operator's
@@ -440,7 +478,7 @@
             {% endif %}
 
             <div class="request-box">
-                <strong>{{ client_name }}</strong> is requesting
+                <strong>{% if client_kind == "cimd" %}{{ client_host }}{% else %}{{ client_name }}{% endif %}</strong> is requesting
                 <strong>{% if requested_write %}Read + Write{% else %}Read only{% endif %}</strong>
                 access to your Obsidian vault.
                 {% if write_unavailable %}
@@ -484,6 +522,9 @@
                 <input type="hidden" name="code_challenge_method" value="{{ code_challenge_method }}">
                 <input type="hidden" name="state"                 value="{{ state }}">
                 <input type="hidden" name="client_state"          value="{{ client_state }}">
+                {% for value in resources or [] %}
+                <input type="hidden" name="resource"              value="{{ value }}">
+                {% endfor %}
 
                 <div class="scope-label">Grant access level</div>
 

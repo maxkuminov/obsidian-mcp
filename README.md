@@ -774,6 +774,21 @@ and claude.ai that expect a proper authorization-code dance. The OAuth
 server supports public (`none`) and confidential (`client_secret_post`)
 token-endpoint authentication plus refresh tokens.
 
+Clients identify themselves in one of two ways:
+- **A Client ID Metadata Document** (CIMD, the MCP 2026-07-28 default). The
+  client's `client_id` is an `https` URL to a JSON document it publishes, and
+  the server fetches it through the same hardened, SSRF-guarded client as
+  `import_from_url`. Claude (claude.ai, Desktop, mobile), Claude Code and
+  ChatGPT use this whenever the server advertises it, which it does by default.
+  Claude Code's loopback callback (`http://localhost:<any port>/callback`) works
+  this way.
+- **Dynamic Client Registration** (`/register`, RFC 7591, deprecated by MCP but
+  kept) remains the fallback for any client that sends no URL.
+
+The consent page names a CIMD client by the **host** its document was fetched
+from, never by the name the document gives itself. Every authorization
+response carries the RFC 9207 `iss` parameter.
+
 Each client's page lists its grants — one row per `/authorize` approval,
 not per token — with a Revoke control and a permission select per grant,
 so revoking really ends the session instead of leaving a refresh token
@@ -989,7 +1004,27 @@ naming conventions, and YAML schema before it writes anything.
 ## Upgrading
 
 Pull, then `make deploy` (or rebuild your compose stack); migrations
-run on start. Across the keyword-tags release (migration 035, #391):
+run on start.
+
+Across the Client ID Metadata Documents release (migration 036, #357):
+
+- **Migration 036** adds one nullable column and one CHECK to
+  `oauth_clients`, with no backfill, and takes seconds. Its downgrade refuses while CIMD clients
+  exist (delete them in the panel first).
+- **Connectors switch to CIMD on their next connection.** Existing DCR
+  grants keep working. claude.ai, Claude Code and ChatGPT stop calling
+  `/register`. `OAUTH_CIMD_ENABLED=false` is the rollback lever.
+- **Every authorization redirect now carries `iss`** (RFC 9207). A client
+  that compares it does so against the metadata `issuer`, which is
+  unchanged.
+- **`resource` (RFC 8707) is logged, not enforced.** Each `/authorize` and
+  `/token` request is classified (`resource_class`) in the security log.
+  Refusing a foreign `resource` is a later change, gated on 14 days of these
+  logs ([DEPLOYMENT.md](./DEPLOYMENT.md#oauth-cimd-and-the-resource-gate-357)).
+- **The consent page's CSP** gains `form-action http://localhost:* http://127.0.0.1:*`
+  for native loopback callbacks.
+
+Across the keyword-tags release (migration 035, #391):
 
 - **Tags become searchable at once.** Migration 035 adds each note's tags
   to its keyword vector in place, in SQL, under the index generation lock
@@ -1362,6 +1397,9 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `SESSION_TOUCH_INTERVAL_SECONDS` | `60` | How stale a session's `last_seen_at` may get before a validated `GET`/`HEAD` rewrites it. Telemetry only — nothing authorizes on it. Must be ≥ 1. |
 | `SESSION_PURGE_RETAIN_DAYS` | `7` | How long a dead panel session row is kept, measured from the *later* of its expiry and its revocation, so a revocation stays visible for the full window. Must be ≥ 1. |
 | `OAUTH_KNOWN_REDIRECT_HOSTS` | `claude.ai,chatgpt.com` | Redirect **hosts** the consent screen badges as known connector destinations. JSON or CSV. Matched by exact host equality — no wildcards, no suffixes; entries containing `*`, `/`, `@` or internal whitespace are refused at startup. An empty list means every client is shown as unverified. |
+| `OAUTH_CIMD_ENABLED` | `true` | Accept OAuth Client ID Metadata Documents (an `https` URL as `client_id`) and advertise `client_id_metadata_document_supported`. `false` removes the flag, so clients fall back to `/register`; existing CIMD grants keep refreshing. |
+| `OAUTH_CIMD_CACHE_MAX_SECONDS` | `86400` | Ceiling on how long a fetched client metadata document is cached (its `Cache-Control: max-age`; 300 s when absent; `no-store` is honoured). 0–86400; `0` never caches. |
+| `OAUTH_CIMD_FETCHES_PER_ADDRESS_PER_MINUTE` | `10` | Client metadata document fetches one client address may start per minute (1–120). Cache hits and requests joining an in-progress fetch spend nothing. Fetches are also capped at one in flight per address and eight per server. |
 | `OAUTH_GRANT_ABSOLUTE_LIFETIME_DAYS` | `90` | Absolute lifetime of an OAuth grant, in whole days (1–365), counted from when the application first receives its tokens. Refresh never extends it; after it the user must approve again. Stated on the consent page. **No off value** — empty, `null`, `none` and `0` refuse to start. Lowering it applies to every grant at its next request; raising it extends existing grants. |
 | `MAX_FILE_READ_BYTES` | `10485760` | `read_file` cap (10 MB); bounds what the server reads from disk |
 | `MAX_FILE_WRITE_BYTES` | `26214400` | `write_file` cap (25 MB), decoded byte length |
