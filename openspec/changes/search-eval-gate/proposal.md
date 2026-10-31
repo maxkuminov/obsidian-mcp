@@ -1,8 +1,8 @@
 ## Why
 
 The search-evaluation harness reported deltas and confidence intervals but
-had no mechanical bar. The first real-data gate run, for #403's
-`hybrid_search` fill-offset proposal, needed one: a step that turns a
+had no mechanical bar. The first real-data evaluation run (2026-10-31), for a `hybrid_search`
+ranking candidate, needed one: a step that turns a
 scored report into PASS or FAIL per (metric × slice) and a table for the
 PR body. That run happened and the fusion change was declined: every cell
 fell within ±0.004 of zero, and recall@50's overall lower bound was

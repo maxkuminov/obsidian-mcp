@@ -1,8 +1,9 @@
 ## Context
 
-This change was built and reviewed inside the `hybrid-any-fill` change
-(#403), which ended in the owner declining the fusion offset after the
-first real-data gate run. That branch stays as history. This change extracts
+This step was built and reviewed for the first real-data evaluation run (2026-10-31), which measured a
+ranking candidate that the owner then declined. History: the step was
+extracted from the declined #403 branch (`hybrid-any-fill`), which stays as
+history. This change extracts
 **only the harness pieces**, ported from its head 06a76e0:
 
 - `scripts/search_eval/gate.py`;

@@ -1441,8 +1441,8 @@ and prints one line per (metric × slice) cell: the delta mean, the paired
 bootstrap CI95, and PASS or FAIL. A cell FAILs when its CI95 lower bound is
 below X, or when its interval is null. The same table goes to F as
 Markdown for the PR body. Exit codes: 0 all pass, 1 any cell fails, 64 on
-a usage error. The step imports nothing from `src`. It was built for the
-first real-data gate run (#403, whose fusion change was then declined).
+a usage error. The step imports nothing from `src`. It was built for
+the first real-data evaluation run (2026-10-31).
 Two rules hold, both verified by Codex:
 
 - **The tenant boundary is checked first.** The report, and for a

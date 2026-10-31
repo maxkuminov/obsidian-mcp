@@ -154,7 +154,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="the candidate threshold T, in (0, 1]")
     p.set_defaults(func=_cmd_confidence)
 
-    p = sub.add_parser("gate", help="PASS/FAIL per metric x slice from a scored report (#403)")
+    p = sub.add_parser("gate", help="PASS/FAIL per metric x slice from a scored report")
     p.add_argument("--report", required=True, help="the scored report.json")
     p.add_argument("--arm", required=True, help="the candidate arm's label in the report")
     p.add_argument("--metrics", required=True, help="comma-separated, e.g. recall@10,ndcg@10")

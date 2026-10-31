@@ -1,4 +1,4 @@
-"""`python -m scripts.search_eval gate` (#403): PASS or FAIL per (metric ×
+"""`python -m scripts.search_eval gate`: PASS or FAIL per (metric ×
 slice) from a scored `report.json`.
 
 It reads the report's `deltas` for one candidate arm against the report's
@@ -139,7 +139,7 @@ def run_gate(*, report_path: Path, arm: str, metrics: str, slices: str,
     # before any runfile source is examined.
     if report.get("deltas_baseline") != baseline:
         raise UsageError("the report's deltas_baseline does not equal its baseline "
-                         "(a pre-#403 report, schema_version < 3, has none: re-score it)")
+                         "(a report with schema_version < 3 has none: re-score it)")
     entries = [a for a in report.get("arms") or [] if isinstance(a, dict)]
     labels = [a.get("arm") for a in entries]
     if labels.count(baseline) != 1:

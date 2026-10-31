@@ -98,7 +98,7 @@ def test_a_shallow_runfile_is_not_scored_at_depth_end_to_end(tmp_path, deepmod):
     assert "R@50" in res.table and "staged_depth 20" in res.table
     again = score(here, [spec, f"{deepmod}:deep"], baseline=spec, min_queries=1, seed=3)
     assert again.report["deltas"] == res.report["deltas"], "seeded CI is reproducible"
-    # #403: schema 3, the deltas baseline, and the runfile arm's source
+    # The gate step: schema 3, the deltas baseline, and the runfile arm's source
     # (never scored here, so no source report digest).
     assert res.report["schema_version"] == 3
     assert res.report["deltas_baseline"] == res.report["baseline"] == base["arm"]
@@ -107,7 +107,7 @@ def test_a_shallow_runfile_is_not_scored_at_depth_end_to_end(tmp_path, deepmod):
 
 
 def test_a_scored_source_generation_s_report_digest_rides_the_runfile_arm(tmp_path, deepmod):
-    """#403 (Codex implementation round 2): when the source data directory's
+    """The gate step (Codex review): when the source data directory's
     `report.json` scores the runfile's generation, `run` records its sha256
     and `score` carries it into the arm entry `gate` checks."""
     import hashlib

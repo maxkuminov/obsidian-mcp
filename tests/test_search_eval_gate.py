@@ -311,6 +311,14 @@ def test_a_runfile_label_without_a_generation_is_refused(tmp_path, capsys):
     _refused(tmp_path, capsys, report, "--baseline-report", str(_rf_source(tmp_path)))
 
 
+def test_the_candidate_arm_cannot_be_the_baseline(tmp_path, capsys):
+    """`--arm` naming the report's own baseline is a usage error: there is no
+    delta of an arm against itself to gate."""
+    report = _report(baseline=CAND, arms=(CAND, BASE))
+    err = _refused(tmp_path, capsys, _write(tmp_path, "r.json", report), existing="old table\n")
+    assert "is the report's baseline" in err
+
+
 @pytest.mark.parametrize("mutate", [
     lambda r: r.update(baseline=None),
     lambda r: r.update(arms=[{"arm": BASE}]),
