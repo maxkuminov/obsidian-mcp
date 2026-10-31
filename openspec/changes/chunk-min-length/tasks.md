@@ -90,7 +90,7 @@
 
 ## 5. Gates
 
-- [ ] 5.1 Run `pytest tests`, `make test-integration`, `make audit`, `make search-eval` (the fixture must be unchanged), `openspec validate chunk-min-length --strict`, and `alembic check` (must be clean; no migration).
+- [x] 5.1 Run `pytest tests`, `make test-integration`, `make audit`, `make search-eval` (the fixture must be unchanged), `openspec validate chunk-min-length --strict`, and `alembic check` (must be clean; no migration).
 - [ ] 5.2 Real-data eval per D8:
   - Drain the baseline at v1.
   - Record the before distribution.
