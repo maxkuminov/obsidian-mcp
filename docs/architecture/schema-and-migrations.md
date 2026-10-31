@@ -1080,7 +1080,7 @@ lexeme shared by title and body is stored once), strips U+0002/U+0003 from
 the tags as `tags_text` does, and additionally flags every candidate with no
 `A` lexeme (`d_only`), since such a row gains its whole head in 035. The gate
 runs that statement verbatim and asserts that every id 035's preflight
-rejects (a D-only row, a shared-lexeme row, a sentinel-tag row) is flagged.
+rejects (a D-only row, a shared-lexeme row, a sentinel-tag row, Codex's position-saturation row) is flagged. The tags part is bounded per tag — each tag's full form and its `/`-expanded form parsed as separate documents — and the multi-config form combines the per-config parses with `UNION ALL` (a deduplicating `UNION` under-counts; an `english,simple` case pins it).
 
 **Downgrade** takes the generation lock and sets `ts_filter(content_tsvector,
 '{a,d}')` on every row carrying a `B` lexeme; a lexeme in both the tags and
