@@ -606,3 +606,158 @@ the redirect URI.
   registered list before minting anything, so the destination shown on the GET
   is the destination the code is delivered to. The read-only preselect below is
   also untouched.
+
+## Client ID Metadata Documents (#357)
+
+MCP 2026-07-28 deprecates RFC 7591 DCR in favour of OAuth Client ID Metadata
+Documents (CIMD, `draft-ietf-oauth-client-id-metadata-document-00`). The
+deprecation window is at least twelve months, so `/register` stays as the
+fallback. Claude uses CIMD only when the AS metadata advertises **both**
+`client_id_metadata_document_supported: true` and `none` in
+`token_endpoint_auth_methods_supported`. Before this change only the second was
+advertised, so every Claude connection registered a fresh DCR client (the
+residue #194 sweeps). Claude Code could not connect at all: its document
+declares `http://localhost/callback` and `http://127.0.0.1/callback`, which DCR
+refuses, and the consent page's `form-action 'self' https:` blocked the 302 to a
+loopback callback. The formal requirements are in
+`openspec/specs/oauth-client-metadata-documents/`. The design, with every
+Codex round, is in `openspec/changes/archive/*-oauth-cimd/design.md`.
+`src/oauth/cimd.py` is the module.
+
+**Detection.** A `client_id` beginning with the exact bytes `https://` is CIMD
+and only CIMD; it is never looked up as a DCR id (DCR ids are 32 hex). With
+`OAUTH_CIMD_ENABLED=false` it is an unknown client and the flag disappears from
+the metadata. Clients then fall back to DCR, and existing CIMD grants keep
+refreshing, because `/token` never fetches.
+
+**The URL** (`validate_client_id_url`, before any DNS) must meet every one of
+these, or it is refused:
+- ≤ 2,048 printable ASCII characters;
+- **no `?` and no `#` anywhere**, because the identifier is stored and a query can carry a secret;
+- no userinfo, and no literal or `%`-encoded `.`/`..` segment;
+- a path other than empty or `/`;
+- port 443 or 8443 (transfer's port policy, L1);
+- **byte-equal** to `canonicalise(url).url`. Two spellings must never be two clients sharing one document.
+
+**The fetch** goes through `transfer.fetch_url_guarded`, never a second client:
+- `allow_http=False`, `max_redirects=0` (any 3xx is a refusal);
+- a 10 s deadline and a 64 KiB cap, identity encoding only;
+- the transfer deny list on every resolved address, with the connection pinned to the validated address and Host/SNI kept;
+- `trust_env=False`.
+
+`FetchResult.cache_control` is the one thing the fetch exposes beyond the body.
+It is a parsed `CacheDirective(max_age, no_store)`, never a raw header.
+
+**Admission, in this order.** A refusal spends nothing.
+1. A cache hit charges nothing.
+2. Joining an in-progress fetch of the same URL charges **nothing**. The join is evaluated before every cap.
+3. A 30 s cooldown after a failed fetch of that URL (1,024 entries, oldest replaced). This is the bounded negative cache. No error is ever served *as a document*; the deviation from the draft's "MUST NOT cache error responses" is L4.
+4. The per-address budget, `OAUTH_CIMD_FETCHES_PER_ADDRESS_PER_MINUTE` (10). This is **the failed-auth algorithm**, `rate_limits.salted_slot_index`, with its own table and salt:
+   - 4,096 fixed slots, with slot 0 reserved for "no address";
+   - a keyed BLAKE2b digest under a per-process salt;
+   - a fixed 60 s window started by the first charge;
+   - collisions merge two addresses (stricter, not choosable), and nothing is ever evicted, so churning addresses cannot refill a spent slot.
+5. At most **1** fetch in flight per slot.
+6. At most **8** fetches in flight per process.
+
+One address can therefore hold one of the eight global slots and no more. Four slow hostile fetches from one address leave a Claude flow from another address unaffected (tested).
+
+**Validation and the projection.** The document must:
+- be a JSON object;
+- have `client_id` byte-equal to the URL, and a non-empty `client_name` of at most 255 characters;
+- have `redirect_uris` of 1–20 distinct entries, each either `https` with a resolvable ASCII host (the #183 rule, stored normalised) or `http` to exactly `localhost`, `127.0.0.1` or `[::1]`;
+- have `token_endpoint_auth_method` absent or `none`, and no `client_secret` / `client_secret_expires_at`;
+- name `authorization_code` / `code` in `grant_types` / `response_types` if those are present;
+- if it has a `scope`, have a valid one naming `read` or `readwrite`. An absent scope means the DCR default.
+
+The **authorization hash** covers only `{client_id, sorted redirect_uris,
+sorted scope}`. `client_name` is outside it (Codex R2-2), so a name-only or
+order-only edit never blocks a consent.
+
+**Cache.** In-process LRU of 256 entries, keyed by the exact URL. The TTL is `max-age` clamped to
+`OAUTH_CIMD_CACHE_MAX_SECONDS` (24 h). A missing header means 300 s, and
+`no-store`/`no-cache` or a ceiling of 0 means not cached. An expired
+entry is never served after a failed refetch.
+
+**Redirect matching** is one function for GET and POST
+(`cimd.redirect_uri_allowed`).
+- **DCR** keeps exact membership.
+- **CIMD**: an exact match, or a loopback `http` entry matched on **any port** with the same host literal and a byte-equal path and query. `localhost` never matches `127.0.0.1`. The code stores the exact requested URI, so `/token`'s comparison is unchanged.
+
+**The synthetic row: one per (URL, user).**
+- `client_id = "cimd_" + HMAC-SHA256(K, url + "\n" + owner)[:59]` (64 characters, so every `VARCHAR(64)` and log bound holds). `K = HMAC-SHA256(SECRET_KEY, "oauth-cimd-client-id/v1")`, so the id cannot be computed from a public URL and integer user ids (Codex R2-1). Rotating `SECRET_KEY` derives new ids, so the next consent makes a new row (L13).
+- Migration 036 adds `client_id_metadata_url` (comment-marked so a re-run reconciles) and `ck_oauth_clients_cimd_shape`: the URL is present exactly when the id starts `cimd_`, and such a row is `none` with no secret.
+- The row is written **only by an approve**, in the code's transaction. A single `INSERT … ON CONFLICT DO UPDATE` refreshes the name, URIs and scope and stamps `last_used_at`. Because the owner is in the id, #68's cross-user rule, the panel's per-user listing and its cascading Delete keep their meaning, and two users connecting Claude get two rows.
+- A GET or a deny writes nothing, which is what removes DCR exhaustion.
+
+**The consent pin (D7).** The GET puts the authorization hash into the signed
+`oauth_state` cookie (`{"s": state, "m": hash}`; a DCR consent still carries
+the plain string). The POST re-resolves under the cache and admission rules and
+refuses `metadata_changed` when the hash differs. **The invariant is that the
+approval binds the projection that was shown.** An origin edit inside a fresh
+cache entry is not seen (L12). The code then pins the client, the exact
+redirect URI and the clamped scope. `/token` and the refresh path never fetch,
+so a withdrawn document ends nothing; revocation and the 90-day lifetime do
+(L2).
+
+**The order of checks per endpoint**, which is load-bearing (Codex round 3):
+
+| Endpoint | Order |
+| --- | --- |
+| `GET /authorize` | session (multi-user) → response type → PKCE → scope → **`cimd_` prefix refused before any lookup** → CIMD: URL rules → admission → fetch → validation → redirect match → render (host, URL, prior approval only from (URL, authenticated user)); DCR: lookup with `client_id_metadata_url IS NULL` |
+| `POST /authorize` | state (and the bound hash) → PKCE → scope → **`cimd_` prefix refused** → CIMD: session → re-resolve → hash pin → redirect match → clamp → deny (no row) / approve (upsert + code) |
+| `/token` | the credential **first, unchanged**: code or refresh row by hash alone → spent-code fork / #182 reuse decision / #326 precedence → **then** the caller's `client_id`: a `cimd_` value refused (`invalid_client` 401 on a live credential; the unknown-code response on a spent code, which fails #325's full revalidation and revokes nothing) → a CIMD row matches only its URL. A replayed refresh token under `client_id=cimd_nonexistent` still revokes its family |
+| `/revoke` | **`cimd_` prefix before the token lookup**, answered with RFC 7009's constant 200 and an empty body (`internal_id_submitted`, log only) → a CIMD row's `client_id` must equal its URL |
+
+Every CIMD refusal at `/authorize` (URL, admission, fetch, validation,
+redirect mismatch, internal id, metadata changed) answers the **constant
+`{"error":"invalid_client"}` 400**. The sub-reason
+(`client_metadata.<sub>`) is only on the one `oauth_authorize_refused`
+record. No record ever carries an `https://` client_id: `cimd_host` plus
+`cimd_ref` (16 hex of SHA-256) stand in for it at `/authorize`, `/token` and
+`/revoke`.
+
+**The consent page** shows the client identifier's **host** as the
+application, the full URL as the client ID, the destination host, and "First
+approved". It never shows the document's `client_name`, which is panel-only and
+labelled "Self-described as". The standing notice says the server fetched a
+document from that host and does not verify who operates it. An all-loopback
+client gets a further "code goes to a program on this computer" warning.
+`form-action` gains `http://localhost:*` and `http://127.0.0.1:*`
+([control panel](control-panel.md)).
+
+**The sweep.** `_expire_unreferenced_cimd_clients` runs on the same tick as
+#194's. A CIMD row with no code and no token row of any state, whose
+`last_used_at` is older than `OAUTH_CLIENT_UNUSED_EXPIRY_DAYS`, is deleted
+**whoever owns it**: it is a re-derivable cache of a public document. It uses
+the same `SKIP LOCKED` batch, in-lock re-read and `null` kill switch. Tokens
+are retained seven days past expiry, so a row is never swept while a grant
+row references it. The DCR sweep excludes CIMD rows explicitly. Each branch
+logs its own INFO count.
+
+**RFC 9207 / RFC 8707.**
+- **`iss`:** every redirect `POST /authorize` issues (approve and deny, both kinds) carries `iss=<issuer>`, and the metadata advertises `authorization_response_iss_parameter_supported`.
+- **`resource`** is **classified, never refused**, by owner decision.
+
+  The classes are `absent`, `accepted_1`…`accepted_4` (`{base}/mcp`, `{base}/mcp/`, `{base}`, `{base}/`), `unexpected` (with `resource_host` only), `unclassified_rate_limited` and `unclassified_malformed`.
+
+  The class is set once at handler entry and rides every record the request emits. A terminal path with no required outcome event emits one `oauth_resource_classified`: a consent render, the login redirect, an unhandled exception, or a framework 422 (route-aware handler in `src/main.py`, query only on `GET /authorize`, no body read elsewhere). The `/token` 429 carries the class on its existing `rate_limit_exceeded` record and reads no body.
+
+  The follow-up that would refuse with `invalid_target` may rely on exactly this evidence: 14 consecutive days with no `unexpected` on any of these records, the two `unclassified_*` classes excluded. The query is in `DEPLOYMENT.md`.
+
+**Accepted limitations (#357)**, recorded so they are not re-fixed when
+re-reported:
+- L1 Ports other than 443/8443 are refused.
+- L2 A changed or withdrawn document does not end existing grants.
+- L3 A `[::1]` callback is matched by the server, but CSP cannot name an IPv6 literal, so the browser may block the final hop.
+- L4 The 30 s cooldown is a bounded negative cache.
+- L5 After the single→multi-user bootstrap, a pre-bootstrap row and a per-admin row can coexist for one URL.
+- L6 The cache, cooldown and budgets are per process.
+- L7 Timing distinguishes a cache hit from a fetch.
+- L8 A local program can claim a loopback callback; the page warns, and PKCE binds the exchange.
+- L9 `resource` is not enforced.
+- L10 Colliding addresses share a budget slot.
+- L11 Eight distinct addresses holding 10 s fetches can fill the global cap for 10 s.
+- L12 An origin edit inside the freshness window is not seen at the POST.
+- L13 `SECRET_KEY` rotation re-derives ids.
+- L14 A client whose every POST is malformed never reaches the gate's evidence (nor the AS).

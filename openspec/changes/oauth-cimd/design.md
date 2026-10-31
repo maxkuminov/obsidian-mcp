@@ -309,6 +309,36 @@ None open. Max answered all three on 2026-10-31: no CIMD host allow-list (decisi
 - **L11** Eight distinct addresses (or slots), each holding a 10 s fetch, can fill the global cap and make other uncached CIMD authorizations answer `fetch_busy` for up to 10 s. Cached URLs, joined flights and DCR are unaffected. In the reference deployment `/authorize` is behind SSO.
 - **L12** An origin edit inside the cached projection's freshness window is not seen by the consent POST. The approval writes the projection that was shown, which is the invariant.
 
+## Implementation notes (2026-10-31)
+
+None of these shifts changes a requirement. Each is recorded here so the
+verifier does not read it as drift.
+
+1. **Migration 036 is re-runnable by reconciliation**, not bare DDL. The schema
+   gate stamps back to 012 and re-runs every revision, so 036 meets its own
+   column and constraint. The column carries a comment marker mirrored in the
+   model (`_OAUTH_CLIENT_CIMD_URL_COLUMN_MARKER`, compared by `alembic check`).
+   A re-run adopts the column only when its type, nullability, default and
+   marker match. It adopts the CHECK only when `pg_get_constraintdef` equals a
+   `NOT VALID` probe of 036's own definition. This is 025's rule.
+2. **The sweep logs one INFO line per branch** (DCR, then CIMD), not one
+   combined line. Both run on the same tick, under the same age and kill
+   switch.
+3. **`FetchResult.cache_control` defaults to `None`.** The existing test fakes
+   that build a `FetchResult` therefore needed no edit (task 4.6's "update every
+   construction site" collapses to the one real site in `_fetch_hops`).
+4. **The salted slot mapping is extracted** as
+   `rate_limits.salted_slot_index(address, size, salt)`. The failed-auth
+   `_slot_index` now calls it, and the CIMD table calls it with its own salt.
+   There is one definition of the algorithm.
+5. **The `/authorize` and `/token` handlers are wrapped.** The route function
+   classifies `resource` and calls `oauth_resource.finish` in a `finally`, and
+   the body moved to `_authorize_get` / `_authorize_post` / the existing
+   `_handle_*`. The signatures the tests call are unchanged.
+6. **The CIMD consent deny carries `cimd_host` / `cimd_ref` and no
+   `client_id`**, because there may be no row to read one from (the
+   unsuffixed `client_id` may hold only a row value).
+
 ## Codex spec review — round 1
 
 Verdict FAIL: 7 MAJOR, 1 MINOR. Verbatim:
