@@ -325,7 +325,10 @@ the wire, so none is cut off by a client's description limit.
   it.
 - `rerank=true` on either of the last two asks an optional,
   operator-configured reranker (`RERANK_URL`) to reorder the candidates
-  the call already fetched (at most 50 notes). The response is either
+  the call already fetched (at most 50 notes). Each note is scored on the
+  best of up to four of its fetched chunks, sent as the same text they were
+  embedded from (title, heading path and tags, then the chunk); a reranked
+  row's preview and `§` locator show the chunk that scored. The response is either
   fully reranked (`reranked: true (candidates: N)`, a `rerank_score` per
   row) or the unreranked page marked `reranked: false (<reason>)`;
   without a reranker it answers `reranked: false (not_configured)`. Its
@@ -1376,7 +1379,8 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `EMBEDDING_CA_FILE` | — | Trust anchor (PEM) for an `https` embedding endpoint behind an internal CA; replaces the default certifi bundle. Refused with an `http` URL. Embedding clients ignore `HTTP(S)_PROXY`, `SSL_CERT_*` and `.netrc`. |
 | `RERANK_URL` | — | Full URL of an optional reranker speaking the Jina-compatible `/v1/rerank` format (`llama-server --reranking`, vLLM, Infinity), e.g. `http://127.0.0.1:8081/v1/rerank`. Empty means no reranker: `rerank=true` answers `reranked: false (not_configured)`. **The endpoint receives the query and candidate note text.** Same transport rule as the embedding URL (`https`, loopback `http`, or `RERANK_ALLOW_PLAINTEXT`); a bad URL refuses to start, an unreachable reranker never does (it is probed at startup and re-probed in the background; `/health` reports `rerank`). Opt-in: no quality gain is claimed until you measure it with the harness on a GPU reranker, and a CPU reranker will time out at the default deadline. See `DEPLOYMENT.md`, "Reranker (optional)". |
 | `RERANK_MODEL` | — | Sent as `model` in the rerank request (≤ 200 characters). `llama-server` serves one model and ignores it. |
-| `RERANK_TIMEOUT_MS` | `1500` | One deadline per rerank call (100–10000), covering connect, write and read; past it the page falls back unreranked with `reranked: false (timeout)`. Also the extra time a `rerank=true` call can hold its concurrency slot. |
+| `RERANK_TIMEOUT_MS` | `1500` | One deadline per rerank call (100–30000), covering connect, write and read; past it the page falls back unreranked with `reranked: false (timeout)`. Also the extra time a `rerank=true` call can hold its `embedding` concurrency slot: under `MCP_CONCURRENCY_MODE` `queue` or `enforce`, keep it at or below `MCP_CONCURRENCY_WAIT_SECONDS` unless `make concurrency-report` passes with rerank traffic (a long hold delays, or under `enforce` refuses, concurrent vector searches). Size it together with `RERANK_MAX_DOCUMENTS` (`DEPLOYMENT.md`). |
+| `RERANK_MAX_DOCUMENTS` | `100` | The most documents one rerank call sends (50–200). Every candidate note (at most 50) is sent its best chunk first, then up to three more of its already-fetched chunks in distance order; a note scores the best of its documents. Rerank latency multiplies with it and `RERANK_TIMEOUT_MS`; `50` restores the pre-#402 count. |
 | `RERANK_ALLOW_PLAINTEXT` | `false` | Permit `http` to a non-loopback reranker host. Separate from `EMBEDDING_ALLOW_PLAINTEXT`, which does not cover it. An `https` reranker is verified against `EMBEDDING_CA_FILE` when set, else certifi's bundle. |
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI model. Changing it post-deploy requires `make reset-embeddings`; the server refuses to start until the stored vectors match. See [Switching providers or models](#switching-providers-or-models). |
 | `CHUNK_SIZE` | `512` | Approx tokens per chunk (4-char heuristic) |

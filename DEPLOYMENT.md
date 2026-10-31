@@ -1119,9 +1119,12 @@ runs — re-run `mine` instead of mixing files.
 
 `semantic_search` and `hybrid_search` accept `rerank=true`, which asks a
 cross-encoder reranker to reorder the candidates the call already fetched
-(at most 50 notes, each sent as its title and its best-matching chunk, cut
-to 2,048 characters). Nothing uses it until you set `RERANK_URL`, and the
-default setup does not. **It is not a recommended default**: on a laptop CPU
+(at most 50 notes). Each note is sent as the same text its vectors were
+embedded from — its title, heading path and tags, then the chunk — for its
+cosine-best chunk and up to three more of its already-fetched chunks, at most
+`RERANK_MAX_DOCUMENTS` documents per call (default 100), each cut to 2,048
+characters; a note scores the best of its documents. Nothing uses it until
+you set `RERANK_URL`, and the default setup does not. **It is not a recommended default**: on a laptop CPU
 scoring 10 documents takes several seconds, so 50 candidates time out at the
 1.5 s default on every call. Treat it as a GPU-only option, and measure it
 with the harness (above) on your own judgments before telling agents to use
@@ -1154,6 +1157,36 @@ check:
   re-probing every 60 s, doubling up to 10 minutes, so a reranker that
   starts after the server is picked up on its own);
 - `semantic_search(query, rerank=true)` says `reranked: true (candidates: N)`.
+
+**Size the timeout with the document budget.** Rerank time grows with the
+characters sent. Measured on an NVIDIA Quadro P4000 running
+`bge-reranker-v2-m3` (uncontended; about 75 µs per character):
+
+| documents × size | time |
+| --- | --- |
+| 50 × ~410 characters | 1.6 s (measured) |
+| 50 × ~2,000 characters | 7.3 s (measured) |
+| 100 × ~410 characters | ≈ 3.2 s (scaled) |
+| 100 × ~2,000 characters | ≈ 15 s (scaled) |
+
+Rule of thumb: `RERANK_TIMEOUT_MS ≥ RERANK_MAX_DOCUMENTS × average
+characters × per-character cost`, doubled when the GPU is shared with the
+embedding model (the indexer's batches slow it down). The 1,500 ms default is
+deliberately conservative and falls back on most calls on hardware like this;
+`RERANK_MAX_DOCUMENTS=50` restores the pre-#402 document count. The
+reference deployment sets `RERANK_TIMEOUT_MS=20000` (in its own
+infrastructure config, not here), which is valid **only while
+`MCP_CONCURRENCY_MODE` is `shadow` or `off`**.
+
+**The concurrency-mode rule.** A `rerank=true` call holds its `embedding`
+concurrency slot through the rerank exchange, up to `RERANK_TIMEOUT_MS`.
+With `MCP_CONCURRENCY_EMBEDDING=1`, under `queue` a concurrent
+`semantic_search` / `hybrid_search` waits `MCP_CONCURRENCY_WAIT_SECONDS` and
+is then admitted with an `overrun` mark, and under `enforce` it is refused
+with `slot_timeout` even though its embedding provider is healthy. So under
+`queue` or `enforce`, keep `RERANK_TIMEOUT_MS ≤ MCP_CONCURRENCY_WAIT_SECONDS
+× 1000` unless `make concurrency-report TARGET=<mode>` passes over evidence
+that includes `rerank=true` traffic. Re-check this before promoting the mode.
 
 A reranker that is slow, down or answering garbage never fails a search:
 the call returns the unreranked page marked `reranked: false (<reason>)`,

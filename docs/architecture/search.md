@@ -478,6 +478,54 @@ when such a candidate exists (by path: the semantic arm's rows carry no id).
 A NULL excerpt sends the title. A keyword-only hybrid call still reranks and
 says both `arms: keyword-only (…)` and `reranked: …`.
 
+**The documents since #402 (rerank-documents).** Live, the reranker demoted
+notes both arms ranked first: it was sent `title + chunk` for one chunk per
+note, the cosine-best, without the heading (#355 keeps heading lines out of
+`chunk_text`). Replayed against bge-reranker-v2-m3, one note's cosine-best
+chunk scored −8.87 while another of its chunks scored −0.62, and +0.33 with
+the heading path prepended. So:
+
+- **The document is the embedding input**, rebuilt from stored columns:
+  `embed_prefix + "\n\n" + EMBEDDED_TEXT_FORMATTERS[stamp](chunk_text)`, cut
+  to 2,048 (the ≤ 300-character prefix always survives). A NULL or unknown
+  stamp sends the title alone; a pre-034 row (NULL prefix) sends `title +
+  chunk`; a stale note sends its title (semantic) or title + excerpt
+  (hybrid); a keyword-only hybrid candidate sends title + excerpt. The
+  rerank=true overfetch projects exactly `embed_prefix` and
+  `embedded_chunking_version` more (the `rerank=false` statement is
+  unchanged; `find_related` never projects them).
+- **The allocation** (`rerank.allocate_documents`, pure, deterministic):
+  every candidate note (the unchanged ≤ 50) gets its primary document first,
+  so the candidate set and `candidates: N` are the incumbent's; then the
+  candidates' other already-fetched chunks in `(distance, file_path,
+  chunk_index)` order, at most 4 documents per note, while fewer than
+  `RERANK_MAX_DOCUMENTS` (default 100, 50–200) are allocated. Bound:
+  documents ≤ min(budget, 4 · candidates); hybrid's 50 candidates send ≤ 50
+  primaries + ≤ 50 secondaries (the arm fetched 50 rows). No extra statement
+  or retrieval: every chunk document is a row of the one overfetch.
+- **Per-note maximum.** One exchange over the flattened documents (the
+  validation counts documents, so a result per note is `count_mismatch`); a
+  note's `rerank_score` is its best document's score, the first maximal
+  document wins a tie (the primary), order `(−score, unreranked position)`.
+- **Preview and locator follow the score.** On a reranked row whose winner is
+  a chunk, the preview and `§` are that chunk's (on `hybrid_search` for any
+  chunk winner, the primary included, over the keyword snippet; on
+  `semantic_search` the primary is already the preview). A winner without a
+  recorded section shows no `§` — the cosine-best locator is never reused.
+  Title or excerpt winners and every fallback page keep the incumbent
+  selection, so the fallback baseline is unchanged.
+- **Latency.** P4000, uncontended, ~75 µs per character: 50 × ~410 chars
+  1.6 s, 50 × ~2,000 7.3 s (measured); 100 × ~410 ≈ 3.2 s, 100 × ~2,000
+  ≈ 15 s (scaled). Size `RERANK_TIMEOUT_MS` (now up to 30,000) with
+  `RERANK_MAX_DOCUMENTS`; the slot-hold rule under `queue`/`enforce` is in
+  DEPLOYMENT.md and rate-limits.md. `rerank_documents` is on the usage row.
+- The harness keeps the pre-#402 builder frozen as the baseline arms
+  `make_semantic_arm_incumbent` / `make_hybrid_arm_incumbent`; the gate runs
+  each pair at `--depth 10`, `20` and `50`, because the depth-50 report alone
+  cannot see crowding or max bias at the limits agents use.
+  `scripts/rerank_allocation_report.py` is the read-only, numbers-only
+  measurement of which of a named note's fetched chunks are allocated.
+
 **Order and all or nothing (D5, D7).** Reranked order is `rerank_score`
 DESC, then the unreranked position ASC; the page is its first `limit` rows,
 every other field keeps its unreranked value. Either every candidate has a
@@ -554,7 +602,9 @@ held through the exchange (at most `RERANK_TIMEOUT_MS` longer), and the
 database session is **closed before the request is sent**: no pooled
 connection is held during the hop (the checkout-peak test pins it).
 
-**The eval gate.** A rerank change is a search-path change:
+**The eval gate.** A rerank change is a search-path change (for a rerank
+document change, the incumbent-builder arms are the `BASELINE`, at depths 10,
+20 and 50):
 `make search-eval-snapshot`, then `make search-eval ...
 ARMS="semantic scripts.search_eval_arms.rerank:make_semantic_arm
 scripts.search_eval_arms.rerank:make_hybrid_arm" BASELINE=semantic` with
@@ -562,7 +612,13 @@ scripts.search_eval_arms.rerank:make_hybrid_arm" BASELINE=semantic` with
 is made without that report on real hardware.
 
 Accepted limitations (the change's design): L1 one wire format; L2 a note is
-judged on its best-distance chunk only; L3 the 2,048-character cut; L4 a
+judged on its best-distance chunk only (retired by #402: the best of up to
+four allocated chunks; rerank-documents' own L1–L11 — depth only from fetched
+and allocated rows, max bias toward multi-document notes, stored-prefix
+staleness within one pass, the 2,048 cut, `similarity` from the cosine-best
+chunk, the hybrid snippet replaced on a chunk winner, the 50 budget leaving no
+depth, the 1.5 s default, the `enforce` slot refusal, the unknown stamp sent
+as its title — are in that change's design); L3 the 2,048-character cut; L4 a
 stale semantic candidate is scored on its title (hybrid: its excerpt); L5
 the probe catches a mis-wired endpoint, not a weak model; L6 re-enabling
 can lag recovery by up to 10 minutes, and a failure after a passed probe is

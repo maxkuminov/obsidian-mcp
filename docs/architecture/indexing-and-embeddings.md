@@ -301,6 +301,20 @@ tags)`: `Title > H1 > … > Hk`, each component whitespace-collapsed and cut at
 then a `tags: a, b` line only if the whole prefix still fits. The row stores
 the prefix (`embed_prefix`) and the un-prefixed `chunk_text`.
 
+**The reranker is a second reader of that input (#402).** A `rerank=true`
+call rebuilds each fetched row's provider input from the stored columns —
+`embed_prefix + "\n\n" + EMBEDDED_TEXT_FORMATTERS[embedded_chunking_version](chunk_text)`,
+the reconstruction vector reuse relies on — and sends it as the rerank
+document (`rerank.embedding_document`). Only a stamp that is a key of the
+table reconstructs; a NULL or unknown stamp (a later version read after a
+rollback) sends the note's title alone. So a change to `build_embed_prefix`,
+the separator or a formatter is also a rerank-input change: it bumps
+`CHUNKING_VERSION` as before, and the eval-gate row applies to the reranker
+too. Because the stored prefix is what is sent, a title or tag edit is
+reflected only once the next pass has re-embedded the note; until then the
+row is stale (the upsert clears `embedded_content_hash`) and sends no stored
+text. See [search](search.md), "Reranking (#367)".
+
 **The certification covers the input (D3a).** `certify_embedded` stamps, in
 its one conditional UPDATE, `embedded_chunking_version = CHUNKING_VERSION` and
 `embedded_input_digest` (SHA-256 of the canonical JSON of the ordered provider
