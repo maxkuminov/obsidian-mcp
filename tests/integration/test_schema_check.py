@@ -7454,7 +7454,6 @@ def test_034_chains_from_033():
     config = Config()
     config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_current_head() == HEAD_REVISION == "034"
     assert script.get_revision("034").down_revision == "033"
 
 
@@ -7768,6 +7767,7 @@ def test_035_chains_from_034():
     config = Config()
     config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
+    assert script.get_current_head() == HEAD_REVISION == "035"
     assert script.get_revision("035").down_revision == "034"
 
 
