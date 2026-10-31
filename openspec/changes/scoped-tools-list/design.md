@@ -31,30 +31,42 @@ The list is filtered **iff** `current_principal` is a tuple whose kind is `"oaut
 
 "No principal → full list" is the fail direction of today's behaviour, not a hole: the filter is not a control, and every path that has no principal is either unauthenticated-by-design (sandbox, stdio) or in-process.
 
-### D2. What is hidden: derived from the code that refuses
+### D2. What is hidden: one registry that enforcement and the filter both read (revised, Codex round 1)
 
-Hidden set `H` = the production tools that refuse **every** call from a read-only credential, before any vault effect: the write bucket `W` (`_tracked(write_class=True)`, eight tools) ∪ `{request_upload}`. Nine tools: `create_note`, `edit_note`, `move_note`, `delete_note`, `set_frontmatter`, `write_file`, `delete_file`, `import_from_url`, `request_upload`.
+Hidden set = `WRITE_REQUIRED_TOOLS`, **one `frozenset` literal** in a new SDK-free module `src/mcp_server/tool_permissions.py`: `create_note`, `edit_note`, `move_note`, `delete_note`, `set_frontmatter`, `write_file`, `delete_file`, `import_from_url`, `request_upload`. Nine tools.
 
-It is **not** a list in `tool_visibility.py`. `_tracked` gains `requires_write: bool | None = None`; the wrapper is stamped `__requires_write__ = write_class if requires_write is None else requires_write`, and `request_upload_impl` is decorated `requires_write=True` (it is not in the write bucket: its write charge is taken at `PUT /transfer/upload` redemption, `rate-limits.md`). `production_write_required_tools()` enumerates the stamp exactly as `production_write_bucket_tools()` does (module attributes of `src.mcp_server.tools` whose `__module__` is that module), so test probes decorated in test modules cannot pollute it — the #343 lesson (Codex spec round 1). The filter maps registered tool names against that set; `tests/test_issue_66_*` already proves every registered tool delegates to a `_tracked` wrapper of the same name.
+It is the single source for **both** consumers:
+
+1. **Enforcement.** `_tracked` looks up its own `tool_name` in the registry once, at decoration time. For a member, at the **body boundary** — after every existing gate (argument caps, vault root, rate buckets, concurrency admission, quota), exactly where the body would start — it calls `_require_write()` and, on refusal, returns that refusal without running the body, classified exactly as the body's own refusal is today (a body refusal, executed work, the same `BodyOutcome`, usage marker and `tool_write_refused` event; `_require_write` already records both at its single definition). Rate tokens and the quota slot are therefore spent exactly as today, because today the body ran and refused as its first act.
+2. **Discovery.** `tool_visibility.hidden_names()` returns the same object.
+
+No decorator argument and no wrapper stamp defines membership (the round-0 `requires_write` stamp is dropped: Codex showed it was metadata that enforcement never consumed). `write_class` stays what it is — the rate-bucket and concurrency class — and a test pins `W == WRITE_REQUIRED_TOOLS − {request_upload}`; `request_upload` is outside the bucket because its write charge is taken at `PUT /transfer/upload` redemption (`rate-limits.md`).
+
+The seven in-body `_require_write()` calls and `_mint_preflight(need_write=True)` **stay** as defence in depth (removing them is a separate, riskier edit to nine write bodies). For a read-only caller they are now unreachable for registry members; an AST guard requires every such call site to sit in a registry member, so a new write body that calls `_require_write` without being registered fails the suite.
+
+**The one enforcement-visible difference.** Seven bodies call `_require_write()` as their first statement and two call `_mint_preflight` first, whose first act is the same check — so moving the check to the body boundary changes nothing for them. `write_file` and `delete_file` run `_precondition_syntax_error(expected_hash)` (and `write_file` its `no_incumbent` check) *before* their in-body permission check; a read-only caller sending them a malformed hash got the syntax refusal and now gets `permission_denied`. This is the safer order (no argument validation is disclosed to a caller who may not write), and it is pinned by its own scenario. Nothing else changes.
 
 Drift guards (all in `tests/test_issue_358_scoped_tools_list.py`):
 
-1. **Behavioural reconciliation**: every one of the 28 registered tools is called under a read-only OAuth principal (the harness of `tests/test_issue_192_write_refusal_marker.py`, with minimal valid arguments); the set refused with `permission_denied` SHALL equal `production_write_required_tools()`. A new write tool that forgets the stamp, or a stamp on a tool that does not refuse, fails here.
-2. **Structural**: `H == W ∪ {request_upload}` and `H == destructive ∪ {create_note}` (the #343 destructive set), and `request_download`, `check_upload` ∉ `H`.
-3. `H ⊆` registered names, and `len(H) == 9`.
+1. **Behavioural reconciliation**: all 28 registered tools are called under a read-only OAuth principal (the harness of `tests/test_issue_192_write_refusal_marker.py`, minimal valid arguments); the `permission_denied` set equals `WRITE_REQUIRED_TOOLS`.
+2. **The gate reads the registry**: with a member monkeypatched out, the body-boundary gate does not refuse (the in-body check still does); with a read tool monkeypatched in, the gate refuses and the list hides it.
+3. **AST**: every `_require_write()` / `_mint_preflight(…, need_write=True)` call in `tools.py` lies in an implementation whose `_tracked` name is a member.
+4. **Structural**: `WRITE_REQUIRED_TOOLS == W ∪ {request_upload} == destructive ∪ {create_note}`; `request_download`, `check_upload` ∉; ⊆ registered names; 9 members.
 
-`check_upload` stays visible: it never refuses a read-only caller (a read grant has minted nothing, so it answers `not_found`, which is true). `request_download` stays visible: it is a read (it mints a download link, `need_write=False`).
+A literal set is immune to the #343 probe-pollution problem by construction (nothing appends to it).
+
+`check_upload` stays visible: it never refuses a read-only caller (a read grant has minted nothing, so it answers `not_found`, which is true). `request_download` stays visible: it is a read (`need_write=False`).
 
 ### D3. API keys keep the full list (owner decision, default)
 
 Per the issue: an API key's permission is set by its owner in the panel and shown there; a read-only key is a deliberate operator artefact, and its full list keeps the #343 fixture test, every registry and every scripted client byte-identical. Recorded as L1; extending the rule to read-only keys later is a one-line change to D1 and a second contract change (question for Max).
 
-### D4. The seam: override the public `list_tools()`, keep the rule SDK-free
+### D4. The seam: override the public `list_tools()`; the rule and the registry import no SDK
 
 ```python
 # src/mcp_server/tool_visibility.py  (no `mcp` import)
 def is_filtered(principal, permission) -> bool: ...
-def hidden_names() -> frozenset[str]:  # production_write_required_tools()
+def hidden_names() -> frozenset[str]:  # returns tool_permissions.WRITE_REQUIRED_TOOLS
 def visible(tools: Sequence[T], *, principal, permission) -> list[T]:  # order-preserving, by `.name`
 
 # src/mcp_server/server.py
@@ -70,19 +82,21 @@ Why this seam:
 
 - It overrides a **public** method the SDK itself dispatches to — `self.list_tools` in 1.30's `_setup_handlers`, `await self.list_tools()` in 2.x's `_handle_list_tools`. The 2.x migration (#365) changes the base class name (`FastMCP` → `mcp.server.mcpserver.MCPServer`) and nothing else here. Re-registering the low-level handler (`mcp._mcp_server.list_tools()(…)`) was rejected: it reaches a private attribute that 2.x replaces with constructor-passed `on_*` handlers.
 - The return type stays `list[MCPTool]`, so every test that calls `await mcp.list_tools()` is unaffected — they run with no principal and get the full list.
-- The rule is an ordinary function of `(tools, principal, permission)`, testable without the SDK and reusable when 2.x arrives.
+- The rule is an ordinary function of `(tools, principal, permission)` over objects with a `.name`. **The promise is precise (Codex round 1):** `tool_visibility.py` and `tool_permissions.py` import nothing from `mcp`, directly or transitively, *including when `hidden_names()` and `visible()` are invoked* — which holds because the registry is a literal in an SDK-free module rather than an enumeration of `tools.py` (which imports `mcp.server.fastmcp.Image`). The test runs both calls in a clean subprocess and inspects `sys.modules`.
 - **2.x obligation, recorded for #365**: on the 2026-07-28 path a `tools/list` result carries `cacheScope`. A list that varies by authorization MUST be `"private"` (caching utility: "`private` is appropriate … for filtered list results that vary per user"; a `"public"` list "may be shared outside of the initial request's authorization context"). 2.x's default `CacheHint` is `"private"`; the migration SHALL NOT configure `cache_hints` for `tools/list` as `"public"`, and SHALL carry a test that a filtered list is `"private"`. Under 1.30 there is no `cacheScope` field; HTTP responses to the `/mcp` POSTs are not cacheable by shared caches.
 
-### D5. Determinism and the fixtures
+### D5. Determinism, the oracle and the fixtures (revised, Codex round 1)
 
-The filtered list is the full list, in registration order, minus `H`. Each kept `MCPTool` is the very object the full list built (same `name`, `title`, `description`, `inputSchema`, `outputSchema`, `annotations`), so its serialised entry is identical. Tests:
+The filtered list is the full list, in registration order, minus the registry. Each kept `MCPTool` is the very object the full list built, so its serialised entry is identical.
 
-- `tests/fixtures/tools_list_readonly_oauth.json`: the 19 names in order — `keyword_search`, `read_note`, `list_notes`, `get_tags`, `get_recent`, `semantic_search`, `get_vault_guide`, `get_backlinks`, `get_links`, `get_neighborhood`, `find_related`, `find_orphans`, `read_file`, `list_files`, `check_upload`, `request_download`, `list_tasks`, `get_changes`, `hybrid_search`. Names only: the schemas are already pinned by the #343 fixtures, and each filtered entry is asserted equal to its full-list entry.
-- The #343 fixture test runs **under an API-key principal** (contextvars set as the middleware sets them) in addition to the no-principal call it makes today, so "full list, byte-identical" is proven for the principal it is promised to.
-- Determinism: N repeated lists under one read-only grant are identical; two different read-only grants get the identical list; a read-only list interleaved with a readwrite list in the same process does not change either (the list does not depend on prior requests — the spec's "MUST NOT vary … as a side effect of other requests").
-- Over HTTP (`httpx.ASGITransport` against `src.main:app`, existing harness): the `tools/list` result body for an API key equals the body before this change; for a read-only grant it equals that body with the nine entries removed.
+- **The oracle**: `tests/fixtures/tools_list_full_v1.json` — the complete `tools/list` `result` object (all 28 tools, every serialised field: `name`, `title`, `description`, `inputSchema`, `outputSchema`, `annotations`, anything else the SDK emits), captured **over HTTP for an API-key principal on the pre-change base c491326**, canonically serialised (UTF-8, `sort_keys`, `separators=(",", ":")`). It is generated and committed as the **first commit of the implementation branch, before any code change**, with the generating script in the test module's docstring. It doubles as the 1.0 contract-freeze fixture: the existing 5a391ca / additions / amendments fixtures pin only names and schemas, and Codex showed that comparing post-change principals to each other proves nothing about the pre-change body.
+- **Byte identity** is then literal: for a `readwrite` key, a `read` key and a `readwrite` grant, the canonical serialisation of the HTTP `result` equals the oracle's bytes.
+- `tests/fixtures/tools_list_readonly_oauth.json`: the 19 names in order — `keyword_search`, `read_note`, `list_notes`, `get_tags`, `get_recent`, `semantic_search`, `get_vault_guide`, `get_backlinks`, `get_links`, `get_neighborhood`, `find_related`, `find_orphans`, `read_file`, `list_files`, `check_upload`, `request_download`, `list_tasks`, `get_changes`, `hybrid_search`; each filtered entry is asserted byte-identical to the oracle's entry of the same name.
+- The #343 fixture test additionally runs under an API-key principal, unchanged otherwise.
+- Sequential determinism: N repeated lists under one read-only grant are identical; a second read-only grant gets the same list; interleaving a readwrite list changes neither.
+- **Concurrent determinism** (Codex round 1): see D6.
 
-### D6. Enforcement unchanged, including the SDK tool cache
+### D6. Enforcement unchanged, including the SDK tool cache and concurrency
 
 The filter changes what is *listed*, never what is *callable*. A read-only grant's `tools/call edit_note` reaches `FastMCP.call_tool` → `_tool_manager` → `_tracked` → `_require_write` and is refused `permission_denied`, with the `tool_write_refused` event and the usage marker, exactly as today.
 
@@ -93,6 +107,8 @@ The one SDK interaction: on 1.30 a filtered list clears and refills `_tool_cache
 - No await separates the refresh from the lookup (`list_tools` is synchronous in effect), so one request cannot observe another's refill mid-lookup.
 
 The implementation SHALL NOT touch `_tool_cache` (an internal). Tests pin the refusal response for a read-only grant with the cache (a) warm from a full list and (b) just cleared by a read-only list, both equal to the response before this change, and a readwrite call after (b) still output-validated.
+
+**Concurrency test (Codex round 1).** Sequenced tests cannot catch an implementation that keeps the principal in shared state or that adds a suspension point between a cache refill and a lookup. The suite therefore drives the real ASGI app (`src.main:app`, one worker, one event loop) with five requests released together through an `anyio` barrier: a read-only OAuth `tools/list`, an API-key `tools/list`, a `readwrite` OAuth `tools/list`, a read-only `tools/call` of a hidden tool, and a `readwrite` `tools/call` of a hidden tool (an output-schema-carrying one, e.g. `edit_note` with `dry_run=true`). Each response is asserted against **its own** credential (19 / oracle / oracle / `permission_denied` / ran and output-validated). The round is repeated ≥ 50 times in each of two cache orderings (cache last filled by a full list; by a filtered list), and once more with a test-only `await asyncio.sleep(0)` injected inside the `list_tools()` override, so a future suspension point is exercised rather than assumed absent.
 
 ### D7. `instructions` are not filtered
 
@@ -114,12 +130,16 @@ No `MCP_SCOPED_TOOLS_LIST`. The behaviour follows the spec, the full list is sti
 
 For read-only OAuth grants the listed set shrinks 28 → 19. Every removed tool could only ever return `permission_denied` to that grant, so no working call disappears; what disappears is a dead end the agent was invited into. 1.0 promises the tool contract; doing this after 1.0 would make it a breaking change to the promise, doing it now makes the read-only list part of the promise. API keys and `readwrite` grants: no change at all.
 
+### D12. Pagination is unchanged (Codex round 1)
+
+SDK 1.30's `FastMCP.list_tools()` takes no request and returns the complete list; the low-level wrapper ignores `params.cursor` and emits no `nextCursor`. The filter runs on that complete list, so the behaviour is preserved exactly: one result, no `nextCursor`, and a request carrying any `cursor` gets the same result as one without, for both principals. If pagination is ever introduced (2.x or later), it SHALL page the already-filtered list, and cursors are then per-authorization — recorded for #365. The transport test sends one cursor-bearing request per principal.
+
 ## Risks
 
 - **SDK 1.30 cache churn** (D6): bounded by the general rate bucket; no correctness effect; one WARNING per read-only call of a hidden tool on a cache miss — those calls already emit a `tool_write_refused` event.
 - **SDK 2.x** (#365): the seam is the public `list_tools()`, present in 2.x; the base-class rename and the `cacheScope: "private"` requirement are recorded for that change. If 2.x's `_tool_input_schema` (called before middleware, "also finds a tool that middleware hides") matters, it only affects `Mcp-Param-*` header validation, which this server does not use.
 - **A client that treats an unlisted tool as unknown** and refuses to call it client-side: that is the intended effect for a read-only grant.
-- **Drift**: a new write tool without the stamp — caught by guard 1 in D2.
+- **Drift**: a new write tool not added to the registry — caught by guards 1 and 3 in D2 (it refuses in its body but is listed; its `_require_write` call site is outside the registry).
 - **Wrong principal kind**: an OAuth request whose `current_principal` were left unset would get the full list (today's behaviour), never a wrong filtered one; the middleware sets both together (`auth.py:1178–1189`).
 
 ## Accepted limitations
@@ -128,6 +148,8 @@ For read-only OAuth grants the listed set shrinks 28 → 19. Every removed tool 
 - **L2** A read-only grant's `instructions` and some read-tool descriptions name tools it does not list (D7).
 - **L3** On SDK 1.30 a read-only call of a hidden tool after a filtered list logs the SDK's "not listed, no validation" WARNING and skips output validation of a refusal that would pass it (D6).
 - **L4** No `list_changed`: after a panel scope change, a client sees the new list only when it re-lists (D8).
+- **L5** `write_file` / `delete_file`: a read-only caller with a malformed `expected_hash` now gets `permission_denied` instead of the syntax refusal (D2). Deliberate.
+- **L6** The in-body permission checks remain beside the registry gate (D2); they are guarded by the AST test rather than removed.
 
 ## Open questions (Max)
 
@@ -138,3 +160,21 @@ For read-only OAuth grants the listed set shrinks 28 → 19. Every removed tool 
 ## Verification plan
 
 Offline + integration suites; `openspec-verifier`; one mandatory adversarial Codex pass (auth/permission surface) framed on: a filter that hides a tool a grant can use, a filter that varies by anything other than the presented credential, a list that leaks across requests, and any change to call-time refusal. Live: a read-only Claude connector lists 19 and is refused on a named `edit_note`; a `readwrite` connector and an API key list 28.
+
+## Codex spec review — round 1
+
+Verdict as written by Codex (`gpt-daybreak-blue-latest`, read-only), verbatim:
+
+FAIL. The SDK 1.30 cache does not itself appear to leak filtered lists: list construction and cache refill contain no suspension point, and `tools/list` does not read from that cache ([SDK source](https://github.com/modelcontextprotocol/python-sdk/blob/v1.30.0/src/mcp/server/lowlevel/server.py)). However, three MAJOR specification-control gaps remain: the hidden set is duplicate metadata rather than the enforcement source, byte identity has no pre-change oracle, and concurrency requirements receive only sequential tests.
+
+```json
+{"verdict":"FAIL","findings":[{"severity":"MAJOR","file":"openspec/changes/scoped-tools-list/specs/mcp-request-routing/spec.md","line":123,"claim":"The hidden set is derived from the code that refuses read-only callers.","failing_input":"Following tasks 2.1-2.3 leaves authorization unchanged: __requires_write__ is metadata defaulted from write_class, while the seven direct _require_write calls and two _mint_preflight need_write flags remain independent. request_upload, for example, is hidden because of one explicit stamp and refused because of a separate need_write=True argument. The sets agree today only because a test reconciles them; enforcement never consumes the stamp.","fix":"Either make one declarative write-required source drive both enforcement and discovery, or state honestly that the stamp is duplicate metadata guarded by reconciliation rather than claiming derivation from enforcement."},{"severity":"MAJOR","file":"openspec/changes/scoped-tools-list/specs/mcp-request-routing/spec.md","line":66,"claim":"The full tools/list result remains byte-identical to its pre-change result for every unfiltered principal.","failing_input":"A tool title, description, annotation, or other serialized field changes while names and schemas remain valid. The 5a391ca, additions, and amendments fixtures contain only name/inputSchema/outputSchema, and tasks 4.3-4.4 provide no stored pre-change HTTP result. Comparing three post-change principals to each other cannot prove equality to the unavailable pre-change body.","fix":"Add a committed oracle for the complete normalized pre-change result, or narrow the requirement from byte identity to the exact fields the existing fixtures actually pin."},{"severity":"MAJOR","file":"openspec/changes/scoped-tools-list/tasks.md","line":25,"claim":"The tests prove results cannot vary with concurrent request timing or process-wide cache mutation.","failing_input":"A read-only OAuth tools/list overlaps an API-key or readwrite tools/list and a hidden tools/call in the same worker. Tasks 4.5 and 4.7 only sequence requests, so an implementation using shared principal state or introducing a suspension inside cache refresh can pass while returning 19 tools to a legitimate caller or skipping its output validation.","fix":"Require synchronized concurrent ASGI requests covering read-only list versus API-key/readwrite list and hidden call, asserting each response against its own credential and repeating both cache orderings."},{"severity":"MINOR","file":"openspec/changes/scoped-tools-list/tasks.md","line":31,"claim":"The SDK-free test exercises the visibility rule's SDK independence.","failing_input":"tool_visibility can lazily import production_write_required_tools from src.mcp_server.tools. The subprocess import test passes because the lazy function is not called, but invoking hidden_names then imports tools.py, which imports mcp.server.fastmcp.Image.","fix":"Test invocation of hidden_names in the clean subprocess, or redefine the promise as no direct SDK import and stop describing the whole rule as SDK-free."},{"severity":"MINOR","file":"openspec/changes/scoped-tools-list/specs/mcp-request-routing/spec.md","line":72,"claim":"The authorization-dependent result is fully specified for tools/list requests.","failing_input":"A tools/list request includes a cursor. Neither the delta nor tasks pin whether the existing SDK behavior of returning the complete unpaginated list is preserved, while filtering before versus after future pagination produces different page sizes and cursors.","fix":"State that cursor and pagination behavior remain unchanged and add one cursor-bearing request to the transport test."}]}
+```
+
+What changed, per finding:
+
+1. **MAJOR, duplicate metadata.** The `requires_write` stamp is gone. One literal `WRITE_REQUIRED_TOOLS` in SDK-free `tool_permissions.py` drives both a body-boundary permission gate in `_tracked` and the list filter; the in-body checks stay as defence in depth under an AST guard; one deliberate precedence change (L5). D2; spec "One write-required registry SHALL drive both…"; tasks §2.
+2. **MAJOR, no pre-change oracle.** A complete canonical `tools/list` result for an API-key principal, captured over HTTP on c491326, is committed first as `tests/fixtures/tools_list_full_v1.json` (also the 1.0 freeze fixture); byte identity is asserted against it. D5; spec "The full list is byte-identical to the committed pre-change oracle"; tasks 4.1.
+3. **MAJOR, sequential-only tests.** A barrier-synchronised concurrent ASGI test (three lists and two hidden calls, each checked against its own credential, both cache orderings, ≥ 50 rounds, plus an injected suspension). D6; spec "Concurrent requests each get their own credential's answer"; tasks 4.6.
+4. **MINOR, SDK-free claim.** Promise restated as "no SDK import, directly or transitively, including on invocation", made true by the literal registry, and tested by invoking `hidden_names()` and `visible()` in a clean subprocess. D4; tasks 4.12.
+5. **MINOR, pagination.** Cursor behaviour stated unchanged (complete list, no `nextCursor`, cursor ignored) and pinned with one cursor-bearing request per principal. D12; spec "A cursor does not change the result"; tasks 4.5.

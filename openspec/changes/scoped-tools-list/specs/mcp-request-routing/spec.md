@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Every registered tool SHALL publish a title and a complete set of behaviour annotations
-Every registered tool — and therefore every entry of every `tools/list` result, full or filtered by the `scoped-tools-list` rule — SHALL carry a non-empty `title` and a `ToolAnnotations` whose `readOnlyHint`, `destructiveHint`, `idempotentHint` and `openWorldHint` are each an explicit boolean, never absent, so that no client falls back to the protocol's defaults (`readOnlyHint` false, `destructiveHint` true, `openWorldHint` true). The hints SHALL be set through the public registration API (`FastMCP.tool(title=…, annotations=…)`) on each registration. The classification SHALL be: every tool that neither changes vault bytes nor mints a capability is `readOnlyHint=true, destructiveHint=false, idempotentHint=true, openWorldHint=false`; the set of `destructiveHint=true` tools is exactly the write-bucket set (the production tools registered with `_tracked(write_class=True)`) minus `create_note` plus `request_upload` (whose `overwrite=True` capability overwrites on redemption — owner decision, 2026-10-28); the set of `readOnlyHint=false` tools is exactly the write-bucket set plus `request_upload` and `request_download`; `openWorldHint=true` is exactly `import_from_url`; and `idempotentHint=true` is exactly the read-only set. The write-bucket set used for these comparisons SHALL be derived from the production tools only, so that a `_tracked(write_class=True)` decoration performed by a test module cannot change it. An undo path through `.trash/` SHALL NOT make a deleting tool non-destructive. The classification is a statement about the registry and the full list; a filtered list SHALL carry each kept tool's annotations unchanged. Annotations are a client-side hint: no server-side gate SHALL consult them, and the tool-list filter SHALL NOT consult them either (it is derived from the write-required stamp); read-only enforcement SHALL remain `_tracked`'s admission and `_require_write`'s permission check, unchanged.
+Every registered tool — and therefore every entry of every `tools/list` result, full or filtered by the `scoped-tools-list` rule — SHALL carry a non-empty `title` and a `ToolAnnotations` whose `readOnlyHint`, `destructiveHint`, `idempotentHint` and `openWorldHint` are each an explicit boolean, never absent, so that no client falls back to the protocol's defaults (`readOnlyHint` false, `destructiveHint` true, `openWorldHint` true). The hints SHALL be set through the public registration API (`FastMCP.tool(title=…, annotations=…)`) on each registration. The classification SHALL be: every tool that neither changes vault bytes nor mints a capability is `readOnlyHint=true, destructiveHint=false, idempotentHint=true, openWorldHint=false`; the set of `destructiveHint=true` tools is exactly the write-bucket set (the production tools registered with `_tracked(write_class=True)`) minus `create_note` plus `request_upload` (whose `overwrite=True` capability overwrites on redemption — owner decision, 2026-10-28); the set of `readOnlyHint=false` tools is exactly the write-bucket set plus `request_upload` and `request_download`; `openWorldHint=true` is exactly `import_from_url`; and `idempotentHint=true` is exactly the read-only set. The write-bucket set used for these comparisons SHALL be derived from the production tools only, so that a `_tracked(write_class=True)` decoration performed by a test module cannot change it. An undo path through `.trash/` SHALL NOT make a deleting tool non-destructive. The classification is a statement about the registry and the full list; a filtered list SHALL carry each kept tool's annotations unchanged. Annotations are a client-side hint: no server-side gate SHALL consult them, and the tool-list filter SHALL NOT consult them either (it reads the write-required registry `WRITE_REQUIRED_TOOLS`); read-only enforcement SHALL remain `_tracked`'s admission and `_require_write`'s permission check, unchanged.
 
 #### Scenario: Every listed tool carries complete metadata
 - **WHEN** a client authenticated with an API key lists tools
@@ -63,19 +63,20 @@ Adding titles, annotations and instructions, and shortening descriptions, SHALL 
 - **WHEN** the `hybrid_search` entry of the additions fixture is read
 - **THEN** its `inputSchema` SHALL carry a `rerank` property of type boolean with default false, absent from `required`, and no other property SHALL differ from the #354 entry
 
-#### Scenario: The full list is byte-identical for every unfiltered principal
+#### Scenario: The full list is byte-identical to the committed pre-change oracle
 - **WHEN** `tools/list` is requested over HTTP with a `readwrite` API key, a `read` API key, and a `readwrite` OAuth grant
-- **THEN** the three `result` bodies SHALL be identical to each other and to the body served before the `scoped-tools-list` change
+- **THEN** each `result` object, serialised canonically (UTF-8 JSON, keys sorted, no insignificant whitespace), SHALL be byte-identical to `tests/fixtures/tools_list_full_v1.json` — the complete `tools/list` result (all 28 tools, every field: `name`, `title`, `description`, `inputSchema`, `outputSchema`, `annotations`, and any other field the SDK serialises), generated over HTTP for an API-key principal on the pre-change base (c491326) and committed before any implementation change
+- **AND** that oracle SHALL be edited only by a change that deliberately alters the published tool surface, which then states the edit in its own spec delta
 
 ## ADDED Requirements
 
 ### Requirement: `tools/list` SHALL omit the write-requiring tools for an OAuth grant without the `readwrite` scope, and only for it
-When the request's principal is an OAuth grant (`current_principal` of kind `"oauth"`) and the request's permission (`current_permission`, the value `_require_write` reads, derived from the token's scope by `token_has_write`) is not `readwrite`, the `tools/list` result SHALL be the full list with every tool in the hidden set removed, in the full list's order, each kept entry identical to its full-list entry. The hidden set SHALL be exactly the production tools stamped as write-required: the write bucket (`create_note`, `edit_note`, `move_note`, `delete_note`, `set_frontmatter`, `write_file`, `delete_file`, `import_from_url`) and `request_upload`, nine tools, so such a grant lists 19. For every other request — an API-key principal of either permission, an OAuth grant with `readwrite`, `MCP_SANDBOX_MODE`, the stdio entry point, or any in-process call with no principal — the result SHALL be the full list. The result SHALL depend only on the authorization presented on that request: it MUST NOT depend on any earlier request, connection, session or time. The server SHALL NOT send `notifications/tools/list_changed` and SHALL keep advertising `listChanged: false`. The server `instructions` and every tool description SHALL be the same for every principal. A `tools/list` request writes no `usage_logs` row, as before. No setting SHALL enable or disable this behaviour. The override SHALL be made by overriding the server object's public `list_tools()` method, with the rule itself in a module that imports nothing from the MCP SDK.
+When the request's principal is an OAuth grant (`current_principal` of kind `"oauth"`) and the request's permission (`current_permission`, the value `_require_write` reads, derived from the token's scope by `token_has_write`) is not `readwrite`, the `tools/list` result SHALL be the full list with every tool named in the write-required registry (`WRITE_REQUIRED_TOOLS`) removed, in the full list's order, each kept entry identical to its full-list entry. The registry SHALL name exactly `create_note`, `edit_note`, `move_note`, `delete_note`, `set_frontmatter`, `write_file`, `delete_file`, `import_from_url` and `request_upload`, so such a grant lists 19. For every other request — an API-key principal of either permission, an OAuth grant with `readwrite`, `MCP_SANDBOX_MODE`, the stdio entry point, or any in-process call with no principal — the result SHALL be the full list. The result SHALL depend only on the authorization presented on that request: it MUST NOT depend on any earlier or concurrent request, connection, session, cache state or time. Cursor and pagination behaviour SHALL be unchanged: the server returns the complete (full or filtered) list in one result with no `nextCursor`, and a request carrying a `cursor` receives the same result as one without. The server SHALL NOT send `notifications/tools/list_changed` and SHALL keep advertising `listChanged: false`. The server `instructions` and every tool description SHALL be the same for every principal. A `tools/list` request writes no `usage_logs` row, as before. No setting SHALL enable or disable this behaviour. The filter SHALL be applied by overriding the server object's public `list_tools()` method; the visibility rule and the registry SHALL live in modules that import nothing from the MCP SDK, directly or transitively, including when the rule is invoked.
 
 #### Scenario: A read-only grant lists 19 tools in a fixed order
 - **WHEN** an OAuth grant whose scope lacks `readwrite` sends `tools/list`
 - **THEN** the result SHALL list exactly the names in `tests/fixtures/tools_list_readonly_oauth.json`, in that order: `keyword_search`, `read_note`, `list_notes`, `get_tags`, `get_recent`, `semantic_search`, `get_vault_guide`, `get_backlinks`, `get_links`, `get_neighborhood`, `find_related`, `find_orphans`, `read_file`, `list_files`, `check_upload`, `request_download`, `list_tasks`, `get_changes`, `hybrid_search`
-- **AND** each entry SHALL be equal, as JSON, to the entry of the same name in the full list
+- **AND** each entry SHALL be byte-identical, under the canonical serialisation, to the entry of the same name in `tests/fixtures/tools_list_full_v1.json`
 
 #### Scenario: Full list for everyone else
 - **WHEN** `tools/list` is sent with a `readwrite` OAuth grant, a `readwrite` API key or a `read` API key
@@ -93,6 +94,14 @@ When the request's principal is an OAuth grant (`current_principal` of kind `"oa
 - **WHEN** one read-only grant lists tools repeatedly, a second read-only grant lists tools, and a `readwrite` principal lists tools between them in the same process
 - **THEN** every read-only result SHALL be identical, and every `readwrite` result SHALL be the full list
 
+#### Scenario: Concurrent requests each get their own credential's answer
+- **WHEN** a read-only OAuth `tools/list`, an API-key `tools/list`, a `readwrite` OAuth `tools/list`, a read-only OAuth `tools/call` of a hidden tool and a `readwrite` `tools/call` of a hidden tool are released together through one synchronisation barrier into the same ASGI app and worker, repeated at least 50 times, once with the SDK tool cache last filled by a full list and once with it last filled by a filtered list, and again with a test-only suspension point (`await asyncio.sleep(0)`) injected inside the `list_tools()` override
+- **THEN** every read-only list SHALL be the 19-entry list, every API-key and `readwrite` list SHALL be byte-identical to the oracle, every read-only hidden call SHALL be refused `permission_denied`, and every `readwrite` hidden call SHALL run with its result validated against that tool's `outputSchema`
+
+#### Scenario: A cursor does not change the result
+- **WHEN** a read-only grant and an API key each send `tools/list` with `params.cursor` set to an arbitrary string
+- **THEN** each result SHALL equal that principal's result without a cursor, and neither SHALL carry `nextCursor`
+
 #### Scenario: The list follows a scope change on the next request
 - **WHEN** a grant's scope is changed from `read` to `readwrite` in the control panel and the grant then sends `tools/list`
 - **THEN** that result SHALL be the full list, and no notification SHALL have been sent
@@ -101,12 +110,29 @@ When the request's principal is an OAuth grant (`current_principal` of kind `"oa
 - **WHEN** a read-only OAuth grant and an API key each send `initialize`
 - **THEN** both results SHALL carry the same `instructions`, equal to the module-level constant
 
-#### Scenario: The rule is SDK-free
-- **WHEN** the visibility module is imported
-- **THEN** it SHALL import nothing from the `mcp` package, and the server's `list_tools()` override SHALL be the only place that applies it
+#### Scenario: The rule and the registry are SDK-free when invoked
+- **WHEN** a clean subprocess imports the visibility module, calls `hidden_names()` and `visible(…)` on stand-in tool objects, and then inspects `sys.modules`
+- **THEN** no module named `mcp` or `mcp.*` SHALL be loaded, and the server's `list_tools()` override SHALL be the only production caller of `visible`
 
-### Requirement: Hiding a tool from `tools/list` SHALL NOT change how a call to it is admitted or refused
-The tool-list filter is a presentation of what a credential can use, not a control. A `tools/call` of a hidden tool by a read-only OAuth grant SHALL pass through the same gates as before this change and SHALL be refused by the same check (`_require_write`, or `_mint_preflight(need_write=True)` for `request_upload` and `import_from_url`) with the same refusal text, the same `MCP-REFUSAL` code `permission_denied`, the same `tool_write_refused` security event and the same usage marker. No code in this server that admits or refuses a tool call SHALL consult the filtered list. The implementation SHALL NOT read or write the SDK's internal tool cache.
+### Requirement: One write-required registry SHALL drive both the pre-body permission check and the tool-list filter
+`WRITE_REQUIRED_TOOLS`, one `frozenset` of tool names in an SDK-free module, SHALL be the single source of which tools require the `readwrite` permission. `_tracked` SHALL consult it for its own tool name and, for a member, SHALL run the read-only check (`_require_write`) at the body boundary — after every existing gate (argument caps, vault root, rate buckets, concurrency, quota), immediately before the body would run — returning that refusal without running the body; the tool-list filter SHALL read the same object. No decorator argument, stamp or second list SHALL define write-required membership. The in-body `_require_write()` calls and `_mint_preflight(need_write=True)` MAY remain as defence in depth, and every production call site of `_require_write` or `_mint_preflight(need_write=True)` SHALL belong to a tool in the registry. The write bucket (`write_class=True`) SHALL equal the registry minus `request_upload`.
+
+#### Scenario: The registry is the enforcement source
+- **WHEN** a tool name is removed from `WRITE_REQUIRED_TOOLS` in a test (monkeypatched) and a read-only grant calls that tool
+- **THEN** the pre-body gate SHALL NOT refuse it (the in-body check still does), proving the gate reads the registry; and when a read-only tool's name is added, the pre-body gate SHALL refuse it and `tools/list` SHALL hide it
+
+#### Scenario: Reconciliation with the call sites
+- **WHEN** each of the 28 registered tools is called with minimal valid arguments under a read-only OAuth principal
+- **THEN** the tools refused with `permission_denied` SHALL be exactly `WRITE_REQUIRED_TOOLS`
+- **AND** an AST scan of `src/mcp_server/tools.py` SHALL find every `_require_write()` and `_mint_preflight(…, need_write=True)` call inside a tool implementation whose `_tracked` name is in the registry
+
+#### Scenario: Reconciliation with the other derived sets
+- **WHEN** the registry is compared with the production write-bucket set and the `destructiveHint=true` set
+- **THEN** it SHALL equal the write-bucket set plus `request_upload`, and the destructive set plus `create_note`
+- **AND** it SHALL NOT contain `request_download` or `check_upload`, and SHALL be a subset of the registered tool names
+
+### Requirement: Hiding a tool from `tools/list` SHALL NOT change whether a call to it is admitted or refused
+The tool-list filter is a presentation of what a credential can use, not a control. A `tools/call` of a hidden tool by a read-only OAuth grant SHALL pass through the same gates as before this change, in the same order, and SHALL be refused with the same refusal text, the same `MCP-REFUSAL` code `permission_denied`, the same `tool_write_refused` security event, the same usage row and marker, and the same rate-token and quota consumption as before. The one permitted difference is precedence inside two bodies: `write_file` and `delete_file` validate `expected_hash` syntax before their in-body permission check today, so a read-only caller sending a malformed hash to them SHALL now receive `permission_denied` (from the body-boundary gate) instead of the syntax refusal; for every other tool and argument the response SHALL be identical. No code in this server that admits or refuses a tool call SHALL consult the filtered list. The implementation SHALL NOT read or write the SDK's internal tool cache.
 
 #### Scenario: A named hidden tool is still refused, not unknown
 - **WHEN** a read-only OAuth grant calls `edit_note`, `request_upload` or `import_from_url` by name without having listed it
@@ -116,22 +142,10 @@ The tool-list filter is a presentation of what a credential can use, not a contr
 - **WHEN** a read-only grant calls `delete_note` once after a full list has been served and once immediately after a filtered list has been served
 - **THEN** both responses SHALL be identical to each other and to the response before this change
 
+#### Scenario: The precedence change is confined
+- **WHEN** a read-only grant calls `write_file` or `delete_file` with a malformed `expected_hash`
+- **THEN** the call SHALL be refused `permission_denied`, and the same call under a `readwrite` credential SHALL still receive the syntax refusal
+
 #### Scenario: A filtered list does not degrade a write caller
 - **WHEN** a filtered list is served and a `readwrite` principal then calls `edit_note`
 - **THEN** the call SHALL run and its result SHALL be validated against `edit_note`'s `outputSchema` as before
-
-### Requirement: The hidden set SHALL be derived from the code that refuses read-only callers
-The hidden set SHALL be computed from a `__requires_write__` stamp that `_tracked` places on its wrapper — defaulting to the wrapper's `write_class`, and set explicitly on `request_upload` — enumerated over the production tool implementations only, so that a probe decorated in a test module cannot change it. It MUST NOT be a list of names kept in the filter module (tests may pin the expected result, never supply it). A test SHALL call every registered tool under a read-only OAuth principal and SHALL assert that the set of tools refused with `permission_denied` equals the hidden set.
-
-#### Scenario: Reconciliation with enforcement
-- **WHEN** each of the 28 registered tools is called with minimal valid arguments under a read-only OAuth principal
-- **THEN** the tools refused with `permission_denied` SHALL be exactly the hidden set
-
-#### Scenario: Reconciliation with the other derived sets
-- **WHEN** the hidden set is compared with the production write-bucket set and the `destructiveHint=true` set
-- **THEN** it SHALL equal the write-bucket set plus `request_upload`, and the destructive set plus `create_note`
-- **AND** it SHALL NOT contain `request_download` or `check_upload`
-
-#### Scenario: A test probe cannot pollute the hidden set
-- **WHEN** a test module decorates functions with `_tracked("probe_write", [], write_class=True)` and `_tracked("probe_upload", [], requires_write=True)` without registering them
-- **THEN** the derived hidden set SHALL be unchanged — still exactly the nine production tools
