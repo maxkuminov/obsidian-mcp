@@ -18,7 +18,7 @@ This change adds the honesty signal and the depth metrics. Nothing is filtered a
   - the best similarity of the call's actual candidate set is below the threshold, or no candidate exists.
 
   `keyword_search` and `find_related` are untouched. A `semantic_search` provider-input rejection is a refusal, not a page, so it carries no token.
-- **A conditional one-line hint when `low`.** For `hybrid_search`: ``low confidence: no keyword match on all terms and weak similarity; try `keyword_search` with an identifier, or `get_neighborhood` from a known note``. `semantic_search` gets a sibling line. The hint is at most 140 characters and sits after the header and the `index_transition:` line. It is withdrawn before it could change the shown rows: hint first, then the abbreviation ladder, then row drops.
+- **A conditional one-line hint when `low`.** For `hybrid_search`: ``low confidence: no all-terms keyword match, weak similarity; try `keyword_search` with an identifier or `get_neighborhood` from a known note``. `semantic_search` gets a sibling line. The hint is at most 140 characters and sits after the header and the `index_transition:` line. It is withdrawn before it could change the shown rows: hint first, then the abbreviation ladder, then row drops.
 - **Bounds re-measured.**
   - Headers: `hybrid_search` `rerank=false` 400 → 405 (floor 990); `rerank=true` 431 → 444; `semantic_search(rerank=true)` 185 → 199. The `confidence: ok` and low-plus-`any` worst cases measure equal.
   - `hybrid_search`'s first-row ladder gains a last `explain omitted` step. Without it, the both-arms `rerank=true` page with the transition line reaches 1,002 at the 1,000 floor.
