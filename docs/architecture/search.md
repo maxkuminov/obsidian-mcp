@@ -1413,8 +1413,9 @@ bootstrap 95 % interval on the mean: 1,000 resamples with replacement from
 `random.Random(seed)` over the deltas in qid order, linear-interpolated
 2.5th / 97.5th percentiles. The interval is reported and never gates.
 
-**The report and the gate.** `report.json` (`schema_version` 2 since #389)
-holds the metrics, counts (per
+**The report and the gate.** `report.json` (`schema_version` 3, current
+since the gate step; 2 was #389's output and is historical, refused by
+`gate`) holds the metrics, counts (per
 class, per source, `n_both_sources`, drift, `ownerless_queries`), each arm's
 label, options, membership, `corpus_loss`, `unsearchable_before` and
 `missing_queries`, the window, the seed, the qrels / snapshot / selection
@@ -1426,10 +1427,44 @@ golden file `tests/fixtures/search_eval/expected-report.json` is compared
 with; `commit_sha` is asserted separately against `git rev-parse HEAD`.
 Exit codes: 0 `OK`, 2 `INSUFFICIENT_DATA` (fewer than `--min-queries`,
 default 50) or `CORPUS_LOSS`, 64 usage error or an incomplete or mismatched
-run, 1 anything else. **There is no metric threshold** (E2): the gate is a
-report the reviewer judges, with the incumbent as `--baseline`. The golden
+run, 1 anything else. **`score` has no metric threshold** (E2): the report
+is for the reviewer to judge, with the incumbent as `--baseline`. A change
+that needs a mechanical bar uses the `gate` step below. The golden
 was regenerated once by #389 (the new metric keys, `staged_depth`, depth 50,
-`schema_version` 2).
+`schema_version` 2), and once by the gate step (`schema_version` 3,
+`deltas_baseline`; a `runfile:` arm also carries `source_generation` and
+`source_report_sha256`).
+
+**The gate step.** `python -m scripts.search_eval gate --report R --arm A
+--metrics m,… --slices s,… --min-ci-lower X --out F [--baseline-report B]`
+reads a scored report's `deltas` for arm A against the report's baseline,
+and prints one line per (metric × slice) cell: the delta mean, the paired
+bootstrap CI95, and PASS or FAIL. A cell FAILs when its CI95 lower bound is
+below X, or when its interval is null. The same table goes to F as
+Markdown for the PR body. Exit codes: 0 all pass, 1 any cell fails, 64 on
+a usage error. The step imports nothing from `src`. It was built for
+the first real-data evaluation run (2026-10-31).
+Two rules hold, both verified by Codex:
+
+- **The tenant boundary is checked first.** The report, and for a
+  `runfile:` baseline the staging generation's report (`--baseline-report`,
+  then required), must each have verdict `OK`, `attachable: true` and
+  `provenance.users == 1`. Otherwise the step exits 64 with no cell and no
+  PASS/FAIL printed, and F is neither created nor replaced.
+- **The baseline is bound to its evidence.**
+  - The report's `baseline` must equal its `deltas_baseline` (the arm every
+    delta was computed against) and occur exactly once in its `arms`.
+  - A `runfile:<label>@<generation>` baseline's report must be **that**
+    generation's report, with the same qrels, snapshot and selection hashes
+    as the candidate report and an arm `<label>`.
+  - Its file's sha256 must equal the `source_report_sha256` that `run`
+    recorded on the runfile arm when it staged it. `run` records that
+    digest only when the source data directory's `report.json` scores the
+    source generation; otherwise it records null and the gate refuses.
+
+  Without these rules, an unrelated or relabeled safe report could vouch
+  for a multi-user runfile. An operator who forges both files and the
+  digest can still pass (accepted: the trusted-operator model).
 
 **The confidence tabulation (#389).** `python -m scripts.search_eval
 confidence --data DIR --threshold T` reads `confidence-rows.jsonl` (one line
