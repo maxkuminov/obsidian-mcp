@@ -48,7 +48,7 @@ Refs #402. Read `proposal.md`, `design.md` (D1–D10, the owner decisions, L1–
   - (3) `P_new` vs `P_ref` built from the same final order and scores with the incumbent preview selection and locator: the diff is only in `preview_kind`, the preview literal and the locator of rows whose `best` is a non-primary chunk, and `candidates: N` is equal;
   - (4) the one-chunk-per-note fixture with a prefix-blind scorer is byte-identical to c491326's reranked page.
 - [x] 4.5 Request-shape tests on the fake reranker:
-  - the documents begin with the stored prefix (the "Stored prefix, not the current title" scenario, with the vault directory unreadable during the call);
+  - the documents begin with the stored prefix (the "Stored prefix, not the current title" scenario). *The "vault directory unreadable" condition was dropped*: the rerank path has no vault read at all (only the session's rows), so no unreadable-vault fixture can exercise anything. The test serves the call from a session stub with no vault configured;
   - a stale note sends exactly its title;
   - an unknown-stamp note (the rollback scenario) sends exactly its title, with no stored text in the body;
   - a keyword-only hybrid row sends its excerpt;
@@ -57,7 +57,7 @@ Refs #402. Read `proposal.md`, `design.md` (D1–D10, the owner decisions, L1–
   - **hybrid rollback**: a fresh both-arms candidate with stamp 3 and a non-NULL excerpt sends exactly its title (no excerpt, no stored chunk or prefix);
   - **one-chunk both-arms**: a both-arms row whose incumbent preview is the keyword snippet and whose single (primary) chunk wins shows that chunk as `preview_kind: chunk` with its locator, and the fallback page shows the snippet (D5 oracle 4);
   - the security scenarios (a forged title, tag or chunk) still pass with the swapped preview.
-- [x] 4.6 Update the existing tests whose one-document-per-note assumption changes (`tests/test_rerank_exchange.py`, `tests/test_hybrid_rerank.py`, `tests/test_semantic_rerank.py`, `tests/test_rerank_eval.py`, `tests/_rerank_support.py`). Justify each change against a spec scenario and weaken no assertion. Settings tests: `RERANK_TIMEOUT_MS=20000` accepted and `30001` refused; `RERANK_MAX_DOCUMENTS` defaults to 100, and 49 and 201 are refused.
+- [x] 4.6 Update the existing tests whose one-document-per-note assumption changes (`tests/test_hybrid_rerank.py`, `tests/test_semantic_rerank.py`, `tests/test_rerank_eval.py`, `tests/test_rerank_probe.py`, plus the statement classifier in `tests/test_hybrid_search_offline.py` and the env-key list in `tests/conftest.py`). Justify each change against a spec scenario and weaken no assertion. Settings tests: `RERANK_TIMEOUT_MS=20000` accepted and `30001` refused; `RERANK_MAX_DOCUMENTS` defaults to 100, and 49 and 201 are refused.
 - [x] 4.7 `pytest tests` and `make test-integration` (real Postgres; the statement-capture and snapshot tests must actually run).
 
 ## 5. Settings

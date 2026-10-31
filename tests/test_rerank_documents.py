@@ -510,3 +510,60 @@ async def test_the_oracle_only_the_winner_rows_preview_and_locator_move(monkeypa
         return t.replace('§ "Conclusion" (#15)', "L").replace('§ "Status Olympics" (#11)', "L")
 
     assert strip(tail_a) == strip(tail_b)
+
+
+# ── verifier minors (10fa0b6) ──────────────────────────────────────────────
+
+
+async def test_the_rendered_ordinal_opens_the_section_holding_the_winning_chunk(monkeypatch, fake):
+    """Task 4.2: `read_note(section="#N")` with the rendered `#N` returns a
+    section whose body contains the winning chunk's `chunk_text`."""
+    import re as _re
+
+    from src.services.embeddings import build_embed_prefix, chunk_note_bounded
+    from tests.test_heading_chunks import long, section_cleaned
+
+    body = (f"# Status Olympics\n\n{long('alpha')}\n\n"
+            f"# False Division\n\n{long('beta')}\n\n"
+            f"# Conclusion\n\n{long('gamma')} concluding\n")
+    specs, _ = chunk_note_bounded(body, chunk_size=512, overlap=0, max_chunks=64)
+    assert len(specs) >= 3
+    rows = [
+        chunk_row(1, "Notes/virtue.md", title="Virtue Note", chunk=s.text, chunk_index=i,
+                  distance=0.1 + 0.01 * i,
+                  prefix=build_embed_prefix("Virtue Note", s.heading_path, None),
+                  heading_path=list(s.heading_path), ordinal=s.section_ordinal)
+        for i, s in enumerate(specs)
+    ]
+    winner = next(s for s in specs if "concluding" in s.text)
+    monkeypatch.setattr(tools, "async_session", lambda: _Session(rows))
+    fake.scorer = lambda q, docs: [5.0 if "concluding" in d else -1.0 for d in docs]
+    out = await tools.semantic_search_impl("q", limit=3, rerank=True)
+    obj, tail = _rows_of(out)[0]
+    n = int(_re.search(r"\(#(\d+)\)", tail).group(1))
+    assert n == winner.section_ordinal != specs[0].section_ordinal
+    assert winner.text in section_cleaned(body, n)
+
+
+async def test_hybrid_secondary_winner_replaces_the_snippet(monkeypatch, fake):
+    """Tasks 4.1/4.4(3): a both-arms note with a NON-empty keyword arm keeps
+    its place on its best allocated (secondary) chunk; the preview and the
+    locator are that chunk's, not the keyword snippet."""
+    keyword = [kw_row(1, "Notes/virtue.md", title="Virtue Note"), kw_row(2, "Notes/b.md"),
+               kw_row(3, "Notes/c.md")]
+    answers = dict(excerpts={}, ranked=[keyword], semantic=[_fixture_rows()],
+                   snippet=[[snip(1, hl="a \x02KEYWORD\x03 snippet")]])
+    _serve_h(monkeypatch, _ExcerptSession(**{k: (list(v) if isinstance(v, list) else v)
+                                             for k, v in answers.items()}))
+    fake.scorer = _scorer
+    out = await tools.hybrid_search_impl("victimhood", limit=3, rerank=True)
+    first = _rows_of(out)[0]
+    assert first[0]["path"] == "Notes/virtue.md"
+    assert first[0]["preview_kind"] == "chunk" and first[0]["preview"] == "concluding argument"
+    assert '§ "Conclusion" (#15)' in first[1] and "rerank_score: 0.33" in first[1]
+    _serve_h(monkeypatch, _ExcerptSession(**{k: (list(v) if isinstance(v, list) else v)
+                                             for k, v in answers.items()}))
+    fake.mode = "status:500"
+    fb = await tools.hybrid_search_impl("victimhood", limit=3, rerank=True)
+    row = next(r for r in _rows_of(fb) if r[0]["path"] == "Notes/virtue.md")
+    assert row[0]["preview_kind"] == "snippet" and '(#11)' in row[1]

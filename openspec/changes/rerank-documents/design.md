@@ -280,3 +280,45 @@ Two contradictions remain, so the verdict is FAIL. The hybrid document partition
 
 What changed: (1) the proposal's oracle now allows the preview and locator to change whenever the winning chunk differs from the incumbent preview, explicitly including a hybrid primary chunk that replaces a keyword snippet; (2) the search-quality projection scenario names the two added columns, `note_embeddings.embed_prefix` and `notes_metadata.embedded_chunking_version`, and excludes the stored vector. Both were prose residuals, and the requirements already said this. By the review budget there is no round 4.
 
+## Implementation notes (10fa0b6 and after)
+
+These are shifts from the design's wording. None of them changes the contract.
+
+- **`rerank.embedding_document(prefix, chunk_text, stamp)`** builds the D1 document. It returns `None` for a NULL or unknown stamp, and `candidate_documents` then sends the title alone. `candidate_documents(title, chunks=…, stamp=…, fallback_text=…)` implements the D1 table and the hybrid partition (a)/(b)/(c). `allocate_documents(candidates, budget)` implements D2.
+- **`rerank_groups(query, groups)` is the core** (D3: state precedence, one exchange over the flattened documents, the per-note max, `best`, `documents`). **`rerank_candidates(query, [(title, text)])` remains** as the one-document-per-candidate wrapper over it, which keeps its #367 callers and tests valid.
+- **`semantic_document_groups(rows)` / `hybrid_document_groups(rows)`** are the allocation entry points. The tools and the two production harness arms both call them, so an arm's request is the tool's request.
+- **The frozen incumbent builder lives in the arm module** (`scripts/search_eval_arms/rerank.py`: `_incumbent_document`, `_incumbent_bounded_text`, marked never-edit). `src/` keeps no legacy builder beyond `build_document`, which the D1 table still uses.
+- **`--depth` is the call limit.** The arms call with `limit = min(depth, 50)`, so the `rerank-l10` / `rerank-l20` runs are `--depth 10` / `--depth 20`, with no arm option. A test pins `limit=10` and the null recall@20/@50 at depth 10.
+- `rerank_text` stays on candidate rows. The hybrid incumbent arm reads the excerpt from it, and nothing renders it.
+- `scripts/rerank_allocation_report.py` (task 7.4) buffers every line until the whole run succeeds. On any failure it prints one fixed line with the exception class only (Codex impl round 1).
+
+## Verifier — implementation (10fa0b6)
+
+`openspec-verifier`: 0 blocking, 0 major, 8 minor. All are folded:
+
+1. Task 8.1: a pointer from search.md "Hybrid search (#354)" to the rerank documents. **Done.**
+2. Task 4.2: a test calls the section extraction behind `read_note(section="#N")` with the rendered ordinal and asserts the winning chunk's `chunk_text` is inside that section (`test_the_rendered_ordinal_opens_the_section_holding_the_winning_chunk`). **Done.**
+3. Tasks 4.1/4.4(3): a hybrid oracle with a non-empty keyword arm, where a secondary chunk winner replaces the keyword snippet (`test_hybrid_secondary_winner_replaces_the_snippet`). **Done.**
+4. Task 4.4(2)/(4): every fallback code, `not_configured` and `timeout` included, plus the prefix-blind one-chunk reranked page, compared byte for byte against frozen renders of c491326 in `tests/fixtures/rerank_documents_golden.json`. These were written by `tests/test_rerank_documents_golden.py` run on an exported c491326 tree, 18 pages. **Done.**
+5. Task 4.5: the unreadable-vault condition is dropped with a note, because no vault read exists on the path. **Done.**
+6. Task 6.2: corpus loss for `make_hybrid_arm_incumbent`, and recall@20/@50 null at `--depth 10`. **Done.**
+7. Task 4.6: the two unchanged files are removed from the list. **Done.**
+8. These implementation notes. **Done.**
+
+## Adversarial Codex — implementation round 1 (10fa0b6)
+
+Verdict, verbatim:
+
+````
+The ranking/allocation implementation itself appears consistent: candidate ownership, document bounds, tie handling, score mapping, and winner metadata propagation hold. The focused rerank suite passed 270/270 tests. However, the operator report has a plausible confidentiality failure, so the control review fails.
+
+```json
+{"verdict":"FAIL","findings":[{"severity":"BLOCKER","file":"scripts/rerank_allocation_report.py","line":158,"claim":"The numbers-only report has no sanitized top-level failure path and prints results incrementally. A provider or SQL exception can therefore leave a plausible but incomplete report and emit tenant query text or SQL parameters through the uncaught traceback.","failing_input":"Run the report with two private queries and capture combined stdout/stderr for an issue attachment. Let the first query succeed, then have an OpenAI-compatible embedding provider reject the second with ProviderInputTooLarge whose message echoes that query, or let the hybrid SQL statement fail while displaying bound parameters. main() propagates the exception, so the captured file contains partial measurements plus the private query in the traceback.","fix":"Buffer all report lines until every operation succeeds; wrap parsing and main_async in a top-level exception handler that prints only a fixed code and exception class, never str(exc), and exits nonzero. Add tests with secret-bearing provider and SQL exceptions asserting neither partial output nor the secret appears on either stream."},{"severity":"MINOR","file":"docs/architecture/search.md","line":462,"claim":"The architecture note still describes the pre-#402 implementation in present tense immediately before the new rules: it says rerank=true uses the same projection as rerank=false and sends one best-distance title-plus-chunk document per semantic note.","failing_input":"An operator or maintainer reads the 'Candidates and the scored unit' section to determine the current SQL projection and scored unit; lines 466–478 contradict lines 488–505 and the implementation.","fix":"Remove the obsolete paragraph or explicitly label it as pre-#402 historical behavior, leaving the stored embedding-input and multi-document allocation rules as the sole current contract."}]}
+```
+````
+
+What changed:
+
+- **BLOCKER (the report script):** `scripts/rerank_allocation_report.py` now buffers every line in memory and writes them at once only after every query on both tools has succeeded. A single top-level handler covers argument parsing (a parser subclass refuses with the fixed code `bad_arguments` instead of echoing the argument) and `main_async`. Any failure prints one line with the exception **class** only, never `str(exc)`, writes no partial report, and exits 1 (64 for a refusal). New tests: a `ProviderInputTooLarge` whose message quotes a secret query, raised on the second query; a `ProgrammingError` carrying the secret in its statement and parameters; a secret-bearing bad argument; a successful run that emits every line at once. Each asserts empty stdout on failure and no secret on stdout or stderr.
+- **MINOR (search.md):** the "Candidates and the scored unit" paragraph no longer describes the pre-#402 scored unit in the present tense. It is now "Candidates (D4, D6)", it states the rerank=true projection, and it labels the old one-document unit "*Before #402*", leading into "The documents since #402".
+

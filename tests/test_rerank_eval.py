@@ -345,3 +345,54 @@ def test_the_hybrid_incumbent_sends_the_excerpt_or_the_chunk(monkeypatch, rerank
     inc, cand = asyncio.run(go())
     assert inc == ["Sem\n\ncosine best", "Kw\n\nthe excerpt"]
     assert cand == ["Sem > H\n\ncosine best", "Kw\n\nthe excerpt"]
+
+
+def test_the_hybrid_incumbent_arm_keeps_union_membership(tmp_path, monkeypatch, reranker):
+    """Task 6.2: corpus loss counts for `make_hybrid_arm_incumbent` too."""
+    async def fake_hybrid(session, query, **kw):
+        rows = [hybrid_service.HybridRow(path=p, title=p, tags=[], score=0.1, keyword_rank=1,
+                                         rerank_text=f"text {p}") for p in ("A.md", "B.md")]
+        return hybrid_service.HybridResult(rows=rows)
+
+    monkeypatch.setattr(hybrid_service, "hybrid_search", fake_hybrid)
+    _stub_replay_db(monkeypatch, [], {"1": {"A.md": {"metadata": True, "keyword": False,
+                                                     "semantic": False},
+                                            "B.md": dict(ALL)}})
+    d = tmp_path / "d"
+    write_data(d, [{"text": "q", "relevant": ["A.md"]}],
+               {"1": {"A.md": KW_ONLY, "B.md": dict(ALL)}})
+    out = run(d, [HYB_INC], depth=10)
+    assert out.exit_code == EXIT_OK, out.manifest
+    meta = json.loads((d / "runs" / out.manifest["files"][HYB_INC]["path"]).read_text())["meta"]
+    assert meta["membership"] == "keyword_or_semantic"
+    assert list(meta["corpus_loss"].values()) == [["A.md"]]
+
+
+def test_at_depth_10_recall_at_20_and_50_are_null(tmp_path, monkeypatch, reranker):
+    """Task 6.2: the `rerank-l10` run calls with limit 10, and recall@20/@50
+    are null under `staged_depth` for both the incumbent and the candidate."""
+    from scripts.search_eval.scoring import score
+
+    rows = [row(i) for i in range(12)]
+    limits = []
+    real = embeddings.semantic_candidates
+
+    async def spy(session, query, **kw):
+        limits.append(kw["limit"])
+        return await real(session, query, **kw)
+
+    monkeypatch.setattr(embeddings, "semantic_candidates", spy)
+    _stub_replay_db(monkeypatch, rows, {"1": {"Notes/n00.md": dict(ALL),
+                                            "Notes/n01.md": dict(ALL)}})
+    d = tmp_path / "d"
+    write_data(d, [{"text": "q", "relevant": ["Notes/n01.md"]}],
+               {"1": {"Notes/n00.md": dict(ALL), "Notes/n01.md": dict(ALL)}})
+    out = run(d, [SEM_INC, SEM], depth=10)
+    assert out.exit_code == EXIT_OK, out.manifest
+    assert set(limits) == {10}
+    res = score(d, [SEM_INC, SEM], baseline=SEM_INC, min_queries=1, seed=1)
+    for arm in res.report["arms"]:
+        assert arm["staged_depth"] == 10
+        assert arm["metrics"]["overall"]["recall@20"] is None
+        assert arm["metrics"]["overall"]["recall@50"] is None
+        assert arm["metrics"]["overall"]["recall@10"] is not None

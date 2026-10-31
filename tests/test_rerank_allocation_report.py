@@ -47,3 +47,99 @@ def test_the_arguments_come_in_pairs():
     args = _parse(["--database-url", "postgresql://u@h/d", "--query", "a", "--note", "b.md",
                    "--limits", "10,20"])
     assert args.pairs == [("a", "b.md")] and args.limit_list == [10, 20]
+
+
+# ── Codex impl round 1: buffered output, sanitised failure ─────────────────
+
+import pytest  # noqa: E402
+
+import scripts.rerank_allocation_report as report  # noqa: E402
+
+SECRET = "SECRET TENANT QUERY about the private note"
+
+
+class _Engine:
+    async def dispose(self):
+        pass
+
+
+class _Maker:
+    def __call__(self):
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_a):
+        return None
+
+
+def _patch(monkeypatch, *, fail_on_call: int, exc: BaseException):
+    import scripts.search_eval.db as db
+    import src.services.embeddings as emb
+    import src.services.hybrid as hyb
+    from src.services.embeddings import SemanticCandidates
+    from src.services.hybrid import HybridResult
+
+    async def fake_open(_url):
+        return _Engine(), _Maker()
+
+    calls = {"n": 0}
+
+    async def fake_candidates(_session, _query, **_kw):
+        calls["n"] += 1
+        if calls["n"] == fail_on_call:
+            raise exc
+        return SemanticCandidates(rows=[], limit=10)
+
+    async def fake_hybrid(_session, _query, **_kw):
+        return HybridResult(rows=[])
+
+    monkeypatch.setattr(db, "open_readonly", fake_open)
+    monkeypatch.setattr(emb, "semantic_candidates", fake_candidates)
+    monkeypatch.setattr(hyb, "hybrid_search", fake_hybrid)
+
+
+def _argv():
+    return ["--database-url", "postgresql://u@h/d", "--query", "first query", "--note", "a.md",
+            "--query", SECRET, "--note", "b.md", "--limits", "10"]
+
+
+def test_a_provider_failure_mid_run_prints_no_partial_report_and_no_secret(monkeypatch, capsys):
+    from src.services.refusals import ProviderInputTooLarge
+
+    _patch(monkeypatch, fail_on_call=2, exc=ProviderInputTooLarge(f"input too large: {SECRET}"))
+    assert report.main(_argv()) == 1
+    out, err = capsys.readouterr()
+    assert out == ""  # the first query's lines were never emitted
+    assert "SECRET" not in out + err and "private" not in out + err
+    assert "ProviderInputTooLarge" in err
+
+
+def test_a_sql_failure_prints_only_the_class(monkeypatch, capsys):
+    from sqlalchemy.exc import ProgrammingError
+
+    exc = ProgrammingError(f"SELECT … WHERE q = '{SECRET}'", {"q": SECRET}, Exception(SECRET))
+    _patch(monkeypatch, fail_on_call=1, exc=exc)
+    assert report.main(_argv()) == 1
+    out, err = capsys.readouterr()
+    assert out == "" and "SECRET" not in out + err and "ProgrammingError" in err
+
+
+def test_a_bad_argument_is_not_echoed(capsys):
+    assert report.main(["--database-url", "x", f"--{SECRET.replace(' ', '-')}"]) == 64
+    out, err = capsys.readouterr()
+    assert "SECRET" not in out + err and "bad_arguments" in err
+
+
+def test_a_successful_run_emits_every_line_at_once(monkeypatch, capsys):
+    _patch(monkeypatch, fail_on_call=0, exc=RuntimeError())
+    assert report.main(_argv()) == 0
+    out, err = capsys.readouterr()
+    assert out.splitlines() == [
+        "q1 semantic limit=10: candidates=0 documents=0 note_rank=absent",
+        "q1 hybrid limit=10: candidates=0 documents=0 note_rank=absent",
+        "q2 semantic limit=10: candidates=0 documents=0 note_rank=absent",
+        "q2 hybrid limit=10: candidates=0 documents=0 note_rank=absent",
+    ]
+    assert "SECRET" not in out + err

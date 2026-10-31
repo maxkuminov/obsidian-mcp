@@ -33,8 +33,20 @@ import json
 import sys
 
 
+class ReportFailure(Exception):
+    """A refusal with a fixed, text-free code (exit 64)."""
+
+
+class _Parser(argparse.ArgumentParser):
+    """argparse's errors echo the offending argument, which may be tenant
+    query text: refuse with a fixed code instead."""
+
+    def error(self, message):  # noqa: D401 - argparse hook
+        raise ReportFailure("bad_arguments")
+
+
 def _parse(argv):
-    p = argparse.ArgumentParser(prog="rerank_allocation_report", description=__doc__.split("\n")[0])
+    p = _Parser(prog="rerank_allocation_report", description=__doc__.split("\n")[0])
     p.add_argument("--database-url", required=True)
     p.add_argument("--query", action="append", default=[])
     p.add_argument("--note", action="append", default=[])
@@ -99,7 +111,9 @@ async def _note_scores(query, title, chunks, stamp):
     return {d.chunk["chunk_index"]: s for d, s in zip(docs, result)}
 
 
-async def main_async(args) -> int:
+async def main_async(args, out: list[str]) -> int:
+    """Append every report line to `out`; print nothing. The caller emits
+    the lines only once every operation has succeeded."""
     from scripts.search_eval.db import open_readonly
     from src.config import settings
     from src.services import rerank
@@ -108,12 +122,10 @@ async def main_async(args) -> int:
 
     if args.score:
         if not settings.rerank_url:
-            print("--score needs RERANK_URL", file=sys.stderr)
-            return 64
+            raise ReportFailure("score_needs_rerank_url")
         code = await rerank.probe_attempt(rerank.RERANK_PROBE_TIMEOUT_S)
         if code is not None:
-            print(f"reranker probe failed ({code})", file=sys.stderr)
-            return 64
+            raise ReportFailure(f"probe_failed:{code}")
         rerank._set_enabled()
     engine, maker = await open_readonly(args.database_url)
     try:
@@ -135,7 +147,7 @@ async def main_async(args) -> int:
                                          path_of=lambda r: r["path"],
                                          chunks_of=lambda r: r.get("rerank_chunks") or [],
                                          groups=groups, scores=scores):
-                    print(line)
+                    out.append(line)
                 async with maker() as session:
                     result = await hybrid_search(session, query, limit=limit,
                                                  user_id=args.user_id, rerank_candidates=True)
@@ -147,7 +159,7 @@ async def main_async(args) -> int:
                                              if r.semantic_rank is not None and not r.stale
                                              else []),
                         groups=hgroups, scores=scores):
-                    print(line)
+                    out.append(line)
     finally:
         await engine.dispose()
         await rerank.close_rerank_client()
@@ -155,7 +167,25 @@ async def main_async(args) -> int:
 
 
 def main(argv=None) -> int:
-    return asyncio.run(main_async(_parse(argv if argv is not None else sys.argv[1:])))
+    """Buffered and sanitised (Codex impl round 1): nothing is printed until
+    every query has been measured, and any failure prints one fixed line with
+    the exception **class** only — never its message, which can quote the
+    query text or SQL parameters — and no partial report."""
+    out: list[str] = []
+    try:
+        args = _parse(argv if argv is not None else sys.argv[1:])
+        code = asyncio.run(main_async(args, out))
+    except SystemExit as exc:  # `--help` only: argparse errors are ReportFailure
+        return int(exc.code or 0)
+    except ReportFailure as exc:
+        print(f"rerank_allocation_report: refused ({exc.args[0]})", file=sys.stderr)
+        return 64
+    except BaseException as exc:  # noqa: BLE001 - sanitised, never re-raised
+        print(f"rerank_allocation_report: failed ({type(exc).__name__}); no report written",
+              file=sys.stderr)
+        return 1
+    sys.stdout.write("".join(line + "\n" for line in out))
+    return code
 
 
 if __name__ == "__main__":

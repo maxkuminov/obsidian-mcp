@@ -291,6 +291,11 @@ rebuild-tsvectors` (L10).
 
 ## Hybrid search (#354)
 
+(With `rerank=true` the fused candidates are reranked on per-chunk documents
+built from the semantic arm's fetched rows — the partition, the allocation
+and the winner's preview over the keyword snippet are in "Reranking (#367)",
+"The documents since #402".)
+
 `hybrid_search(query, limit=10, folder?, tags?, frontmatter?)` is a **third
 peer**, not a replacement and not a "primary" tool. The one measured
 pgvector + tsvector reciprocal-rank-fusion study (2026-10-22, 94 passages,
@@ -459,24 +464,21 @@ shutdown. One wall-clock deadline (`RERANK_TIMEOUT_MS`) covers the pool
 wait, connect, write and a raw body read under the 1 MiB cap (asked for
 uncompressed; a compressed body fails closed). No retry.
 
-**Candidates and the scored unit (D4, D6).** For `semantic_search` the
-candidates come from one service, `embeddings.semantic_candidates`, which
-the tool and the harness arm both call: the call's unchanged overfetch
-statement, re-sorted and deduped as always, **before** truncation to
-`limit`, capped at 50 notes. The statements are the same as `rerank=false`.
+**Candidates (D4, D6).** For `semantic_search` the candidates come from one
+service, `embeddings.semantic_candidates`, which the tool and the harness arms
+call: the call's unchanged overfetch statement (under `rerank=true` it projects
+`embed_prefix` and `embedded_chunking_version` more, nothing else), re-sorted
+and deduped as always, **before** truncation to `limit`, capped at 50 notes.
 Because `limit ≤ 50`, every note of the unreranked page is a candidate, so
-reranking can only reorder that page and promote notes from deeper ranks.
-The scored unit is the **note**: `title + "\n\n" + text`, at most 2,048
-code points, where the text is the best-distance chunk, uncut (as #355's
-arm projects it; `rerank_text`, internal, never on a legacy row).
-A stale note (#200) is sent as its title alone: superseded text never
-leaves the server. For `hybrid_search` the candidates are the first 50 fused
-rows; a note in the semantic arm and not stale sends its chunk, any other
-sends `left(body_excerpt, 2048)` read by one statement **inside the hybrid
-snapshot**, under the owner predicate, after the snippet statements and only
-when such a candidate exists (by path: the semantic arm's rows carry no id).
-A NULL excerpt sends the title. A keyword-only hybrid call still reranks and
-says both `arms: keyword-only (…)` and `reranked: …`.
+reranking can only reorder that page and promote notes from deeper ranks. For
+`hybrid_search` the candidates are the first 50 fused rows; the excerpt for a
+stale or keyword-only candidate is `left(body_excerpt, 2048)`, read by one
+statement **inside the hybrid snapshot**, under the owner predicate, after the
+snippet statements and only when such a candidate exists (by path: the
+semantic arm's rows carry no id). A keyword-only hybrid call still reranks and
+says both `arms: keyword-only (…)` and `reranked: …`. *Before #402* the scored
+unit was one document per note, `title + "\n\n" + text` with the
+best-distance chunk (or the stale title / the excerpt); what replaced it:
 
 **The documents since #402 (rerank-documents).** Live, the reranker demoted
 notes both arms ranked first: it was sent `title + chunk` for one chunk per
