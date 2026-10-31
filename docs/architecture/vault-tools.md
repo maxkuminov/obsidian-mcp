@@ -174,9 +174,13 @@ plus `create_note`. `check_upload` and `request_download` stay listed: neither
 refuses a read-only caller.
 
 **The one behaviour difference at call time (L5).** `write_file` and
-`delete_file` validate `expected_hash` syntax before their in-body permission
-check; a read-only caller sending them a malformed hash used to get the syntax
-refusal and now gets `permission_denied`. The safer order — nothing about the
+`delete_file` refused some calls before their in-body permission check:
+`expected_hash` syntax (`malformed_precondition`, both tools) and, for
+`write_file(overwrite=false)` with a well-formed hash, `no_incumbent`. For a
+read-only caller **any** such pre-permission refusal is now
+`permission_denied`; a `readwrite` caller's refusals are unchanged (owner
+decision, 2026-10-31, after the verifier and adversarial Codex both found the
+`no_incumbent` case). The safer order — nothing about the
 arguments is disclosed to a caller who may not write.
 
 **The seam survives SDK 2.x.** The override is the public `list_tools()`, which
@@ -473,7 +477,7 @@ Neither subsumes the other and neither was removed. A matching `expected_hash` d
 
 ### The precedence ladder, and why the order is the design
 
-1. **syntax** — a non-canonical hash is `malformed_precondition`, decided **at the tool's entry: before path resolution, before `_leaf_state_error`, before any read**, in every tool and every mode. `_precondition_syntax_error` is therefore a *separate* helper from the comparison, and a pure function of the argument. It wins over not-found, over a symlinked leaf and over the size cap — a caller told "not found" for a call whose argument was never valid fixes the wrong thing.
+1. **syntax** — a non-canonical hash is `malformed_precondition` (for a *read-only* caller of a write tool the body-boundary permission gate answers first, #358 L5), decided **at the tool's entry: before path resolution, before `_leaf_state_error`, before any read**, in every tool and every mode. `_precondition_syntax_error` is therefore a *separate* helper from the comparison, and a pure function of the argument. It wins over not-found, over a symlinked leaf and over the size cap — a caller told "not found" for a call whose argument was never valid fixes the wrong thing.
 2. **no incumbent** — a tool or mode that can never bind incumbent bytes (`create_note`, `write_file(overwrite=False)`, an overwrite of a path with no file at it) is `no_incumbent`.
 3. **unavailable** — an incumbent larger than the cap this tool may read is `precondition_unavailable`, naming the cap. "I could not check" and "I checked and it differs" are different facts; answering the first with the second sends the caller after a hash it can never obtain.
 4. **required** — an enforceable call supplying no hash while `WRITE_PRECONDITION_REQUIRED` is on is `precondition_required`. Over-cap **outranks** it, for the same reason.

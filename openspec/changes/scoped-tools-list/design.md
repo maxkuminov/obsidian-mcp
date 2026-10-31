@@ -44,7 +44,7 @@ No decorator argument and no wrapper stamp defines membership (the round-0 `requ
 
 The seven in-body `_require_write()` calls and `_mint_preflight(need_write=True)` **stay** as defence in depth (removing them is a separate, riskier edit to nine write bodies). For a read-only caller they are now unreachable for registry members; an AST guard requires every such call site to sit in a registry member, so a new write body that calls `_require_write` without being registered fails the suite.
 
-**The one enforcement-visible difference.** Seven bodies call `_require_write()` as their first statement and two call `_mint_preflight` first, whose first act is the same check — so moving the check to the body boundary changes nothing for them. `write_file` and `delete_file` run `_precondition_syntax_error(expected_hash)` (and `write_file` its `no_incumbent` check) *before* their in-body permission check; a read-only caller sending them a malformed hash got the syntax refusal and now gets `permission_denied`. This is the safer order (no argument validation is disclosed to a caller who may not write), and it is pinned by its own scenario. Nothing else changes.
+**The one enforcement-visible difference.** Seven bodies call `_require_write()` as their first statement and two call `_mint_preflight` first, whose first act is the same check — so moving the check to the body boundary changes nothing for them. `write_file` and `delete_file` run `_precondition_syntax_error(expected_hash)` (and `write_file`, for `overwrite=false` with a well-formed hash, its `no_incumbent` refusal) *before* their in-body permission check; a read-only caller who got either of those refusals now gets `permission_denied` (widened after the verifier and adversarial Codex round 1 both found the `no_incumbent` case). This is the safer order (no argument validation is disclosed to a caller who may not write), and it is pinned by its own scenario. Nothing else changes.
 
 Drift guards (all in `tests/test_issue_358_scoped_tools_list.py`):
 
@@ -148,7 +148,7 @@ SDK 1.30's `FastMCP.list_tools()` takes no request and returns the complete list
 - **L2** A read-only grant's `instructions` and some read-tool descriptions name tools it does not list (D7).
 - **L3** On SDK 1.30 a read-only call of a hidden tool after a filtered list logs the SDK's "not listed, no validation" WARNING and skips output validation of a refusal that would pass it (D6).
 - **L4** No `list_changed`: after a panel scope change, a client sees the new list only when it re-lists (D8).
-- **L5** `write_file` / `delete_file`: a read-only caller with a malformed `expected_hash` now gets `permission_denied` instead of the syntax refusal (D2). Deliberate.
+- **L5** `write_file` / `delete_file`: for a read-only caller, every refusal those bodies made before their in-body permission check — `malformed_precondition` (both tools) and `no_incumbent` (`write_file`, `overwrite=false` with a well-formed `expected_hash`) — is now `permission_denied` (D2). Deliberate, owner decision 2026-10-31: the safer order, disclosing nothing about the arguments or the path's state to a caller who may not write. A `readwrite` caller's refusals are unchanged. Pinned by `test_l5_a_pre_permission_refusal_is_now_permission_denied_for_a_readonly_caller` (including Codex's exact case).
 - **L6** The in-body permission checks remain beside the registry gate (D2); they are guarded by the AST test rather than removed.
 
 ## Open questions (Max)
@@ -206,3 +206,23 @@ No new BLOCKER or MAJOR defect was found within the requested failure classes. T
 ```
 
 Owner answers to the open questions (Max, 2026-10-31): read-only API keys are **not** filtered (L1 stands); no consent-page wording; 19 is the count.
+
+## Verifier and adversarial Codex — implementation round 1 (cfbf2b8)
+
+The `openspec-verifier` passed cfbf2b8 with 0 blocking, 1 MAJOR, 3 MINOR; adversarial Codex failed it with exactly one finding, the verifier's MAJOR.
+
+**Decision (owner, 2026-10-31):** keep the new, safer order and widen L5 explicitly — in the spec requirement and its scenario, D2, L5 and `docs/architecture/vault-tools.md` — to "any pre-permission refusal of `write_file` / `delete_file` (malformed `expected_hash`, `no_incumbent`) is now `permission_denied` for a read-only caller", with Codex's regression case pinned as a test.
+
+Verifier minors, folded:
+
+1. Task 4.9's test now asserts, per refused call, the `tool_write_refused` record, the usage row and its `permission_denied` marker, the rate tokens taken (one general, plus one write for a write-bucket tool — what the pre-change path took before its body refused) and exactly one quota admission; and both cache orderings run inside one test, so the comparison no longer depends on two parameters sharing a process.
+2. The real scope-change path: `tests/integration/test_scoped_tools_list_pg.py` seeds a `read` grant in Postgres, lists through the real `APIKeyMiddleware` (19), upgrades the family through the panel handler `update_oauth_token_scope`, lists again (28), and asserts exactly one JSON-RPC message per response and that `ServerSession.send_tool_list_changed` was never called.
+3. Task 6.1 names what ran and where (below the tasks list), unchanged otherwise.
+
+Adversarial Codex verdict, verbatim:
+
+FAIL. The filtering/cache implementation held up under targeted review, and 129 relevant tests passed, but there is one plausible, unapproved call-time behavior change beyond L5.
+
+```json
+{"verdict":"FAIL","findings":[{"severity":"MAJOR","file":"src/mcp_server/tools.py","line":1946,"claim":"The new body-boundary gate changes write_file refusal precedence beyond the sole malformed-hash exception approved in L5.","failing_input":"A read-only OAuth grant calls write_file(path=\"a.bin\", content=\"AAAA\", overwrite=false, expected_hash=\"sha256:\" followed by 64 zeroes). On c491326, write_file returned no_incumbent before reaching _require_write; HEAD returns permission_denied from _tracked. The new tests cover only malformed expected_hash, so this valid-hash case passes unnoticed.","fix":"Preserve the existing valid-hash/no-overwrite no_incumbent precheck ahead of the permission gate and add an exact regression assertion for this read-only case. If the broader precedence change is intended, obtain owner approval and amend L5 and the documentation explicitly."}]}
+```

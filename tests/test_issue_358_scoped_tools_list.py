@@ -331,25 +331,97 @@ HIDDEN_CALLS = {
 }
 
 
-@pytest.mark.parametrize("prime", ["full", "filtered"])
-async def test_a_named_hidden_tool_is_refused_the_same_way_in_either_cache_state(prime, vault_root):
-    responses = {}
+@pytest.fixture
+def refusal_audit(monkeypatch):
+    """What a refused call spends and records: rate tokens per bucket, quota
+    admissions, usage rows (with their markers) and `tool_write_refused`
+    records. Captured at the same seams the pre-change path used — the body
+    refused *after* `_bucket_admission` and `_quota_admission_error`, so a
+    call that spends exactly one general token (+ one write token for a
+    write-bucket tool) and one quota admission spends what it always did."""
+    import logging
+    from types import SimpleNamespace
+
+    from src.services import security_events
+
+    audit = SimpleNamespace(takes=[], quota=0, rows=[], events=[])
+    real_take = rate_limits.take
+
+    def take(principal, scope):
+        audit.takes.append(scope)
+        return real_take(principal, scope)
+
+    monkeypatch.setattr(rate_limits, "take", take)
+    real_quota = tools._quota_admission_error
+
+    async def quota():
+        audit.quota += 1
+        return await real_quota()
+
+    monkeypatch.setattr(tools, "_quota_admission_error", quota)
+
+    async def capture(tool, params, duration_ms, response_size):
+        audit.rows.append({"tool": tool, "params": dict(params)})
+        return True
+
+    monkeypatch.setattr(tools, "_log_usage", capture)
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            audit.events.append(record.getMessage())
+
+    handler = _Capture(level=logging.DEBUG)
+    logger = security_events.logger
+    logger.addHandler(handler)
+    propagate, level = logger.propagate, logger.level
+    logger.propagate = False
+    logger.setLevel(logging.DEBUG)
+    security_events.reset_state()
+    try:
+        with security_events.suppression_disabled():
+            yield audit
+    finally:
+        logger.removeHandler(handler)
+        logger.propagate = propagate
+        logger.setLevel(level)
+        security_events.reset_state()
+
+
+async def test_a_named_hidden_tool_is_refused_and_audited_the_same_way_in_either_cache_state(
+    vault_root, refusal_audit
+):
+    """Both cache orderings in one test (no cross-parameter state), each call
+    checked for its refusal, its usage marker, its security record and its
+    token and quota spend."""
+    from src.services import refusals as refusal_scopes
+
+    bucket = tools.production_write_bucket_tools()
+    by_prime = {}
     async with h.running_client(mcp, vault_root) as client:
-        await h.list_result(client, h.READWRITE_KEY if prime == "full" else h.READ_GRANT)
-        for name, args in HIDDEN_CALLS.items():
-            message = await h.call_tool(client, h.READ_GRANT, name, args)
-            assert "error" not in message, "a tool result, never an unknown-tool protocol error"
-            assert refusal_code(message) == "permission_denied", (name, message)
-            text = message["result"]["content"][0]["text"]
-            assert text.startswith(REFUSAL_PROSE)
-            responses[name] = h.canonical(message["result"])
-    test_a_named_hidden_tool_is_refused_the_same_way_in_either_cache_state.seen.setdefault(prime, responses)
-    seen = test_a_named_hidden_tool_is_refused_the_same_way_in_either_cache_state.seen
-    if len(seen) == 2:
-        assert seen["full"] == seen["filtered"]
-
-
-test_a_named_hidden_tool_is_refused_the_same_way_in_either_cache_state.seen = {}
+        for prime in ("full", "filtered"):
+            rate_limits.reset_state_for_tests()
+            await h.list_result(client, h.READWRITE_KEY if prime == "full" else h.READ_GRANT)
+            responses = {}
+            for name, args in HIDDEN_CALLS.items():
+                refusal_audit.takes.clear()
+                refusal_audit.quota = 0
+                refusal_audit.rows.clear()
+                refusal_audit.events.clear()
+                message = await h.call_tool(client, h.READ_GRANT, name, args)
+                assert "error" not in message, "a tool result, never an unknown-tool protocol error"
+                assert refusal_code(message) == "permission_denied", (name, message)
+                assert message["result"]["content"][0]["text"].startswith(REFUSAL_PROSE)
+                expected_takes = [refusal_scopes.SCOPE_PRINCIPAL] + (
+                    [refusal_scopes.SCOPE_PRINCIPAL_WRITE] if name in bucket else []
+                )
+                assert refusal_audit.takes == expected_takes, (name, refusal_audit.takes)
+                assert refusal_audit.quota == 1, (name, "one quota admission, as before")
+                assert [r["tool"] for r in refusal_audit.rows] == [name]
+                assert refusal_audit.rows[0]["params"].get("error") == tools._PERMISSION_DENIED_MARKER
+                assert refusal_audit.events.count("tool_write_refused") == 1, (name, refusal_audit.events)
+                responses[name] = h.canonical(message["result"])
+            by_prime[prime] = responses
+    assert by_prime["full"] == by_prime["filtered"]
 
 
 @pytest.fixture
@@ -367,15 +439,29 @@ def read_only_in_process(vault_root):
         var.reset(tok)
 
 
+ZERO_HASH = "sha256:" + "0" * 64
+
+
 @pytest.mark.parametrize(
-    "call",
+    "call,readwrite_code",
     [
-        lambda: tools.write_file_impl("a.bin", "AAAA", expected_hash="not-a-hash"),
-        lambda: tools.delete_file_impl("a.bin", expected_hash="not-a-hash"),
+        (lambda: tools.write_file_impl("a.bin", "AAAA", expected_hash="not-a-hash"), None),
+        (lambda: tools.delete_file_impl("a.bin", expected_hash="not-a-hash"), None),
+        # Codex implementation round 1: a well-formed hash with
+        # `overwrite=false` is refused `no_incumbent` before the in-body
+        # permission check; the body-boundary gate now answers first.
+        (
+            lambda: tools.write_file_impl(
+                path="a.bin", content="AAAA", overwrite=False, expected_hash=ZERO_HASH
+            ),
+            "no_incumbent",
+        ),
     ],
-    ids=["write_file", "delete_file"],
+    ids=["write_file-malformed", "delete_file-malformed", "write_file-no_incumbent"],
 )
-async def test_l5_malformed_hash_from_a_readonly_caller_is_permission_denied(call, read_only_in_process):
+async def test_l5_a_pre_permission_refusal_is_now_permission_denied_for_a_readonly_caller(
+    call, readwrite_code, read_only_in_process
+):
     result = await call()
     assert result.refusal.code == "permission_denied"
     perm = current_permission.set("readwrite")
@@ -384,8 +470,10 @@ async def test_l5_malformed_hash_from_a_readonly_caller_is_permission_denied(cal
     finally:
         current_permission.reset(perm)
     assert again.refusal is not None and again.refusal.code != "permission_denied", (
-        "a readwrite caller still gets the syntax refusal"
+        "a readwrite caller still gets the pre-permission refusal"
     )
+    if readwrite_code is not None:
+        assert again.refusal.code == readwrite_code
 
 
 # ══════════════════════════════════════════════════════════════════════════

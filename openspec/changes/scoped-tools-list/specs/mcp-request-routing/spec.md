@@ -132,7 +132,7 @@ When the request's principal is an OAuth grant (`current_principal` of kind `"oa
 - **AND** it SHALL NOT contain `request_download` or `check_upload`, and SHALL be a subset of the registered tool names
 
 ### Requirement: Hiding a tool from `tools/list` SHALL NOT change whether a call to it is admitted or refused
-The tool-list filter is a presentation of what a credential can use, not a control. A `tools/call` of a hidden tool by a read-only OAuth grant SHALL pass through the same gates as before this change, in the same order, and SHALL be refused with the same refusal text, the same `MCP-REFUSAL` code `permission_denied`, the same `tool_write_refused` security event, the same usage row and marker, and the same rate-token and quota consumption as before. The one permitted difference is precedence inside two bodies: `write_file` and `delete_file` validate `expected_hash` syntax before their in-body permission check today, so a read-only caller sending a malformed hash to them SHALL now receive `permission_denied` (from the body-boundary gate) instead of the syntax refusal; for every other tool and argument the response SHALL be identical. No code in this server that admits or refuses a tool call SHALL consult the filtered list. The implementation SHALL NOT read or write the SDK's internal tool cache.
+The tool-list filter is a presentation of what a credential can use, not a control. A `tools/call` of a hidden tool by a read-only OAuth grant SHALL pass through the same gates as before this change, in the same order, and SHALL be refused with the same refusal text, the same `MCP-REFUSAL` code `permission_denied`, the same `tool_write_refused` security event, the same usage row and marker, and the same rate-token and quota consumption as before. The one permitted difference is precedence inside two bodies: `write_file` and `delete_file` run refusals before their in-body permission check today — `expected_hash` syntax (`malformed_precondition`, both tools) and, for `write_file` with `overwrite=false` and a well-formed `expected_hash`, `no_incumbent` — so for a read-only caller **any** such pre-permission refusal of those two tools SHALL now be `permission_denied` (from the body-boundary gate); a `readwrite` caller SHALL still receive the pre-permission refusal unchanged, and for every other tool and argument the response SHALL be identical. No code in this server that admits or refuses a tool call SHALL consult the filtered list. The implementation SHALL NOT read or write the SDK's internal tool cache.
 
 #### Scenario: A named hidden tool is still refused, not unknown
 - **WHEN** a read-only OAuth grant calls `edit_note`, `request_upload` or `import_from_url` by name without having listed it
@@ -143,8 +143,9 @@ The tool-list filter is a presentation of what a credential can use, not a contr
 - **THEN** both responses SHALL be identical to each other and to the response before this change
 
 #### Scenario: The precedence change is confined
-- **WHEN** a read-only grant calls `write_file` or `delete_file` with a malformed `expected_hash`
-- **THEN** the call SHALL be refused `permission_denied`, and the same call under a `readwrite` credential SHALL still receive the syntax refusal
+- **WHEN** a read-only grant calls `write_file` or `delete_file` with a malformed `expected_hash`, or `write_file(path="a.bin", content="AAAA", overwrite=false, expected_hash="sha256:" + 64 zeroes)`
+- **THEN** each call SHALL be refused `permission_denied`
+- **AND** the same calls under a `readwrite` credential SHALL still receive `malformed_precondition` and `no_incumbent` respectively
 
 #### Scenario: A filtered list does not degrade a write caller
 - **WHEN** a filtered list is served and a `readwrite` principal then calls `edit_note`
