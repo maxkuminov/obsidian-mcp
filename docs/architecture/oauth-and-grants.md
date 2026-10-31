@@ -164,6 +164,15 @@ vanished from the page, so the operator saw a blank space that read as success.
   `readwrite` for a client not registered for it *and* clamps what it writes,
   and `_handle_refresh` re-clamps on every rotation — otherwise a scope raised
   above the registration survives forever (#67).
+- **A `read` grant lists 19 tools, not 28** (#358). `tools/list` omits the nine
+  write-required tools (`tool_permissions.WRITE_REQUIRED_TOOLS`) for an OAuth
+  grant without `readwrite` — the preselected consent choice, so the common
+  case. The list is decided per request from `token_has_write`, the same
+  mapping the middleware and the panel badge use; a panel scope change shows on
+  the client's next `tools/list` (no `list_changed` is sent, so a connector
+  sees new write tools after it reconnects). A hidden tool called by name is
+  still refused `permission_denied`. API keys are not filtered. See
+  [vault tools](vault-tools.md), "Who sees which tools (#358)".
 - **`authorize_post` refuses a client bound to a different user** (#68). Fixed
   at the source rather than by unioning the panel listing, which would hand the
   other user the owner's cascading Delete. Single-user mode cannot trigger it.

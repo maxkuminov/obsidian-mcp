@@ -129,6 +129,96 @@ untouched `create_note` and `delete_note`) now say so; and "`expected_hash` is
 optional" is a default, because `WRITE_PRECONDITION_REQUIRED=true` refuses an
 omitted hash with `precondition_required`.
 
+### Who sees which tools (#358)
+
+`tools/list` follows the authorization presented on the request, which the MCP
+2026-07-28 tools page permits in so many words: the set "**MUST NOT** vary
+per-connection or as a side effect of other requests on the connection. The
+set **MAY** vary by the authorization presented on the request — for example,
+returning only the tools the caller's granted scopes permit".
+
+| Request | `tools/list` |
+| --- | --- |
+| OAuth grant whose scope lacks `readwrite` | **19** — the full list minus the nine write-required tools |
+| OAuth grant with `readwrite`, API key (`read` or `readwrite`) | 28, byte-identical to before |
+| `MCP_SANDBOX_MODE`, stdio, in-process (no principal) | 28 |
+| No credential | never reaches the handler: the middleware answers 401 |
+
+Read-only **API keys** keep the full list by owner decision (2026-10-31): a
+key's permission is set and shown by its owner in the panel, and keeping it
+full leaves every script and registry byte-identical (L1).
+
+**One registry, two consumers.** `WRITE_REQUIRED_TOOLS` in
+`src/mcp_server/tool_permissions.py` is a `frozenset` literal: `create_note`,
+`edit_note`, `move_note`, `delete_note`, `set_frontmatter`, `write_file`,
+`delete_file`, `import_from_url`, `request_upload`. It drives
+
+- **the gate**: `_tracked` calls `_require_write()` for a member at the *body
+  boundary* — after every admission gate (rate buckets, vault root, argument
+  caps, concurrency, quota), exactly where the body would start — and returns
+  its refusal without running the body. Tokens and the quota slot are spent as
+  before, because the body used to refuse as its first act; the marker, the
+  `tool_write_refused` event and the outcome are `_require_write`'s own. The
+  in-body `_require_write()` calls and `_mint_preflight(need_write=True)` stay
+  as defence in depth;
+- **the list**: `_ScopedFastMCP.list_tools()` (`server.py`) drops the members
+  for a filtered principal, reading `current_principal` and the same
+  `current_permission` `_require_write` reads.
+
+A first draft stamped the hidden set on the `_tracked` wrapper; Codex's spec
+review showed that was metadata enforcement never consumed, agreeing with the
+refusals only because a test said so. The registry is the enforcement source
+now, and it must equal the write bucket plus `request_upload` (whose write
+charge is taken at `PUT /transfer/upload` redemption) and the destructive set
+plus `create_note`. `check_upload` and `request_download` stay listed: neither
+refuses a read-only caller.
+
+**The one behaviour difference at call time (L5).** `write_file` and
+`delete_file` refused some calls before their in-body permission check:
+`expected_hash` syntax (`malformed_precondition`, both tools) and, for
+`write_file(overwrite=false)` with a well-formed hash, `no_incumbent`. For a
+read-only caller **any** such pre-permission refusal is now
+`permission_denied`; a `readwrite` caller's refusals are unchanged (owner
+decision, 2026-10-31, after the verifier and adversarial Codex both found the
+`no_incumbent` case). The safer order — nothing about the
+arguments is disclosed to a caller who may not write.
+
+**The seam survives SDK 2.x.** The override is the public `list_tools()`, which
+1.30's `FastMCP._setup_handlers` registers as the handler and 2.x's
+`MCPServer._handle_list_tools` awaits. `tool_permissions.py` imports nothing
+from `mcp`, directly or transitively, even when invoked (a clean-subprocess
+test). For #365: the 2026-07-28 `cacheScope` of `tools/list` must stay
+`"private"` (2.x's default) because the list varies by credential, and any
+future pagination must page the filtered list. Today the result is complete,
+with no `nextCursor`, and a `cursor` is ignored.
+
+**The 1.30 tool cache.** The SDK keeps one process-wide `_tool_cache`, which a
+plain-list `tools/list` result clears and refills — so after a filtered list it
+holds 19 entries. Every cache miss refreshes under the *calling* request's
+credential, so a `readwrite` call still finds and output-validates its tool; a
+read-only call of a hidden tool after a filtered list logs the SDK's "not
+listed, no validation will be performed" WARNING and skips output validation
+of a refusal that would have passed it (L3). The code never touches the cache.
+
+**Not filtered**: `instructions` (L2 — a read-only grant reads a lead naming
+`create_note`/`edit_note`), descriptions, schemas, annotations. No
+`notifications/tools/list_changed` and `listChanged: false`: the list depends
+on the credential, not on time, so after a panel scope change a client sees the
+new list when it next lists (reconnect; L4). `tools/list` writes no usage row.
+No setting.
+
+**Fixtures.** `tests/fixtures/tools_list_full_v1.json` is the complete
+pre-change `tools/list` result for an API key — every field of all 28 tools —
+captured over HTTP before the code changed; the full list is asserted
+byte-identical to it (canonical JSON) for a `read` key, a `readwrite` key and a
+`readwrite` grant. It is also the 1.0 freeze fixture: a change that alters the
+published surface regenerates it deliberately and says so in its spec.
+`tests/fixtures/tools_list_readonly_oauth.json` pins the 19 names in order.
+`tests/test_issue_358_scoped_tools_list.py` also races, through one barrier,
+a read-only list, an API-key list, a `readwrite` list and two hidden-tool calls
+(50 rounds per cache ordering, plus an injected suspension), each checked
+against its own credential.
+
 ## Write tools
 Returned body refusals carry a pure `BodyOutcome` and an authoritative final
 `MCP-REFUSAL` line (#263). `_tracked` classifies only the terminal typed value;
@@ -387,7 +477,7 @@ Neither subsumes the other and neither was removed. A matching `expected_hash` d
 
 ### The precedence ladder, and why the order is the design
 
-1. **syntax** — a non-canonical hash is `malformed_precondition`, decided **at the tool's entry: before path resolution, before `_leaf_state_error`, before any read**, in every tool and every mode. `_precondition_syntax_error` is therefore a *separate* helper from the comparison, and a pure function of the argument. It wins over not-found, over a symlinked leaf and over the size cap — a caller told "not found" for a call whose argument was never valid fixes the wrong thing.
+1. **syntax** — a non-canonical hash is `malformed_precondition` (for a *read-only* caller of a write tool the body-boundary permission gate answers first, #358 L5), decided **at the tool's entry: before path resolution, before `_leaf_state_error`, before any read**, in every tool and every mode. `_precondition_syntax_error` is therefore a *separate* helper from the comparison, and a pure function of the argument. It wins over not-found, over a symlinked leaf and over the size cap — a caller told "not found" for a call whose argument was never valid fixes the wrong thing.
 2. **no incumbent** — a tool or mode that can never bind incumbent bytes (`create_note`, `write_file(overwrite=False)`, an overwrite of a path with no file at it) is `no_incumbent`.
 3. **unavailable** — an incumbent larger than the cap this tool may read is `precondition_unavailable`, naming the cap. "I could not check" and "I checked and it differs" are different facts; answering the first with the second sends the caller after a hash it can never obtain.
 4. **required** — an enforceable call supplying no hash while `WRITE_PRECONDITION_REQUIRED` is on is `precondition_required`. Over-cap **outranks** it, for the same reason.

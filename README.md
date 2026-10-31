@@ -497,7 +497,10 @@ origin the mint tools refuse rather than emit a localhost link.
 - OAuth 2.0 PKCE (S256) flow for public and confidential clients,
   including ChatGPT, Claude Desktop, and claude.ai. Dynamic registration
   defaults to both vault permission levels; the user chooses the actual
-  grant on the consent screen.
+  grant on the consent screen. A read-only grant lists 19 tools — the
+  nine write tools are left out of `tools/list` (and still refused if
+  called by name); choose read + write at consent for all 28, and
+  reconnect the client after changing a grant's scope.
 - Control panel (Jinja2, hand-written CSS, vendored Chart.js, nonce-based
   CSP) for keys, usage logs,
   indexer status, embedding-provider info, and a danger-zone reset.

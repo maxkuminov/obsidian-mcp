@@ -1,0 +1,21 @@
+[
+ "keyword_search",
+ "read_note",
+ "list_notes",
+ "get_tags",
+ "get_recent",
+ "semantic_search",
+ "get_vault_guide",
+ "get_backlinks",
+ "get_links",
+ "get_neighborhood",
+ "find_related",
+ "find_orphans",
+ "read_file",
+ "list_files",
+ "check_upload",
+ "request_download",
+ "list_tasks",
+ "get_changes",
+ "hybrid_search"
+]
