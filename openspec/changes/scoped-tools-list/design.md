@@ -178,3 +178,21 @@ What changed, per finding:
 3. **MAJOR, sequential-only tests.** A barrier-synchronised concurrent ASGI test (three lists and two hidden calls, each checked against its own credential, both cache orderings, ≥ 50 rounds, plus an injected suspension). D6; spec "Concurrent requests each get their own credential's answer"; tasks 4.6.
 4. **MINOR, SDK-free claim.** Promise restated as "no SDK import, directly or transitively, including on invocation", made true by the literal registry, and tested by invoking `hidden_names()` and `visible()` in a clean subprocess. D4; tasks 4.12.
 5. **MINOR, pagination.** Cursor behaviour stated unchanged (complete list, no `nextCursor`, cursor ignored) and pinned with one cursor-bearing request per principal. D12; spec "A cursor does not change the result"; tasks 4.5.
+
+## Codex spec review — round 2
+
+Verdict as written by Codex, verbatim:
+
+1. Hidden-set enforcement source — VERIFIED. `WRITE_REQUIRED_TOOLS` now drives both `_tracked` enforcement and discovery, with reconciliation and AST guards.
+2. Pre-change byte-identity oracle — VERIFIED. The complete canonical HTTP result must be captured and committed before implementation changes.
+3. Concurrent request isolation — VERIFIED. Barrier-synchronized ASGI tests cover three principals, hidden calls, both cache orderings, and an injected suspension point.
+4. SDK-free visibility rule — VERIFIED. The subprocess invokes both `hidden_names()` and `visible()` before inspecting loaded modules.
+5. Cursor and pagination behavior — VERIFIED. The specification preserves the complete unpaginated response and tests cursor-bearing requests for filtered and full-list principals.
+
+No new BLOCKER or MAJOR defect was found within the requested failure classes. The revised proposal closes the round-1 control gaps and passes strict OpenSpec validation.
+
+```json
+{"verdict":"PASS","round1":[{"claim":"The hidden set is duplicate metadata rather than the enforcement source.","status":"VERIFIED","note":"One literal WRITE_REQUIRED_TOOLS registry now drives both the _tracked body-boundary permission gate and the list filter; behavioral, AST, and structural tests guard drift."},{"claim":"Byte identity has no pre-change oracle.","status":"VERIFIED","note":"Tasks require the complete canonical HTTP tools/list result to be captured from the unchanged base and committed alone before source changes, then compared for all unfiltered principal types."},{"claim":"Concurrency requirements receive only sequential tests.","status":"VERIFIED","note":"The revised scenario requires barrier-synchronized requests for three list principals and two hidden calls, repeated under both cache orderings and with an injected suspension."},{"claim":"The SDK-free test does not invoke the visibility rule.","status":"VERIFIED","note":"The clean subprocess must invoke hidden_names and visible on stand-in objects before asserting that no mcp module was loaded."},{"claim":"Cursor and pagination behavior are unspecified.","status":"VERIFIED","note":"The result is explicitly complete and unpaginated, cursor is ignored, nextCursor is absent, and cursor-bearing transport requests are required for both filtered and full-list principals."}],"findings":[]}
+```
+
+Owner answers to the open questions (Max, 2026-10-31): read-only API keys are **not** filtered (L1 stands); no consent-page wording; 19 is the count.

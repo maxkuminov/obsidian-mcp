@@ -1,0 +1,2166 @@
+{
+ "tools": [
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": true
+   },
+   "description": "Full-text keyword search via PostgreSQL tsvector. Use this for exact identifiers,\n    code symbols, proper nouns, titles, or known phrases — anywhere semantic noise hurts.\n\n    Exact identifiers, code symbols, titles or known phrases: `keyword_search`.\n    Conceptual or paraphrased questions: `semantic_search`. Unsure which:\n    `hybrid_search`.\n\n    **Bare terms are ANDed**: `budget forecast` matches only notes containing\n    both stems. Notes matching every term come first, tagged `match: all`;\n    when they do not fill the page, notes matching some of the terms follow,\n    tagged `match: any`, in their own rank order. The operators:\n    `\"exact phrase\"` (adjacent words), `budget OR forecast` (either), `-draft`\n    (exclude; honoured in the `any` block too). A note's title and frontmatter\n    `aliases` are indexed above its body, so a query that is a note's title\n    ranks that note first. A note's tags (frontmatter and inline `#tags`; a\n    nested `#a/b` also as `a` and `b`) are indexed below its title and\n    aliases and above its body.\n\n    Each result carries `rank` (a relative score: a body-only match scores in\n    the thousandths, a title match near 1, and an `any` row is scored against\n    the fallback query, so ranks compare only within one block of one page),\n    `match`, `matched_in` (the parts that alone match: `title` — title or\n    aliases — `tags`, `body`, comma-joined; or, when the terms are split\n    between parts, the first of `title+tags`, `title+body`, `tags+body`,\n    `title+tags+body` that matches), `terms` (`k/n`: how many of the query's\n    terms the note contains), and a second line: `snippet:` — the matching\n    body text with the matches in `«»` — or `head:` — the note's opening\n    words when the body alone does not match or the match is beyond the\n    stored excerpt (a note with no body has no second line). Snippets are\n    computed for the first rows of the page (the header says\n    `snippets: first N` when the page is longer). The header always carries the `all`/`any` counts and how many\n    rows have no stored excerpt yet (notes indexed before this version; the\n    footer names the one-time rebuild). Call `read_note` on a result's path\n    for the full note.\n\n    Args:\n        query: Keywords or phrase to match (websearch tsquery syntax: \"foo bar\", \"foo OR bar\", \"-bar\").\n        folder: Optional folder prefix (e.g. \"Cards/\", \"Projects/\").\n        limit: Maximum number of results (default 20).\n        tags: Optional list of tag names; only notes carrying ALL listed tags match\n            (e.g. [\"project\", \"active\"]).\n        frontmatter: Optional dict of frontmatter key/value pairs; only notes whose JSONB\n            frontmatter contains every pair match. Strict type matching — string \"0\" does\n            not match integer 0 (e.g. {\"status\": \"draft\"}).\n    ",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "folder": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Folder"
+     },
+     "frontmatter": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Frontmatter"
+     },
+     "limit": {
+      "default": 20,
+      "title": "Limit",
+      "type": "integer"
+     },
+     "query": {
+      "title": "Query",
+      "type": "string"
+     },
+     "tags": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "string"
+        },
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Tags"
+     }
+    },
+    "required": [
+     "query"
+    ],
+    "title": "keyword_searchArguments",
+    "type": "object"
+   },
+   "name": "keyword_search",
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "title": "Result",
+      "type": "string"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "keyword_searchOutput",
+    "type": "object"
+   },
+   "title": "Keyword search"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": true
+   },
+   "description": "Read a note from the Obsidian vault by its relative path.\n\n    Arguments: `path`, an optional `section` (an ATX heading), and `offset` / `limit` for paging. Returns a\n    **structured result**, not a rendered document — read the fields:\n\n    - `content` — the selected note text. Whole-note reads: the body with a valid YAML frontmatter block\n      stripped, which is byte-exact input for `edit_note(path, content)` full replacement only when the read is\n      complete and unwindowed (`offset=0` and `truncated` false). Section reads: the section's **body only**,\n      byte-exact input for `edit_note(path, content, section=...)` under the same condition. Pass it straight\n      back; do not add, strip or split anything. Page a truncated read to the end before writing it back, or\n      full replacement replaces the whole body with the fragment.\n    - `heading` — section reads only: the matched heading line, with no line terminator. It is *not* part of\n      `content`; a section write never rewrites the heading line.\n    - `error` — set when the read failed (missing note, bad `offset`/`limit`, unknown section). A normal\n      result, not a transport error; the content-bearing fields are absent beside it.\n    - `content_hash` — the **whole file's** digest, `sha256:<64 lowercase hex>`, in every mode (a section or\n      truncated read returns the value a whole-note read would), and the token the write tools take as\n      `expected_hash`. It is not a hash of `content`: never compute it yourself, hand it back verbatim.\n    - `path`, `title`, `tags` — metadata as data.\n    - `frontmatter_yaml` — the frontmatter block's YAML source, fence lines excluded, LF-normalized (a CRLF\n      block comes back with LF terminators — the same declared residual `content` carries, because this tool\n      normalises and the write tools work on raw bytes; `edit_note` still reattaches the original block\n      byte-identically). This is the authoritative copy. `frontmatter` is a best-effort JSON view of the same\n      block and may be absent; `metadata_omissions` then says which fields were dropped and why. To change\n      frontmatter use `set_frontmatter`, or edit the raw block with `edit_note(find=...)`; never write back a\n      round trip of the JSON view.\n    - `truncated`, `offset`, `next_offset`, `total_chars` — truncation as data. `outline` (truncated whole-note\n      reads) lists every section with its `#N` ordinal so you can fetch the one you want directly, and `notice`\n      carries the guidance in prose. Read the one section you need with `section=` rather than paging a large\n      note; `content`, the outline and the metadata fields each have their own budget.\n    - `metadata_omissions` — any metadata field this response had to drop, and why. Nothing is ever signalled\n      by a marker inside a field.\n\n    Byte-identity holds for notes whose body newlines are LF: terminators inside the selected content come back\n    as LF. `read_file` on the same path is the byte-exact route to the file itself.\n\n    Args:\n        path: Vault-relative path to the note (e.g. \"Cards/My Note.md\")\n        section: Optional ATX heading to read instead of the whole note. Plain text (\"Balance Sheet\"), a\n            path-style chain (\"Parent/Child\") when the heading appears under different parents, or a \"#N\"\n            ordinal (\"#7\", 1-based document order) — the only form that can address duplicate headings\n            sharing the same parent; the outline of a truncated note carries the ordinal for every section.\n            A bare \"#N\" always selects by position; use \"Parent/#N\" to reach a heading titled \"#N\".\n        offset: Character offset to start reading from (default 0); continue from the reported `next_offset`.\n        limit: Maximum characters of `content` to return. Only lowers the server cap; it cannot raise it.\n    ",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "limit": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Limit"
+     },
+     "offset": {
+      "default": 0,
+      "title": "Offset",
+      "type": "integer"
+     },
+     "path": {
+      "title": "Path",
+      "type": "string"
+     },
+     "section": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Section"
+     }
+    },
+    "required": [
+     "path"
+    ],
+    "title": "read_noteArguments",
+    "type": "object"
+   },
+   "name": "read_note",
+   "outputSchema": {
+    "$defs": {
+     "MetadataCoercion": {
+      "description": "One metadata value this response rendered in a canonicalized form.\n\nServer-authored, every field of it, exactly as `MetadataOmission` is: the\nchannel is out of band precisely so that nothing has to be signalled inside\nthe note-controlled field itself.",
+      "properties": {
+       "detail": {
+        "title": "Detail",
+        "type": "string"
+       },
+       "field": {
+        "title": "Field",
+        "type": "string"
+       },
+       "reason": {
+        "title": "Reason",
+        "type": "string"
+       }
+      },
+      "required": [
+       "field",
+       "reason",
+       "detail"
+      ],
+      "title": "MetadataCoercion",
+      "type": "object"
+     },
+     "MetadataOmission": {
+      "description": "One metadata field this response could not carry, and why.\n\nServer-authored, every field of it. This is the *only* channel that reports\na dropped field: nothing is ever signalled by writing a marker into the\nnote-controlled field itself.",
+      "properties": {
+       "detail": {
+        "title": "Detail",
+        "type": "string"
+       },
+       "field": {
+        "title": "Field",
+        "type": "string"
+       },
+       "reason": {
+        "title": "Reason",
+        "type": "string"
+       }
+      },
+      "required": [
+       "field",
+       "reason",
+       "detail"
+      ],
+      "title": "MetadataOmission",
+      "type": "object"
+     },
+     "NoteOutline": {
+      "description": "The outline, with its degraded states as data rather than as prose.\n\n`truncated` is the explicit marker the requirement asks for: when the\nbudget cannot hold even one entry, `entries` is empty and `truncated` is\ntrue, which is a statement, not a silence. `omitted`, `first_ordinal` and\n`last_ordinal` are present exactly when the listing is incomplete — a\ncomplete listing carries no omission summary, so nothing has to be reserved\nfor one.",
+      "properties": {
+       "entries": {
+        "default": [],
+        "items": {
+         "$ref": "#/$defs/OutlineEntry"
+        },
+        "title": "Entries",
+        "type": "array"
+       },
+       "first_ordinal": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "null"
+         }
+        ],
+        "default": null,
+        "title": "First Ordinal"
+       },
+       "last_ordinal": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "null"
+         }
+        ],
+        "default": null,
+        "title": "Last Ordinal"
+       },
+       "omitted": {
+        "anyOf": [
+         {
+          "type": "integer"
+         },
+         {
+          "type": "null"
+         }
+        ],
+        "default": null,
+        "title": "Omitted"
+       },
+       "truncated": {
+        "default": false,
+        "title": "Truncated",
+        "type": "boolean"
+       }
+      },
+      "title": "NoteOutline",
+      "type": "object"
+     },
+     "OutlineEntry": {
+      "description": "One section of a truncated whole-note read's heading outline.",
+      "properties": {
+       "depth": {
+        "title": "Depth",
+        "type": "integer"
+       },
+       "duplicate": {
+        "title": "Duplicate",
+        "type": "boolean"
+       },
+       "exceeds_cap": {
+        "title": "Exceeds Cap",
+        "type": "boolean"
+       },
+       "ordinal": {
+        "title": "Ordinal",
+        "type": "integer"
+       },
+       "size": {
+        "title": "Size",
+        "type": "integer"
+       },
+       "text": {
+        "title": "Text",
+        "type": "string"
+       }
+      },
+      "required": [
+       "ordinal",
+       "depth",
+       "text",
+       "size",
+       "exceeds_cap",
+       "duplicate"
+      ],
+      "title": "OutlineEntry",
+      "type": "object"
+     }
+    },
+    "description": "What `read_note` returns.\n\nEvery field is either server-controlled or a note-controlled value sitting\nalone in a field of its own. Nothing here is composed into a frame, so\nnothing note-controlled can change which field another value appears in —\nthat is the whole point (#149).\n\nOn an error result the content-bearing fields are absent: `error` is the\nanswer, and a caller must never find a half-response beside it.",
+    "properties": {
+     "content": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Content"
+     },
+     "content_hash": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Content Hash"
+     },
+     "error": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Error"
+     },
+     "frontmatter": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Frontmatter"
+     },
+     "frontmatter_yaml": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Frontmatter Yaml"
+     },
+     "heading": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Heading"
+     },
+     "metadata_coercions": {
+      "anyOf": [
+       {
+        "items": {
+         "$ref": "#/$defs/MetadataCoercion"
+        },
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Metadata Coercions"
+     },
+     "metadata_omissions": {
+      "anyOf": [
+       {
+        "items": {
+         "$ref": "#/$defs/MetadataOmission"
+        },
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Metadata Omissions"
+     },
+     "next_offset": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Next Offset"
+     },
+     "notice": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Notice"
+     },
+     "offset": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Offset"
+     },
+     "outline": {
+      "anyOf": [
+       {
+        "$ref": "#/$defs/NoteOutline"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null
+     },
+     "path": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Path"
+     },
+     "tags": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "string"
+        },
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Tags"
+     },
+     "title": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Title"
+     },
+     "total_chars": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Total Chars"
+     },
+     "truncated": {
+      "anyOf": [
+       {
+        "type": "boolean"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Truncated"
+     }
+    },
+    "title": "ReadNoteResult",
+    "type": "object"
+   },
+   "title": "Read note"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": true
+   },
+   "description": "List notes in a vault folder, sorted by most recently modified.\n\n    Results come from the index, so a note that exists on disk but has not yet been\n    picked up by the indexer will not appear (lag is bounded by the index interval,\n    typically up to 5 minutes).\n\n    Notes whose content changed in a window: `order_by=\"content_changed\"` with\n    `since` (and optionally `until`). File mtime (the default order) also moves\n    when a file is merely touched or re-synced; `content_changed` moves only when\n    the indexed content hash changes.\n\n    Args:\n        folder: Vault-relative folder path (e.g. \"Cards/\", \"Projects/\"). Empty for vault root.\n        limit: Maximum number of results (default 50).\n        tags: Optional list of tag names; only notes carrying ALL listed tags match\n            (e.g. [\"idea\"]).\n        frontmatter: Optional dict of frontmatter key/value pairs; strict type match\n            (e.g. {\"status\": \"active\"}).\n        since: Optional UTC lower bound, inclusive: `YYYY-MM-DD` (that whole UTC\n            day) or an ISO 8601 datetime with `Z` or `±HH:MM` (no offset is refused).\n        until: Optional UTC upper bound, exclusive; a date includes that whole day.\n        order_by: `\"mtime\"` (default) or `\"content_changed\"`; the bounds apply to it.\n        cursor: The `more: cursor=…` value from the previous page of the same call.\n            When any of since/until/order_by/cursor is given, a full page ends with\n            that footer.\n    ",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "cursor": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Cursor"
+     },
+     "folder": {
+      "default": "",
+      "title": "Folder",
+      "type": "string"
+     },
+     "frontmatter": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Frontmatter"
+     },
+     "limit": {
+      "default": 50,
+      "title": "Limit",
+      "type": "integer"
+     },
+     "order_by": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Order By"
+     },
+     "since": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Since"
+     },
+     "tags": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "string"
+        },
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Tags"
+     },
+     "until": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Until"
+     }
+    },
+    "title": "list_notesArguments",
+    "type": "object"
+   },
+   "name": "list_notes",
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "title": "Result",
+      "type": "string"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "list_notesOutput",
+    "type": "object"
+   },
+   "title": "List notes"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": true
+   },
+   "description": "List all tags used across the vault with note counts.\n\n    Args:\n        limit: Maximum number of tags to return (default 50)\n    ",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "limit": {
+      "default": 50,
+      "title": "Limit",
+      "type": "integer"
+     }
+    },
+    "title": "get_tagsArguments",
+    "type": "object"
+   },
+   "name": "get_tags",
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "title": "Result",
+      "type": "string"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "get_tagsOutput",
+    "type": "object"
+   },
+   "title": "List tags"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": true
+   },
+   "description": "Get recently modified notes, newest first.\n\n    Each line shows the note's modification time in UTC, as\n    \"YYYY-MM-DD HH:MM UTC\".\n\n    Notes whose content changed since a point in time:\n    `order_by=\"content_changed\"` with `since`. File mtime (the default order)\n    also moves when a file is touched or re-synced without a content change;\n    `content_changed` moves only when the indexed content hash changes, and each\n    line is then labelled `changed`. For an exact list of creations, edits,\n    moves and deletions since a stored cursor, see `get_changes`.\n\n    Args:\n        limit: Number of recent notes to return (default 20).\n        folder: Optional folder prefix to filter (e.g. \"Projects/\").\n        tags: Optional list of tag names; only notes carrying ALL listed tags match\n            (e.g. [\"meeting\"]).\n        frontmatter: Optional dict of frontmatter key/value pairs; strict type match\n            (e.g. {\"status\": \"active\"}).\n        since: Optional UTC lower bound, inclusive: `YYYY-MM-DD` (that whole UTC\n            day) or an ISO 8601 datetime with `Z` or `±HH:MM` (no offset is refused).\n        until: Optional UTC upper bound, exclusive; a date includes that whole day.\n        order_by: `\"mtime\"` (default) or `\"content_changed\"`; the bounds apply to it.\n        cursor: The `more: cursor=…` value from the previous page of the same call.\n            When any of since/until/order_by/cursor is given, a full page ends with\n            that footer.\n    ",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "cursor": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Cursor"
+     },
+     "folder": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Folder"
+     },
+     "frontmatter": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Frontmatter"
+     },
+     "limit": {
+      "default": 20,
+      "title": "Limit",
+      "type": "integer"
+     },
+     "order_by": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Order By"
+     },
+     "since": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Since"
+     },
+     "tags": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "string"
+        },
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Tags"
+     },
+     "until": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Until"
+     }
+    },
+    "title": "get_recentArguments",
+    "type": "object"
+   },
+   "name": "get_recent",
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "title": "Result",
+      "type": "string"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "get_recentOutput",
+    "type": "object"
+   },
+   "title": "Recent notes"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": true
+   },
+   "description": "Vector similarity search over the vault's chunk embeddings. Use this for conceptual\n    or paraphrased queries — anywhere exact word matching would miss the point.\n\n    Exact identifiers, code symbols, titles or known phrases: `keyword_search`.\n    Conceptual or paraphrased questions: `semantic_search`. Unsure which:\n    `hybrid_search`.\n\n    Each result is one note (deduped) with its closest-matching chunk as a ~200-character preview.\n    Call `read_note` on a result's path to get the full note content.\n\n    The header line carries a stale count and a truncated count, always —\n    including when both are zero, so \"nothing here is degraded\" is\n    distinguishable from a build that does not report it.\n\n    `stale: true` on a row means the note changed after it was embedded: it was\n    matched and ranked against its **previous** content, and its preview is\n    **withheld** rather than shown, because that excerpt is text the note no\n    longer has. Its path, title and tags are current — the indexer refreshed\n    them, which is how the staleness is known at all — so `read_note` on that\n    path returns the true content and is the remedy. Stale notes are never\n    filtered out: during an embedding outage that would empty the result set\n    rather than degrade it.\n\n    `embedding_truncated: true` means the note is longer than the indexer's\n    per-note chunk cap and only its head was embedded. A match against such a\n    note is a match against its head; its tail is not reachable by semantic\n    search at all, though `keyword_search` still covers the whole note.\n\n    **Section locator.** A fresh row names the section it matched on its\n    result line: `§ \"<heading path>\" (#N)` for a heading's section, or\n    `§ (top of note)` for text before the first heading.\n    `read_note(path, section=\"#N\")` reads exactly that section. The quoted\n    path is note text; the `(#N)` after it is the server's. The locator is\n    omitted on stale rows and on rows not yet re-embedded since heading-aware\n    chunking. While any of your notes is not yet re-chunked, the line after\n    the header reads `index_transition: N notes not yet re-chunked; …`:\n    ranking across the two generations is approximate, so re-run once it is\n    gone. Previews are one line.\n\n    **The bound on the staleness signal, stated so it is not over-read:** it\n    reports what the index has *committed*. An edit that the indexer has not\n    yet scanned is not marked, so a note edited in the last few minutes may\n    come back unmarked with a superseded preview. The guarantee is \"no result\n    presents text the index knows to be superseded\", not \"no result is ever\n    out of date\".\n\n    `rerank=true` asks the deployment's reranker to reorder the candidates\n    this call already fetched; it can add up to the configured timeout. Its\n    rows are one-line quoted objects followed by server fields (with\n    `rerank_score` when reranked). The header says `reranked: true` or\n    `reranked: false (<reason>)`, and an unreranked page keeps the unreranked\n    order; `reranked: false (not_configured)` means this deployment has no\n    reranker.\n\n    The header also carries `confidence: ok` or `confidence: low` (the\n    closest match is under the deployment's threshold; `ok` when none is set).\n\n    Args:\n        query: Natural language description of what you're looking for.\n        limit: Maximum number of distinct notes to return (default 15).\n        folder: Optional folder prefix (e.g. \"Projects/\").\n        tags: Optional list of tag names; only notes carrying ALL listed tags match\n            (e.g. [\"product\"]).\n        frontmatter: Optional dict of frontmatter key/value pairs; strict type matching —\n            string \"0\" does not match integer 0 (e.g. {\"status\": \"active\"}).\n        rerank: Reorder the fetched candidates with the deployment's reranker\n            (default false).\n    ",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "folder": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Folder"
+     },
+     "frontmatter": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Frontmatter"
+     },
+     "limit": {
+      "default": 15,
+      "title": "Limit",
+      "type": "integer"
+     },
+     "query": {
+      "title": "Query",
+      "type": "string"
+     },
+     "rerank": {
+      "default": false,
+      "title": "Rerank",
+      "type": "boolean"
+     },
+     "tags": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "string"
+        },
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Tags"
+     }
+    },
+    "required": [
+     "query"
+    ],
+    "title": "semantic_searchArguments",
+    "type": "object"
+   },
+   "name": "semantic_search",
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "title": "Result",
+      "type": "string"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "semantic_searchOutput",
+    "type": "object"
+   },
+   "title": "Semantic search"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "idempotentHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false
+   },
+   "description": "Create a new markdown note in the Obsidian vault. Requires write permission — a `readwrite` API key, or an OAuth token\n    carrying the `readwrite` scope.\n\n    See `get_vault_guide` for Obsidian syntax and any vault-specific conventions\n    (naming, folder placement, frontmatter, tags).\n\n    Refuses a path whose final component is a symlink, naming its target, so a\n    write never lands on a note other than the one named; symlinked folders\n    inside the vault work normally.\n\n    The note is published no-clobber: the content is staged out of sight and\n    linked into place in one kernel-atomic step, so an existing file at `path`\n    can never be replaced by this tool. A vault filesystem that cannot stage an\n    unnamed file refuses the write with an error naming\n    `VAULT_ALLOW_NAMED_STAGING_FALLBACK` rather than staging under a visible\n    name.\n\n    **`expected_hash` — binding a write to the bytes you read.** Optional; omit\n    it and nothing changes. Pass the `content_hash` a read returned, verbatim\n    and canonical (`sha256:<64 lowercase hex>`), and the call is refused with\n    nothing written if the file changed in between. It is always the **whole\n    file's** hash, never a hash of the text you received. Two windows, both\n    live: `expected_hash` covers your read → this call's read, the server's own\n    pre-publication compare covers this call's read → its publication, and a\n    match on the first does not exempt the second. Every refusal the server raises ends with one\n    machine-readable `MCP-REFUSAL {\"code\":…}` line (an undeclared or mistyped argument is rejected by\n    protocol validation before the tool runs and carries no such line) — `stale_precondition` (with\n    the file's current hash, ready to resend), `concurrent_write`,\n    `no_incumbent`, `malformed_precondition`, `precondition_unavailable`,\n    `precondition_required` — and each states what resolves it.\n\n    Here there are no incumbent bytes to bind: a supplied hash is answered\n    `no_incumbent` before any filesystem work, nothing is created, and the\n    remedy is to call again without it. A malformed hash is still reported as\n    malformed first. Success reports the `content_hash` of the note this call\n    published.\n\n    Args:\n        path: Vault-relative path for the new note (e.g. \"Cards/New Topic.md\"). The .md extension is added if missing.\n        content: Full markdown content for the note, including any frontmatter.\n        expected_hash: Accepted and always refused as `no_incumbent`, so the\n            refusal is a normal result rather than a protocol error.\n    ",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "content": {
+      "title": "Content",
+      "type": "string"
+     },
+     "expected_hash": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Expected Hash"
+     },
+     "path": {
+      "title": "Path",
+      "type": "string"
+     }
+    },
+    "required": [
+     "path",
+     "content"
+    ],
+    "title": "create_noteArguments",
+    "type": "object"
+   },
+   "name": "create_note",
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "title": "Result",
+      "type": "string"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "create_noteOutput",
+    "type": "object"
+   },
+   "title": "Create note"
+  },
+  {
+   "annotations": {
+    "destructiveHint": true,
+    "idempotentHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false
+   },
+   "description": "Edit an existing note in the Obsidian vault. Requires write permission (a `readwrite` API key or OAuth scope).\n\n    Arguments: `path`, `content`, at most one mode flag — `append`, `find` or `section` (`operation` is a\n    legacy alias) — plus `replace_all`, `dry_run`, `replace_frontmatter`, and the `expected_hash`\n    precondition. Every refusal the server raises ends with one machine-readable `MCP-REFUSAL {\"code\":…}`\n    line; an undeclared or mistyped argument is rejected by protocol validation before the tool runs and\n    carries no such line. See `get_vault_guide` for vault conventions.\n\n    Modes (mutually exclusive):\n    1. **Full replace** (default): `content` becomes the note's **body**; an existing valid line-1 YAML\n       frontmatter block is **preserved byte-identically** ahead of it. `replace_frontmatter=True` overwrites\n       the entire file, frontmatter included. A note with no valid block is replaced wholesale.\n       Change frontmatter with `set_frontmatter` or `find=`; never write back `read_note`'s `frontmatter` JSON\n       view. The round-trip guarantee covers a complete, unwindowed whole-note read only — no `section`,\n       `offset=0`, `truncated` false; page a truncated read to the end first, or full replacement replaces the\n       whole body with the fragment. A section response belongs to section mode.\n    2. **Append**: `append=True`; `content` is added at the end, after one newline.\n    3. **Find & replace**: `find=<exact text>` is replaced with `content`; it must match exactly once unless\n       `replace_all=True`.\n    4. **Section**: `section=<heading>` replaces the **whole body** under the named ATX heading. `Parent/Child`\n       disambiguates repeated headings; a `#N` ordinal (\"#7\", 1-based document order) is the only form that\n       addresses duplicate siblings. A selector resolves to the same section here as in `read_note` on any\n       write this tool admits — parity is about resolution, not admission.\n\n    `dry_run=True` returns a unified diff and writes nothing.\n\n    **`expected_hash`**: pass the `content_hash` a read returned, verbatim, and the call is refused with\n    nothing written if the file changed since — in every mode, `dry_run` included. It is the **whole file's**\n    hash, never a hash of the text you received. Optional by default — omitted, a stale edit overwrites —\n    unless the deployment requires it, when an omitted hash is refused `precondition_required`. Codes:\n    `stale_precondition`, `concurrent_write`, `no_incumbent`, `malformed_precondition`,\n    `precondition_unavailable`, `precondition_required`. Success reports the `content_hash` of the bytes\n    **this call wrote**, not what is on disk when you read it; `dry_run` reports none.\n\n    **Section mode.** `content` is the section's **body**: the text beginning on the line immediately after the\n    matched heading line; the heading line is never rewritten. The body is replaced **whole** — anything\n    `content` does not resend, a fenced code block under the heading included, is deleted — so a blank\n    line you want after the heading belongs in `content`. `read_note(path, section=...)` is the matching read:\n    its `heading` field carries the heading line and its `content` field the body, and this tool takes exactly\n    that `content`. Byte-identity holds for notes whose body newlines are LF: non-LF terminators inside the\n    selected body come back as LF. `#N` ordinals agree with `read_note`; a heading inside a fenced code block is\n    not a heading.\n\n    **Two shapes refuse a section write outright, naming the problem and writing nothing:** a malformed\n    frontmatter block, whose refusal names the `replace_frontmatter=True` repair; and a fence opener indented by\n    one to three spaces that nothing below it closes — close the fence or unindent it to column zero, then\n    reissue. Both are asymmetric with reads: `read_note` keeps working on such notes. A symlinked\n    final component is refused.\n    ",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "append": {
+      "default": false,
+      "title": "Append",
+      "type": "boolean"
+     },
+     "content": {
+      "title": "Content",
+      "type": "string"
+     },
+     "dry_run": {
+      "default": false,
+      "title": "Dry Run",
+      "type": "boolean"
+     },
+     "expected_hash": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Expected Hash"
+     },
+     "find": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Find"
+     },
+     "operation": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Operation"
+     },
+     "path": {
+      "title": "Path",
+      "type": "string"
+     },
+     "replace_all": {
+      "default": false,
+      "title": "Replace All",
+      "type": "boolean"
+     },
+     "replace_frontmatter": {
+      "default": false,
+      "title": "Replace Frontmatter",
+      "type": "boolean"
+     },
+     "section": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Section"
+     }
+    },
+    "required": [
+     "path",
+     "content"
+    ],
+    "title": "edit_noteArguments",
+    "type": "object"
+   },
+   "name": "edit_note",
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "title": "Result",
+      "type": "string"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "edit_noteOutput",
+    "type": "object"
+   },
+   "title": "Edit note"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": true
+   },
+   "description": "Returns a two-part guide for working with this Obsidian vault:\n\n    1. **Obsidian primer** — generic syntax (wikilinks, embeds, block refs,\n       heading refs, tags, frontmatter, callouts, comments, highlights,\n       math, mermaid, footnotes, tasks, plugin literals).\n    2. **Vault-specific conventions** — folder structure, naming rules,\n       frontmatter requirements, and tag taxonomy as configured by the\n       vault owner in `CLAUDE.md`. If `CLAUDE.md` is absent, the response\n       includes instructions for creating one.\n    ",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {},
+    "title": "get_vault_guideArguments",
+    "type": "object"
+   },
+   "name": "get_vault_guide",
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "title": "Result",
+      "type": "string"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "get_vault_guideOutput",
+    "type": "object"
+   },
+   "title": "Vault guide"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": true
+   },
+   "description": "Notes that link TO `path`. Use this to discover what references a given\n    note — projects citing a card, daily notes mentioning a person, etc.\n\n    Resolved links only (dangling references are not counted as backlinks).\n\n    Args:\n        path: Vault-relative path to the target note (e.g. \"Cards/Foo.md\").\n        limit: Maximum results (default 50, hard cap 500).\n    ",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "limit": {
+      "default": 50,
+      "title": "Limit",
+      "type": "integer"
+     },
+     "path": {
+      "title": "Path",
+      "type": "string"
+     }
+    },
+    "required": [
+     "path"
+    ],
+    "title": "get_backlinksArguments",
+    "type": "object"
+   },
+   "name": "get_backlinks",
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "title": "Result",
+      "type": "string"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "get_backlinksOutput",
+    "type": "object"
+   },
+   "title": "Backlinks"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": true
+   },
+   "description": "Outgoing links from `path` — both resolved and dangling.\n\n    Useful for \"what does this note depend on?\" or finding broken references\n    that need follow-up notes.\n\n    The result carries a `truncated` field. `truncated: true` means this note\n    holds more links than the indexer's per-note cap and the list is the first\n    N in document order only — treat it as incomplete rather than as the\n    note's full outgoing-link set.\n\n    Links come back in document order and are capped by `limit`; when more rows\n    exist the result says how many of them were persisted, so a partial page is\n    never read as the whole set. `limit` raises the page up to a hard cap of\n    500 — this tool has no paging beyond that, so a note with more than 500\n    link rows can only be read in full from the note itself.\n\n    Each row's link text is clipped to 120 characters.\n\n    Args:\n        path: Vault-relative path to the source note.\n        limit: Maximum links returned (default 100, hard cap 500).\n    ",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "limit": {
+      "default": 100,
+      "title": "Limit",
+      "type": "integer"
+     },
+     "path": {
+      "title": "Path",
+      "type": "string"
+     }
+    },
+    "required": [
+     "path"
+    ],
+    "title": "get_linksArguments",
+    "type": "object"
+   },
+   "name": "get_links",
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "title": "Result",
+      "type": "string"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "get_linksOutput",
+    "type": "object"
+   },
+   "title": "Outgoing links"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": true
+   },
+   "description": "The connected subgraph reachable from `path` via links or backlinks,\n    up to `depth` hops (treated as undirected).\n\n    Use this when an agent needs the local cluster around a topic — e.g.\n    \"summarize everything connected to this project\". Prefer this over\n    `find_related` when explicit links are the signal you want; prefer\n    `find_related` when the connection is conceptual rather than linked.\n\n    Args:\n        path: Vault-relative path to the seed note.\n        depth: Maximum BFS depth (default 1, capped at 5).\n        limit: Maximum distinct neighbor notes (default 50, hard cap 200).\n    ",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "depth": {
+      "default": 1,
+      "title": "Depth",
+      "type": "integer"
+     },
+     "limit": {
+      "default": 50,
+      "title": "Limit",
+      "type": "integer"
+     },
+     "path": {
+      "title": "Path",
+      "type": "string"
+     }
+    },
+    "required": [
+     "path"
+    ],
+    "title": "get_neighborhoodArguments",
+    "type": "object"
+   },
+   "name": "get_neighborhood",
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "title": "Result",
+      "type": "string"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "get_neighborhoodOutput",
+    "type": "object"
+   },
+   "title": "Link neighborhood"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": true
+   },
+   "description": "Semantically similar notes based on the source note's chunk embeddings,\n    averaged then queried via pgvector.\n\n    Independent of the link graph — useful when the source is sparsely linked\n    or when looking for thematic neighbors. For link-based exploration use\n    `get_neighborhood`. For arbitrary topic queries use `semantic_search`.\n\n    Carries `semantic_search`'s per-row markers and its header counts:\n    `stale: true` means that neighbour changed after it was embedded, so it was\n    ranked against its previous content and its preview is **withheld** —\n    `read_note` returns the current text. `embedding_truncated: true` means\n    only that note's head was embedded, so a match against it says nothing\n    about its tail.\n\n    **One marker is about the source rather than a neighbour.** If the note you\n    asked about has itself changed since it was embedded, the result says so\n    once, at the top — and it says so on the empty result too. The query vector\n    is the average of the *source's stored* chunk vectors, so a stale source\n    means every neighbour answers a question about content that note no longer\n    has, and \"no related notes\" from a stale source means \"nothing is near what\n    this note used to say\", not \"this note has no neighbours\". The next embed\n    pass repairs it. A source with no vectors at all is a different message\n    (\"has not been embedded yet\") with a different fix.\n\n    **The bound on the staleness signal:** it reports what the index has\n    committed, so an edit the indexer has not yet scanned is not marked.\n\n    **Section locator.** A fresh row names the section it matched on its\n    result line: `§ \"<heading path>\" (#N)` for a heading's section, or\n    `§ (top of note)` for text before the first heading.\n    `read_note(path, section=\"#N\")` reads exactly that section. The quoted\n    path is note text; the `(#N)` after it is the server's. The locator is\n    omitted on stale rows and on rows not yet re-embedded since heading-aware\n    chunking. While any of your notes is not yet re-chunked, the line after\n    the header reads `index_transition: N notes not yet re-chunked; …`:\n    ranking across the two generations is approximate, so re-run once it is\n    gone. Previews are one line.\n\n    Args:\n        path: Vault-relative path to the source note.\n        limit: Maximum results (default 10, hard cap 50).\n    ",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "limit": {
+      "default": 10,
+      "title": "Limit",
+      "type": "integer"
+     },
+     "path": {
+      "title": "Path",
+      "type": "string"
+     }
+    },
+    "required": [
+     "path"
+    ],
+    "title": "find_relatedArguments",
+    "type": "object"
+   },
+   "name": "find_related",
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "title": "Result",
+      "type": "string"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "find_relatedOutput",
+    "type": "object"
+   },
+   "title": "Related notes"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": true
+   },
+   "description": "Notes with zero incoming AND zero outgoing resolved links — useful for\n    vault hygiene (\"what's disconnected?\") and cleanup decisions.\n\n    Args:\n        folder: Optional vault-relative folder prefix to scope the search\n            (e.g. \"Cards/\").\n        limit: Maximum results (default 50, hard cap 500).\n    ",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "folder": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Folder"
+     },
+     "limit": {
+      "default": 50,
+      "title": "Limit",
+      "type": "integer"
+     }
+    },
+    "title": "find_orphansArguments",
+    "type": "object"
+   },
+   "name": "find_orphans",
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "title": "Result",
+      "type": "string"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "find_orphansOutput",
+    "type": "object"
+   },
+   "title": "Orphan notes"
+  },
+  {
+   "annotations": {
+    "destructiveHint": true,
+    "idempotentHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false
+   },
+   "description": "Move or rename a note inside the vault. Requires write permission — a `readwrite` API key, or an OAuth token\n    carrying the `readwrite` scope.\n\n    Arguments: `from_path`, `to_path` (must not exist; parent directories are created), `rewrite_links`\n    (default False) and the optional `expected_hash` precondition. The index follows the move, so backlinks\n    keep working without rewriting source notes. Every refusal the server raises ends with one\n    machine-readable `MCP-REFUSAL {\"code\":…}` line; an undeclared or mistyped argument is rejected by\n    protocol validation before the tool runs and carries no such line.\n\n    **`expected_hash`** binds **`from_path`'s own bytes and nothing else**: pass the `content_hash` a read\n    returned, verbatim, and the move is refused with nothing written if that note\n    changed since. It is compared at preflight, before the rename and before any rewrite; the rename then pins\n    inode identity but does not compare the bytes again, so an in-place edit landing after that comparison is\n    still moved. The backlink sources a `rewrite_links=True` move rewrites are *not* bound, because you never\n    read them. Optional by default — omitted, the move proceeds — unless the deployment requires it, when\n    an omitted hash is refused `precondition_required`. Codes: `stale_precondition`, `concurrent_write`,\n    `no_incumbent`, `malformed_precondition`, `precondition_unavailable`, `precondition_required`.\n\n    With `rewrite_links=True`, every source note that links to this note is rewritten in place — wikilinks,\n    embeds, path-style links, and bare-href markdown links `[text](Old.md)`, whose new href is written\n    relative to the linking note's own folder; angle-bracket hrefs `[text](<Old.md>)` are **not** rewritten.\n    Aliases and anchors survive. **The moved note's own body is rewritten as well**, so a self-reference\n    does not end up pointing at the old path. The rewrites are planned\n    before anything changes: if one would push a source past the note size limit, or the planning would exceed\n    the aggregate memory bound, the whole move is refused before any file is touched, naming the source or the\n    count.\n\n    **The same preflight refuses the whole move, before the rename, when any source it would rewrite — the\n    moved note's own body included — contains a fence opener indented by one to three spaces that nothing below\n    it closes.** The refusal names each such source and where its opener sits. Move with `rewrite_links=False`\n    (unaffected by this refusal) and fix the links yourself, or close the fences first.\n\n    **A rewrite can still fail after the move has committed.** The move is one rename and the rewrites follow\n    it, so an I/O failure or a lost vault assignment stops the remaining rewrites and the result reads `partial\n    success: …`, naming the sources that still link to the old path. The move is **not** rolled back; treat the\n    link graph as agreeing with the vault bytes only on plain success, and fix the named sources with\n    `edit_note`.\n\n    Success reports the `content_hash` of the bytes actually published at `to_path` — the moved bytes for a\n    plain move, the post-rewrite bytes when the moved note's own body was rewritten — and that value binds a\n    following `edit_note(to_path, …, expected_hash=…)`. A failed rewrite stays a partial success and never\n    claims nothing was written; if another writer changed `to_path` in between, **no hash is reported** and the\n    result says to re-read `to_path` first.\n\n    Writes are atomic; a symlinked final component on either path is refused. See `get_vault_guide` for\n    vault folder conventions.\n\n    Args:\n        from_path: Vault-relative path of the existing note.\n        to_path: Vault-relative path of the destination.\n        rewrite_links: Also rewrite incoming links in source notes (off by default).\n        expected_hash: `from_path`'s `content_hash` as you last read it.\n    ",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "expected_hash": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Expected Hash"
+     },
+     "from_path": {
+      "title": "From Path",
+      "type": "string"
+     },
+     "rewrite_links": {
+      "default": false,
+      "title": "Rewrite Links",
+      "type": "boolean"
+     },
+     "to_path": {
+      "title": "To Path",
+      "type": "string"
+     }
+    },
+    "required": [
+     "from_path",
+     "to_path"
+    ],
+    "title": "move_noteArguments",
+    "type": "object"
+   },
+   "name": "move_note",
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "title": "Result",
+      "type": "string"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "move_noteOutput",
+    "type": "object"
+   },
+   "title": "Move note"
+  },
+  {
+   "annotations": {
+    "destructiveHint": true,
+    "idempotentHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false
+   },
+   "description": "Delete a note from the vault. Requires write permission — a `readwrite` API key, or an OAuth token\n    carrying the `readwrite` scope.\n\n    By default this is a soft-delete: the file is moved to\n    `.trash/<YYYYMMDD-HHMMSS>-<basename>-<8 hex>` inside the vault root, by a\n    single non-replacing rename, so an existing trash entry is never\n    overwritten and two deletes in the same second land on distinct names. The\n    indexer skips dot-prefixed directories, so search and embeddings drop the\n    note automatically on the next reindex pass (≤ 5 minutes). Soft-deleted\n    files accumulate in `.trash/` — emptying that directory is the user's\n    responsibility.\n\n    A vault filesystem that cannot perform that non-replacing rename into\n    `.trash/` makes the soft delete refuse with an error naming the limitation\n    rather than fall back to a rename that could overwrite; pass\n    `permanent=True` to unlink instead.\n\n    With `permanent=True`, the file is unlinked directly with no recovery path\n    inside this server. Existing backups are the rollback story.\n\n    A path whose final component is a symlink is refused, naming its target, so\n    a delete never removes a note other than the one named; symlinked folders\n    inside the vault work normally.\n\n    Dangling backlinks left behind by a delete are surfaced via\n    `get_backlinks` and `find_orphans`. See `get_vault_guide` for context.\n\n    **`expected_hash` — binding a write to the bytes you read.** Optional by default — omitted, the\n    delete proceeds against whatever is on disk — unless the deployment requires it, when an omitted hash\n    is refused `precondition_required`. Pass the `content_hash` a read returned, verbatim\n    and canonical (`sha256:<64 lowercase hex>`), and the call is refused with\n    nothing written if the file changed in between. It is always the **whole\n    file's** hash, never a hash of the text you received. `expected_hash`\n    covers your read through this call's preflight read. The delete acts through the\n    pinned parent directory but does not compare the bytes again: an in-place edit after that\n    comparison can still be deleted. Every refusal the server raises ends with one\n    machine-readable `MCP-REFUSAL {\"code\":…}` line (an undeclared or mistyped argument is rejected by\n    protocol validation before the tool runs and carries no such line) — `stale_precondition` (with\n    the file's current hash, ready to resend), `concurrent_write`,\n    `no_incumbent`, `malformed_precondition`, `precondition_unavailable`,\n    `precondition_required` — and each states what resolves it.\n\n    It applies in **both modes**, and the comparison runs before the `.trash`\n    rename and before the unlink, so a refused delete leaves the note where it\n    was and creates no trash entry. A successful delete reports **no**\n    `content_hash`: nothing remains to hash.\n\n    Args:\n        path: Vault-relative path to the note.\n        permanent: If True, unlink instead of soft-deleting.\n        expected_hash: The note's `content_hash` as you last read it. Refuses\n            the delete, changing nothing, if the note has changed since.\n    ",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "expected_hash": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Expected Hash"
+     },
+     "path": {
+      "title": "Path",
+      "type": "string"
+     },
+     "permanent": {
+      "default": false,
+      "title": "Permanent",
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "path"
+    ],
+    "title": "delete_noteArguments",
+    "type": "object"
+   },
+   "name": "delete_note",
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "title": "Result",
+      "type": "string"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "delete_noteOutput",
+    "type": "object"
+   },
+   "title": "Delete note"
+  },
+  {
+   "annotations": {
+    "destructiveHint": true,
+    "idempotentHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false
+   },
+   "description": "Mutate a note's YAML frontmatter without touching its body. Requires write permission — a `readwrite` API key, or an OAuth token\n    carrying the `readwrite` scope.\n\n    Arguments: `path`, `updates` (keys to set), `remove` (keys to drop) and the optional `expected_hash`\n    precondition. Parses the existing frontmatter, merges in `updates` (overwriting matching keys, adding new\n    ones), then drops the keys in `remove`; the body is preserved byte-for-byte. A note with no frontmatter\n    (no `---` fence on line 1) gets a fresh block prepended ahead of the unchanged body.\n\n    **`expected_hash`**: pass the `content_hash` a read returned, verbatim (`sha256:<64 lowercase hex>`), and\n    the call is refused with nothing written if the file changed since. It is the **whole file's** hash, never\n    a hash of the text you received. Optional by default — omitted, a stale edit overwrites — unless the\n    deployment requires it, when an omitted hash is refused `precondition_required`. The comparison runs ahead\n    of the malformed-block diagnosis and ahead of the no-op check, so a stale base never yields \"no changes\"\n    or a defect report about bytes you have not seen. Every refusal the server raises ends with one\n    machine-readable `MCP-REFUSAL {\"code\":…}` line (an undeclared or mistyped argument is rejected by protocol\n    validation before the tool runs and carries no such line) — `stale_precondition` (with the current hash),\n    `concurrent_write`, `no_incumbent`, `malformed_precondition`, `precondition_unavailable`,\n    `precondition_required` — each stating what resolves it. The server also re-compares the file immediately\n    before publishing. A write\n    reports the `content_hash` of the bytes **this call published**; a no-op publishes nothing and reports none.\n\n    **A malformed block is refused, never worked around.** An unclosed line-1 fence, YAML that fails to parse,\n    and YAML that is not a mapping (`null`, `~`, comments only, a list, a scalar) each return an error naming\n    the defect and pointing at `edit_note(path, content, replace_frontmatter=True)` as the repair. Nothing is\n    written — in particular no second block is prepended above the broken one — and `remove=` refuses\n    identically rather than silently doing nothing, even for a call with no `updates` and no `remove`. An\n    empty fenced block (`---` immediately followed by `---`) is *valid*: it is a valid empty mapping and is\n    updated in place.\n\n    **Only an effective change writes.** `updates` that set every named key to the value it already holds\n    (compared type-sensitively, so `true` is not `1`) together with `remove` naming only absent keys report no\n    changes and leave the file byte-identical. Removing the last key removes the block entirely — no fences, no\n    separator, exactly the prior body.\n\n    Re-serialization goes through PyYAML, which does NOT preserve YAML comments — any `# comment` in the\n    original frontmatter is lost on the first `set_frontmatter` call. A path whose final component is a symlink\n    is refused, naming its target; symlinked folders inside the vault work normally. See `get_vault_guide` for\n    vault frontmatter conventions.\n\n    Args:\n        path: Vault-relative path to the note.\n        updates: Mapping of keys to set. Use the empty dict (or omit) to skip.\n        remove: List of keys to delete from the frontmatter. Missing keys are ignored (and, on their own, make\n            the call a no-op rather than a write).\n        expected_hash: The note's `content_hash` as you last read it. Refuses the write, changing nothing, if\n            the note has changed since.\n    ",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "expected_hash": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Expected Hash"
+     },
+     "path": {
+      "title": "Path",
+      "type": "string"
+     },
+     "remove": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "string"
+        },
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Remove"
+     },
+     "updates": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Updates"
+     }
+    },
+    "required": [
+     "path"
+    ],
+    "title": "set_frontmatterArguments",
+    "type": "object"
+   },
+   "name": "set_frontmatter",
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "title": "Result",
+      "type": "string"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "set_frontmatterOutput",
+    "type": "object"
+   },
+   "title": "Set frontmatter"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": true
+   },
+   "description": "Read any file in the vault — including non-markdown (PDFs, images,\n    skill HTML/JS, data files). Peer to `read_note`, which stays markdown-only.\n\n    This is pure byte transport: the server does NOT extract or parse PDFs and\n    cannot interpret binary bytes. Non-text/non-image files come back as an\n    opaque base64 string intended for a client-side skill to decode — not as\n    something the model can read directly.\n\n    Encoding:\n    - `\"auto\"` (default): text-like files (HTML, JSON, CSV, source, …) return\n      as readable text; images (PNG/JPEG/GIF/WebP) return as an inline image\n      block that renders in-client; everything else returns as a labeled\n      base64 string.\n    - `\"text\"`: force a UTF-8 text decode; errors if the file is not valid UTF-8.\n    - `\"base64\"`: force a raw-bytes base64 string regardless of type.\n\n    Files larger than `MAX_FILE_READ_BYTES` (default 10 MB) are refused with a\n    size report. Base64 reads pass through the model context and inflate ~33%,\n    so they are token-heavy — check a file's size with `list_files` before\n    reading large binaries. Any path with a component starting with `.` is\n    rejected — dot-directories (`.obsidian`, `.git`, `.trash`, …) and dot-files\n    alike — as is path traversal.\n\n    Text results are additionally capped to a context-safe size: the cap bounds\n    the returned window, and a truncated read appends a short notice carrying\n    the `offset` to continue from. Base64 and image results are not windowed.\n\n    The base64 header and `hash_only=True` return the whole raw file's\n    `content_hash` (`sha256:<64 lowercase hex>`), which write/delete tools\n    accept as `expected_hash`. Their path is a quoted JSON string. Text stays\n    deliberately unenveloped. Use base64 for byte-exact frontmatter bytes;\n    `read_note.frontmatter_yaml` has normalized line endings.\n\n    Encoding is validated first, then hash_only/window compatibility, then\n    ranges. `hash_only` refuses `offset != 0` or any non-None `limit`; explicitly\n    passing `offset=0` is fine. A valid encoding has no effect in this mode.\n\n    Args:\n        path: Vault-relative path to the file (e.g. \"Reference Docs/spec.pdf\").\n        hash_only: Return only path, byte count, MIME and hash, with no content.\n        encoding: One of \"auto\" (default), \"text\", or \"base64\".\n        offset: Character offset to start a text read from (default 0). Use the\n            value the truncation notice reports to continue.\n        limit: Maximum characters to return for a text read. Only lowers the\n            server cap; it cannot raise it.\n    ",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "encoding": {
+      "default": "auto",
+      "title": "Encoding",
+      "type": "string"
+     },
+     "hash_only": {
+      "default": false,
+      "title": "Hash Only",
+      "type": "boolean"
+     },
+     "limit": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Limit"
+     },
+     "offset": {
+      "default": 0,
+      "title": "Offset",
+      "type": "integer"
+     },
+     "path": {
+      "title": "Path",
+      "type": "string"
+     }
+    },
+    "required": [
+     "path"
+    ],
+    "title": "read_fileArguments",
+    "type": "object"
+   },
+   "name": "read_file",
+   "title": "Read file"
+  },
+  {
+   "annotations": {
+    "destructiveHint": true,
+    "idempotentHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false
+   },
+   "description": "Write a file into the vault — including non-markdown (e.g. save a\n    generated PDF or image). Requires write permission — a `readwrite` API key, or an OAuth token\n    carrying the `readwrite` scope.\n    Peer to `create_note`/`edit_note`, which stay markdown-only.\n\n    `content` carries the bytes: with `encoding=\"base64\"` (default) it is\n    base64-decoded to raw bytes; with `encoding=\"text\"` it is written verbatim\n    as UTF-8. The write is atomic — the bytes are staged and flushed before\n    anything is published — missing parent folders are created, and content over\n    `MAX_FILE_WRITE_BYTES` (default 25 MB, decoded length) is refused.\n\n    No-clobber by default: writing over an existing file requires\n    `overwrite=True`. The default publishes by linking a staged, never-named\n    inode into place in one kernel-atomic step, so an existing file cannot be\n    replaced; `overwrite=True` publishes with a single same-directory rename\n    instead. A vault filesystem that cannot stage an unnamed file refuses the\n    no-clobber write with an error naming\n    `VAULT_ALLOW_NAMED_STAGING_FALLBACK`, rather than staging under a visible\n    name. Any path with a component starting with `.` (dot-directories and\n    dot-files alike) and path traversal are rejected; invalid\n    base64 errors without writing anything. A path whose final component is a\n    symlink is refused, naming its target, so `overwrite=True` cannot clobber a\n    file through an alias; symlinked folders inside the vault work normally.\n\n    The MCP transport also bounds the whole request body (sized so a base64\n    write at the cap always gets through). Base64 is therefore the always-safe\n    encoding: `encoding=\"text\"` content whose JSON escaping inflates past that\n    bound is rejected by the transport with a bare HTTP 413 before this tool\n    runs — send such content as base64 instead.\n\n    `expected_hash` binds an existing whole file on `overwrite=True`; optional by default — omitted, the\n    overwrite replaces whatever is on disk — unless the deployment requires it, when an omitted hash on\n    an overwrite is refused `precondition_required`. Obtain its canonical `sha256:<64 lowercase hex>` value from `read_file`'s\n    base64 header, `read_file(hash_only=True)`, or a prior write's success.\n    Syntax is checked before path work; a hash with no-clobber or a missing\n    destination is `no_incumbent`. An over-cap incumbent cannot be guarded.\n    A stale hash refuses before publication; matching also enables the in-call\n    comparison, which refuses an edit arriving during this call as\n    `concurrent_write`. Without a hash, overwrite remains unconditional unless\n    the deployment requires preconditions. Creation is exempt.\n\n    Success reports the hash of the bytes this call published, not necessarily\n    what remains when the response arrives. Over-cap incumbents or results omit\n    the hash without failing an otherwise permitted unguarded write.\n\n    Args:\n        path: Vault-relative destination path (e.g. \"Outputs/report.pdf\").\n        content: File contents — base64 string (default) or UTF-8 text.\n        encoding: \"base64\" (default) or \"text\".\n        overwrite: If True, replace an existing file. Off by default.\n        expected_hash: Optional whole-file raw-byte digest of the incumbent.\n    ",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "content": {
+      "title": "Content",
+      "type": "string"
+     },
+     "encoding": {
+      "default": "base64",
+      "title": "Encoding",
+      "type": "string"
+     },
+     "expected_hash": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Expected Hash"
+     },
+     "overwrite": {
+      "default": false,
+      "title": "Overwrite",
+      "type": "boolean"
+     },
+     "path": {
+      "title": "Path",
+      "type": "string"
+     }
+    },
+    "required": [
+     "path",
+     "content"
+    ],
+    "title": "write_fileArguments",
+    "type": "object"
+   },
+   "name": "write_file",
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "title": "Result",
+      "type": "string"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "write_fileOutput",
+    "type": "object"
+   },
+   "title": "Write file"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": true
+   },
+   "description": "Browse the vault filesystem (`ls`-style), including non-markdown files.\n    Peer to `list_notes`, which lists indexed markdown only; `list_files` reads\n    the filesystem directly and reports sizes so you can gauge a binary before\n    `read_file`.\n\n    By default lists the immediate children of `folder` — subdirectories and\n    files, each file with size and modification time. `pattern` is a glob that\n    filters file entries (e.g. \"*.pdf\"); `recursive=True` descends into\n    subfolders and returns matching files. Anything with a path component\n    starting with `.` is hidden — dot-directories (`.obsidian`, `.git`,\n    `.trash`, …) **and dot-files** — and a `folder` with such a component is\n    rejected.\n\n    At most `limit` entries are returned (default 200, hard cap 1000); the\n    response indicates when the listing was truncated.\n\n    Args:\n        folder: Vault-relative folder (default \".\" = vault root).\n        pattern: Glob applied to file names (default \"*\").\n        recursive: If True, descend into subfolders. Off by default.\n        limit: Maximum entries to return (default 200, hard cap 1000).\n    ",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "folder": {
+      "default": ".",
+      "title": "Folder",
+      "type": "string"
+     },
+     "limit": {
+      "default": 200,
+      "title": "Limit",
+      "type": "integer"
+     },
+     "pattern": {
+      "default": "*",
+      "title": "Pattern",
+      "type": "string"
+     },
+     "recursive": {
+      "default": false,
+      "title": "Recursive",
+      "type": "boolean"
+     }
+    },
+    "title": "list_filesArguments",
+    "type": "object"
+   },
+   "name": "list_files",
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "title": "Result",
+      "type": "string"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "list_filesOutput",
+    "type": "object"
+   },
+   "title": "List files"
+  },
+  {
+   "annotations": {
+    "destructiveHint": true,
+    "idempotentHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false
+   },
+   "description": "Get a short-lived link a person can use to put a file into the vault.\n    Requires write permission — a `readwrite` API key, or an OAuth token\n    carrying the `readwrite` scope.\n    Peer to `write_file`, which takes the bytes directly — use this one when you\n    do not have them.\n\n    No MCP client can hand a tool the bytes of a file the user is looking at,\n    and your shell cannot reach their machine. This mints a link bound to\n    exactly one destination path: hand it to the person you are helping, they\n    open it and pick a file, and it lands at `path`. Nothing else can be\n    written with it.\n\n    The token lives in the URL's `#` fragment, which browsers never send to a\n    server, so it stays out of access logs. **Treat the whole URL as a secret**\n    — whoever holds it can write that one path, once, until it expires. Never\n    put it in a query string: that *would* log it.\n\n    Single use, and no-clobber unless you ask otherwise. With\n    `overwrite=True` the link also remembers what the file looked like now and\n    refuses to publish if it changed in the meantime, so a stale link cannot\n    silently undo an edit someone made while it was waiting.\n\n    From a shell you can upload without the page:\n    `curl -H \"Authorization: Bearer <token>\" -T <file> <base>/transfer/upload`.\n\n    Then call `check_upload(upload_id)` to confirm the bytes landed and get\n    their sha256. See `get_vault_guide` for how files fit into the vault.\n\n    Args:\n        path: Vault-relative destination (e.g. \"Attachments/photo.png\").\n        overwrite: If True, allow replacing an existing file at `path`.\n        expires_in: Seconds until the link dies. Clamped to 60–3600; defaults\n            to `TRANSFER_TOKEN_TTL_SECONDS` (600). A link can never outlive the\n            credential you are calling with, so the deadline in the result may\n            be earlier than you asked for — it says so when that happens.\n    ",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "expires_in": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Expires In"
+     },
+     "overwrite": {
+      "default": false,
+      "title": "Overwrite",
+      "type": "boolean"
+     },
+     "path": {
+      "title": "Path",
+      "type": "string"
+     }
+    },
+    "required": [
+     "path"
+    ],
+    "title": "request_uploadArguments",
+    "type": "object"
+   },
+   "name": "request_upload",
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "title": "Result",
+      "type": "string"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "request_uploadOutput",
+    "type": "object"
+   },
+   "title": "Request upload link"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": true
+   },
+   "description": "Ask what happened to an upload link you minted with `request_upload`.\n\n    Returns one of `pending` (nothing sent yet), `uploading` (bytes are in\n    flight), `completed` (with the path, size, sha256 and MIME type of what\n    landed), `unknown` (a stream started and the server never recorded how it\n    ended), `revoked` (the link is dead because the credential or vault root\n    changed under it), or `expired`. Use it to confirm a transfer really\n    finished before you tell the user it did, and to get the sha256 if they\n    want to verify it.\n\n    Visibility is scoped to the *principal* that minted the link, not to one\n    credential row. For an API key that is the key itself. For OAuth it is the\n    whole grant family behind the access token you are calling with, so a handle\n    stays readable across the hourly token refresh that mints a new row. A\n    different API key, a different client, or a separate approval of the same\n    client reads as `not found`.\n\n    `uploading` names the deadline the stream has. Check again after it: past\n    that point the answer becomes either `completed` or `unknown`. **`unknown`\n    does not mean nothing arrived** — a publish can succeed and still fail to\n    record its completion — so read or list the path before minting another\n    link or telling anyone the file did not arrive.\n\n    Pass the `upload_id` itself — the short handle from `request_upload`, not\n    the upload URL and not the token after the `#`. Anything else is refused\n    without a lookup.\n\n    Args:\n        upload_id: The `upload_id` that `request_upload` returned.\n    ",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "upload_id": {
+      "title": "Upload Id",
+      "type": "string"
+     }
+    },
+    "required": [
+     "upload_id"
+    ],
+    "title": "check_uploadArguments",
+    "type": "object"
+   },
+   "name": "check_upload",
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "title": "Result",
+      "type": "string"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "check_uploadOutput",
+    "type": "object"
+   },
+   "title": "Check upload"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "idempotentHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false
+   },
+   "description": "Get a short-lived link a person can use to save a vault file. Peer to\n    `read_file`, which returns the bytes to you — use this one when the file is\n    for the human, not for you.\n\n    Handy for anything `read_file` would waste context on or cannot render: a\n    PDF, a large image, an archive. Reading works with a read-only key.\n\n    The token lives in the URL's `#` fragment, so it never reaches an access\n    log. **Treat the whole URL as a secret** — whoever holds it can read that\n    one file until it expires. Never put it in a query string.\n\n    The link is bound to the file *as it is now*: if it is edited or replaced,\n    the link stops working rather than serving different content than you\n    described. Unlike an upload link it can be used more than once, so the\n    person can preview and then save.\n\n    From a shell: `curl -H \"Authorization: Bearer <token>\" -o <file>\n    <base>/transfer/download/file`.\n\n    Args:\n        path: Vault-relative path of the file to share.\n        expires_in: Seconds until the link dies. Clamped to 60–3600; defaults\n            to `TRANSFER_TOKEN_TTL_SECONDS` (600). A link can never outlive the\n            credential you are calling with, so the deadline in the result may\n            be earlier than you asked for — it says so when that happens.\n    ",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "expires_in": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Expires In"
+     },
+     "path": {
+      "title": "Path",
+      "type": "string"
+     }
+    },
+    "required": [
+     "path"
+    ],
+    "title": "request_downloadArguments",
+    "type": "object"
+   },
+   "name": "request_download",
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "title": "Result",
+      "type": "string"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "request_downloadOutput",
+    "type": "object"
+   },
+   "title": "Request download link"
+  },
+  {
+   "annotations": {
+    "destructiveHint": true,
+    "idempotentHint": false,
+    "openWorldHint": true,
+    "readOnlyHint": false
+   },
+   "description": "Fetch a file from a public https URL straight into the vault. Requires write permission — a `readwrite` API key, or an OAuth token\n    carrying the `readwrite` scope.\n    Peer to `write_file` and `request_upload` — use this one when the bytes are\n    already somewhere public.\n\n    The server does the fetching, so nothing passes through your context: a\n    20 MB PDF costs one tool call. Returns the path, size, sha256, MIME type\n    and the final URL after any redirects.\n\n    **Only genuinely public addresses.** This server sits on a private network\n    next to a database and other services, so the fetch is restricted: https\n    only — plain http is refused unless the operator has set\n    `IMPORT_ALLOW_HTTP=true` — no credentials in the URL, no\n    private/loopback/link-local/metadata addresses in any spelling, and the same\n    rules re-checked at every redirect.\n    A refusal names the rule that was violated — that is information about the\n    URL, not a hint to work around it. Rewriting the URL to evade the check is\n    never the right next step; ask the user for a public link instead.\n\n    Size-capped at `MAX_FILE_WRITE_BYTES`, with one 30-second deadline for the\n    whole fetch. No-clobber unless `overwrite=True`. Nothing is written unless\n    the whole body arrives intact.\n\n    This tool shares the transfer tools' preflight, so it also refuses when the\n    server has no public origin configured (`MCP_HOSTNAME` or `BASE_URL`), even\n    though it mints no link — that is an operator setting, not something to work\n    around.\n\n    Args:\n        url: Public https URL of the file, at most 8,192 characters; a longer\n            one is refused with `argument_too_long` before anything is fetched.\n        path: Vault-relative destination (e.g. \"Attachments/paper.pdf\").\n        overwrite: If True, allow replacing an existing file at `path`.\n    ",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "overwrite": {
+      "default": false,
+      "title": "Overwrite",
+      "type": "boolean"
+     },
+     "path": {
+      "title": "Path",
+      "type": "string"
+     },
+     "url": {
+      "title": "Url",
+      "type": "string"
+     }
+    },
+    "required": [
+     "url",
+     "path"
+    ],
+    "title": "import_from_urlArguments",
+    "type": "object"
+   },
+   "name": "import_from_url",
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "title": "Result",
+      "type": "string"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "import_from_urlOutput",
+    "type": "object"
+   },
+   "title": "Import from URL"
+  },
+  {
+   "annotations": {
+    "destructiveHint": true,
+    "idempotentHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false
+   },
+   "description": "Delete a non-markdown file from the vault. Requires write permission — a `readwrite` API key, or an OAuth token\n    carrying the `readwrite` scope.\n    Peer to `delete_note`, which stays markdown-only.\n\n    By default this is a soft delete: the file moves to\n    `.trash/<YYYYMMDD-HHMMSS>-<basename>-<8 hex>` inside the vault, keeping a\n    copy the user can recover. Two files with the same name deleted in the same\n    second both survive — the trash never clobbers.\n\n    With `permanent=True` the file is unlinked outright and this server has no\n    recovery path; the user's backups are the only rollback.\n\n    Refuses markdown files (use `delete_note`, which understands the index and\n    backlinks), directories, and symlinks. Non-markdown files are not indexed,\n    so search and embeddings are unaffected either way.\n\n    `expected_hash` binds the whole raw file in either mode; optional by default — omitted, the delete\n    proceeds — unless the deployment requires it, when an omitted hash is refused `precondition_required`.\n    Use the canonical `sha256:<64 lowercase hex>` from `read_file`'s base64 header,\n    `read_file(hash_only=True)`, or a write success. Malformed hashes refuse\n    before path checks; unavailable, required and stale preconditions refuse\n    before any trash entry or unlink.\n    This checks the caller-read-to-call window; a later concurrent replacement\n    remains possible, so it is not an atomic filesystem compare-and-delete.\n    A successful delete reports no content hash.\n\n    Args:\n        path: Vault-relative path to the file.\n        permanent: If True, unlink instead of moving to `.trash/`.\n        expected_hash: Optional whole-file raw-byte digest of the incumbent.\n    ",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "expected_hash": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Expected Hash"
+     },
+     "path": {
+      "title": "Path",
+      "type": "string"
+     },
+     "permanent": {
+      "default": false,
+      "title": "Permanent",
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "path"
+    ],
+    "title": "delete_fileArguments",
+    "type": "object"
+   },
+   "name": "delete_file",
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "title": "Result",
+      "type": "string"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "delete_fileOutput",
+    "type": "object"
+   },
+   "title": "Delete file"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": true
+   },
+   "description": "List checkbox tasks (`- [ ] …`) across the vault in one call, from the index — no note is read.\n\n    Reads the index, refreshed each pass (default every 300 s): a just-edited\n    note may show its previous tasks until the next pass. Tasks-plugin and\n    Dataview query blocks are fenced text and are not evaluated; only the\n    checkbox lines themselves are tasks. A checkbox inside a fenced code block\n    or inline code is not a task.\n\n    Status: `[ ]`, `[/]` (in progress) and any other marker are `open`; `[x]`\n    and `[X]` are `done`; `[-]` is `cancelled` — excluded from `open`,\n    included in `all`. Each line shows the raw marker.\n\n    Ordering: due date ascending, undated tasks last, then path, then line.\n    When more rows match than fit, the header says `more: yes` and the\n    response ends with `next: <cursor>`; pass it back as `cursor` with the same\n    filters to continue. A cursor from other filters or another owner is\n    refused (`invalid_argument`); so is a compact cursor whose note has since\n    gone — start again without one.\n\n    Each task is one line: the marker, the path in backticks with `:line`, then any of due,\n    scheduled, start and done dates, priority, the task's own `#tags`, the\n    heading path (`under:`), and `text:` last, as written (Tasks-plugin\n    emoji included). Text past 1,000 characters is cut and labelled; a task\n    whose tags were capped (64 kept) says `tags cut`. A first row too long for\n    the response is shown abbreviated rather than skipped.\n\n    The header always states `not yet scanned for tasks` (notes the index has\n    not re-derived yet, e.g. right after an upgrade), `tasks could not be\n    indexed` and `over the task cap` (5,000 per note), each even when zero, and\n    with `tags` the count of tasks whose tags were cut. When either of the\n    first two is non-zero the list is incomplete and the response says so —\n    \"no tasks\" then does not mean none exist.\n\n    Args:\n        folder: Only notes under this path prefix (e.g. \"Projects/\").\n        status: `open` (default), `done`, `cancelled` or `all`.\n        due_by: `YYYY-MM-DD`; only tasks due on or before this date. Tasks\n            with no due date are excluded when it is given.\n        scheduled_by: `YYYY-MM-DD`; only tasks scheduled on or before this\n            date. Tasks with no scheduled date are excluded when it is given.\n        tags: Only tasks carrying every one of these inline tags on the task\n            line itself (a leading `#` is optional; note-level tags are not\n            consulted). At most 32, each 1–128 characters.\n        limit: Maximum tasks per page (1–500, default 100). The response size\n            cap can end a page sooner; `next` then continues it.\n        cursor: The `next` value from the previous page of the same query.\n    ",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "cursor": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Cursor"
+     },
+     "due_by": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Due By"
+     },
+     "folder": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Folder"
+     },
+     "limit": {
+      "default": 100,
+      "title": "Limit",
+      "type": "integer"
+     },
+     "scheduled_by": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Scheduled By"
+     },
+     "status": {
+      "default": "open",
+      "title": "Status",
+      "type": "string"
+     },
+     "tags": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "string"
+        },
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Tags"
+     }
+    },
+    "title": "list_tasksArguments",
+    "type": "object"
+   },
+   "name": "list_tasks",
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "title": "Result",
+      "type": "string"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "list_tasksOutput",
+    "type": "object"
+   },
+   "title": "List tasks"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": true
+   },
+   "description": "List what changed in your vault after a cursor: one line per note created, modified, moved or deleted, oldest first.\n\n    `since` is either the `next_since` cursor a previous call returned\n    (`ev:<number>`, exclusive and exact) or a UTC date/datetime\n    (`YYYY-MM-DD`, or ISO 8601 with `Z`/`±HH:MM`). A date or datetime *starts*\n    a feed and is approximate; `next_since` *continues* one without losing or\n    repeating an event. Store `next_since` (it is in the header and the last\n    line) in your own notes and pass it next session. A cursor means\n    something only for your own vault; one above this vault's last event is\n    refused (`invalid_argument`).\n\n    Each line: `- ev:<n> <UTC time> <kind> \"<path>\"` (a move shows\n    `\"<from>\" -> \"<to>\"`; paths are JSON-quoted, so a newline in a name is\n    `\n`), then `reason=…` where it applies, then who: `by api_key \"<name>\"\n    via <tool>` or `by oauth \"<client>\" via <tool>`, marked `(you)` when it was\n    your own credential, or `by human/sync` for anything the index discovered\n    — edits outside MCP (Obsidian, a sync client, git, a shell) are\n    `human/sync`. `created` means first seen at this path: a new note, one half\n    of a rename that could not be paired, or a note that became indexable.\n    `deleted` always carries `reason=`: `removed` (the file is gone),\n    `not_indexable` (still on disk but cannot be indexed) or `quarantined`.\n\n    Two meta lines are always shown, whatever the filters: `gap` (events not\n    itemised, with a count) and `reset` (the index was rebuilt from empty).\n    After either, resync with `get_recent(order_by=\"content_changed\",\n    since=…)`. `history_truncated: true` in the header means events older than\n    the retained history (default 90 days) were removed.\n\n    Args:\n        since: A `next_since` cursor (`ev:<n>`) or a UTC date/datetime.\n        folder: Only events whose path or source path is under this prefix (a\n            move out of the folder counts).\n        kinds: Subset of `created`, `modified`, `moved`, `deleted`.\n        by: `any` (default); `me` (your exact credential — the same API key,\n            or the same OAuth grant across token refreshes); `agents` (any MCP\n            caller of this vault); `human` (`human/sync`, discovered by the index).\n        limit: Events per page (1–500, default 50). A full page says\n            `more: true`; pass its `next_since` to continue.\n    ",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "by": {
+      "default": "any",
+      "title": "By",
+      "type": "string"
+     },
+     "folder": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Folder"
+     },
+     "kinds": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "string"
+        },
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Kinds"
+     },
+     "limit": {
+      "default": 50,
+      "title": "Limit",
+      "type": "integer"
+     },
+     "since": {
+      "title": "Since",
+      "type": "string"
+     }
+    },
+    "required": [
+     "since"
+    ],
+    "title": "get_changesArguments",
+    "type": "object"
+   },
+   "name": "get_changes",
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "title": "Result",
+      "type": "string"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "get_changesOutput",
+    "type": "object"
+   },
+   "title": "Change feed"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": true
+   },
+   "description": "Keyword and semantic search fused into one ranking, for a query that is not clearly an identifier or a paraphrase.\n\n    Exact identifiers, code symbols, titles or known phrases: `keyword_search`.\n    Conceptual or paraphrased questions: `semantic_search`. Unsure which:\n    `hybrid_search`.\n\n    Both arms run for the same query and filters in one database snapshot:\n    the `keyword_search` ranking and the `semantic_search` ranking, each taken\n    to its top 50. They are fused by reciprocal rank fusion over note paths\n    with equal votes: a note's score is the sum, over the arms that found it,\n    of `1/(k + rank)` (`k` is the server's `HYBRID_RRF_K`, shown as `rrf_k`).\n    A note outside both top-50 lists is not considered; the header's\n    `arm_depth: keyword n/50, semantic c/50 chunks` says when an arm was full.\n    Fusion helps when the query's kind is unclear, and a single arm can rank\n    better than it on its own kind of query (an exact identifier, or a pure\n    paraphrase); use that arm's tool then.\n\n    One line per result: a JSON object of the note-controlled fields\n    `{\"title\",\"path\",\"tags\",\"preview_kind\",\"preview\"}` (every value a JSON\n    string, so note text cannot forge a field), then the server fields:\n    `score`, semantic_rank (with similarity) or `-`, keyword_rank (with\n    `match` and `matched_in`) or `-`, and `explain` (the `1/(k+rank)` terms\n    that make the score). `preview_kind` is `snippet` (a keyword highlight in\n    `«»`), `head`, `chunk` (semantic), `stale_notice` or `none`, from the arm\n    that ranked the note better. `stale: true` and `embedding_truncated: true`\n    mean what they mean in `semantic_search`, and so do the semantic arm's\n    `§ \"<heading path>\" (#N)` / `§ (top of note)` field (read the section\n    with `read_note(path, section=\"#N\")`) and the `index_transition:` line\n    under the header. A long response drops whole rows\n    from the end and says how many; a first row that does not fit is cut and\n    labelled. Call `read_note` on a path for the full note.\n\n    The header always says `arms:`. `arms: both` is a fused answer. `arms:\n    keyword-only (semantic unavailable: provider_error | provider_input_rejected)`\n    means the embedding provider failed or refused the query: the page is the\n    keyword arm alone, in keyword order, and `semantic_search` will fail the\n    same way until the provider recovers.\n\n    `rerank=true` asks the deployment's reranker to reorder the candidates\n    this call already fetched; it can add up to the configured timeout. Its\n    rows are one-line quoted objects followed by server fields (with\n    `rerank_score` after them when reranked). The header says\n    `reranked: true` or `reranked: false (<reason>)`, and an unreranked page\n    keeps the unreranked order; `reranked: false (not_configured)` means\n    this deployment has no reranker.\n\n    Every page's header also says `confidence: ok` or `confidence: low`:\n    `low` means no note matched all the keyword terms and the closest\n    semantic candidate is under this deployment's similarity threshold (a\n    line then suggests `keyword_search` or `get_neighborhood`), and `ok` is\n    also what a deployment that set no threshold says, so it is not a\n    quality claim.\n\n    Args:\n        query: What you are looking for — words, a phrase or a question.\n        limit: Maximum number of results (default 10, at most 50).\n        folder: Optional folder prefix (e.g. \"Projects/\").\n        tags: Optional list of tag names; only notes carrying ALL listed tags match.\n        frontmatter: Optional dict of frontmatter key/value pairs; strict type matching —\n            string \"0\" does not match integer 0 (e.g. {\"status\": \"active\"}).\n        rerank: Reorder the first 50 fused candidates with the deployment's\n            reranker (default false).\n    ",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "folder": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Folder"
+     },
+     "frontmatter": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Frontmatter"
+     },
+     "limit": {
+      "default": 10,
+      "title": "Limit",
+      "type": "integer"
+     },
+     "query": {
+      "title": "Query",
+      "type": "string"
+     },
+     "rerank": {
+      "default": false,
+      "title": "Rerank",
+      "type": "boolean"
+     },
+     "tags": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "string"
+        },
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "title": "Tags"
+     }
+    },
+    "required": [
+     "query"
+    ],
+    "title": "hybrid_searchArguments",
+    "type": "object"
+   },
+   "name": "hybrid_search",
+   "outputSchema": {
+    "properties": {
+     "result": {
+      "title": "Result",
+      "type": "string"
+     }
+    },
+    "required": [
+     "result"
+    ],
+    "title": "hybrid_searchOutput",
+    "type": "object"
+   },
+   "title": "Hybrid search"
+  }
+ ]
+}
