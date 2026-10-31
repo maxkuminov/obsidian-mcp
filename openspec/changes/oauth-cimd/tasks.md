@@ -8,7 +8,7 @@
 - [x] 1.1 `src/config.py`: `oauth_cimd_enabled` (bool, true), `oauth_cimd_cache_max_seconds` (int, 86400, 0–86400), `oauth_cimd_fetches_per_address_per_minute` (int, 10, 1–120). Out-of-range values refuse boot.
 - [x] 1.2 `src/models/db.py`: `OAuthClient.client_id_metadata_url: String(2048) | None` and `CheckConstraint` `ck_oauth_clients_cimd_shape` (design D6).
 - [x] 1.3 `alembic/versions/036_oauth_cimd.py` (`revision "036"`, `down_revision "035"`): add the column and the CHECK. The downgrade refuses while any CIMD row exists, naming the count. Module docstring states why the column exists and why `client_id` is not widened.
-- [ ] 1.4 `make test-schema` and `make db-check` clean ("No new upgrade operations detected"). `test_nonsuperuser_migrations_pg.py` still passes.
+- [x] 1.4 `make test-schema` and `make db-check` clean ("No new upgrade operations detected"). `test_nonsuperuser_migrations_pg.py` still passes.
 
 ## 2. AS metadata
 
@@ -86,7 +86,7 @@
 - [x] 10.16 Credential-first replay under a synthetic id: rotate refresh token R, then present revoked R with `client_id=cimd_nonexistent`. The family is revoked, the response is the constant reuse `invalid_grant`, and `oauth_refresh_reuse_detected` is emitted. The same holds for a replayed spent code (the unknown-code response; the family is revoked only after full revalidation, which a `cimd_` id fails, so nothing is revoked and `invalid_grant.spent_code_internal_id_submitted` is logged). Two `SECRET_KEY` values derive different ids.
 - [x] 10.14 URL-free logging: a `?`/`#` client_id is refused before any fetch; `/authorize`, `/token` (both grants) and `/revoke` records about an `https://` client_id carry `cimd_host` + `cimd_ref` and never `client_id_submitted` or the URL.
 - [x] 10.12 Event catalogue parity test and the allow-list AST sweep cover the new fields, and no `oauth_client_registration_path` exists. The existing exactly-one-emission tests for `/register` and approval pass. The canary test confirms no secret in any new record.
-- [ ] 10.13 `pytest tests` plus `make test-integration` green, with the integration suite actually executed.
+- [x] 10.13 `pytest tests` plus `make test-integration` green, with the integration suite actually executed.
 
 ## 11. Docs (same PR)
 
