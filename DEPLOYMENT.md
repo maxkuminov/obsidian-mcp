@@ -999,6 +999,24 @@ and needs nothing; the real run is this path, from a checkout with
    included (a query whose search finds nothing is scored as empty and
    counted per arm as `empty_candidates` in the manifest): raise `RERANK_TIMEOUT_MS` for replay if the reranker is slow,
    and say so next to the report.
+   **A change with a mechanical bar adds the `gate` step.** After `make
+   search-eval` has written `.search-eval/report.json` with the incumbent
+   as `BASELINE`, run `python -m scripts.search_eval gate --report
+   .search-eval/report.json --arm <candidate arm> --metrics
+   recall@10,recall@20,recall@50,ndcg@10 --slices overall,class:identifier
+   --min-ci-lower -0.01 --out .search-eval/gate.md` (the metrics, slices
+   and bound are the change's own bar). It prints PASS or FAIL per
+   (metric × slice) and exits 0 (all pass), 1 (a cell's CI95 lower bound is
+   below the bound, or its interval is null) or 64. It exits 64, printing
+   nothing and writing no file, when the report is not `OK`, `attachable:
+   true` and `provenance.users == 1`. On a multi-user deployment, export
+   with `USER_ID=` first. The two paths are the scored `report.json` and
+   the gate's Markdown table `gate.md`, and the PR body carries only a
+   table from a successful run. With a `runfile:` baseline, also pass
+   `--baseline-report` with the source generation's `report.json`.
+   **Score the source generation before staging the runfile**, and do not
+   re-score it afterwards: the gate checks that file against the digest
+   `run` recorded when it staged the runfile.
 7. **Attach `report.json` to the PR only if it says `attachable: true`.** It
    carries metrics, counts and hashes, no query text and no note paths. A
    `CORPUS_LOSS` verdict means the candidate lost searchable notes for that

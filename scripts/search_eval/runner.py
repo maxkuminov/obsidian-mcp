@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scripts.search_eval import EXIT_FAILURE, EXIT_OK, UsageError
-from scripts.search_eval._io import atomic_write, ensure_private_dir, pretty_json
+from scripts.search_eval._io import atomic_write, ensure_private_dir, pretty_json, sha256_file
 from scripts.search_eval.arms import (
     ArmContext,
     EvalQuery,
@@ -113,6 +113,25 @@ def _loss(arm_membership: str, selected: list[str], data: DataDir, judged: dict[
     return loss, before
 
 
+def _source_report_sha256(runfile: Path, generation: str | None) -> str | None:
+    """The sha256 of the source data directory's `report.json` when it is the
+    scored report of `generation` (the gate step): `<data>/runs/<gen>/<file>` →
+    `<data>/report.json`. `None` when it is absent, unreadable or scores
+    another generation."""
+    import json
+
+    from scripts.search_eval.scoring import REPORT_FILE
+
+    report = runfile.parent.parent.parent / REPORT_FILE
+    try:
+        body = json.loads(report.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(body, dict) or not generation or body.get("generation") != generation:
+        return None
+    return sha256_file(report)
+
+
 def _is_semantic(membership: str | None) -> bool:
     return membership in ("semantic", "keyword_and_semantic", "keyword_or_semantic")
 
@@ -172,6 +191,12 @@ async def run_generation(
         for key in getattr(arm.factory, "required_options", ()) or ():
             if key not in options:
                 raise UsageError(f"arm {arm.spec!r} needs --arm-opt {key}=…")
+        # A factory may also validate its option values here
+        # (`factory.check_options(options)`), for the same reason: a bad value
+        # is a usage error, not a failed generation.
+        check = getattr(arm.factory, "check_options", None)
+        if check is not None:
+            check(options)
     runs_dir = data_dir / RUNS_DIR
     gen_dir = runs_dir / generation
     needs_db = any(a.requires_db for a in arms)
@@ -272,6 +297,13 @@ async def run_generation(
                         k: v for k, v in (src_meta.get("unsearchable_before") or {}).items()
                         if k in selected},
                     "missing_queries": [qid for qid in selected if qid not in src_runs],
+                    # The search-eval gate (Codex review): the digest of the
+                    # source generation's own scored report, so `gate` can
+                    # bind `--baseline-report` to it. Null when the source
+                    # data directory's `report.json` is absent or scores
+                    # another generation (gate then refuses).
+                    "source_report_sha256": _source_report_sha256(
+                        Path(arm.spec[len("runfile:"):]), src_meta.get("generation")),
                 })
             else:
                 if arm.requires_db and _is_semantic(arm.membership):
