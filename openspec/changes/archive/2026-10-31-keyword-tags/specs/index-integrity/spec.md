@@ -78,4 +78,3 @@ The tags text bound to every keyword-vector writer SHALL be `tags_text(tags)` in
 
 - **WHEN** a note's only `#gamma` is inside a fenced code block
 - **THEN** its vector SHALL hold no weight-`B` lexeme for `gamma`, as `notes_metadata.tags` holds no `gamma`
-
