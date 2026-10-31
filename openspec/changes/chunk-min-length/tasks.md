@@ -1,13 +1,13 @@
 ## 1. Constants (no setting)
 
-- [ ] 1.1 In `src/services/embeddings.py`, add the constants `CHUNK_MIN_CHARS = 200` and `CHUNK_BOUNDARY_LOOKBACK_CHARS = 200`, plus the helpers `effective_min_chars(W) = min(200, W // 2)` and `lookback(W) = min(200, W // 10)`. Docstring: changing either constant is a `CHUNKING_VERSION` bump. Do not touch `src/config.py` or `embedding_fingerprint()`.
-- [ ] 1.2 Tests:
+- [x] 1.1 In `src/services/embeddings.py`, add the constants `CHUNK_MIN_CHARS = 200` and `CHUNK_BOUNDARY_LOOKBACK_CHARS = 200`, plus the helpers `effective_min_chars(W) = min(200, W // 2)` and `lookback(W) = min(200, W // 10)`. Docstring: changing either constant is a `CHUNKING_VERSION` bump. Do not touch `src/config.py` or `embedding_fingerprint()`.
+- [x] 1.2 Tests:
   - At `CHUNK_SIZE` 1, 64 and 512, settings load and `embedding_fingerprint()` is byte-identical to the pre-change literal, so no startup refuses.
   - The effective minimum is 2 at `CHUNK_SIZE=1`, 128 at 64, and 200 at 512.
 
 ## 2. Chunker (`src/services/embeddings.py`)
 
-- [ ] 2.1 `chunk_text_bounded(…, min_chars=0)`:
+- [x] 2.1 `chunk_text_bounded(…, min_chars=0)`:
   - Cut at the last line start, then the last word start, within the lookback; otherwise cut hard (D1).
   - Store the raw window, unstripped. Emit a window only if its stripped text is non-empty.
   - With overlap, snap forward only within `[s, cut]`.
@@ -15,16 +15,16 @@
   - Accept a cut only if it is admissible (`clen` of the preceding window ≥ m). Fall back to step 4 for windows that are mostly whitespace.
   - Apply D3's tail balancing: split at `S ≥ 2m + 1` (the admissible word start nearest the midpoint, otherwise the midpoint hard cut), or merge into one window at `S ≤ 2m`.
   - Keep the termination guard and the one-past-the-cap rule.
-- [ ] 2.2 `chunk_note_bounded`, using D3 grouping over the unchanged `_note_sections`:
+- [x] 2.2 `chunk_note_bounded`, using D3 grouping over the unchanged `_note_sections`:
   - Extend a group forward over short sections.
   - At the end, join a short group backward.
   - A sole short group stands alone when the whole note is short; otherwise the note becomes one whole-body group at ordinal 0.
   - Keep the headings-only fallback as one group.
   - Keep one cap counter across groups.
-- [ ] 2.3 D4 locator: build a cleaned-to-raw offset map per group, compute each chunk's raw span, and take the deepest N with `raw span ⊆ _section_body_span(N)` (imported), else 0. Take the heading path and the prefix from N.
-- [ ] 2.4 Set `CHUNKING_VERSION = 2` and add `EMBEDDED_TEXT_FORMATTERS = {1: identity, 2: collapse_long_runs}`, with the docstring rule (D6, D9). `embedding_input(prefix, chunk)` returns `prefix + "\n\n" + EMBEDDED_TEXT_FORMATTERS[CHUNKING_VERSION](chunk)`, and `embedded_input_digest` and `note_provider_inputs` use it unchanged.
-- [ ] 2.5 Make the reuse lookup accept a stamp that is a key of the table (NULL never is), with equal prefixes and `fmt[stamp](stored) == fmt[2](new)`. Every other `== CHUNKING_VERSION` site, such as the backstop's `= :cv`, stays strict, with a justifying comment.
-- [ ] 2.6 Unit tests in `tests/test_chunk_min_length.py`:
+- [x] 2.3 D4 locator: build a cleaned-to-raw offset map per group, compute each chunk's raw span, and take the deepest N with `raw span ⊆ _section_body_span(N)` (imported), else 0. Take the heading path and the prefix from N.
+- [x] 2.4 Set `CHUNKING_VERSION = 2` and add `EMBEDDED_TEXT_FORMATTERS = {1: identity, 2: collapse_long_runs}`, with the docstring rule (D6, D9). `embedding_input(prefix, chunk)` returns `prefix + "\n\n" + EMBEDDED_TEXT_FORMATTERS[CHUNKING_VERSION](chunk)`, and `embedded_input_digest` and `note_provider_inputs` use it unchanged.
+- [x] 2.5 Make the reuse lookup accept a stamp that is a key of the table (NULL never is), with equal prefixes and `fmt[stamp](stored) == fmt[2](new)`. Every other `== CHUNKING_VERSION` site, such as the backstop's `= :cv`, stays strict, with a justifying comment.
+- [x] 2.6 Unit tests in `tests/test_chunk_min_length.py`:
   - **Live fixture 1.** `## Email Triage\nSee entries in the Email Triage log\n### 2026-10-01\n<300 chars>`: no chunk is under the minimum. The first chunk contains the short line and the `###` line, at the ordinal of `## Email Triage`.
   - **Live fixture 2.** A section of 2,048·2 + 4 characters ending `…themselves`: no chunk is `lves`, and no cut falls inside a word that has whitespace in its lookback.
   - **Codex B2.** At W=400 with overlap 1, `A×400 + B×20 + " " + C×500`: every `B` is in a chunk.
@@ -44,21 +44,21 @@
   - LF, CRLF and CR line endings.
   - A fence across a merge boundary.
   - `CHUNK_SIZE=1` and `64`.
-- [ ] 2.7 Property test over generated notes (random heading depths, short and long sections, empty sections, fences, frontmatter, three terminators, overlap 0 and above 0, small and default `CHUNK_SIZE`):
+- [x] 2.7 Property test over generated notes (random heading depths, short and long sections, empty sections, fences, frontmatter, three terminators, overlap 0 and above 0, small and default `CHUNK_SIZE`):
   - For every chunk, `read_note(section="#N")` resolves and the chunk is a substring of that body after the whole-body fence spans are removed.
   - Every non-heading cleaned character is in some chunk.
   - Every window except a whole-short note's only chunk has `clen ≥ m` and `clen ≤ W`.
   - The raw length is at most `W` whenever the generated text has no whitespace run longer than `W − 2m`. Otherwise any excess is whitespace only.
   - D8's `under_min` (`clen < m` in a note with more than one chunk) is 0.
   - A note has zero chunks exactly when `chunk_text_bounded(clean_for_embedding(body))` has zero.
-- [ ] 2.8 Golden formatter test: every `EMBEDDED_TEXT_FORMATTERS` entry, `embedding_input` and `build_embed_prefix` on fixed inputs match committed outputs. On a mismatch it fails with "frozen formatter changed: add an entry or clear the table".
-- [ ] 2.8a D9 tests:
+- [x] 2.8 Golden formatter test: every `EMBEDDED_TEXT_FORMATTERS` entry, `embedding_input` and `build_embed_prefix` on fixed inputs match committed outputs. On a mismatch it fails with "frozen formatter changed: add an entry or clear the table".
+- [x] 2.8a D9 tests:
   - For `A×100 + space×3000 + B×100` under prefix `P`, the provider input is `P + "\n\n" + A×100 + " " + B×100` (length `len(P) + 203`), and the stored `chunk_text` keeps the run.
   - Runs of exactly 8, and `\n\n`, are kept byte-for-byte.
   - A run of 9 tabs or CRs collapses to one space.
   - NBSP runs are not collapsed.
   - For every chunk of at most `W` raw in the 2.7 property test, the input is at most `W + 302`.
-- [ ] 2.9 Update the version literals in `test_heading_chunks.py`, `test_heading_chunks_reuse.py`, `test_heading_chunks_pg.py` and `test_search_eval_pg.py`. Reuse cases:
+- [x] 2.9 Update the version literals in `test_heading_chunks.py`, `test_heading_chunks_reuse.py`, `test_heading_chunks_pg.py` and `test_search_eval_pg.py`. Reuse cases:
   - A v1 stamp with an identical pair and no run longer than 8 reuses; the same pair holding a 12-space run does not.
   - A NULL stamp does not reuse.
   - A stamp outside the set does not reuse.
@@ -67,10 +67,10 @@
 
 ## 3. Observation
 
-- [ ] 3.1 `src/services/indexer.py`: sum `result.chunks_submitted` beside `total_chunks`, and extend the completion line to `…: N notes, X chunks (S submitted, R reused)`, counts only. Test with a mocked pass: one note fully reused and one fresh, and assert the line's numbers.
-- [ ] 3.2 `scripts/search_eval/db.chunk_lengths(session, owner, m, W)`: one read-only `SELECT` under `legacy_chunked_notes`' owner predicate. It returns `{chunks, p10, p50, p90, whole_short, under_min, raw_over_window}` per D8, or null for an empty set or a pre-034 copy. The SQL `clen` expression is a module-level constant paired with the chunker's Python `clen`.
-- [ ] 3.3 `runner.py` / `scoring.py`: record it for DB-backed semantic arms. A `runfile:` arm carries its staged value or null. Fixture arms gain nothing.
-- [ ] 3.4 Tests:
+- [x] 3.1 `src/services/indexer.py`: sum `result.chunks_submitted` beside `total_chunks`, and extend the completion line to `…: N notes, X chunks (S submitted, R reused)`, counts only. Test with a mocked pass: one note fully reused and one fresh, and assert the line's numbers.
+- [x] 3.2 `scripts/search_eval/db.chunk_lengths(session, owner, m, W)`: one read-only `SELECT` under `legacy_chunked_notes`' owner predicate. It returns `{chunks, p10, p50, p90, whole_short, under_min, raw_over_window}` per D8, or null for an empty set or a pre-034 copy. The SQL `clen` expression is a module-level constant paired with the chunker's Python `clen`.
+- [x] 3.3 `runner.py` / `scoring.py`: record it for DB-backed semantic arms. A `runfile:` arm carries its staged value or null. Fixture arms gain nothing.
+- [x] 3.4 Tests:
   - Two tenants: the other tenant's rows change no byte.
   - The fixture's golden projection is unchanged.
   - An older runfile yields null.
@@ -79,14 +79,14 @@
 
 ## 4. Docs (same PR)
 
-- [ ] 4.1 README result format: previews start on a word, and a merged chunk can contain an inner heading line. One sentence noting that the minimum is a constant tied to the chunking version (not a setting).
-- [ ] 4.2 DEPLOYMENT.md:
+- [x] 4.1 README result format: previews start on a word, and a merged chunk can contain an inner heading line. One sentence noting that the minimum is a constant tied to the chunking version (not a setting).
+- [x] 4.2 DEPLOYMENT.md:
   - Upgrade note "Chunking version 2 (#390)": no migration or setting, a **second gradual re-embed of the whole vault** right after #355's, the marker and `/health` reappearing and draining, the `(S submitted, R reused)` line, and the rollback cost (L8).
   - Recipe: change the predicate literal to `2`, and add the baseline drain, the before distribution, the S/R sum, the `under_min` SQL and D8's CI95 release rule with its exact report fields.
-- [ ] 4.3 `docs/architecture/indexing-and-embeddings.md`, "Heading-aware chunks (#355)": add a subsection covering the minimum and the effective minimum, grouping, the tail rule, the window bound, the locator rule, lookback, coverage, raw windows, the compatible set and the log line. Replace the "byte-identical to `chunk_text_bounded(clean_for_embedding(body))`" sentence.
-- [ ] 4.4 `docs/architecture/search.md`: the windowing truth and the chunk-length note.
-- [ ] 4.5 CLAUDE.md: one key-decision bullet.
-- [ ] 4.6 Grep check: no doc still says `IS DISTINCT FROM 1`, and no doc names a `CHUNK_MIN_CHARS` setting.
+- [x] 4.3 `docs/architecture/indexing-and-embeddings.md`, "Heading-aware chunks (#355)": add a subsection covering the minimum and the effective minimum, grouping, the tail rule, the window bound, the locator rule, lookback, coverage, raw windows, the compatible set and the log line. Replace the "byte-identical to `chunk_text_bounded(clean_for_embedding(body))`" sentence.
+- [x] 4.4 `docs/architecture/search.md`: the windowing truth and the chunk-length note.
+- [x] 4.5 CLAUDE.md: one key-decision bullet.
+- [x] 4.6 Grep check: no doc still says `IS DISTINCT FROM 1`, and no doc names a `CHUNK_MIN_CHARS` setting.
 
 ## 5. Gates
 

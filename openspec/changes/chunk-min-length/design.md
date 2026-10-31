@@ -653,3 +653,77 @@ Declined: none.
 - **L8** — Rolling back to a v1 build fully re-embeds the notes stamped 2.
 - **L9** — The live "lves" row was not traced to its note. The fixtures
   reproduce both mechanisms, not the exact note.
+
+## Implementation notes (2026-10-30)
+
+Choices the spec left open, and the places where the implementation had to
+read it one way. None changes a pinned output: all four pinned cases (W=400
+`A×161 + " " + B×239`, default W `A×1800 + space×390 + B×10`, W=400 overlap
+99 `A×599`, `A×100 + space×3000 + B×100`) reproduce exactly.
+
+1. **`min_chars` is a parameter of `chunk_text_bounded` only**, default 0
+   (task 2.1). `chunk_note_bounded` takes no minimum argument: it always
+   passes `effective_min_chars(W)`. `chunk_text` and the zero-chunk probe keep
+   0, which cannot change whether a text has a chunk.
+2. **"Empty" is `clen == 0` everywhere** (a section's non-emptiness, a kept
+   window), per D3 after r3-1, not `str.strip()`. The difference is Unicode
+   whitespace other than the six ASCII characters: a note holding only NBSP
+   now yields one chunk where version 1 yielded none. The zero-chunk
+   invariant holds against the new `chunk_text_bounded`, as task 2.7 states.
+3. **The midpoint hard cut** is the smallest position whose left side has
+   `clen ≥ ⌊S/2⌋`. Exact equality is unreachable when the half falls on a
+   collapsed space (including a word's first character also includes the
+   space before it, so `clen` steps by two); the right side still keeps `m`
+   because `S ≥ 2m + 1`.
+4. **"Nearest the collapsed midpoint"** is measured as
+   `|clen(left) − clen(right)|`, the earlier word start on a tie.
+5. **D1 step 4 respects the window bound.** The first admissible word start
+   past the limit is taken only when the window it ends has `clen ≤ W`;
+   otherwise the first admissible position is. Without this, a mostly
+   whitespace window followed by a long unbroken run (`A` + 3,000 spaces +
+   5,000 `B` + ` C`) produced a chunk of `clen` 5,002, contradicting the
+   Bounds clause.
+6. **The whole-body groups record ordinal 0 for every window**, as the
+   grouping and "No sections" clauses say ("at ordinal 0"), rather than the
+   deepest containing section. Both satisfy parity; a later window of a
+   whole-body group may lie inside one section's body and still reports 0.
+7. **Task 2.7's raw-bound condition is not sufficient, so the test asserts a
+   weaker true property.** "Raw length ≤ W whenever no whitespace run is
+   longer than `W − 2m`" fails on a generated note at the default window: a
+   1,098-character unbroken run followed by a 1,428-space run (shorter than
+   `W − 2m` = 1,648). The last window cuts hard inside the space run, tail
+   balancing finds no word start leaving both sides `≥ m` within `W` raw
+   (the run has no word starts), and the midpoint hard cut lands outside the
+   in-bound range, giving a chunk of 2,071 raw, `clen` 619. An in-bound hard
+   cut existed, but the spec's fallback is the midpoint. At `W ≤ 400`,
+   `W − 2m` is 0. The property test therefore asserts `clen ≤ W` for every
+   chunk (the excess is whitespace only, as the spec's Bounds clause
+   requires), and `raw ≤ W` at the default window for ordinary text (no
+   whitespace run over 8, no unbroken run over the lookback); a second
+   generator of headings and prose asserts `raw ≤ W` and the `W + 302` input
+   bound on every chunk. A candidate for the adversarial pass: whether the
+   hard-cut fallback should clamp into `[end − W, a + W]` (no pinned output
+   would change); left as specified.
+8. **`S` in the completion line is summed over the same certified notes as
+   `X`** (`EMBEDDED` and `CERTIFIED_EMPTY`), so `R = X − S` is never
+   negative. Provider work spent on a note that then failed or lost its
+   certification race is not in `S`. The line's test is on PostgreSQL with a
+   fake provider (a real pass), not an offline mock of `embed_vault`.
+9. **The reuse lookup returns `(row id, vector, stored chunk_text)`**, and
+   the under-lock re-check compares the stored row's own text. Under version
+   2 two different raw texts can map to one embedded input (runs of 9 and 20
+   spaces), so the new chunk's text is not the row's.
+10. **`CLEN_SQL` lives in `embeddings.py` beside `clen`**, and
+    `scripts/search_eval/db.UNDER_MIN_SQL` is built from it. DEPLOYMENT.md
+    quotes that statement with `m = 200`; an offline test checks the doc
+    holds it byte for byte, and a PostgreSQL test checks the SQL and Python
+    `clen` agree (tabs, CR, VT, FF, NBSP, long runs).
+11. **`chunk_lengths` is null for an owner with no chunks** as well as for a
+    pre-034 copy; the percentiles are `percentile_disc`.
+12. `_note_sections` keeps its output; it now delegates to
+    `_sections_from_headings` so the chunker scans headings once.
+    `_chunk_note` returns each chunk's raw span beside it (the property test
+    reads it for coverage); `chunk_note_bounded` is its public wrapper.
+13. #355's offline tests were updated, not deleted: their sections were
+    padded to at least `m`, and the "byte-identical to the pre-change
+    chunker" test now compares with `chunk_text_bounded(…, min_chars=m)`.

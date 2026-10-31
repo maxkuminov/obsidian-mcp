@@ -722,7 +722,24 @@ heading cannot close the quote and the `(#7)` after it is server-authored; a
 forged `(#3)` inside a heading stays inside the quotes. Over 160 characters
 the outer components are dropped behind `…/`, keeping the innermost heading.
 `read_note(path, section="#7")` resolves the same ordinal over the same bytes
-(the chunker uses the section-addressing scanner).
+(the chunker uses the section-addressing scanner). Since #390 the ordinal is
+the **deepest** section whose `read_note(section="#N")` body contains the
+chunk, so a chunk merged across headings names the parent (or the top of the
+note), and the follow-up still contains it.
+
+**What a chunk is (#390, chunking version 2).** The windowing no longer cuts
+fixed 2,048-character slices: a window ends on a line or word start within
+`min(200, W // 10)` of its limit, and no stored chunk is shorter than
+`min(200, W // 2)` collapsed characters except the single chunk of a note that
+short. Short sections are grouped with their neighbours, so a merged chunk's
+preview can show an inner heading line (collapsed to one line by
+`_preview_line`, so it cannot forge a row), and previews start on a word. The
+reason is ranking: a 25-character chunk's provider input is mostly its
+300-character breadcrumb prefix, so its vector is the note's topic and it
+outranked real passages for any query about that topic. Ranking-time
+down-weighting was declined — it would keep the degenerate vectors stored
+and add a score transform hybrid, the reranker and the harness would all have
+to know about. See [indexing and embeddings](indexing-and-embeddings.md).
 
 **Withheld on stale and pre-034 rows.** `section` is `None` when the row is
 stale — `#N` is positional, and an ordinal recorded for content the index knows
@@ -1218,6 +1235,18 @@ only for a `"multi"`, non-attachable report) that hold vector rows and whose
 the committed golden fixture is unchanged. A re-chunk comparison is evidence
 only when the candidate arm's `legacy_chunked_notes` is 0 (DEPLOYMENT.md,
 "Before and after a re-chunk or re-embed").
+
+**And the chunk-length distribution (#390).** The same arms stage
+`chunk_lengths`: `{chunks, p10, p50, p90, whole_short, under_min,
+raw_over_window}` over the owner's stored chunks, by one read-only `SELECT`
+under the same owner predicate, null for an empty set or a pre-034 copy.
+Every length is the chunker's `clen` through its SQL twin
+(`embeddings.CLEN_SQL`); `whole_short` counts chunks below the effective
+minimum in a one-chunk note (L7), `under_min` those in a note with more than
+one chunk — **0 for a conforming chunker**, and `scripts/search_eval/db.
+UNDER_MIN_SQL` is the exact statement the recipe runs — and
+`raw_over_window` chunks longer than one window raw (L3, observation only).
+A re-chunk to version 2 is evidence only with `under_min: 0` as well.
 
 ## Change-feed lines and the listing windows (#351)
 

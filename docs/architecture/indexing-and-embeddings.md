@@ -274,16 +274,20 @@ strictly shallower heading, `_path_chain_match`'s rule), components cut at 200
 characters with `…`. A change to the heading scan is now also a
 `CHUNKING_VERSION` bump.
 
-**The zero-chunk invariant.** A note with no headings chunks byte-identically
-to `chunk_text_bounded(clean_for_embedding(body))`. A note whose sections are
-all empty but whose cleaned body is not (headings only) falls back to that
-whole-body chunking as section 0, so a note has zero chunks exactly when the
-pre-034 chunker gave it zero: `CERTIFIED_EMPTY`, #127's convergence exceptions
+**The zero-chunk invariant.** A note with no headings is one group, chunked
+exactly like `chunk_text_bounded(clean_for_embedding(body), min_chars=m)`
+(since #390; #355's "byte-identical to the pre-change chunker" ended with the
+minimum and the word-boundary windows below). A note whose sections are all
+empty but whose cleaned body is not (headings only) is chunked as one group of
+the whole cleaned body at ordinal 0, so a note has zero chunks exactly when
+`chunk_text_bounded(clean_for_embedding(body))` gives it zero: `CERTIFIED_EMPTY`, #127's convergence exceptions
 and the exclusion sweep's probe (which now calls `chunk_note_bounded`) keep
 their meaning.
 
 **The prefix.** The provider input is `embedding_input(prefix, chunk)` =
-`prefix + "\n\n" + chunk`; `prefix` is `build_embed_prefix(title, path,
+`prefix + "\n\n" + embedded_text(chunk)` (`embedded_text` is the identity at
+version 1 and collapses whitespace runs longer than 8 at version 2, #390);
+`prefix` is `build_embed_prefix(title, path,
 tags)`: `Title > H1 > … > Hk`, each component whitespace-collapsed and cut at
 80, outer headings replaced by one `…` until the breadcrumb fits
 `EMBED_PREFIX_MAX_CHARS` (300; the title and innermost heading always fit),
@@ -371,6 +375,87 @@ reused) until its next edit or the next full-hash backstop.
   marked `…`.
 - **L11** — the full-hash backstop holds every note body for the pass, once
   per interval and at startup, the memory profile of a re-derive.
+
+### A minimum chunk length and word-boundary windows (#390, chunking version 2)
+
+Live, a four-word chunk ("in the Email Triage log") ranked first for a
+paraphrase query, and another row's preview was "lves". A chunk that short is
+mostly its own prefix, so its vector is the note's topic and outranks real
+passages; and the windowing cut fixed 2,048-character slices with no word
+boundary, leaving four-character tails. Both are fixed at chunking time.
+
+- **One length, `clen`.** Every rule — the minimum, a section's shortness, cut
+  admissibility, tail balancing, the harness's `under_min` — measures the
+  *collapsed length*: runs of the six ASCII whitespace characters (U+0009–
+  U+000D, U+0020) collapsed to one space, then stripped, in code points.
+  `embeddings.clen` and `embeddings.CLEN_SQL` are one pair; a PostgreSQL test
+  checks they agree. The stored `chunk_text` is the **raw** window,
+  unstripped, as single-window chunks always were (previews trim).
+- **The minimum is a constant.** `CHUNK_MIN_CHARS = 200` and
+  `CHUNK_BOUNDARY_LOOKBACK_CHARS = 200` live in `embeddings.py`: not
+  settings, not fingerprint fields, no validator. The effective minimum is
+  `m = min(200, W // 2)` with `W = CHUNK_SIZE × 4`, so every previously valid
+  `CHUNK_SIZE` (1 included, `m = 2`) still starts. Changing either constant is
+  a `CHUNKING_VERSION` bump.
+- **Grouping.** Over the unchanged `_note_sections`, a section is *short* when
+  its cleaned `clen` is non-zero and below `m`. A group opens at a non-empty
+  section and extends forward while short; a group still short at the end
+  joins the previous group; a sole short group stands alone only when the
+  whole cleaned note is short (L7), otherwise the note becomes one whole-body
+  group at ordinal 0 (the sixty-empty-headings-then-`x` outline). A group's
+  text is its **contiguous** raw span cleaned with the whole-body fence spans,
+  so a merged chunk keeps the inner heading lines and is still one substring
+  of the note; a one-section group is exactly #355's section text.
+- **Windows.** A window of `W` is cut at the last line start, else the last
+  word start, within `L = min(200, W // 10)` of its limit, and hard only when
+  that range holds none (L4). A cut is taken only when *admissible* (the
+  window before it reaches `m`); a window that is mostly whitespace extends
+  to the first admissible word start, or position, past the limit. When the
+  text after a cut falls below `m`, the last two windows are **re-balanced**
+  over their span `S`: at `S ≥ 2m + 1` two windows, cut at the admissible word
+  start nearest the collapsed midpoint with both sides within `W` raw, else
+  the midpoint hard cut; at `S ≤ 2m` one window. With overlap the next start
+  is `max(cut − overlap × 4, a + 1)`, and after a balance
+  `min(cut, max(cut − overlap × 4, end − W, a + 1))`, each snapped forward to
+  a word start **never past the cut**, so every non-heading cleaned character
+  is in some chunk (Codex r1 B2's skipped `B`s).
+- **The bound.** Every chunk has `clen ≤ W`; its raw length exceeds `W` only
+  by whitespace, when no in-bound choice meets the minimum (L3), counted as
+  `raw_over_window`. The provider never receives those runs: `embedded_text`
+  collapses every run longer than 8 whitespace characters to one space
+  (stored text untouched), so an ordinary chunk's input stays within #355's
+  `W + 302`.
+- **The locator** is the deepest heading `N` whose `read_note(section="#N")`
+  body span (`vault._section_body_span`, imported) contains the chunk's raw
+  span, recovered through the cleaned-to-raw offset map; 0 when none does, and
+  0 for the whole-body groups. An unmerged chunk keeps its own section; a
+  short lead merged into its first child keeps the parent; merged siblings
+  take their common parent or 0 (L1). Containment and ordinal parity hold by
+  construction, and a property test asserts them, coverage and the bounds.
+- **Reuse across versions.** `EMBEDDED_TEXT_FORMATTERS = {1: identity,
+  2: collapse runs > 8}` is frozen per version, like `_EXTRACTION_CLEANERS`. A
+  stored vector is reused when its note's stamp is a key of the table (NULL
+  never is), its prefix equals the new chunk's, and `fmt[stamp](stored text)
+  == fmt[2](new text)` — the input it was built from equals the input that
+  would now be sent. A frozen entry is never edited; a formatter change adds
+  an entry; a prefix-builder or separator change clears the table to its own
+  entry; a golden test pins every entry. The under-lock re-check compares the
+  stored row's own `(chunk_text, embed_prefix)`. Every other version
+  comparison stays strict (the backstop's `= :cv`).
+- **The transition** is #355's, unchanged: the backlog (`IS DISTINCT FROM 2`),
+  the `index_transition:` marker, `/health` `rechunk: "in_progress"` and the
+  rollback rule. The embed stage's completion line now reads
+  `Embedding complete…: N notes, X chunks (S submitted, R reused)` — counts
+  only — where `S` is the provider work and `R = X − S`, both over the
+  certified notes of the pass.
+
+**Accepted limitations (#390).** L1 merged locators are coarser; L3 a chunk
+may exceed `W` raw by whitespace only; L4 an unbroken run (base64, a URL, CJK
+without spaces) is cut hard; L5 lengths are code points, not tokens; L6 the
+second transition repeats #355's L1; L7 a note whose whole cleaned text is
+below `m` keeps its one short chunk (`whole_short`); L8 a rollback to a
+version-1 build re-embeds every note stamped 2; L9 the live "lves" row was not
+traced to its note.
 
 ## Indexing decisions
 

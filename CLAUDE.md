@@ -399,13 +399,11 @@ update it in the same change.** What stays here is the short list:
 - **Chunks are heading-aware, and the chunking format is per note, not in
   the fingerprint** (#355, #367, migration 034). `chunk_note_bounded` splits
   at ATX headings with `vault._scan_headings` itself (each heading's own text;
-  heading lines excluded; a no-heading note chunks byte-identically; a
-  headings-only note falls back to whole-body chunking), so a chunk's
+  heading lines excluded; a headings-only note falls back to whole-body
+  chunking), so a chunk's
   `section_ordinal` is the `#N` `read_note(section=…)` resolves. The provider
   input is `embed_prefix + "\n\n" + chunk_text` (`Title > H > H`, tags line
-  if ≤ 300 chars); `chunk_text` stays un-prefixed. Reuse keys on
-  `(embed_prefix, chunk_text)` under the note's `embedded_chunking_version ==
-  CHUNKING_VERSION`. `certify_embedded` stamps that version and
+  if ≤ 300 chars); `chunk_text` stays un-prefixed. `certify_embedded` stamps that version and
   `embedded_input_digest`; the upsert clears certification on a changed
   title/tags and the full-hash pass re-checks the digest. A version change
   re-selects notes through the backlog (budgeted in **every** mode, after
@@ -419,6 +417,25 @@ update it in the same change.** What stays here is the short list:
   document`; `EMBEDDING_QUERY_INSTRUCTION` is queries-only and outside the
   stored fingerprint (in the logged retrieval fingerprint). A heading-scan
   change bumps `CHUNKING_VERSION`. See [indexing and embeddings](docs/architecture/indexing-and-embeddings.md).
+- **No chunk is shorter than the minimum; `CHUNKING_VERSION` is 2** (#390,
+  no migration). `CHUNK_MIN_CHARS = 200` and the 200-char boundary lookback
+  are **constants** in `embeddings.py` (never settings or fingerprint fields;
+  changing one is a version bump); the effective minimum is
+  `min(200, W // 2)`, `W = CHUNK_SIZE × 4`. Every length is `clen` (ASCII
+  whitespace runs collapsed, stripped; `CLEN_SQL` is its tested SQL twin);
+  stored `chunk_text` is the raw, unstripped window. Short sections group
+  forward (a short tail backward; a sole short group stands alone only in a
+  whole-short note, else the whole body is one group at 0); a group is its
+  contiguous cleaned span, inner heading lines included, then windowed at a
+  line/word start within the lookback, cuts admissible only at `clen ≥ m`,
+  the last two windows re-balanced, overlap starts never past the cut. The
+  locator is the **deepest** `#N` whose `read_note` body contains the chunk.
+  The provider input collapses whitespace runs > 8 (`EMBEDDED_TEXT_FORMATTERS`,
+  frozen per version, never edited; a prefix/separator change clears it);
+  reuse needs the stamp to be a key, equal prefixes and
+  `fmt[stamp](stored) == fmt[current](new)`. The embed completion line reads
+  `(S submitted, R reused)`; the harness's `chunk_lengths.under_min` must be
+  0. See [indexing and embeddings](docs/architecture/indexing-and-embeddings.md).
 - **A pass does not prune what it could not see** (#309). Rows at or beneath
   a directory the walk could not list (or type) are neither pruned nor
   move-paired, and the run is recorded `walk incomplete` (failed); under a

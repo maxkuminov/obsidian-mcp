@@ -1019,6 +1019,15 @@ harness's `runfile:` arms carry the baseline across:
 2. **Baseline generation**, from a checkout of the incumbent release:
    `make search-eval … ARMS="keyword semantic"`. Keep that generation's
    staged `semantic` arm file (`.search-eval/runs/<generation>/semantic.json`).
+   **The incumbent runs first, on a drained copy.** If the copy still holds
+   notes of an older chunking version (production had not finished the
+   previous transition when it was backed up), first run the *incumbent*
+   image over it as in step 3 until the drain query reads 0 at the
+   incumbent's version, then take the baseline. For chunking version 2
+   (#390), also record the **before distribution**: run the candidate
+   checkout's harness with `ARMS="semantic"` on that drained copy, before
+   re-embedding, and keep its `chunk_lengths` (its `legacy_chunked_notes` is
+   non-zero, as expected; that run is not the candidate).
 3. **Upgrade and re-embed the copy** with the candidate image, as a one-off
    container: `DATABASE_URL` is the scratch copy, the vault is mounted
    **read-only** at the path the copy's `users.vault_path` names, no port is
@@ -1026,19 +1035,35 @@ harness's `runfile:` arms carry the baseline across:
    the migrations and its indexer re-embeds. To finish in one sitting, set
    `EMBED_TIME_BUDGET_SECONDS_PER_USER=0` and `EMBED_CHUNK_BUDGET_PER_USER=0`
    **on that container only**. Wait until
-   `SELECT count(*) FROM notes_metadata WHERE embedded_content_hash IS DISTINCT FROM content_hash OR embedded_chunking_version IS DISTINCT FROM 1`
-   reads 0, then stop it. A residue that does not drain is notes whose bytes
+   `SELECT count(*) FROM notes_metadata WHERE embedded_content_hash IS DISTINCT FROM content_hash OR embedded_chunking_version IS DISTINCT FROM 2`
+   reads 0 (the literal is the candidate's `CHUNKING_VERSION`, 2 since #390),
+   then stop it. A residue that does not drain is notes whose bytes
    changed since the backup: report it, do not chase it. Record
    `SELECT count(*) FROM note_embeddings` and the pass durations in
-   `indexer_runs`; that is your production estimate.
+   `indexer_runs`; that is your production estimate. Also sum the
+   `(S submitted, R reused)` counts over the container's
+   `Embedding complete…` log lines: `S` is the provider work the transition
+   costs, `R` the vectors it reused.
 4. **Candidate generation**, from the candidate checkout:
    `make search-eval … ARMS="keyword semantic runfile:<baseline semantic file>" BASELINE=runfile:<baseline semantic file>`.
    Each semantic arm in `report.json` carries its `retrieval_fingerprint`
    (the embedding settings, the chunking version and a digest of
    `EMBEDDING_QUERY_INSTRUCTION`, never the text) and the copy's
    `legacy_chunked_notes`, counted for the export's owner. That count must
-   be 0 for the report to be evidence.
-5. Attach `report.json` only if `attachable: true`, as above.
+   be 0 for the report to be evidence. Since #390 it also carries
+   `chunk_lengths` (`chunks`, `p10`/`p50`/`p90`, `whole_short`, `under_min`,
+   `raw_over_window`), and `under_min` must be 0 too. It is exactly this
+   statement, with the effective minimum (200 at the default `CHUNK_SIZE`):
+   `SELECT count(*) FROM note_embeddings ne WHERE length(btrim(regexp_replace(ne.chunk_text, '[\t\n\v\f\r ]+', ' ', 'g'))) < 200 AND (SELECT count(*) FROM note_embeddings o WHERE o.note_id = ne.note_id) > 1`
+5. **The release rule for a chunking change (#390).** For the candidate
+   arm's label, read
+   `deltas[<label>][<slice>][<metric>]["ci95"]` for `<slice>` in `overall`
+   and `class:prose` and `<metric>` in `recall@10` and `ndcg@10`. **Accept**
+   when all four have `ci95[1] >= 0` (the interval contains zero or lies
+   above it); **reject** when any has `ci95[1] < 0`. **Re-measure, never
+   accept,** when the `verdict` is `INSUFFICIENT_DATA` or `CORPUS_LOSS`, or
+   any of the four `ci95` is null.
+6. Attach `report.json` only if `attachable: true`, as above.
 
 ### Reranker (optional)
 
@@ -1126,6 +1151,33 @@ is backfilled.
   prefixed input as if they were the bare chunk's), then deploy the old
   image, which re-embeds those notes. Until it does, they are missing from
   semantic search.
+
+## Upgrading to chunking version 2 (#390, minimum chunk length)
+
+No migration and no new setting. **This is a second gradual re-embed of the
+whole vault, right after the 034 one above**: version 2 stops storing chunks
+shorter than 200 characters (a short section is grouped with its
+neighbours), cuts windows at a line or word start, and sends long whitespace
+runs collapsed. The minimum is a constant tied to the chunking version, not
+a setting, so every previously valid `CHUNK_SIZE` still starts (below 100 the
+minimum is half the window).
+
+- **Startup does not refuse**, and the startup `Embedding retrieval:` line
+  shows `"chunking_version":2`.
+- **What you see.** The same transition as 034's: every note is selected
+  again in the background under the per-tenant budgets; the
+  `index_transition: N notes not yet re-chunked; …` line returns on
+  `semantic_search`, `find_related` and `hybrid_search` until your notes
+  drain; `/health` reads `indexer.rechunk: "in_progress"` and then
+  `"complete"`; the dashboard's pending count jumps to about your note count
+  and falls each pass. Each pass logs
+  `Embedding complete: N notes, X chunks (S submitted, R reused)`: a section
+  that did not change keeps its vector, so expect fewer provider calls than
+  034's transition. Previews now start on a word, and a merged chunk's
+  preview can include an inner heading line.
+- **Rollback.** Deploy the previous image. There is no schema to undo, but
+  that build re-embeds every note stamped 2 in full (it reuses nothing
+  across the versions).
 
 ## Upgrading: split database roles
 
