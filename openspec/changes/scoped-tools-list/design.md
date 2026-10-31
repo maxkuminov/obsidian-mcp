@@ -226,3 +226,19 @@ FAIL. The filtering/cache implementation held up under targeted review, and 129 
 ```json
 {"verdict":"FAIL","findings":[{"severity":"MAJOR","file":"src/mcp_server/tools.py","line":1946,"claim":"The new body-boundary gate changes write_file refusal precedence beyond the sole malformed-hash exception approved in L5.","failing_input":"A read-only OAuth grant calls write_file(path=\"a.bin\", content=\"AAAA\", overwrite=false, expected_hash=\"sha256:\" followed by 64 zeroes). On c491326, write_file returned no_incumbent before reaching _require_write; HEAD returns permission_denied from _tracked. The new tests cover only malformed expected_hash, so this valid-hash case passes unnoticed.","fix":"Preserve the existing valid-hash/no-overwrite no_incumbent precheck ahead of the permission gate and add an exact regression assertion for this read-only case. If the broader precedence change is intended, obtain owner approval and amend L5 and the documentation explicitly."}]}
 ```
+
+## Adversarial Codex — implementation round 2
+
+Verdict on ffc7320, verbatim:
+
+PASS. Round-1’s MAJOR is resolved by the owner-approved L5 expansion. Baseline inspection confirms only `write_file` and `delete_file` had pre-permission refusals; all other seven write-required tools checked permission first, directly or through `_mint_preflight`.
+
+Token/quota accounting matches the baseline: one general token, one additional write token for write-bucket tools, and one quota admission. The integration test uses the real OAuth middleware and panel family-scope update. Targeted tests: 220 passed, 3 skipped; the PostgreSQL test was statically verified but skipped because `PGVECTOR_TEST_ADMIN_URL` was unavailable.
+
+One minor assertion gap remains: the malformed-hash cases do not pin the exact readwrite refusal code.
+
+```json
+{"verdict":"PASS","round1":[{"claim":"The body-boundary gate changes write_file refusal precedence beyond the previously approved malformed-hash L5 exception.","status":"VERIFIED"}],"findings":[{"severity":"MINOR","file":"tests/test_issue_358_scoped_tools_list.py","line":443,"claim":"The L5 regression test does not enforce the specified exact malformed_precondition result for readwrite callers.","failing_input":"If either readwrite malformed-expected_hash path regressed to validation_failed, no_incumbent, or any other non-permission_denied refusal, the test would still pass because both parameter rows use readwrite_code=None and line 472 only checks that the code is not permission_denied.","fix":"Set readwrite_code to malformed_precondition for both malformed-hash rows and unconditionally assert again.refusal.code == readwrite_code."}]}
+```
+
+Folded: both malformed-hash rows of the L5 test now expect `malformed_precondition` from a `readwrite` caller, and the expected code is asserted unconditionally.

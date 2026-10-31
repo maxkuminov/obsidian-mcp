@@ -445,8 +445,8 @@ ZERO_HASH = "sha256:" + "0" * 64
 @pytest.mark.parametrize(
     "call,readwrite_code",
     [
-        (lambda: tools.write_file_impl("a.bin", "AAAA", expected_hash="not-a-hash"), None),
-        (lambda: tools.delete_file_impl("a.bin", expected_hash="not-a-hash"), None),
+        (lambda: tools.write_file_impl("a.bin", "AAAA", expected_hash="not-a-hash"), "malformed_precondition"),
+        (lambda: tools.delete_file_impl("a.bin", expected_hash="not-a-hash"), "malformed_precondition"),
         # Codex implementation round 1: a well-formed hash with
         # `overwrite=false` is refused `no_incumbent` before the in-body
         # permission check; the body-boundary gate now answers first.
@@ -472,8 +472,7 @@ async def test_l5_a_pre_permission_refusal_is_now_permission_denied_for_a_readon
     assert again.refusal is not None and again.refusal.code != "permission_denied", (
         "a readwrite caller still gets the pre-permission refusal"
     )
-    if readwrite_code is not None:
-        assert again.refusal.code == readwrite_code
+    assert again.refusal.code == readwrite_code
 
 
 # ══════════════════════════════════════════════════════════════════════════
