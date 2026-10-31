@@ -30,6 +30,31 @@
   See "Filtered vector search" in [search.md](search.md) for why an older
   backend fails *silently* without it.
 
+### Reference deployment (2026-10-31)
+
+The reference deployment moved from Ollama `bge-m3` to Ollama
+`qwen3-embedding:0.6b` (1024 dimensions, so `EMBEDDING_DIMENSIONS` stayed
+1024) with
+`EMBEDDING_QUERY_INSTRUCTION="Instruct: Given a question, retrieve the notes that answer it\nQuery: "`
+— queries only; documents get no instruction, and the instruction is
+outside the stored fingerprint. The switch was the documented procedure:
+`.env` change, the refused start, `make reset-embeddings` (or the
+equivalent k8s job), then a full re-embed — ~4,200 notes in about 84
+minutes on an 8 GiB Quadro P4000 shared by Ollama and the reranker. The
+later `CHUNKING_VERSION` 2 re-chunk reused ~65% of the vectors.
+
+**No harness A/B was run for the switch** (owner-waived). What was
+observed, on one user's vault and not as a benchmark: strong
+cross-language recall between English and Russian queries and notes, and
+`hybrid_search` as the day-to-day default. The way to measure it on
+another vault is the search-evaluation recipe in `DEPLOYMENT.md`.
+
+`bge-m3` stays the code default and fully supported: the stored-fingerprint
+guard refuses to start a deployment whose model changed, so a changed
+default would break every existing install that never set
+`EMBEDDING_MODEL`. The mutable-tag limitation (L1, under "The settings
+fingerprints") applies to `qwen3-embedding:0.6b` exactly as to `bge-m3`.
+
 ### The embedding hop's transport (#185)
 
 Every chunk the indexer embeds and every `semantic_search` / `find_related`
@@ -2200,7 +2225,7 @@ short-circuit, so `MCP_SANDBOX_MODE` skips them like every other guard.
   artifact, and including them would demand a full vault re-embed for a move
   that changed nothing about the vectors. The consequence is that the
   fingerprint records the **configuration, not the artifact**: `bge-m3` is a
-  mutable Ollama tag, so `ollama pull` can replace the weights behind it and a
+  mutable Ollama tag (as is `qwen3-embedding:0.6b`), so `ollama pull` can replace the weights behind it and a
   second host can serve different weights under the same name. No value
   available to this process distinguishes those cases, and a probe would have
   to trust the endpoint it is checking. **The operator rule that stands in its
