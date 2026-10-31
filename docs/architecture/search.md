@@ -536,8 +536,9 @@ the separator (after `rerank_score`), exactly as their `rerank=false`
 pages; the line is reserved in the budget, and an abbreviated first row
 drops the locator with `section omitted`. On a both-arms hybrid page the
 line (≤ 127 characters) makes the cut form sum 1,004 at the worst case
-(1,021 with the #389 token), so that case falls through to the labelled
-omitted form (1,002 with the token) and then to `explain omitted` (983):
+(1,026 with the #389 token and #391's longest `matched_in`), so that case
+falls through to the labelled omitted form (1,007) and then to `explain
+omitted` (988):
 the 1,000 bound holds, the 20–25 cut is not guaranteed there. The
 `rerank=false` byte-identity baseline is the search-confidence page since
 #389: the pre-#389 page plus ` — confidence: ok` before the header's

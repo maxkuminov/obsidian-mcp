@@ -409,7 +409,8 @@ update it in the same change.** What stays here is the short list:
   leaves every row byte-identical. A refusal carries neither; usage rows
   always record `confidence`, `top_similarity`, `keyword_all`. Bounds:
   hybrid header 405 / 444 (`rerank=true`), semantic rerank header 199, floor
-  990, last rung `explain omitted`. See [search](docs/architecture/search.md).
+  995 (row structure 345 / 367 with #391's `title+tags+body`), last rung
+  `explain omitted`. See [search](docs/architecture/search.md).
 - **The vector index is a `halfvec` expression index** (#283, migration 027),
   defined once in `src/services/vector_index.py` and excluded from `alembic
   check` by `include_object`; queries cast to match it and re-rank by
