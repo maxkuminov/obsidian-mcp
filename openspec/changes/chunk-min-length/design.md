@@ -764,3 +764,10 @@ literal byte for byte. The verifier's generator is now
 limitation **L10** records the small-window residue (`W ≤ 400`).
 
 Declined: none.
+
+## Codex implementation review, round 2 (2026-10-31)
+
+PASS on d479ba5, a verification round. All four round-1 fixes (M1, M2, M3,
+m1) VERIFIED, no new findings, and 1,375 randomized cases clean.
+
+Declined: none.

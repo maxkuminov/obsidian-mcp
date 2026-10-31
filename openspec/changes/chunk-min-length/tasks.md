@@ -99,7 +99,7 @@
   - Apply the CI95 release rule over `deltas[<label>][overall|class:prose][recall@10|ndcg@10].ci95`. `INSUFFICIENT_DATA`, a null CI or `CORPUS_LOSS` means re-measure.
   - Attach `report.json` only if `attachable: true`.
 - [x] 5.3 Run the `openspec-verifier` subagent, not as the author, until there are zero blocking gaps. — Done 2026-10-31: 0 blockers; 1 MAJOR + 4 minor, all folded; 430k-chunk property run clean.
-- [ ] 5.4 Adversarial Codex review: mandatory, `gpt-daybreak-blue-latest`, read-only, on the committed tree.
+- [x] 5.4 Adversarial Codex review: mandatory, `gpt-daybreak-blue-latest`, read-only, on the committed tree. — Done 2026-10-31: round 1 FAIL (3 MAJOR + 1 MINOR, all fixed); round 2 PASS, 4 VERIFIED, no findings.
   - Framing: silently wrong search results and a broken live path.
   - Targets: containment and parity under merges, coverage with overlap, the window bound, compatible-set reuse, the zero-chunk invariant, the cap, and the `under_min` predicate.
   - Two rounds by default, with triage per the workflow.
