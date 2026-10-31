@@ -203,11 +203,27 @@ abort is possible only for a row within 64 bytes of the limit. The
 rewrite's all-or-nothing rule stays as the backstop.
 
 The operator runs the SQL equivalent against the live 034 database before
-merging (`DEPLOYMENT.md`, read-only, counts and ids only). It approximates
-`tags_text` in SQL (U+0002/U+0003 stripped as `tags_text` strips them,
-full forms plus `/` replaced by spaces, no cut — an over-estimate) and takes
-the existing head from the vector itself, which the re-head replaces with an
-equal `A` part. It sums `S(ts_filter(v, '{a}')) + S(ts_filter(v, '{d}')) +
+merging (`DEPLOYMENT.md`, read-only, counts and ids only). It does not
+reproduce `tags_text`; it bounds it, by construction (Codex impl r2). For
+each tag, with U+0002/U+0003 stripped as `tags_text` strips them, it parses
+two documents **separately** — the tag's full form, and the tag with every
+`/` replaced by a space — and for each distinct lexeme across all of a row's
+tags and both forms sums the number of positions, then counts `even(bytes) +
+2 + 2 × least(npos, 256)`. Why that is ≥ the `B` part 035 builds:
+(1) `tags_text`'s text is a subset of these documents — each of its lines is
+one tag's full form followed by its non-empty segments, the same tokens the
+two forms yield (the default parser never joins tokens across whitespace),
+and the 2,048-character cut only drops lines; (2) a tag is at most 1,024
+bytes, so a per-tag document stays far below the 16,383 position at which
+PostgreSQL saturates positions and collapses repeats, so every occurrence is
+counted; (3) in 035's vector a lexeme's positions can only be fewer — they
+saturate, collapse and are capped at 256 per lexeme — never more. The single
+document the previous statement parsed (`t || E'\n' || replace(t, '/', ' ')`)
+broke (2): a stop-word tail pushed the expanded forms past 16,383, their
+repeats collapsed, and on Codex's row the statement said 1,048,506 (passes)
+while 035's preflight said 1,048,760 (aborts). It takes the existing head
+from the vector itself, which the re-head replaces with an equal `A` part.
+It sums `S(ts_filter(v, '{a}')) + S(ts_filter(v, '{d}')) +
 S(b)` — the parts separately, as 035's preflight counts them, never `S(v)`
 of the merged vector, where a lexeme in both title and body is stored once
 (verifier V1: `A('Quarterly Review Budget') || D('quarterly review budget
@@ -221,35 +237,38 @@ flag (a title that stems to nothing, `The`) is acceptable, a false pass is
 not. A flagged D-only row is fixed before upgrading by shortening the note,
 or by letting the current image write it through the halving retreat (an
 edit, or `make rebuild-tsvectors`), after which it has an `A` part and the
-size check applies to it. One config shown; with several,
-add one `to_tsvector` per config to `b`. Prototyped on PG16:
+size check applies to it. One config shown; with several, add one
+`VALUES`-style source per config to `toks` (a lexeme two configs share is
+stored once, so summing over both only over-counts). Prototyped on PG16:
 
 ```sql
 WITH tagged AS (
-  SELECT id, content_tsvector AS v,
-         translate(array_to_string(tags, E'\n'), chr(2) || chr(3), '') AS t
+  SELECT id, content_tsvector AS v, tags
   FROM notes_metadata
   WHERE content_tsvector IS NOT NULL AND cardinality(tags) > 0
     AND length(ts_filter(content_tsvector, '{b}')) = 0
-), parts AS (
-  SELECT id,
-         ts_filter(v, '{a}') AS a,
-         ts_filter(v, '{d}') AS d,
-         setweight(to_tsvector('english', t || E'\n' || replace(t, '/', ' ')), 'B') AS b
-  FROM tagged
+), toks AS (
+  SELECT t.id, x.lexeme, sum(cardinality(x.positions)) AS npos
+  FROM tagged t
+  CROSS JOIN LATERAL unnest(t.tags) AS g(tag)
+  CROSS JOIN LATERAL (VALUES (translate(g.tag, chr(2) || chr(3), '')),
+                             (replace(translate(g.tag, chr(2) || chr(3), ''), '/', ' '))) AS f(txt)
+  CROSS JOIN LATERAL unnest(to_tsvector('english', f.txt)) AS x
+  GROUP BY t.id, x.lexeme
+), b AS (
+  SELECT id, sum((octet_length(lexeme) + 1) / 2 * 2 + 2 + 2 * least(npos, 256)) AS bytes
+  FROM toks GROUP BY id
 ), est AS (
-  SELECT id,
+  SELECT t.id,
     (SELECT coalesce(sum((octet_length(lexeme) + 1) / 2 * 2
        + CASE WHEN cardinality(positions) > 0 THEN 2 + 2 * cardinality(positions) ELSE 0 END), 0)
-     FROM unnest(a))
+     FROM unnest(ts_filter(t.v, '{a}')))
   + (SELECT coalesce(sum((octet_length(lexeme) + 1) / 2 * 2
        + CASE WHEN cardinality(positions) > 0 THEN 2 + 2 * cardinality(positions) ELSE 0 END), 0)
-     FROM unnest(d))
-  + (SELECT coalesce(sum((octet_length(lexeme) + 1) / 2 * 2
-       + CASE WHEN cardinality(positions) > 0 THEN 2 + 2 * cardinality(positions) ELSE 0 END), 0)
-     FROM unnest(b)) AS bytes
-    , length(a) = 0 AS d_only
-  FROM parts WHERE length(b) > 0
+     FROM unnest(ts_filter(t.v, '{d}')))
+  + b.bytes AS bytes
+    , length(ts_filter(t.v, '{a}')) = 0 AS d_only
+  FROM tagged t JOIN b USING (id)
 )
 SELECT count(*) AS tagged_rows,
        count(*) FILTER (WHERE bytes > 1048511 OR d_only) AS flagged,
@@ -650,3 +669,27 @@ chunk or `none` under the existing preview rule; `move_note`'s fallback
 re-derives the title from the stored frontmatter as well (implementation
 note 3); 035's timing wording is "tens of seconds" (measured 28–41 s for
 4,265 synthetic rows), not the design's original "seconds".
+
+## Codex implementation review, round 2 (2026-10-31)
+
+Verdict on 65fe418: the three round-1 fixes VERIFIED; 1 MAJOR + 1 MINOR,
+both fixed.
+
+1. **MAJOR — the operator statement's tags part could under-count.** It
+   parsed `t || E'\n' || replace(t, '/', ' ')` as one document, so a long
+   stop-word tail pushed the expanded segments past PostgreSQL's 16,383
+   position limit and their repeats collapsed. Codex's row (English, title
+   `Big Note`, 87,139 distinct 8-character body words, 128 tags
+   `00000/x`…`00127/x` and 66 distinct 999-byte tags of `and`/`the`;
+   `tags_text` 2,047 characters): statement 1,048,506 (passes), preflight
+   1,048,760 (aborts). → The statement now bounds the tags part by
+   construction (D5): each tag's full form and its `/`-expanded form are
+   parsed as separate documents (≤ 1,024 bytes each, so no saturation), and
+   per distinct lexeme it counts `even(bytes) + 2 + 2 × least(npos, 256)`.
+   On Codex's row it now reports **1,048,760 against the preflight's
+   1,048,760**, flagged. The row joins the verbatim operator/preflight schema
+   case, which asserts rejected ⇒ flagged over every seeded row.
+2. **MINOR — two architecture paragraphs** (`search.md`'s writer
+   description, `indexing-and-embeddings.md`'s keyword-vector bullet) still
+   described the three-part vector and title-versus-body competition. →
+   four-part vector, title/tags/body competition.

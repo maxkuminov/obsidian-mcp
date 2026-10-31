@@ -428,11 +428,12 @@ reused) until its next edit or the next full-hash backstop.
   bytes through `set_frontmatter`. One shared token helper, `.nan` / `.inf` /
   `-.inf`, keys included — see [the section below](#non-finite-frontmatter-numbers-and-the-one-title-rule-154),
   which also names the one title rule every surface shares.
-- **The keyword vector is `A(title) || A(aliases) || D(body)` (since 035 with
-  `B(tags)` before the body, below) and stores its
-  excerpt** (#344, migration 031). One builder, `fts.index_tsvector_sql`,
-  produces the fragment for every writer — title parts for every config, then
-  aliases parts, then the pre-031 content parts byte for byte — and the same
+- **The keyword vector is `A(title) || A(aliases) || B(tags) || D(body)` and
+  stores its excerpt** (#344 and #391, migrations 031 and 035). One builder,
+  `fts.index_tsvector_sql`, produces the fragment for every writer — title
+  parts for every config, then aliases parts, then tags parts (the bullet
+  below), then the pre-031 content parts byte for byte; ranking is a
+  title-versus-tags-versus-body competition under `RANK_WEIGHTS` — and the same
   UPDATE writes `body_excerpt`, the first `KEYWORD_EXCERPT_CHARS` characters
   of exactly the prefix the successful attempt bound. The title is the row's
   (the shared `note_title` rule); the aliases are `fts.note_aliases` over the

@@ -34,6 +34,7 @@ import contextlib
 import datetime
 import itertools
 import os
+import random
 
 import asyncpg
 import pytest
@@ -8033,10 +8034,38 @@ def test_every_row_the_preflight_rejects_is_flagged_by_the_operator_statement():
         assert merged + 10 <= PREFLIGHT_MAX_035, "a merged-vector estimate would pass it"
         # The sentinel tag.
         insert_tagged_note(url, 9, "x.md", "Big Note", {}, ["the\x02a"], near_limit_words(87_377))
+        # Codex impl r2: 128 nested tags then 66 distinct 999-byte stop-word
+        # tags. `tags_text` keeps only the 128 nested lines (2,047 chars); a
+        # single concatenated document saturates positions after the
+        # stop-word tail and under-counts the expanded segments.
+        rng = random.Random(391)
+        stop_tags: set[str] = set()
+        while len(stop_tags) < 66:
+            stop_tags.add(" ".join(rng.choice(("and", "the")) for _ in range(250)))
+        codex_tags = sorted([f"{i:05d}/x" for i in range(128)] + sorted(stop_tags))
+        assert len(_fts().tags_text(codex_tags)) == 2047
+        assert all(len(t.encode()) == 999 for t in stop_tags)
+        insert_tagged_note(url, 10, "c.md", "Big Note", {}, codex_tags, near_limit_words(87_139))
+
+        per_row = operator_statement().split("SELECT count(*)")[0] + "SELECT id, bytes FROM est"
+        operator_bytes = {r["id"]: r["bytes"] for r in fetch(url, per_row)}
+        preflight_bytes = size_of(
+            url, "(SELECT ts_filter(content_tsvector, '{d}') FROM notes_metadata WHERE id = 10)"
+        ) + size_of(
+            url,
+            "setweight(to_tsvector('english', $1), 'A') || setweight(to_tsvector('english', $2), 'A')"
+            " || setweight(to_tsvector('english', $3), 'B')",
+            "Big Note", "", _fts().tags_text(codex_tags),
+        )
+        print(f"\n[operator vs preflight, Codex r2 row] {operator_bytes[10]} vs {preflight_bytes}")
+        assert operator_bytes[10] >= preflight_bytes > PREFLIGHT_MAX_035
+
         flagged = set(fetch(url, operator_statement())[0]["ids"] or [])
         rejected = preflight_rejected_ids(url)
-        assert rejected == {7, 8, 9}, rejected
-        assert rejected <= flagged, (rejected, flagged)
+        assert rejected == {7, 8, 9, 10}, rejected
+        # The implication over every seeded row: rejected ⇒ flagged.
+        for row_id in (1, 7, 8, 9, 10):
+            assert row_id not in rejected or row_id in flagged, row_id
         assert 1 not in flagged
 
 

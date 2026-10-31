@@ -38,11 +38,13 @@
 `keyword_search("<exact two-word title of an existing note>")` returned ten
 rows without that note, live, on 2026-10-28. Three causes, three changes.
 
-**The vector weights the title and aliases above the body.** Every writer
-builds `content_tsvector` through `fts.index_tsvector_sql` as *title parts for
-every config, then aliases parts, then the content parts* (configs in sorted
-order — the fingerprint's order, so 031 and the writers agree byte for byte) — `setweight(…,
-'A')` on the first two, the pre-031 `to_tsvector(cfg, body)` fragment byte for
+**The vector weights the title and aliases above the tags, and the tags
+above the body.** Every writer builds `content_tsvector` through
+`fts.index_tsvector_sql` as *title parts for every config, then aliases
+parts, then tags parts, then the content parts* (configs in sorted order —
+the fingerprint's order, so the migrations and the writers agree byte for
+byte) — `setweight(…, 'A')` on the first two, `setweight(…, 'B')` on the
+tags (#391, below), the pre-031 `to_tsvector(cfg, body)` fragment byte for
 byte on the last, so a pre-031 vector is exactly the body part of a post-031
 one. Ranking is `ts_rank_cd(RANK_WEIGHTS, vector, query)` with the array bound
 as `float4[]` (a setting, default `{0.02, 0.2, 0.4, 1.0}` for `D, C, B, A`,
@@ -54,7 +56,8 @@ value binds as float4 zero, and PostgreSQL refuses one above 1). `calc_rank_cd` 
 `1.0` against `3.725` under PostgreSQL's default array (the hub wins) and
 `1.0` against `0.745` under ours (the title wins; the crossover is near forty
 adjacent repetitions, fifty for a one-word title — L8). The array moves only
-title-versus-body competition: body-only order is identical under any uniform
+title-versus-tags-versus-body competition (a tag cover scores `B = 0.4`,
+twenty body covers): body-only order is identical under any uniform
 `D`, which the identity suite pins. Normalisation flags were rejected (flag 1
 still loses the issue's case; flag 2 makes every short note beat every long
 one) and would re-rank body-only matches.

@@ -1125,35 +1125,38 @@ bump.
   image digest.
 - **Check before merging.** Run this read-only statement against the live
   database (034) first. It reports counts and ids only. It shows one FTS
-  config (`english`); with several, add one `to_tsvector` per config to `b`.
+  config (`english`); with several, run the `to_tsvector` in `toks` once per
+  config (a union over the configs).
   `flagged` must be `0` before you upgrade.
 
   ```sql
   WITH tagged AS (
-    SELECT id, content_tsvector AS v,
-           translate(array_to_string(tags, E'\n'), chr(2) || chr(3), '') AS t
+    SELECT id, content_tsvector AS v, tags
     FROM notes_metadata
     WHERE content_tsvector IS NOT NULL AND cardinality(tags) > 0
       AND length(ts_filter(content_tsvector, '{b}')) = 0
-  ), parts AS (
-    SELECT id,
-           ts_filter(v, '{a}') AS a,
-           ts_filter(v, '{d}') AS d,
-           setweight(to_tsvector('english', t || E'\n' || replace(t, '/', ' ')), 'B') AS b
-    FROM tagged
+  ), toks AS (
+    SELECT t.id, x.lexeme, sum(cardinality(x.positions)) AS npos
+    FROM tagged t
+    CROSS JOIN LATERAL unnest(t.tags) AS g(tag)
+    CROSS JOIN LATERAL (VALUES (translate(g.tag, chr(2) || chr(3), '')),
+                               (replace(translate(g.tag, chr(2) || chr(3), ''), '/', ' '))) AS f(txt)
+    CROSS JOIN LATERAL unnest(to_tsvector('english', f.txt)) AS x
+    GROUP BY t.id, x.lexeme
+  ), b AS (
+    SELECT id, sum((octet_length(lexeme) + 1) / 2 * 2 + 2 + 2 * least(npos, 256)) AS bytes
+    FROM toks GROUP BY id
   ), est AS (
-    SELECT id,
+    SELECT t.id,
       (SELECT coalesce(sum((octet_length(lexeme) + 1) / 2 * 2
          + CASE WHEN cardinality(positions) > 0 THEN 2 + 2 * cardinality(positions) ELSE 0 END), 0)
-       FROM unnest(a))
+       FROM unnest(ts_filter(t.v, '{a}')))
     + (SELECT coalesce(sum((octet_length(lexeme) + 1) / 2 * 2
          + CASE WHEN cardinality(positions) > 0 THEN 2 + 2 * cardinality(positions) ELSE 0 END), 0)
-       FROM unnest(d))
-    + (SELECT coalesce(sum((octet_length(lexeme) + 1) / 2 * 2
-         + CASE WHEN cardinality(positions) > 0 THEN 2 + 2 * cardinality(positions) ELSE 0 END), 0)
-       FROM unnest(b)) AS bytes
-      , length(a) = 0 AS d_only
-    FROM parts WHERE length(b) > 0
+       FROM unnest(ts_filter(t.v, '{d}')))
+    + b.bytes AS bytes
+      , length(ts_filter(t.v, '{a}')) = 0 AS d_only
+    FROM tagged t JOIN b USING (id)
   )
   SELECT count(*) AS tagged_rows,
          count(*) FILTER (WHERE bytes > 1048511 OR d_only) AS flagged,
@@ -1165,8 +1168,9 @@ bump.
 
   The estimate counts the title part, the body part and the tags part
   separately, as 035 does (a word in both a note's title and its body is
-  stored once but rebuilt twice), and strips the U+0002/U+0003 characters
-  from tags as 035 does. A row is flagged when its estimate is over the limit, **or** when its
+  stored once but rebuilt twice), strips the U+0002/U+0003 characters
+  from tags as 035 does, and counts the tag words one tag at a time, so it
+  is never smaller than the tags part 035 builds. A row is flagged when its estimate is over the limit, **or** when its
   vector has no title part at all (`d_only`: a note 031 left at the size
   limit). 035 builds such a row's whole title-and-aliases head, which the
   stored vector does not show, so the statement flags every one of them
