@@ -103,6 +103,14 @@ class HybridRow:
     #: The semantic arm's section locator (#355): `None` on a stale or
     #: pre-034 row, or when the note came from the keyword arm alone.
     section: dict | None = None
+    #: #402 (`rerank=true` only, never rendered): the semantic arm's fetched
+    #: rows of this note, cosine-best first (empty when stale or keyword-only),
+    #: and the note's chunking stamp — the inputs of its rerank documents.
+    rerank_chunks: list[dict] = field(default_factory=list)
+    rerank_stamp: int | None = None
+    #: #402: set by the tool on a reranked row whose winning document is a
+    #: semantic chunk (the primary included): its preview is then that chunk.
+    rerank_chunk_winner: bool = False
 
     @property
     def best_rank(self) -> int:
@@ -288,6 +296,8 @@ async def hybrid_search(
             row.section = sr.get("section")
             if rerank_candidates:
                 row.rerank_text = sr.get("rerank_text")
+                row.rerank_chunks = list(sr.get("rerank_chunks") or [])
+                row.rerank_stamp = sr.get("rerank_stamp")
         page.append(row)
 
     # ── 7. Keyword snippets for the page's keyword rows, capped ─────────────

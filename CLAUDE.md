@@ -575,7 +575,12 @@ update it in the same change.** What stays here is the short list:
   `status` or the 200. The session closes before the hop (no connection held),
   the call stays in the `embedding` class (no version bump), the trust anchor
   is `EMBEDDING_CA_FILE`'s with a separate plaintext flag, and the CLAUDE.md
-  eval-gate row applies to any rerank change. See
+  eval-gate row applies to any rerank change. Since #402 the documents are
+  the stored embedding input (`embed_prefix` + the stamped formatter; title
+  only for an unknown stamp), every candidate's cosine-best chunk first and
+  then further fetched chunks in distance order (≤ 4 per note, ≤
+  `RERANK_MAX_DOCUMENTS`, default 100), scored per note by the max, and a
+  chunk winner's preview and `§` are that chunk's. See
   [search](docs/architecture/search.md), "Reranking (#367)".
 - `MCP_SANDBOX_MODE=true` is a registry-eval-only switch: lifespan skips `_check_embedding_dim` and the indexer, and `APIKeyMiddleware` bypasses auth on `/mcp/*`. Lets Glama's sandbox build the image and validate MCP introspection without external deps. Never enable in production — tools register but cannot run.
 

@@ -14,8 +14,15 @@ compare the candidate with itself.
   service's first 50 fused rows, with `hybrid_k` from `--arm-opt` (default
   `HYBRID_RRF_K`).
 
-Both rerank through `src.services.rerank.rerank_candidates`, the function the
-tools use, calling the services directly (never `_tracked`) with one fresh
+- `…:make_semantic_arm_incumbent` / `…:make_hybrid_arm_incumbent` (#402,
+  rerank-documents D10): the **baseline arms** — the same candidates, sent
+  with the frozen pre-#402 builder, one `title + chunk|excerpt` document per
+  note. Use one as `BASELINE` against the matching arm above, at `--depth`
+  10, 20 and 50 (the call limit is the depth).
+
+All four rerank through `src.services.rerank.rerank_groups`; the two
+production arms allocate with `semantic_document_groups` /
+`hybrid_document_groups`, the functions the tools use, calling the services directly (never `_tracked`) with one fresh
 read-only session per query, closed before the rerank exchange. They embed
 each query through the configured provider, exactly as the incumbent
 `semantic` arm does, and add one hop: `RERANK_URL`, through
@@ -78,7 +85,60 @@ def _require(outcome) -> None:
         )
 
 
-def make_semantic_arm(ctx: ArmContext) -> Arm:
+# ── The incumbent builder, frozen (rerank-documents D10) ───────────────────
+#
+# The document construction before #402, copied here so the baseline arms can
+# replay it after `src/` moved on: one `title + "\n\n" + text` document per
+# candidate note, the text being the cosine-best chunk (a fresh semantic row)
+# or the excerpt (any other hybrid row), cut to 2,048 code points. **Frozen:
+# never edit these two functions**; a different incumbent is a new arm.
+
+_INCUMBENT_DOC_CHARS = 2048
+
+
+def _incumbent_bounded_text(title: str | None, text: str | None) -> str | None:
+    if text is None:
+        return None
+    room = _INCUMBENT_DOC_CHARS - len(title or "") - 2
+    return text[: max(0, room)]
+
+
+def _incumbent_document(title: str | None, text: str | None) -> str:
+    title = title or ""
+    doc = f"{title}\n\n{text}" if text else title
+    return doc[:_INCUMBENT_DOC_CHARS]
+
+
+def _semantic_incumbent_groups(rows: list[dict]) -> list[list[str]]:
+    return [[_incumbent_document(
+        r["title"], None if r["stale"] else _incumbent_bounded_text(r["title"], r["chunk"]))]
+        for r in rows]
+
+
+def _hybrid_incumbent_groups(rows) -> list[list[str]]:
+    out = []
+    for r in rows:
+        if r.semantic_rank is not None and not r.stale and r.chunk is not None:
+            text = _incumbent_bounded_text(r.title, r.chunk)
+        else:
+            text = r.rerank_text  # the excerpt, already bounded by `_fill_excerpts`
+        out.append([_incumbent_document(r.title, text)])
+    return out
+
+
+def _production_semantic_groups(rows):
+    from src.services import rerank
+
+    return [[d.text for d in g] for g in rerank.semantic_document_groups(rows)]
+
+
+def _production_hybrid_groups(rows):
+    from src.services import rerank
+
+    return [[d.text for d in g] for g in rerank.hybrid_document_groups(rows)]
+
+
+def _semantic_arm(ctx: ArmContext, groups_of) -> Arm:
     from src.services import rerank
     from src.services.embeddings import semantic_candidates
 
@@ -90,9 +150,7 @@ def make_semantic_arm(ctx: ArmContext) -> Arm:
                 frontmatter=q.frontmatter, user_id=q.user_id,
             )
         candidates = found.rows
-        outcome = await rerank.rerank_candidates(
-            q.text, [(r["title"], r.get("rerank_text")) for r in candidates]
-        )
+        outcome = await rerank.rerank_groups(q.text, groups_of(candidates))
         if _empty(outcome):
             arm.empty_candidates += 1
             return []
@@ -103,11 +161,11 @@ def make_semantic_arm(ctx: ArmContext) -> Arm:
     return arm
 
 
-def make_hybrid_arm(ctx: ArmContext) -> Arm:
+def _hybrid_arm(ctx: ArmContext, groups_of) -> Arm:
     try:
         from src.services.hybrid import ARMS_BOTH, hybrid_search
     except ImportError as e:  # pragma: no cover - the service ships with #354
-        raise UsageError("make_hybrid_arm needs the hybrid_search service (#354)") from e
+        raise UsageError("the hybrid rerank arms need the hybrid_search service (#354)") from e
     from scripts.search_eval_arms.hybrid import _k
     from src.config import settings
     from src.services import rerank
@@ -127,9 +185,7 @@ def make_hybrid_arm(ctx: ArmContext) -> Arm:
                 f"hybrid rerank arm answered keyword-only ({result.semantic_unavailable})"
             )
         candidates = result.rows
-        outcome = await rerank.rerank_candidates(
-            q.text, [(r.title, r.rerank_text) for r in candidates]
-        )
+        outcome = await rerank.rerank_groups(q.text, groups_of(candidates))
         if _empty(outcome):
             arm.empty_candidates += 1
             return []
@@ -140,8 +196,31 @@ def make_hybrid_arm(ctx: ArmContext) -> Arm:
     return arm
 
 
+def make_semantic_arm(ctx: ArmContext) -> Arm:
+    """`semantic_search(rerank=true)` as production allocates it (#402)."""
+    return _semantic_arm(ctx, _production_semantic_groups)
+
+
+def make_hybrid_arm(ctx: ArmContext) -> Arm:
+    """`hybrid_search(rerank=true)` as production allocates it (#402)."""
+    return _hybrid_arm(ctx, _production_hybrid_groups)
+
+
+def make_semantic_arm_incumbent(ctx: ArmContext) -> Arm:
+    """The baseline arm: the pre-#402 builder, one document per candidate."""
+    return _semantic_arm(ctx, _semantic_incumbent_groups)
+
+
+def make_hybrid_arm_incumbent(ctx: ArmContext) -> Arm:
+    """The baseline arm: the pre-#402 builder, one document per candidate."""
+    return _hybrid_arm(ctx, _hybrid_incumbent_groups)
+
+
 make_semantic_arm.membership = "semantic"
 make_hybrid_arm.membership = "keyword_or_semantic"
-for _f in (make_semantic_arm, make_hybrid_arm):
+make_semantic_arm_incumbent.membership = "semantic"
+make_hybrid_arm_incumbent.membership = "keyword_or_semantic"
+for _f in (make_semantic_arm, make_hybrid_arm, make_semantic_arm_incumbent,
+           make_hybrid_arm_incumbent):
     _f.requires_db = True
     _f.preflight = preflight

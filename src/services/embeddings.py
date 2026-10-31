@@ -2474,6 +2474,14 @@ async def semantic_arm_rows(
         )
         .join(NoteMetadata, NoteEmbedding.note_id == NoteMetadata.id)
     )
+    if with_rerank_text:
+        # #402 (rerank-documents D6): only for `rerank=true`, exactly these two
+        # columns more, so each fetched row's embedding input can be rebuilt
+        # from storage. Never rendered or logged; the `rerank=false`
+        # statement is unchanged (the search-quality carve-out).
+        stmt = stmt.add_columns(
+            NoteEmbedding.embed_prefix, NoteMetadata.embedded_chunking_version
+        )
     stmt = apply_note_filters(
         stmt, folder=folder, tags=tags, frontmatter=frontmatter, user_id=user_id
     )
@@ -2523,7 +2531,12 @@ async def semantic_arm_rows(
 
     seen: set[int] = set()
     deduped: list = []
+    #: #402: every fetched row per note, in this re-sort order (cosine-best
+    #: first), kept only for `rerank=true` — the rows the dedupe drops.
+    by_note: dict[int, list] = {}
     for row in rows:
+        if with_rerank_text:
+            by_note.setdefault(row.note_id, []).append(row)
         if row.note_id in seen:
             continue
         seen.add(row.note_id)
@@ -2610,6 +2623,21 @@ async def semantic_arm_rows(
             result["rerank_text"] = (
                 None if result["stale"] else bounded_text(row.title, row.chunk_text)
             )
+            # #402 (D1/D2): the note's fetched rows as rerank documents, the
+            # cosine-best first; none for a stale note (#200: superseded text
+            # never leaves the server). Internal, never on a legacy row.
+            result["rerank_stamp"] = getattr(row, "embedded_chunking_version", None)
+            result["rerank_chunks"] = [] if result["stale"] else [
+                {
+                    "chunk_text": r.chunk_text,
+                    "chunk_index": r.chunk_index,
+                    "section": section_of(r, False),
+                    "distance": float(r.distance),
+                    "file_path": r.file_path,
+                    "embed_prefix": getattr(r, "embed_prefix", None),
+                }
+                for r in by_note.get(row.note_id, [row])
+            ]
     return SemanticArm(rows=results, chunk_rows=chunk_rows, exact_fallback=exact_fallback,
                        fetched_at=fetched_at)
 

@@ -1051,13 +1051,19 @@ held only after the embedding returns, so one connection.
 A `rerank=true` call (#367) on either tool **stays in `embedding`**: the
 class is per tool, not per argument, so `CLASS_MAPPING_VERSION` does not
 move. The slot is held through the rerank exchange, which extends the hold by
-at most `RERANK_TIMEOUT_MS` (1.5 s by default, 10 s at most); the database
+at most `RERANK_TIMEOUT_MS` (1.5 s by default, 30 s at most since #402); the database
 session is closed before the request is sent, so no connection is held during
 it. In `shadow` nothing waits, and the reranker client's two-connection pool
 is what bounds work in flight on the reranker. Readiness evidence gathered
 while reranking is in use mixes the two hold profiles, and the class version
 does not separate them (L7); read `make concurrency-report` with that in mind
-before promoting to `queue`.
+before promoting to `queue`. **Under `queue` or `enforce`, keep
+`RERANK_TIMEOUT_MS ≤ MCP_CONCURRENCY_WAIT_SECONDS × 1000`** unless that report
+passes over evidence including `rerank=true` traffic (#402, rerank-documents
+L10): with `MCP_CONCURRENCY_EMBEDDING=1`, one rerank call holding the sole
+`embedding` slot for 20 s makes a concurrent `semantic_search` /
+`hybrid_search` wait the 5 s tool wait and then, under `enforce`, be refused
+with `slot_timeout` (under `queue`, admitted with `overrun`).
 
 #261's `other` held 15 of the 25 tools and was pinned to 1. Raising it alone
 would let one tenant's scans hold every cheap-read slot, so it was split by
