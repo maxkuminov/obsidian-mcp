@@ -676,8 +676,10 @@ def test_query_cut():
 
 
 def test_the_fixed_bounds():
-    """The constants the floor arithmetic (D7) rests on: header ≤ 400,
-    abbreviated structure ≤ 340, both footers ≤ 75, and 985 ≤ 1,000."""
+    """The constants the floor arithmetic (D7) rests on: header ≤ 405 (400
+    before the #389 `confidence` token), abbreviated structure ≤ 340, both
+    footers ≤ 75, and 990 ≤ 1,000. The low-plus-`any` header is pinned in
+    `tests/test_search_confidence.py`."""
     worst_rows = [
         HybridRow(path=f"{i}.md", title="", tags=[], score=2 / 1050, keyword_rank=50,
                   semantic_rank=50, match="any", similarity=-0.123, stale=True,
@@ -690,7 +692,7 @@ def test_the_fixed_bounds():
         semantic_chunks=50, overlap=50, snippet_cap=49)
     q_lit, query_cut = tools._hybrid_query_echo("\x01" * 8192)
     header = tools._hybrid_header(q_lit, query_cut, result, worst_rows, 50)
-    assert len(header) <= tools.HYBRID_HEADER_MAX == 400, len(header)
+    assert len(header) <= tools.HYBRID_HEADER_MAX == 405, len(header)
     # The structure of the cut form, which the floor arithmetic adds 45 + 45
     # to; the omitted form trades both values (≥ 80 rendered) for two labels
     # (31 characters), so it is always the shorter line.
@@ -705,7 +707,7 @@ def test_the_fixed_bounds():
     assert len(omitted) < len(structure) + 80
     assert len(tools.HYBRID_KEYWORD_ONLY_FOOTER) <= tools.HYBRID_FOOTER_MAX == 75
     assert max(len(tools._hybrid_cap_footer(n)) for n in range(1, 51)) <= 75
-    assert 400 + 340 + 45 + 45 + 75 + 75 + 5 == 985 <= 1000
+    assert 405 + 340 + 45 + 45 + 75 + 75 + 5 == 990 <= 1000
 
 
 # ── telemetry from rendered rows ────────────────────────────────────────────

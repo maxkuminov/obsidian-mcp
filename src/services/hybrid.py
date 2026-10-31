@@ -131,6 +131,11 @@ class HybridResult:
     #: generation (#355, D4), read in this call's snapshot; 0 when the
     #: semantic arm did not run (no cross-generation ranking took place).
     rechunk_pending: int = 0
+    #: The best similarity over the semantic arm's deduped notes (the 50-chunk
+    #: overfetch, independent of `limit`), before fusion, rerank and the
+    #: response cap (#389, D1). `None` when the arm returned no note or did
+    #: not run. One input of the `confidence` token, with `keyword_all`.
+    top_similarity: float | None = None
 
 
 async def _fill_excerpts(session, page: list[HybridRow], *, user_id: int | None) -> None:
@@ -327,6 +332,7 @@ async def hybrid_search(
         overlap=overlap,
         snippet_cap=cap,
         rechunk_pending=rechunk_pending,
+        top_similarity=max((r["similarity"] for r in s_rows), default=None),
     )
 
     # ── Telemetry (D7); `result_count` / `result_paths` are the tool's ──────
@@ -340,4 +346,7 @@ async def hybrid_search(
     timing.record("semantic_rows", result.semantic_rows)
     timing.record("overlap", overlap)
     timing.record("rrf_k", k)
+    # #389 (D7): the all-terms evidence, on every executed call. The tool
+    # records `confidence` and `top_similarity` beside it.
+    timing.record("keyword_all", result.keyword_all)
     return result

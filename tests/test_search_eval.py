@@ -950,6 +950,7 @@ def test_fixture_golden_numbers_by_hand(tmp_path):
     approx = lambda v: pytest.approx(v, abs=1e-6)  # noqa: E731
     nd = 1 / (1 + L3)
     assert title["overall"] == {"n_queries": 12, "recall@5": approx(0.75), "recall@10": approx(0.75),
+                                "recall@20": approx(0.75), "recall@50": approx(0.75),
                                 "mrr": approx(10 / 12), "ndcg@10": approx((8 + 2 * nd) / 12),
                                 "novel@10": 0.0}
     assert title["class:identifier"]["recall@10"] == approx(0.7)
@@ -958,7 +959,8 @@ def test_fixture_golden_numbers_by_hand(tmp_path):
     assert title["class:prose"]["mrr"] == approx(6 / 7)
     assert title["source:mined"]["recall@10"] == approx(8 / 11)
     assert title["source:manual"] == {"n_queries": 2, "recall@5": approx(0.75),
-                                      "recall@10": approx(0.75), "mrr": approx(1.0),
+                                      "recall@10": approx(0.75), "recall@20": approx(0.75),
+                                      "recall@50": approx(0.75), "mrr": approx(1.0),
                                       "ndcg@10": approx((1 + nd) / 2), "novel@10": 0.0}
     c = report["counts"]
     assert (c["n_queries"], c["n_both_sources"], c["dropped_paths"], c["dropped_queries"]) == (12, 1, 1, 1)
