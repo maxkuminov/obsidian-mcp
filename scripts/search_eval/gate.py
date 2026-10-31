@@ -32,7 +32,7 @@ from pathlib import Path
 
 from scripts.search_eval import EXIT_FAILURE, EXIT_OK, UsageError
 from scripts.search_eval._io import atomic_write, sha256_file
-from scripts.search_eval.scoring import METRICS, SLICES, VERDICT_OK
+from scripts.search_eval.scoring import METRICS, SCHEMA_VERSION, SLICES, VERDICT_OK
 
 RUNFILE_PREFIX = "runfile:"
 
@@ -130,6 +130,11 @@ def run_gate(*, report_path: Path, arm: str, metrics: str, slices: str,
     slice_list = _split(slices, SLICES, "slices")
 
     report = _load(report_path, "report")
+    # Exactly the schema this gate reads (Codex review): a schema-2 report
+    # hand-carrying `deltas_baseline` is not schema-3 evidence.
+    if report.get("schema_version") != SCHEMA_VERSION:
+        raise UsageError(f"the report's schema_version is {report.get('schema_version')!r}, "
+                         f"not {SCHEMA_VERSION}: re-score it")
     _require_evidence(report, "the report")
     baseline = report.get("baseline")
     if not baseline or not isinstance(baseline, str):

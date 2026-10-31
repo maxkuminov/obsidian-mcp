@@ -265,7 +265,11 @@ _DATA_KEYED = frozenset({"deltas", "options"})
 #: against query text would refuse real data sets (a query `2026` inside a
 #: UTC-stamp generation, a query `hybrid` inside an arm label); they are
 #: checked for exact equality only.
-_EXACT_ONLY = frozenset({"generation", "arm", "baseline"})
+#: `deltas_baseline` (an arm label) and a runfile arm's `source_generation`
+#: (a generation id) are the same kind of value (Codex review of the gate
+#: step: a query `hybrid` inside a baseline label refused the report).
+_EXACT_ONLY = frozenset({"generation", "arm", "baseline", "deltas_baseline",
+                         "source_generation"})
 
 
 def _strings(value: Any, parent: str | None = None, exact: bool = False):

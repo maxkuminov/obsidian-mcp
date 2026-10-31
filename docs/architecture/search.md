@@ -1413,8 +1413,9 @@ bootstrap 95 % interval on the mean: 1,000 resamples with replacement from
 `random.Random(seed)` over the deltas in qid order, linear-interpolated
 2.5th / 97.5th percentiles. The interval is reported and never gates.
 
-**The report and the gate.** `report.json` (`schema_version` 2 since #389)
-holds the metrics, counts (per
+**The report and the gate.** `report.json` (`schema_version` 3, current
+since the gate step; 2 was #389's output and is historical, refused by
+`gate`) holds the metrics, counts (per
 class, per source, `n_both_sources`, drift, `ownerless_queries`), each arm's
 label, options, membership, `corpus_loss`, `unsearchable_before` and
 `missing_queries`, the window, the seed, the qrels / snapshot / selection

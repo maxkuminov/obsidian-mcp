@@ -303,7 +303,10 @@ async def run_generation(
                     # data directory's `report.json` is absent or scores
                     # another generation (gate then refuses).
                     "source_report_sha256": _source_report_sha256(
-                        Path(arm.spec[len("runfile:"):]), src_meta.get("generation")),
+                        # Resolved first, so an equivalent path with an
+                        # internal `..` finds the same data directory.
+                        Path(arm.spec[len("runfile:"):]).resolve(),
+                        src_meta.get("generation")),
                 })
             else:
                 if arm.requires_db and _is_semantic(arm.membership):

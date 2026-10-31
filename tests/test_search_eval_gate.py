@@ -311,6 +311,19 @@ def test_a_runfile_label_without_a_generation_is_refused(tmp_path, capsys):
     _refused(tmp_path, capsys, report, "--baseline-report", str(_rf_source(tmp_path)))
 
 
+@pytest.mark.parametrize("version", [2, None, "3", 4])
+def test_a_report_not_at_schema_3_is_refused(tmp_path, capsys, version):
+    """Codex review: a schema-2 report hand-carrying `deltas_baseline` and
+    eight passing cells is not schema-3 evidence."""
+    report = _report()
+    if version is None:
+        report.pop("schema_version")
+    else:
+        report["schema_version"] = version
+    err = _refused(tmp_path, capsys, _write(tmp_path, "r.json", report), existing="old table\n")
+    assert "schema_version" in err
+
+
 def test_the_candidate_arm_cannot_be_the_baseline(tmp_path, capsys):
     """`--arm` naming the report's own baseline is a usage error: there is no
     delta of an arm against itself to gate."""

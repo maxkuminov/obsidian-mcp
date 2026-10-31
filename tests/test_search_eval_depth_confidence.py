@@ -127,6 +127,56 @@ def test_a_scored_source_generation_s_report_digest_rides_the_runfile_arm(tmp_pa
     assert (base["source_generation"], base["source_report_sha256"]) == ("R20", digest)
 
 
+def test_an_equivalent_runfile_path_with_dotdot_records_the_digest(tmp_path, deepmod):
+    """Codex review: `runs/G/../G/<file>` is accepted as a runfile, so the
+    source data directory is derived from the resolved path."""
+    other = tmp_path / "other"
+    write_data(other, [{"text": f"q{i}", "relevant": ["A.md"]} for i in range(4)], SNAP)
+    assert run(other, [f"{deepmod}:fixed_a"], generation="R20", depth=20).exit_code == EXIT_OK
+    score(other, [f"{deepmod}:fixed_a"], min_queries=1)
+    digest = sha256_file(other / "report.json")
+    staged = other / "runs" / manifest_of(other)["files"][f"{deepmod}:fixed_a"]["path"]
+    roundabout = staged.parent / ".." / staged.parent.name / staged.name
+    here = tmp_path / "here"
+    _copy_inputs(other, here)
+    spec = f"runfile:{roundabout}"
+    assert run(here, [spec, f"{deepmod}:deep"], generation="H50").exit_code == EXIT_OK
+    res = score(here, [spec, f"{deepmod}:deep"], baseline=spec, min_queries=1)
+    assert res.report["arms"][0]["source_report_sha256"] == digest
+
+
+def test_query_text_inside_the_baseline_label_does_not_refuse_the_report(tmp_path, deepmod):
+    """Codex review (MAJOR): `deltas_baseline` is an arm label, checked for
+    exact equality only, like `baseline`. A query whose text occurs inside
+    the baseline arm's label must not make `score` raise `ReportLeak`."""
+    d = tmp_path / "d"
+    write_data(d, [{"text": "fixed", "relevant": ["A.md"]},
+                   {"text": "q1", "relevant": ["A.md"]}], SNAP)
+    arms = [f"{deepmod}:fixed_a", f"{deepmod}:deep"]
+    assert run(d, arms, generation="G1").exit_code == EXIT_OK
+    res = score(d, arms, baseline=arms[0], min_queries=1)
+    assert "fixed" in res.report["deltas_baseline"]
+    assert (d / "report.json").exists()
+
+
+def test_query_text_inside_a_source_generation_does_not_refuse_the_report(tmp_path, deepmod):
+    """Codex review (MAJOR): a runfile arm's `source_generation` is a
+    generation id, exact-only like `generation`: a query `2026` beside a
+    source generation `R2026` must not make `score` raise `ReportLeak`."""
+    other = tmp_path / "other"
+    queries = [{"text": "2026", "relevant": ["A.md"]}, {"text": "q1", "relevant": ["A.md"]}]
+    write_data(other, queries, SNAP)
+    assert run(other, [f"{deepmod}:fixed_a"], generation="R2026", depth=20).exit_code == EXIT_OK
+    staged = other / "runs" / manifest_of(other)["files"][f"{deepmod}:fixed_a"]["path"]
+    here = tmp_path / "here"
+    _copy_inputs(other, here)
+    spec = f"runfile:{staged}"
+    assert run(here, [spec, f"{deepmod}:deep"], generation="H50").exit_code == EXIT_OK
+    res = score(here, [spec, f"{deepmod}:deep"], baseline=spec, min_queries=1)
+    assert res.report["arms"][0]["source_generation"] == "R2026"
+    assert (here / "report.json").exists()
+
+
 def _forge_depth(staged: Path, other: Path, arm: str, value, *, drop=False):
     content = json.loads(staged.read_text())
     if drop:
