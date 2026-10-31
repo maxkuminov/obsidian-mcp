@@ -1412,9 +1412,11 @@ async def hybrid_search(
 
     Both arms run for the same query and filters in one database snapshot:
     the `keyword_search` ranking and the `semantic_search` ranking, each taken
-    to its top 50. They are fused by reciprocal rank fusion over note paths
-    with equal votes: a note's score is the sum, over the arms that found it,
-    of `1/(k + rank)` (`k` is the server's `HYBRID_RRF_K`, shown as `rrf_k`).
+    to its top 50. They are fused by reciprocal rank fusion over note paths:
+    a note's score is the sum, over the arms that found it, of `1/(k + rank)`
+    (`k` is the server's `HYBRID_RRF_K`, shown as `rrf_k`), the same
+    reciprocal-rank formula for semantic and all-terms keyword ranks; a fill
+    (`match: any`) keyword rank enters offset by 50, below every all-terms row.
     A note outside both top-50 lists is not considered; the header's
     `arm_depth: keyword n/50, semantic c/50 chunks` says when an arm was full.
     Fusion helps when the query's kind is unclear, and a single arm can rank

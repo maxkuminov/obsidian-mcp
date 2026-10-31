@@ -369,8 +369,12 @@ def test_the_token_can_cost_a_boundary_row_and_the_footer_says_so(monkeypatch, r
 RERANK_TOKEN = "reranked: false (malformed_response)"
 
 
-def _worst_rows():
+def _worst_rows(fusion_rank=50):
+    """#403: a fused `match: any` row renders its keyword term at fusion rank
+    `keyword_rank + 50` (100 at worst) when both arms ran; the keyword-only
+    path applies no offset (50)."""
     return [HybridRow(path=f"{i}.md", title="", tags=[], score=2 / 1050, keyword_rank=50,
+                      keyword_fusion_rank=fusion_rank,
                       semantic_rank=50, match="any", similarity=-0.123, stale=True,
                       embedding_truncated=True, no_excerpt=True, matched_in=["title+tags+body"])
             for i in range(50)]
@@ -390,13 +394,16 @@ def _worst_result(rows, *, keyword_only: bool, low: bool):
 #: footer (71) or the ten-digit transition line (127) + 1 + the cap footer's
 #: bound (75) + the line breaks.
 #: Re-measured after the #391 merge with the longest `matched_in`
-#: (`title+tags+body`): every case is five characters longer.
+#: (`title+tags+body`): every case is five characters longer. Re-measured for
+#: #403: the both-arms cut and omitted forms carry the three-digit fill fusion
+#: rank (`1/(1000+100)`), one character more; the keyword-only forms (no
+#: offset) and `explain omitted` (no term) do not move.
 D5 = {
     ("keyword_only", False, "cut"): 981,
     ("keyword_only", True, "cut"): 1008,
     ("keyword_only", True, "omitted"): 989,
-    ("both", False, "cut"): 999,
-    ("both", True, "omitted"): 1007,
+    ("both", False, "cut"): 1000,
+    ("both", True, "omitted"): 1008,
     ("both", True, "explain_omitted"): 988,
 }
 
@@ -405,9 +412,9 @@ D5 = {
 def test_the_d5_worst_cases(threshold, low):
     threshold(0.5 if low else 0.0)
     q_lit, query_cut = tools._hybrid_query_echo("\x01" * 8192)
-    rows = _worst_rows()
     measured = {}
     for arms in ("keyword_only", "both"):
+        rows = _worst_rows(50 if arms == "keyword_only" else 100)
         result = _worst_result(rows, keyword_only=arms == "keyword_only", low=low)
         assert tools.hybrid_confidence(result) == ("low" if low else "ok")
         for reranked in (False, True):

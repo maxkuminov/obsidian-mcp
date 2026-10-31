@@ -107,7 +107,7 @@ specific to this MCP server.
 | Schema gate (any change carrying a migration) | `make test-schema` |
 | Integration suite (real Postgres) | `make test-integration` |
 | Search-quality fixture | `make search-eval` |
-| Search eval (any search-path change) | `make search-eval-snapshot` then `make search-eval SEARCH_EVAL_DATA=.search-eval SEARCH_EVAL_DATABASE_URL=<restored BACKUP_FULL=1 copy>` — attach `report.json` only if `attachable: true` (`USER_ID=` export on multi-user), incumbent as `BASELINE`; `CORPUS_LOSS` invalidates |
+| Search eval (any search-path change) | `make search-eval-snapshot` then `make search-eval SEARCH_EVAL_DATA=.search-eval SEARCH_EVAL_DATABASE_URL=<restored BACKUP_FULL=1 copy>` — attach `report.json` only if `attachable: true` (`USER_ID=` export on multi-user), incumbent as `BASELINE`; `CORPUS_LOSS` invalidates; a change with a mechanical bar adds `python -m scripts.search_eval gate` (PASS/FAIL per metric × slice; exit 64 with no output on a non-attachable or multi-user report) and its table goes in the PR body |
 | Deploy | merge to `main` → CI → `image` workflow → Flux (homelab k3s); `make deploy` for a compose host |
 
 **`tests/integration/` skips itself without a database.** Those modules are
@@ -487,7 +487,11 @@ update it in the same change.** What stays here is the short list:
   lead names all three. It fuses both arms by RRF over note paths, `score =
   Σ 1/(k + rank)` with `k = HYBRID_RRF_K` (60, 1–1000, no per-call
   argument), over **each arm's top 50 only** (`arm_depth:` says when an arm
-  was full); ties by the better arm rank, then path. The query is embedded
+  was full); ties by the better arm rank, then path. A `match: any` keyword
+  row enters at `rank + 50` (`HYBRID_ANY_FILL_OFFSET` = arm depth, #403), so
+  a fill row never outranks an all-terms row through the keyword arm; never
+  on the keyword-only path, tie-break and `keyword_rank` unoffset, `explain`
+  at the fusion rank. The query is embedded
   **before** any statement; both arms then run on one session in one
   `REPEATABLE READ, READ ONLY` snapshot (keyword arm first, `SET LOCAL
   enable_indexscan = on` restored after an exact re-run, before the

@@ -3168,7 +3168,11 @@ def _hybrid_server_fields(r, k: int, *, omit_explain: bool = False) -> list[str]
         fields.append(f"keyword_rank: {r.keyword_rank} ({detail})")
     else:
         fields.append("keyword_rank: -")
-    terms = [f"1/({k}+{rank})" for rank in (r.semantic_rank, r.keyword_rank)
+    # #403: the keyword term is rendered at the rank fusion used (a fused
+    # `match: any` row's `keyword_rank + 50`), so the terms sum to the score;
+    # `keyword_rank:` above stays the unoffset arm position.
+    k_fused = r.keyword_fusion_rank if r.keyword_fusion_rank is not None else r.keyword_rank
+    terms = [f"1/({k}+{rank})" for rank in (r.semantic_rank, k_fused)
              if rank is not None]
     if omit_explain:
         # The last rung of the first-row ladder (#389, D5): the terms follow

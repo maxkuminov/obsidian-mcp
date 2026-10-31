@@ -693,7 +693,10 @@ def test_the_fixed_bounds():
     footers ≤ 75, and 995 ≤ 1,000. The low-plus-`any` header is pinned in
     `tests/test_search_confidence.py`."""
     worst_rows = [
+        # #403: the worst fused fill row renders its keyword term at fusion
+        # rank 100 (`keyword_rank + 50`), one digit more than rank 50.
         HybridRow(path=f"{i}.md", title="", tags=[], score=2 / 1050, keyword_rank=50,
+                  keyword_fusion_rank=100,
                   semantic_rank=50, match="any", similarity=-0.123, stale=True,
                   embedding_truncated=True, no_excerpt=True, matched_in=["title+tags+body"])
         for i in range(50)
@@ -781,9 +784,20 @@ def test_the_routing_sentence_is_in_all_three_descriptions():
 
 def test_the_hybrid_description_states_the_contract():
     doc = " ".join(_description("hybrid_search").split())
-    for token in ("reciprocal rank fusion", "top 50", "equal votes", "semantic_rank",
+    for token in ("reciprocal rank fusion", "top 50",
+                  "the same reciprocal-rank formula for semantic and all-terms keyword ranks",
+                  "a fill (`match: any`) keyword rank enters offset by 50, below every "
+                  "all-terms row", "semantic_rank",
                   "keyword_rank", "`explain`", "arms: keyword-only", "a single arm can rank better"):
         assert token in doc, token
+    # #403: the votes are no longer equal for a fill row.
+    assert "equal votes" not in doc
+
+
+def test_the_hybrid_description_length_is_pinned():
+    """#403 re-measured the raw docstring (what ships) at 3,976 characters,
+    under the 4,000 cap (#343). An edit re-measures here."""
+    assert len(_description("hybrid_search")) == 3976
 
 
 def test_hybrid_search_is_registered_last_with_read_only_annotations():

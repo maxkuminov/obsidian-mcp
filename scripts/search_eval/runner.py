@@ -172,6 +172,11 @@ async def run_generation(
         for key in getattr(arm.factory, "required_options", ()) or ():
             if key not in options:
                 raise UsageError(f"arm {arm.spec!r} needs --arm-opt {key}=…")
+        # #403: a factory may also validate its option values here
+        # (`make_arm_alt`'s `hybrid_alt_any_offset`), for the same reason.
+        check = getattr(arm.factory, "check_options", None)
+        if check is not None:
+            check(options)
     runs_dir = data_dir / RUNS_DIR
     gen_dir = runs_dir / generation
     needs_db = any(a.requires_db for a in arms)

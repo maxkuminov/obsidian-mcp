@@ -222,7 +222,9 @@ async def test_the_zero_result_line_carries_the_token(monkeypatch, captured, fak
 
 def test_the_fixed_bounds_with_rerank():
     worst_rows = [
+        # #403: fusion rank 100 for the worst fused fill row.
         HybridRow(path=f"{i}.md", title="", tags=[], score=2 / 1050, keyword_rank=50,
+                  keyword_fusion_rank=100,
                   semantic_rank=50, match="any", similarity=-0.123, stale=True,
                   embedding_truncated=True, no_excerpt=True, matched_in=["title+tags+body"])
         for i in range(50)
@@ -369,6 +371,7 @@ def test_the_floor_arithmetic_with_the_transition_line():
     from src.services.embeddings import transition_line
 
     rows = [HybridRow(path=f"{i}.md", title="", tags=[], score=2 / 1050, keyword_rank=50,
+                      keyword_fusion_rank=100,  # #403: both arms, a fused fill row
                       semantic_rank=50, match="any", similarity=-0.123, stale=True,
                       embedding_truncated=True, no_excerpt=True, matched_in=["title+tags+body"])
             for i in range(50)]
@@ -393,10 +396,12 @@ def test_the_floor_arithmetic_with_the_transition_line():
         omit_explain=True))
     # With #391's longest `matched_in` (`title+tags+body`, five characters
     # more than `title,body`) every row form is five longer.
-    assert (header, line, cut_form, omitted) == (388, 127, 383, 414)
-    assert header + 1 + line + 1 + cut_form + 25 + 25 + 1 + 75 == 1026
-    assert header + 1 + line + 1 + omitted + 1 + 75 == 1007
-    assert omitted - explain_omitted == 19
+    # #403: the fill row's keyword term at fusion rank 100 is one more again
+    # in the cut and omitted forms; `explain omitted` drops the term.
+    assert (header, line, cut_form, omitted) == (388, 127, 384, 415)
+    assert header + 1 + line + 1 + cut_form + 25 + 25 + 1 + 75 == 1027
+    assert header + 1 + line + 1 + omitted + 1 + 75 == 1008
+    assert omitted - explain_omitted == 20
     assert header + 1 + line + 1 + explain_omitted + 1 + 75 == 988 <= 1000
 
 

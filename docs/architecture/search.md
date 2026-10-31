@@ -351,6 +351,49 @@ arm's top 50, not the full rankings** (L3): a note at rank 51 in both
 1 (`1/61`); the header's always-present `arm_depth: keyword n/50, semantic
 c/50 chunks` says when an arm was full.
 
+**The fill is offset (#403).** When both arms ran, a `match: any` keyword
+row (the disjunctive fill) enters at fusion rank `rank + HYBRID_ANY_FILL_OFFSET`,
+where the constant is `HYBRID_ARM_DEPTH` (50). It is not a setting and has no
+call argument. A conjunctive row's keyword rank is ≤ 50, so its term is ≥
+`1/(k+50)`. A fill row's term is ≤ `1/(k+51)`. For every k, then, a fill row
+cannot outrank an all-terms row through the keyword arm alone, and a
+fill-only note sorts below every semantic-only note. Before #403 a fill row
+at keyword rank 3 scored `1/63`, the same as an all-terms match. The fill
+row's term still **adds** to the same note's semantic term: recall at depth
+is the product goal, and the fused candidate set (the union) is unchanged.
+Details:
+
+- **Unoffset elsewhere.** The tie-break key (`best_rank`) and
+  `keyword_rank:` stay unoffset, and so does the preview choice between one
+  row's keyword and semantic preview. `explain` renders the term at the rank
+  fusion used (`keyword_rank: 5 (match: any)` with `1/(60+55)`), so the
+  terms still sum to the score. No header token was added: `match: any` on
+  the row and `(all a, any b)` in the header already disclose the fill.
+- **Snippets follow the shown order.** Snippets and `matched_in` go to the
+  first `KEYWORD_SNIPPET_ROWS` keyword rows **of the new fused order**, so a
+  reordering can move a snippet across that boundary.
+- **Keyword-only pages are exempt.** When the semantic arm was unavailable,
+  no offset is applied, and the degraded page is byte-identical to before.
+- **Rerank.** `rerank=true` still takes the first 50 fused rows. Fill-only
+  notes are now the first to leave that window.
+- **Confidence** (`keyword_all`) is unchanged.
+- **The oracle against the incumbent.** The union is identical before the
+  cut. A call that fused no fill row is byte-identical. After the cut, the
+  exchange rule holds: non-fill rows keep their relative order, and the page
+  and the rerank window change only by fill-bearing rows being exchanged for
+  other union members. A non-fill row's line changes only by a snippet
+  reassignment at the boundary.
+
+#403's own query (*My opinion on AI replacing software engineers*) is led by
+the **semantic** arm: it ranks the job notes 3–5 and the opinion note 7th,
+so this change leaves that note 5th. The query is addressed by the re-test
+after the `CHUNKING_VERSION` 2 drain and by #402's reranker path.
+#403's accepted limitations: L1, the offset is uniform, so four of five
+words matched gets the same penalty as one; L2, on an `all 0` query the
+keyword arm can no longer lift a semantically weak note above a strong one
+(`keyword_search` is the tool for that); L3, scores of fill-bearing rows are
+not comparable with pre-#403 scores.
+
 **Degradation (D4).** Any exception from the embedding call — and only that
 call — makes the semantic arm unavailable: `ProviderInputTooLarge` →
 `provider_input_rejected`, anything else → `provider_error`. One WARNING
@@ -407,7 +450,15 @@ shared with `semantic_search` (one provider, one slot); `CLASS_MAPPING_VERSION`
 production service: `make_arm` (`--arm-opt hybrid_k=…`, default the
 setting) and `make_arm_alt` (`hybrid_alt_k`, required — the run exits 64
 without it), membership `keyword_or_semantic`, so one report can hold two
-values of k. A keyword-only answer during replay fails the run.
+values of k. A keyword-only answer during replay fails the run. Since #403
+`make_arm_alt` also takes `hybrid_alt_any_offset=0|50` (default 50; any
+other value is exit 64 before the generation is reserved). With 0 it
+replays the incumbent fusion through `hybrid._any_fill_offset_override`, a
+task-local `ContextVar` that the arm sets and resets around its own call,
+so a concurrent `make_arm` query never sees it. An AST test pins that
+nothing under `src/` sets it. The #403 A/B is therefore one generation:
+`make_arm` against `make_arm_alt` with `hybrid_alt_k=60
+hybrid_alt_any_offset=0` as `BASELINE`, judged by the `gate` step below.
 
 Accepted limitations (the change's design, L1–L13): equal votes can demote a
 strong single-arm hit (the paraphrase regression is expected on
@@ -528,17 +579,18 @@ before #389) and structure ≤ 367 (362 before #391's longest `matched_in`,
 75 + 5 = 1,016 (the keyword-only case measures 1,008), so that case falls
 through to the labelled omitted form (≤ 997, measured 989): the bound
 holds, the 20–25 cut is not guaranteed there (#389 L6). The both-arms
-rerank=true case with the transition line measures 1,026 cut, 1,007
-omitted and 988 at the last rung, `explain omitted`.
+rerank=true case with the transition line measures 1,027 cut, 1,008
+omitted and 988 at the last rung, `explain omitted` (1,026 and 1,007 before
+#403's three-digit fill fusion rank).
 Since #355 both tools' `rerank=true` pages carry the `index_transition:`
 line directly after the header and the `§` locator as a server field after
 the separator (after `rerank_score`), exactly as their `rerank=false`
 pages; the line is reserved in the budget, and an abbreviated first row
 drops the locator with `section omitted`. On a both-arms hybrid page the
 line (≤ 127 characters) makes the cut form sum 1,004 at the worst case
-(1,026 with the #389 token and #391's longest `matched_in`), so that case
-falls through to the labelled omitted form (1,007) and then to `explain
-omitted` (988):
+(1,026 with the #389 token and #391's longest `matched_in`, 1,027 with
+#403's fill fusion rank), so that case falls through to the labelled
+omitted form (1,008) and then to `explain omitted` (988):
 the 1,000 bound holds, the 20–25 cut is not guaranteed there. The
 `rerank=false` byte-identity baseline is the search-confidence page since
 #389: the pre-#389 page plus ` — confidence: ok` before the header's
@@ -646,8 +698,13 @@ equal): hybrid header 405 (`rerank=false`) and 444 (`rerank=true`),
 where both arms ran, `matched_in: title+tags+body`; each five more than
 #389 measured with `title,body`): keyword-only `rerank=false` cut form 981;
 keyword-only `rerank=true` cut 1,008 → omitted 989; both arms
-`rerank=false` cut 999; both arms `rerank=true` omitted 1,007 → `explain
-omitted` 988. These are the structural sums the tests pin; a page actually
+`rerank=false` cut 1,000; both arms `rerank=true` omitted 1,008 → `explain
+omitted` 988. Since #403 the both-arms forms carry a fused fill row's
+fusion rank up to 100 (`1/(1000+100)`, one character more: 999 → 1,000 and
+1,007 → 1,008). The keyword-only forms apply no offset, and `explain
+omitted` drops the term, so neither moves. The row structures measure 338
+(`rerank=false`) and 366 (`rerank=true`), inside the unchanged pinned 345 /
+367, and the 40–45 cut still holds at the `rerank=false` floor. These are the structural sums the tests pin; a page actually
 rendered from the worst-case fixtures fits in an earlier form (the sum mixes
 the fallback token with a `rerank_score`, and the reserved header's
 full-page counts with the shown header's), so the new rung is a guarantee
@@ -1426,10 +1483,30 @@ golden file `tests/fixtures/search_eval/expected-report.json` is compared
 with; `commit_sha` is asserted separately against `git rev-parse HEAD`.
 Exit codes: 0 `OK`, 2 `INSUFFICIENT_DATA` (fewer than `--min-queries`,
 default 50) or `CORPUS_LOSS`, 64 usage error or an incomplete or mismatched
-run, 1 anything else. **There is no metric threshold** (E2): the gate is a
-report the reviewer judges, with the incumbent as `--baseline`. The golden
+run, 1 anything else. **`score` has no metric threshold** (E2): the report
+is for the reviewer to judge, with the incumbent as `--baseline`. A change
+that needs a mechanical bar uses the `gate` step. The golden
 was regenerated once by #389 (the new metric keys, `staged_depth`, depth 50,
 `schema_version` 2).
+
+**The gate step (#403).** `python -m scripts.search_eval gate --report
+R --arm A --metrics m,… --slices s,… --min-ci-lower X --out F
+[--baseline-report B]` reads a scored report's `deltas` for arm A against
+the report's baseline, and prints one line per (metric × slice) cell with
+the delta mean, the paired bootstrap CI95 and PASS or FAIL. A cell FAILs
+when its CI95 lower bound is below X, or when its interval is null. The
+same table goes to F as Markdown for the PR body. Exit codes: 0 all pass, 1
+any cell fails, 64 on a usage error.
+
+**The tenant boundary is checked first.** The report, and for a `runfile:`
+baseline the staging generation's report (`--baseline-report`, then
+required), must each have verdict `OK`, `attachable: true` and
+`provenance.users == 1`. Otherwise the step exits 64 with no cell and no
+PASS/FAIL printed, and F is neither created nor replaced.
+
+#403's bar is eight cells: `--metrics
+recall@10,recall@20,recall@50,ndcg@10 --slices overall,class:identifier
+--min-ci-lower -0.01`. The step imports nothing from `src`.
 
 **The confidence tabulation (#389).** `python -m scripts.search_eval
 confidence --data DIR --threshold T` reads `confidence-rows.jsonl` (one line

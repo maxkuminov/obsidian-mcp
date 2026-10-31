@@ -373,3 +373,42 @@ What changed (owner decision, 2026-10-31):
   an attachable report (`USER_ID=` export on multi-user). Round 3 is
   verification-only for this item.
 
+## Codex spec review — round 3
+
+Verdict, verbatim:
+
+PASS. The gate now enforces attachable single-user provenance for candidate and baseline evidence, including `runfile:` baselines, with the required fail-closed output behavior. Task 7.3 and the multi-user scenario are aligned, and the four previously verified fixes remain intact. Strict OpenSpec validation passes.
+
+```json
+{"verdict":"PASS","round1":[{"claim":"Union identity and permitted page/reranker-window exchanges remain correctly specified.","status":"VERIFIED"},{"claim":"Snippet and matched_in reassignment at the fused-order boundary remains correctly specified.","status":"VERIFIED"},{"claim":"The explain-omitted intermediate figure remains 1,008 rather than 1,007.","status":"VERIFIED"},{"claim":"The tool description distinguishes equal reciprocal formulas from the fill-rank offset.","status":"VERIFIED"}],"round2":[{"claim":"The release gate must reject non-attachable or non-single-user candidate and baseline evidence without publishing results.","status":"VERIFIED"}],"findings":[]}
+```
+
+No change: every item VERIFIED.
+
+## Implementation notes (2026-10-31)
+
+- `fuse(..., *, any_paths, any_offset)` as D1, with the defaults the #354
+  fusion (a randomized test compares it with the verbatim incumbent).
+  `hybrid.any_fill_offset(semantic_ran)` returns 0 on the keyword-only path,
+  the override when set, and the constant otherwise.
+  `HybridRow.keyword_fusion_rank` carries the rank the renderer prints in
+  `explain`.
+- Snippet assignment needed no code change: the service already assigned
+  snippets to the page's keyword rows in fused order. The #403 change of
+  order is what moves them (D2), and a test pins it.
+- **Small shift: the runner gained a `check_options` factory hook** beside
+  `required_options`, so `hybrid_alt_any_offset`'s value is a usage error
+  (exit 64) *before* the generation is reserved, which D6 required.
+- **Shift: the named judgment is not in the synthetic fixture.** The
+  synthetic fixture (`tests/fixtures/search_eval/`) replays only the
+  `fixture-*` arms, which have no database and no hybrid arm. The opinion
+  note's vault path is tenant data and does not belong in a public repo.
+  The judgment therefore goes into `.search-eval/manual.jsonl` (tenant data,
+  never committed) in the operator pass (task 7.3), with its rank reported
+  and no target.
+- Re-measured bounds: headers 405 / 444 unchanged; structures 338 / 366
+  inside the unchanged 345 / 367; D5 figures keyword-only 981 / 1,008 →
+  989 unchanged, both arms `rerank=false` cut 1,000, `rerank=true` omitted
+  1,008 → `explain omitted` 988; with the transition line `rerank=true` cut
+  1,027 (was 1,026). The description measures 3,976 characters (pinned).
+

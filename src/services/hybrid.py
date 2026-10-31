@@ -49,6 +49,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 
 from sqlalchemy import text
@@ -61,6 +62,22 @@ logger = logging.getLogger(__name__)
 #: How deep each arm is taken: the keyword arm's row limit and the semantic
 #: arm's chunk overfetch. RRF is computed over these lists only (D3, L3).
 HYBRID_ARM_DEPTH = 50
+
+#: #403 (design D1): when both arms ran, a `match: any` (disjunctive fill)
+#: keyword row enters fusion at `rank + HYBRID_ANY_FILL_OFFSET`. A
+#: conjunctive row's keyword rank is at most `HYBRID_ARM_DEPTH`, so its term
+#: is at least `1/(k + 50)`; a fill row's fusion rank is at least 51, so its
+#: term is at most `1/(k + 51)`: a fill row can never outrank an all-terms
+#: row through the keyword arm alone, for every k (`HYBRID_RRF_K` is read
+#: from settings, 1–1000). Not a setting, no per-call argument.
+HYBRID_ANY_FILL_OFFSET = HYBRID_ARM_DEPTH
+
+#: The harness's A/B seam (#403, design D6): `None` uses the constant. Only
+#: `scripts/search_eval_arms/hybrid.py` sets it (task-local, so a concurrent
+#: live call never sees it); an AST test pins that nothing under `src/` does.
+_any_fill_offset_override: ContextVar[int | None] = ContextVar(
+    "hybrid_any_fill_offset_override", default=None
+)
 
 #: The page cap (owner decision 5): past it the fused order is mostly one
 #: arm's tail.
@@ -86,6 +103,10 @@ class HybridRow:
     score: float
     keyword_rank: int | None = None
     semantic_rank: int | None = None
+    #: #403: the rank the keyword term was fused at — `keyword_rank + 50`
+    #: for a fused `match: any` row, else `keyword_rank`. `None` on a row
+    #: built without it (the renderer then uses `keyword_rank`).
+    keyword_fusion_rank: int | None = None
     # Keyword-arm fields.
     match: str | None = None
     matched_in: list[str] | None = None
@@ -165,22 +186,42 @@ async def _fill_excerpts(session, page: list[HybridRow], *, user_id: int | None)
 
 
 def fuse(
-    keyword_paths: list[str], semantic_paths: list[str], k: int
+    keyword_paths: list[str],
+    semantic_paths: list[str],
+    k: int,
+    *,
+    any_paths: frozenset[str] | set[str] = frozenset(),
+    any_offset: int = 0,
 ) -> list[tuple[str, float, int | None, int | None]]:
     """Reciprocal rank fusion over paths: `(path, score, keyword_rank,
     semantic_rank)`, ordered by score DESC, then the smaller of the note's arm
     ranks ASC, then path ASC — a tie-break that favours no arm (D3). Ranks are
-    1-based positions; each list holds a path at most once."""
+    1-based positions; each list holds a path at most once.
+
+    #403: a keyword path in `any_paths` contributes `1/(k + rank +
+    any_offset)`. The returned `keyword_rank` and the tie-break use the
+    **unoffset** rank. With the defaults the result is the #354 fusion."""
     kr = {p: i + 1 for i, p in enumerate(keyword_paths)}
     sr = {p: i + 1 for i, p in enumerate(semantic_paths)}
     out = []
     for p in dict.fromkeys([*keyword_paths, *semantic_paths]):
         k_rank, s_rank = kr.get(p), sr.get(p)
-        score = sum(1.0 / (k + r) for r in (k_rank, s_rank) if r is not None)
+        k_fused = k_rank + any_offset if k_rank is not None and p in any_paths else k_rank
+        score = sum(1.0 / (k + r) for r in (k_fused, s_rank) if r is not None)
         best = min(r for r in (k_rank, s_rank) if r is not None)
         out.append((p, score, k_rank, s_rank, best))
     out.sort(key=lambda t: (-t[1], t[4], t[0]))
     return [t[:4] for t in out]
+
+
+def any_fill_offset(semantic_ran: bool) -> int:
+    """The offset this call fuses fill rows at (#403): 0 on the keyword-only
+    path (design D3: that page stays byte-identical), else the harness
+    override when set, else `HYBRID_ANY_FILL_OFFSET`."""
+    if not semantic_ran:
+        return 0
+    override = _any_fill_offset_override.get()
+    return HYBRID_ANY_FILL_OFFSET if override is None else override
 
 
 async def hybrid_search(
@@ -268,7 +309,12 @@ async def hybrid_search(
     # ── 6. Fusion ───────────────────────────────────────────────────────────
     k_by_path = {r["path"]: r for r in k_arm.rows}
     s_by_path = {r["path"]: r for r in s_rows}
-    fused = fuse([r["path"] for r in k_arm.rows], [r["path"] for r in s_rows], k)
+    any_paths = frozenset(r["path"] for r in k_arm.rows if r["match"] == "any")
+    offset = any_fill_offset(unavailable is None)
+    fused = fuse(
+        [r["path"] for r in k_arm.rows], [r["path"] for r in s_rows], k,
+        any_paths=any_paths, any_offset=offset,
+    )
     page: list[HybridRow] = []
     for path, score, k_rank, s_rank in fused[:depth]:
         kr, sr = k_by_path.get(path), s_by_path.get(path)
@@ -276,6 +322,10 @@ async def hybrid_search(
         row = HybridRow(
             path=path, title=src["title"], tags=src["tags"], score=score,
             keyword_rank=k_rank, semantic_rank=s_rank,
+            keyword_fusion_rank=(
+                None if k_rank is None
+                else k_rank + offset if path in any_paths else k_rank
+            ),
         )
         if kr is not None:
             row.match = kr["match"]
@@ -291,6 +341,8 @@ async def hybrid_search(
         page.append(row)
 
     # ── 7. Keyword snippets for the page's keyword rows, capped ─────────────
+    # In the fused order this page shows (#403, design D2): a reordering can
+    # move a snippet across the `KEYWORD_SNIPPET_ROWS` boundary.
     cap = settings.keyword_snippet_rows
     started = time.monotonic()
     if cap > 0:

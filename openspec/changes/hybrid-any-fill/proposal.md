@@ -115,7 +115,9 @@ delta. The `reranker` spec's "first 50 fused rows" wording still holds.
   `ContextVar`, `HybridRow.keyword_fusion_rank`);
   `src/mcp_server/tools.py` (`_hybrid_server_fields`' keyword term);
   `src/mcp_server/server.py` (`hybrid_search` description);
-  `scripts/search_eval_arms/hybrid.py`.
+  `scripts/search_eval_arms/hybrid.py`; `scripts/search_eval/gate.py`,
+  `scripts/search_eval/__main__.py` (`gate`), `scripts/search_eval/runner.py`
+  (`check_options` hook).
 - Tests: `tests/test_hybrid_search_offline.py`, `tests/test_hybrid_rerank.py`,
   `tests/test_hybrid_search_eval.py`, `tests/integration/test_hybrid_search_pg.py`,
   `tests/test_issue_343_tool_metadata.py` (description cap).

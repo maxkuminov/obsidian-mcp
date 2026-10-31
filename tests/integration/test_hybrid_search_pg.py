@@ -542,3 +542,48 @@ async def test_the_keyword_arm_carries_a_tags_and_body_match(maker, corpus):
         async with maker() as session:
             await session.execute(text("DELETE FROM notes_metadata WHERE file_path = 'HOA/board.md'"))
             await session.commit()
+
+
+async def test_fill_rows_are_fused_at_the_offset_and_the_oracle_holds(maker, corpus):
+    """#403 on real PostgreSQL. `zx81 rollback` has one all-terms note
+    (`both.md`) and a `match: any` fill (the other `zx81` notes). The fused
+    order is the formula with the fill offset on the arms' own ranks; against
+    the incumbent fusion (override 0) the union is identical before the cut,
+    the non-fill rows keep their relative order, and every fill row's
+    `explain` term renders at `keyword_rank + 50`."""
+    from src.mcp_server import tools
+
+    filters = dict(folder="Projects/", user_id=corpus["u7"])
+    query = "zx81 rollback"
+    async with maker() as session:
+        kw = await full_text_search(session, query, limit=50, **filters)
+    async with maker() as session:
+        sem = await semantic_search(session, query, limit=50, **filters)
+    any_paths = frozenset(r["path"] for r in kw if r["match"] == "any")
+    assert any_paths and any(r["match"] == "all" for r in kw), "the corpus has both blocks"
+    keyword, semantic = [r["path"] for r in kw], [r["path"] for r in sem]
+
+    async def run(incumbent):
+        token = hybrid._any_fill_offset_override.set(0) if incumbent else None
+        try:
+            async with maker() as session:
+                return await hybrid.hybrid_search(session, query, limit=50, **filters)
+        finally:
+            if token is not None:
+                hybrid._any_fill_offset_override.reset(token)
+
+    new, old = await run(False), await run(True)
+    expected = fuse(keyword, semantic, 60, any_paths=any_paths, any_offset=50)
+    assert [(r.path, r.keyword_rank, r.semantic_rank) for r in new.rows] == [
+        (p, kr, sr) for p, _, kr, sr in expected]
+    assert [r.path for r in old.rows] == [p for p, *_ in fuse(keyword, semantic, 60)]
+    # Union identity before the cut (limit 50 holds the whole union here).
+    assert {r.path for r in new.rows} == {r.path for r in old.rows} == set(keyword) | set(semantic)
+    non_fill = [r.path for r in old.rows if r.path not in any_paths]
+    assert [r.path for r in new.rows if r.path not in any_paths] == non_fill
+    text_out, _ = tools.render_hybrid_results(query, new)
+    for r in new.rows:
+        if r.path in any_paths:
+            assert r.keyword_fusion_rank == r.keyword_rank + 50
+            line = next(ln for ln in text_out.splitlines() if f'"path":"{r.path}"' in ln)
+            assert f"1/(60+{r.keyword_rank + 50})" in line

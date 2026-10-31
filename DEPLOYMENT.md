@@ -997,6 +997,23 @@ and needs nothing; the real run is this path, from a checkout with
    included (a query whose search finds nothing is scored as empty and
    counted per arm as `empty_candidates` in the manifest): raise `RERANK_TIMEOUT_MS` for replay if the reranker is slow,
    and say so next to the report.
+   **A change with a mechanical bar adds the `gate` step** (#403). The
+   fill-offset change replays the incumbent fusion as its baseline:
+   `ARMS="keyword semantic scripts.search_eval_arms.hybrid:make_arm
+   scripts.search_eval_arms.hybrid:make_arm_alt" ARM_OPTS="hybrid_alt_k=60
+   hybrid_alt_any_offset=0" BASELINE=scripts.search_eval_arms.hybrid:make_arm_alt`.
+   Then run `python -m scripts.search_eval gate --report
+   .search-eval/report.json --arm scripts.search_eval_arms.hybrid:make_arm
+   --metrics recall@10,recall@20,recall@50,ndcg@10 --slices
+   overall,class:identifier --min-ci-lower -0.01 --out
+   .search-eval/hybrid-any-fill-gate.md`. It prints PASS or FAIL per cell
+   and exits 0 (all pass), 1 (a cell's CI95 lower bound is below the bound,
+   or its interval is null) or 64. It exits 64, printing nothing and writing
+   no file, when the report is not `OK`, `attachable: true` and
+   `provenance.users == 1`. On a multi-user deployment, export with
+   `USER_ID=` first. The two paths are the scored `report.json` and the
+   gate's Markdown table, and the PR body carries only a table from a
+   successful run.
 7. **Attach `report.json` to the PR only if it says `attachable: true`.** It
    carries metrics, counts and hashes, no query text and no note paths. A
    `CORPUS_LOSS` verdict means the candidate lost searchable notes for that

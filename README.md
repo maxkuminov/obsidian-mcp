@@ -307,7 +307,8 @@ the wire, so none is cut off by a client's description limit.
 - `hybrid_search(query, limit=10, folder?, tags?, frontmatter?, rerank=false)`, both
   of the above fused by reciprocal rank fusion over each arm's top 50, one
   line per note with its fused score, each arm's rank and the `1/(k+rank)`
-  terms behind the score. The three are peers, and every description
+  terms behind the score. A keyword note that matched only some of the
+  words (`match: any`) counts below every all-words match. The three are peers, and every description
   carries the same routing sentence: exact identifiers, code symbols,
   titles or known phrases go to `keyword_search`; conceptual or
   paraphrased questions to `semantic_search`; unsure which, `hybrid_search`.
