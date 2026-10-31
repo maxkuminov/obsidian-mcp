@@ -1131,22 +1131,29 @@ bump.
   ```sql
   WITH tagged AS (
     SELECT id, content_tsvector AS v,
-           setweight(to_tsvector('english',
-             array_to_string(tags, E'\n') || E'\n' ||
-             replace(array_to_string(tags, E'\n'), '/', ' ')), 'B') AS b
+           translate(array_to_string(tags, E'\n'), chr(2) || chr(3), '') AS t
     FROM notes_metadata
     WHERE content_tsvector IS NOT NULL AND cardinality(tags) > 0
       AND length(ts_filter(content_tsvector, '{b}')) = 0
+  ), parts AS (
+    SELECT id,
+           ts_filter(v, '{a}') AS a,
+           ts_filter(v, '{d}') AS d,
+           setweight(to_tsvector('english', t || E'\n' || replace(t, '/', ' ')), 'B') AS b
+    FROM tagged
   ), est AS (
     SELECT id,
       (SELECT coalesce(sum((octet_length(lexeme) + 1) / 2 * 2
          + CASE WHEN cardinality(positions) > 0 THEN 2 + 2 * cardinality(positions) ELSE 0 END), 0)
-       FROM unnest(v))
+       FROM unnest(a))
+    + (SELECT coalesce(sum((octet_length(lexeme) + 1) / 2 * 2
+         + CASE WHEN cardinality(positions) > 0 THEN 2 + 2 * cardinality(positions) ELSE 0 END), 0)
+       FROM unnest(d))
     + (SELECT coalesce(sum((octet_length(lexeme) + 1) / 2 * 2
          + CASE WHEN cardinality(positions) > 0 THEN 2 + 2 * cardinality(positions) ELSE 0 END), 0)
        FROM unnest(b)) AS bytes
-      , length(ts_filter(v, '{a}')) = 0 AS d_only
-    FROM tagged WHERE length(b) > 0
+      , length(a) = 0 AS d_only
+    FROM parts WHERE length(b) > 0
   )
   SELECT count(*) AS tagged_rows,
          count(*) FILTER (WHERE bytes > 1048511 OR d_only) AS flagged,
@@ -1156,7 +1163,10 @@ bump.
   FROM est;
   ```
 
-  A row is flagged when its estimate is over the limit, **or** when its
+  The estimate counts the title part, the body part and the tags part
+  separately, as 035 does (a word in both a note's title and its body is
+  stored once but rebuilt twice), and strips the U+0002/U+0003 characters
+  from tags as 035 does. A row is flagged when its estimate is over the limit, **or** when its
   vector has no title part at all (`d_only`: a note 031 left at the size
   limit). 035 builds such a row's whole title-and-aliases head, which the
   stored vector does not show, so the statement flags every one of them

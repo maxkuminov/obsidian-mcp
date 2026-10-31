@@ -507,8 +507,13 @@ async def test_the_identity_oracle_exempts_exactly_the_tag_contributions(session
         "Hoa tagged.md": ({"tags": ["hoa"]}, "a note about forecast and siding\n"),
         "Budget tagged.md": ({"tags": ["budget"]}, "the budget forecast for next year\n"),
         "Untagged.md": "another budget forecast entirely\n",
+        # Distinct term frequencies (V7), so clause (b) compares real ranks.
+        "Twice.md": "forecast filler words forecast\n",
+        "Thrice.md": "forecast and forecast again, forecast\n",
+        "Many.md": "forecast " * 7 + "\n",
     })
     await index(vault)
+    distinct_body_ranks = 0
     expected_exempt = {
         "hoa": {"Hoa tagged.md"},
         "budget forecast": {"Budget tagged.md"},
@@ -533,6 +538,9 @@ async def test_the_identity_oracle_exempts_exactly_the_tag_contributions(session
         body_only = [r["path"] for r in new if r["match"] == "all"
                      and r["matched_in"] == ["body"] and r["path"] not in exempt]
         assert body_only == [p for p in old_paths if p in body_only], query  # (b)
+        old_rank = dict(old)
+        distinct_body_ranks = max(distinct_body_ranks, len({old_rank[p] for p in body_only}))
+    assert distinct_body_ranks >= 3, "clause (b) must compare distinct ranks"
 # ── the disjunctive fill ────────────────────────────────────────────────────
 
 

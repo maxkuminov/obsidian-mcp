@@ -582,7 +582,11 @@ def _worst_case(monkeypatch, *, keyword_only: bool, split: bool = False):
         sem_row(100 + i, f"s{i}.md") for i in range(49)]
     session = _Session(ranked=[keyword], semantic=[semantic],
                        snippet=[[snip(1, hl="a \x02b\x03", title=False, body=not split)]
-                                + [snip(10 + i) for i in range(19)]])
+                                + [snip(10 + i) for i in range(19)]]
+                       # A split row gets a computed head (V5), so its keyword
+                       # preview exists and `preview omitted` is asserted.
+                       + ([[SimpleNamespace(_mapping={"id": 1, "head": "opening words"})]]
+                          if split else []))
     result = _search(session, query, limit=50)
     assert result.rows[0].path == path
     if split:
@@ -610,12 +614,7 @@ def test_the_worst_case_at_the_minimum_cap(monkeypatch, keyword_only, split):
         lit = _field_literal(row, key)
         assert 40 <= _rendered_content(lit) <= 45, (key, lit)
         assert full.startswith(json.loads(lit)), "a whole-character prefix"
-    # A split, keyword-only row has no preview to omit (no head was
-    # computed by the fake), so `preview omitted` is not required there.
-    labels = ("title_cut", "path_cut", "tags omitted", "abbreviated")
-    if not (split and keyword_only):
-        labels += ("preview omitted",)
-    for label in labels:
+    for label in ("title_cut", "path_cut", "tags omitted", "preview omitted", "abbreviated"):
         assert label in row, label
     assert '"tags":[]' in row
     if split:

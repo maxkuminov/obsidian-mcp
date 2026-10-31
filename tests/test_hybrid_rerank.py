@@ -268,7 +268,8 @@ async def test_the_hybrid_worst_case_with_rerank(monkeypatch, captured, fake, mo
         excerpts={path: "e" * 3000},
         ranked=[keyword],
         snippet=[[snip(1, hl="a \x02b\x03", title=False, body=not split)]
-                 + [snip(10 + i) for i in range(19)]])
+                 + [snip(10 + i) for i in range(19)]]
+        + ([[SimpleNamespace(_mapping={"id": 1, "head": "opening words"})]] if split else []))
     _serve(monkeypatch, session)
     fake.mode = mode
     fake.scorer = (lambda q, d: [-1.234e-05 if i == 0 else -9.0 for i in range(len(d))]) \
@@ -282,16 +283,14 @@ async def test_the_hybrid_worst_case_with_rerank(monkeypatch, captured, fake, mo
     rows = [line for line in lines if line.startswith("- {")]
     assert len(rows) == 1
     if split:
-        # `matched_in: title+tags+body` (#391): structure ≤ 367, and when the
-        # 20–25 cut form does not fit the row takes the labelled omitted form.
+        # `matched_in: title+tags+body` (#391). These inputs' real header is
+        # shorter than the 431 worst case, so the 20–25 cut form fits here
+        # (pinned); the arithmetic worst case (1,003 > 1,000) takes the
+        # omitted form, pinned by the direct-render test below.
         assert "matched_in: title+tags+body" in rows[0]
-        if '"title":""' in rows[0]:
-            for label in ("title omitted", "path omitted", "abbreviated"):
-                assert label in rows[0], label
+        assert '"title":""' not in rows[0] and '"path":""' not in rows[0]
     for key in ("title", "path"):
         lit = re.search(r'"%s":("(?:[^"\\]|\\.)*")' % key, rows[0]).group(1)
-        if split and lit == '""':
-            continue
         assert 20 <= len(lit) - 2 <= 25, (key, lit)
         assert {"title": title, "path": path}[key].startswith(json.loads(lit))
     assert lines[-1].startswith("Response cap: 49 omitted — more: true")
@@ -385,3 +384,28 @@ def test_the_floor_arithmetic_with_the_transition_line():
     assert (header, line, cut_form) == (371, 127, 378)
     assert header + 1 + line + 1 + cut_form + 25 + 25 + 1 + 75 == 1004
     assert header + 1 + line + 1 + omitted + 1 + 75 <= 1000
+
+
+def test_the_rerank_worst_case_takes_the_omitted_form_when_the_cut_cannot_fit(monkeypatch):
+    """#391 V6: with `matched_in: title+tags+body` the cut-form floor sum is
+    431 + 367 + 25 + 25 + 75 + 75 + 5 = 1,003 > 1,000, so at the arithmetic
+    worst case the first row must take the labelled omitted form. Pinned by
+    rendering at the budget the omitted form needs, which the cut form
+    exceeds."""
+    from tests.test_hybrid_search_offline import _worst_case
+
+    query, _title, _path, result = _worst_case(monkeypatch, keyword_only=True, split=True)
+    n = len(result.rows)
+    outcome = rerank.RerankOutcome(False, list(range(n)), n, reason="malformed_response")
+    omitted, _ = tools.render_hybrid_results(query, result, rerank=outcome, budget=1)
+    cut, _ = tools.render_hybrid_results(query, result, rerank=outcome, budget=1000)
+    assert '"title":""' in omitted and '"title":""' not in cut
+    L_omit = len(omitted)
+    assert len(cut) > L_omit
+    text, _ = tools.render_hybrid_results(query, result, rerank=outcome, budget=L_omit)
+    row = next(line for line in text.splitlines() if line.startswith("- {"))
+    assert "matched_in: title+tags+body" in row
+    assert '"title":""' in row and '"path":""' in row
+    for label in ("title_cut", "title omitted", "path_cut", "path omitted", "abbreviated"):
+        assert label in row, label
+    assert len(text) <= L_omit

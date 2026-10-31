@@ -7863,7 +7863,8 @@ def test_035_size_formula_tracks_postgresqls_own_count():
                           "setweight(to_tsvector('english', $2), 'B'))", words, tags)
         reported = int(re.search(r"\((\d+) bytes", str(raised.value)).group(1))
         print(f"\n[035 size formula] S = {estimate}, PostgreSQL reported {reported}")
-        assert abs(reported - estimate) <= 8
+        # Within four bytes, absorbed by the 64-byte margin — not an upper bound.
+        assert abs(reported - estimate) <= 4
         # A storable vector's own S is below the limit.
         assert size_of(url, "to_tsvector('english', $1)", words) == 12 * 87_370 < SIZE_LIMIT_035
 
@@ -7999,3 +8000,81 @@ def test_downgrade_035_strips_the_tags_part_and_keeps_the_rest():
         _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
         assert "hoa" in part_lexemes(url, 1, "{b}")
         assert_alembic_check_clean(url, DIM)
+
+
+def preflight_rejected_ids(url) -> set[int]:
+    """The ids 035's preflight names (it must refuse)."""
+    import re
+
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0 and "035 size preflight" in combined, combined[-2000:]
+    listed = re.search(r"id\(s\) ([0-9, ]+)\. Nothing", combined).group(1)
+    assert alembic_version(url) == "034"
+    return {int(x) for x in listed.split(", ")}
+
+
+def test_every_row_the_preflight_rejects_is_flagged_by_the_operator_statement():
+    """Verifier V1 and Codex r1 C1: the documented statement never passes a
+    row 035's preflight rejects — a D-only row, a headed row whose title and
+    body share lexemes (stored once in the merged vector, counted per part by
+    the preflight), and a row whose tag hides a word behind U+0002 (`the\\x02a`
+    is stop words to a naive parse and `thea` to `tags_text`)."""
+    with throwaway_db("schema_035_operator_cover", revision="034") as url:
+        insert_tagged_note(url, 1, "ok.md", "Fine Note", {}, ["budget"], "body one")
+        # D-only (Codex r2).
+        insert_tagged_note(url, 7, "q.md", "Quarterly Review", {}, ["hoa"],
+                           near_limit_words(87_374), headed=False)
+        # Shared lexemes: 200 aliases that are also body words.
+        shared = [f"w{i:07d}" for i in range(200)]
+        insert_tagged_note(url, 8, "s.md", "Shared", {"aliases": shared}, ["hoa"],
+                           near_limit_words(87_176))
+        merged = size_of(url, "(SELECT content_tsvector FROM notes_metadata WHERE id = 8)")
+        assert merged + 10 <= PREFLIGHT_MAX_035, "a merged-vector estimate would pass it"
+        # The sentinel tag.
+        insert_tagged_note(url, 9, "x.md", "Big Note", {}, ["the\x02a"], near_limit_words(87_377))
+        flagged = set(fetch(url, operator_statement())[0]["ids"] or [])
+        rejected = preflight_rejected_ids(url)
+        assert rejected == {7, 8, 9}, rejected
+        assert rejected <= flagged, (rejected, flagged)
+        assert 1 not in flagged
+
+
+def test_035_preflight_names_every_rejected_row():
+    """Codex r1 C2: fifty-one rows over the margin, all fifty-one ids named."""
+    with throwaway_db("schema_035_preflight_51", revision="034") as url:
+        sql(
+            url,
+            "INSERT INTO notes_metadata (id, user_id, file_path, title, frontmatter, tags, "
+            " content_hash, content_tsvector) "
+            "SELECT g, NULL, 'n' || g || '.md', 'Big Note', '{}'::jsonb, '{hoa}', 'h', "
+            "       setweight(to_tsvector('english', 'Big Note'), 'A') || to_tsvector('english', $1) "
+            "FROM generate_series(1, 51) g",
+            near_limit_words(87_377),
+        )
+        combined = refuse_035(url, must_mention=["035 size preflight: 51 tagged keyword vector(s)"])
+        assert "id(s) " + ", ".join(str(i) for i in range(1, 52)) + ". Nothing" in combined
+        assert "…" not in combined
+
+
+def test_035_a_headed_row_with_an_empty_body_and_a_tag_in_its_title():
+    """V8: a headed row with no body gains `B` byte-exactly (A + B only); a
+    row whose tag word is also its title word carries `A` and `B` positions on
+    one lexeme, and the stamp-back re-run skips it."""
+    with throwaway_db("schema_035_edges", revision="034") as url:
+        insert_tagged_note(url, 1, "e.md", "Alpha", {}, ["hoa"], "")
+        insert_tagged_note(url, 2, "h.md", "Hoa board", {}, ["hoa"], "the minutes")
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert all_vectors(url)[1] == expected_tagged(url, "Alpha", {}, ["hoa"], "")
+        assert part_lexemes(url, 1, "{d}") == []
+        weights = fetchval(
+            url,
+            "SELECT weights FROM unnest((SELECT content_tsvector FROM notes_metadata "
+            "WHERE id = 2)) WHERE lexeme = 'hoa'",
+        )
+        assert set(weights) == {"A", "B"}, weights
+        first = all_vectors(url)
+        _harness.run_alembic(url, "stamp", "034", dimensions=DIM)
+        result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert "0 re-headed, 2 already tagged" in result.stdout + result.stderr
+        assert all_vectors(url) == first

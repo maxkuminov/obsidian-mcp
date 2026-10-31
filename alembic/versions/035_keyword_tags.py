@@ -37,11 +37,12 @@ Before the first UPDATE, read-only and under the same lock and configs, every
 row the rewrite would change is estimated as `S(ts_filter(v, '{d}')) +
 S(head(title, aliases, tags))`, where `S(v)` sums over `unnest(v)` the
 lexeme's bytes rounded up to even plus `2 + 2 × npos` when it has positions —
-PostgreSQL's own accounting of a tsvector's string area, an upper bound for a
-concatenation (a lexeme in two parts is stored once). Any estimate above
-1,048,511 (the 1,048,575-byte limit less a 64-byte margin; measured within
-four bytes of PostgreSQL's own count) aborts the migration before anything is
-written, naming the count and the row ids — so a Kubernetes `migrate`
+PostgreSQL's own accounting of a tsvector's string area. Summed over the parts
+of a concatenation it is within four bytes of PostgreSQL's count (it
+over-counts a lexeme the parts share, stored once, and is otherwise not a
+strict upper bound). Any estimate above 1,048,511 (the 1,048,575-byte limit
+less a 64-byte margin that absorbs that difference) aborts the migration before anything is
+written, naming the count and every row id — so a Kubernetes `migrate`
 initContainer fails in seconds, not after rewriting rows.
 
 The rewrite is **all-or-nothing** (Codex r1 B1): no savepoints; any error on
@@ -104,9 +105,6 @@ REHEAD_STATEMENT_TIMEOUT = "15min"
 #: 64-byte margin for the estimate's measured four-byte slack (design D5).
 TSVECTOR_LIMIT_BYTES = 1048575
 PREFLIGHT_MAX_BYTES = TSVECTOR_LIMIT_BYTES - 64
-
-#: How many flagged ids the preflight's refusal lists before an ellipsis.
-PREFLIGHT_REPORT_LIMIT = 50
 
 
 def _say(message: str, *args) -> None:
@@ -307,13 +305,13 @@ def preflight(bind, configs: list[str], rows) -> tuple[list[dict], int]:
             flagged.append(params["id"])
         work.append(params)
     if flagged:
-        shown = ", ".join(str(i) for i in flagged[:PREFLIGHT_REPORT_LIMIT])
-        more = " …" if len(flagged) > PREFLIGHT_REPORT_LIMIT else ""
+        # Every id, never a prefix: each named note needs its own remedy.
+        shown = ", ".join(str(i) for i in flagged)
         raise RuntimeError(
             f"035 size preflight: {len(flagged)} tagged keyword vector(s) would "
             f"exceed PostgreSQL's 1 MiB tsvector limit once the tags part is "
             f"added (estimate over {PREFLIGHT_MAX_BYTES} bytes): notes_metadata "
-            f"id(s) {shown}{more}. Nothing has been changed: the database is "
+            f"id(s) {shown}. Nothing has been changed: the database is "
             "still at revision 034. Serve the previous image, shorten each "
             "named note's body or tags, let the previous image re-index it, "
             "then deploy again (DEPLOYMENT.md, 'Upgrading across migration 035')."
