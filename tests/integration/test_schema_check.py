@@ -8107,3 +8107,46 @@ def test_035_a_headed_row_with_an_empty_body_and_a_tag_in_its_title():
         result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
         assert "0 re-headed, 2 already tagged" in result.stdout + result.stderr
         assert all_vectors(url) == first
+
+
+def operator_statement_multi():
+    """The multi-config (`english,simple`) statement, verbatim from
+    `DEPLOYMENT.md` — the second SQL block of the 035 note."""
+    import re
+    import textwrap
+
+    text_ = (_harness.ROOT / "DEPLOYMENT.md").read_text(encoding="utf-8")
+    section = text_[text_.index("## Upgrading across migration 035"):]
+    blocks = re.findall(r"```sql\n(.*?)\n\s*```", section, re.S)
+    return textwrap.dedent(blocks[1])
+
+
+def test_the_multi_config_operator_statement_flags_every_preflight_rejection():
+    """Codex impl r3: with an `english,simple` fingerprint the per-config
+    parses must be combined with `UNION ALL`. A plain `UNION` keeps one of
+    the two equal per-config rows of each tag word and under-counts the head
+    035 builds under both configs."""
+    with throwaway_db("schema_035_operator_multi", revision="034") as url:
+        sql(url, "INSERT INTO indexer_state (key, value, updated_at) VALUES "
+                 "('fts_fingerprint', '{\"configs\":[\"english\",\"simple\"],\"v\":1}', now())")
+        tags = [f"{i:05d}/x" for i in range(128)]
+        sql(
+            url,
+            "INSERT INTO notes_metadata (id, user_id, file_path, title, frontmatter, tags, "
+            " content_hash, content_tsvector) VALUES (1, NULL, 'c.md', 'Big Note', '{}'::jsonb, "
+            " $1::varchar[], 'h', "
+            " setweight(to_tsvector('english', 'Big Note'), 'A') || "
+            " setweight(to_tsvector('simple', 'Big Note'), 'A') || "
+            " to_tsvector('english', $2) || to_tsvector('simple', $2))",
+            tags, near_limit_words(84_350),
+        )
+        statement = operator_statement_multi()
+        assert "UNION ALL" in statement
+        per_row = statement.split("SELECT count(*)")[0] + "SELECT id, bytes FROM est"
+        union_all = {r["id"]: r["bytes"] for r in fetch(url, per_row)}[1]
+        union = {r["id"]: r["bytes"]
+                 for r in fetch(url, per_row.replace("UNION ALL", "UNION"))}[1]
+        print(f"\n[multi-config operator] UNION ALL {union_all}, UNION {union}")
+        assert fetch(url, statement)[0]["ids"] == [1]
+        assert union <= PREFLIGHT_MAX_035 < union_all, "UNION would pass the row"
+        assert preflight_rejected_ids(url) == {1}

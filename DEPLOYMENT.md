@@ -1125,8 +1125,7 @@ bump.
   image digest.
 - **Check before merging.** Run this read-only statement against the live
   database (034) first. It reports counts and ids only. It shows one FTS
-  config (`english`); with several, run the `to_tsvector` in `toks` once per
-  config (a union over the configs).
+  config (`english`); the multi-config form follows it.
   `flagged` must be `0` before you upgrade.
 
   ```sql
@@ -1143,6 +1142,62 @@ bump.
                                (replace(translate(g.tag, chr(2) || chr(3), ''), '/', ' '))) AS f(txt)
     CROSS JOIN LATERAL unnest(to_tsvector('english', f.txt)) AS x
     GROUP BY t.id, x.lexeme
+  ), b AS (
+    SELECT id, sum((octet_length(lexeme) + 1) / 2 * 2 + 2 + 2 * least(npos, 256)) AS bytes
+    FROM toks GROUP BY id
+  ), est AS (
+    SELECT t.id,
+      (SELECT coalesce(sum((octet_length(lexeme) + 1) / 2 * 2
+         + CASE WHEN cardinality(positions) > 0 THEN 2 + 2 * cardinality(positions) ELSE 0 END), 0)
+       FROM unnest(ts_filter(t.v, '{a}')))
+    + (SELECT coalesce(sum((octet_length(lexeme) + 1) / 2 * 2
+         + CASE WHEN cardinality(positions) > 0 THEN 2 + 2 * cardinality(positions) ELSE 0 END), 0)
+       FROM unnest(ts_filter(t.v, '{d}')))
+    + b.bytes AS bytes
+      , length(ts_filter(t.v, '{a}')) = 0 AS d_only
+    FROM tagged t JOIN b USING (id)
+  )
+  SELECT count(*) AS tagged_rows,
+         count(*) FILTER (WHERE bytes > 1048511 OR d_only) AS flagged,
+         array_agg(id ORDER BY id) FILTER (WHERE bytes > 1048511 OR d_only) AS ids,
+         count(*) FILTER (WHERE d_only) AS d_only,
+         max(bytes) AS largest
+  FROM est;
+  ```
+
+  **With several FTS configs** (the stored fingerprint names them; for
+  example `english,simple`), use this form instead: one `to_tsvector(cfg,
+  txt)` branch per config, combined with **`UNION ALL`** and grouped by id
+  and lexeme afterwards. Plain `UNION` is wrong: it removes duplicate rows,
+  and the same tag word parsed under two configs gives two identical
+  `(id, lexeme, npos)` rows, so `UNION` counts it once while 035's head
+  holds it under both configs — an under-estimate that lets a near-limit row
+  pass (Codex impl r3: 1,048,060 under `UNION` against the preflight's
+  1,048,828).
+
+  ```sql
+  WITH tagged AS (
+    SELECT id, content_tsvector AS v, tags
+    FROM notes_metadata
+    WHERE content_tsvector IS NOT NULL AND cardinality(tags) > 0
+      AND length(ts_filter(content_tsvector, '{b}')) = 0
+  ), toks AS (
+    SELECT id, lexeme, sum(npos) AS npos FROM (
+      SELECT t.id, x.lexeme, cardinality(x.positions) AS npos
+      FROM tagged t
+      CROSS JOIN LATERAL unnest(t.tags) AS g(tag)
+      CROSS JOIN LATERAL (VALUES (translate(g.tag, chr(2) || chr(3), '')),
+                                 (replace(translate(g.tag, chr(2) || chr(3), ''), '/', ' '))) AS f(txt)
+      CROSS JOIN LATERAL unnest(to_tsvector('english', f.txt)) AS x
+      UNION ALL
+      SELECT t.id, x.lexeme, cardinality(x.positions) AS npos
+      FROM tagged t
+      CROSS JOIN LATERAL unnest(t.tags) AS g(tag)
+      CROSS JOIN LATERAL (VALUES (translate(g.tag, chr(2) || chr(3), '')),
+                                 (replace(translate(g.tag, chr(2) || chr(3), ''), '/', ' '))) AS f(txt)
+      CROSS JOIN LATERAL unnest(to_tsvector('simple', f.txt)) AS x
+    ) AS per_config
+    GROUP BY id, lexeme
   ), b AS (
     SELECT id, sum((octet_length(lexeme) + 1) / 2 * 2 + 2 + 2 * least(npos, 256)) AS bytes
     FROM toks GROUP BY id

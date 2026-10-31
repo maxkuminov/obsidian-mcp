@@ -237,9 +237,15 @@ flag (a title that stems to nothing, `The`) is acceptable, a false pass is
 not. A flagged D-only row is fixed before upgrading by shortening the note,
 or by letting the current image write it through the halving retreat (an
 edit, or `make rebuild-tsvectors`), after which it has an `A` part and the
-size check applies to it. One config shown; with several, add one
-`VALUES`-style source per config to `toks` (a lexeme two configs share is
-stored once, so summing over both only over-counts). Prototyped on PG16:
+size check applies to it. One config shown here; the multi-config form
+(below the single-config one, in `DEPLOYMENT.md` too) has one
+`to_tsvector(cfg, txt)` branch per config combined with **`UNION ALL`** and
+grouped by id and lexeme afterwards — a lexeme two configs share is stored
+once in the vector, so summing over both only over-counts. Plain `UNION` is
+wrong (Codex impl r3): the same tag word under two configs yields two equal
+`(id, lexeme, npos)` rows and `UNION` keeps one, under-counting the head 035
+builds under both configs (`english,simple`: 1,048,060 under `UNION`
+against the preflight's 1,048,828). Prototyped on PG16:
 
 ```sql
 WITH tagged AS (
@@ -255,6 +261,54 @@ WITH tagged AS (
                              (replace(translate(g.tag, chr(2) || chr(3), ''), '/', ' '))) AS f(txt)
   CROSS JOIN LATERAL unnest(to_tsvector('english', f.txt)) AS x
   GROUP BY t.id, x.lexeme
+), b AS (
+  SELECT id, sum((octet_length(lexeme) + 1) / 2 * 2 + 2 + 2 * least(npos, 256)) AS bytes
+  FROM toks GROUP BY id
+), est AS (
+  SELECT t.id,
+    (SELECT coalesce(sum((octet_length(lexeme) + 1) / 2 * 2
+       + CASE WHEN cardinality(positions) > 0 THEN 2 + 2 * cardinality(positions) ELSE 0 END), 0)
+     FROM unnest(ts_filter(t.v, '{a}')))
+  + (SELECT coalesce(sum((octet_length(lexeme) + 1) / 2 * 2
+       + CASE WHEN cardinality(positions) > 0 THEN 2 + 2 * cardinality(positions) ELSE 0 END), 0)
+     FROM unnest(ts_filter(t.v, '{d}')))
+  + b.bytes AS bytes
+    , length(ts_filter(t.v, '{a}')) = 0 AS d_only
+  FROM tagged t JOIN b USING (id)
+)
+SELECT count(*) AS tagged_rows,
+       count(*) FILTER (WHERE bytes > 1048511 OR d_only) AS flagged,
+       array_agg(id ORDER BY id) FILTER (WHERE bytes > 1048511 OR d_only) AS ids,
+       count(*) FILTER (WHERE d_only) AS d_only,
+       max(bytes) AS largest
+FROM est;
+```
+
+The multi-config form (`english,simple` shown):
+
+```sql
+WITH tagged AS (
+  SELECT id, content_tsvector AS v, tags
+  FROM notes_metadata
+  WHERE content_tsvector IS NOT NULL AND cardinality(tags) > 0
+    AND length(ts_filter(content_tsvector, '{b}')) = 0
+), toks AS (
+  SELECT id, lexeme, sum(npos) AS npos FROM (
+    SELECT t.id, x.lexeme, cardinality(x.positions) AS npos
+    FROM tagged t
+    CROSS JOIN LATERAL unnest(t.tags) AS g(tag)
+    CROSS JOIN LATERAL (VALUES (translate(g.tag, chr(2) || chr(3), '')),
+                               (replace(translate(g.tag, chr(2) || chr(3), ''), '/', ' '))) AS f(txt)
+    CROSS JOIN LATERAL unnest(to_tsvector('english', f.txt)) AS x
+    UNION ALL
+    SELECT t.id, x.lexeme, cardinality(x.positions) AS npos
+    FROM tagged t
+    CROSS JOIN LATERAL unnest(t.tags) AS g(tag)
+    CROSS JOIN LATERAL (VALUES (translate(g.tag, chr(2) || chr(3), '')),
+                               (replace(translate(g.tag, chr(2) || chr(3), ''), '/', ' '))) AS f(txt)
+    CROSS JOIN LATERAL unnest(to_tsvector('simple', f.txt)) AS x
+  ) AS per_config
+  GROUP BY id, lexeme
 ), b AS (
   SELECT id, sum((octet_length(lexeme) + 1) / 2 * 2 + 2 + 2 * least(npos, 256)) AS bytes
   FROM toks GROUP BY id
@@ -693,3 +747,18 @@ both fixed.
    description, `indexing-and-embeddings.md`'s keyword-vector bullet) still
    described the three-part vector and title-versus-body competition. →
    four-part vector, title/tags/body competition.
+
+## Codex implementation review, round 3 (2026-10-31)
+
+Verification only, on 7b65ae5. The two architecture paragraphs: VERIFIED.
+The operator statement: NOT_FIXED for multi-config fingerprints. The note
+said to "union" the `toks` parse over the configs, and a plain SQL `UNION`
+deduplicates the equal per-config rows of each tag word (`english,simple`,
+title `Big Note`, 84,350 distinct body words, tags `00000/x`…`00127/x`:
+preflight 1,048,828 rejects, `UNION` form 1,048,060 passes). → Fixed here:
+`DEPLOYMENT.md` and D5 give the executable multi-config form, one
+`to_tsvector(cfg, txt)` branch per config combined with `UNION ALL` and
+grouped afterwards, and say why `UNION` is wrong; a schema case runs that
+statement verbatim on an `english,simple` near-limit row the preflight
+rejects (`UNION ALL` 1,048,820 flags it; the `UNION` variant 1,047,798 would
+pass it). Verified by the supervisor by grep; no round 4.
