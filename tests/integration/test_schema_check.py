@@ -61,7 +61,7 @@ DIM = 64  # irrelevant here; keeps the migration cheap.
 # The current head. Every case that migrates forward asserts it, so adding a
 # revision without teaching this module about it fails loudly rather than
 # leaving the new migration unexercised.
-HEAD_REVISION = "035"
+HEAD_REVISION = "036"
 
 CONSTRAINT = "ck_oauth_clients_auth_method_secret"
 MARKER = "created by 013_schema_reconciliation"
@@ -7768,8 +7768,19 @@ def test_035_chains_from_034():
     config = Config()
     config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_current_head() == HEAD_REVISION == "035"
     assert script.get_revision("035").down_revision == "034"
+
+
+def test_036_chains_from_035_and_is_head():
+    """Migration 036 (#357): the CIMD column and its shape CHECK."""
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config()
+    config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+    assert script.get_current_head() == HEAD_REVISION == "036"
+    assert script.get_revision("036").down_revision == "035"
 
 
 def test_035_adds_the_tags_part_to_tagged_rows_only():
