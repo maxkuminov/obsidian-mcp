@@ -1,0 +1,59 @@
+## 0. Pre-flight
+
+- [ ] 0.1 Base check: the branch `hybrid-any-fill` contains c491326 (#391); `git ls-files .venv` is empty
+- [ ] 0.2 Owner answers to design "Open questions" (release bar, `explain` form) recorded in `design.md` before 7.3 is judged
+
+## 1. Fusion (`src/services/hybrid.py`)
+
+- [ ] 1.1 `HYBRID_ANY_FILL_OFFSET = HYBRID_ARM_DEPTH` beside `HYBRID_ARM_DEPTH`, with a comment stating the D1 bound (`1/(k+51) < 1/(k+50)` for every k)
+- [ ] 1.2 `_any_fill_offset_override: ContextVar[int | None]` (default `None`), with a comment saying only `scripts/search_eval_arms/hybrid.py` sets it
+- [ ] 1.3 `fuse(keyword_paths, semantic_paths, k, *, any_paths=frozenset(), any_offset=0)`: the keyword term uses `rank + any_offset` for paths in `any_paths`; the tie-break key stays `min(unoffset ranks)`; return the keyword fusion rank as well (or let the service derive it); every existing caller and test of `fuse` keeps its result with the defaults
+- [ ] 1.4 `hybrid_search`: `any_paths` = keyword rows with `match == "any"`; `any_offset` = the override when set, else `HYBRID_ANY_FILL_OFFSET`, **only when the semantic arm ran**, else 0 (D3)
+- [ ] 1.5 `HybridRow.keyword_fusion_rank` set on every keyword row (`keyword_rank + offset` for a fused fill row, else `keyword_rank`); `best_rank` unchanged
+
+## 2. Rendering and description
+
+- [ ] 2.1 `_hybrid_server_fields`: the keyword `explain` term uses `keyword_fusion_rank` (falling back to `keyword_rank` when unset, so hand-built rows in tests keep working); `keyword_rank:` and the preview choice stay unoffset; no header token
+- [ ] 2.2 `hybrid_search` description (`src/mcp_server/server.py`): one sentence that a `match: any` keyword row enters at `rank + 50`, below every all-terms row; ≤ 4,000 characters (`tests/test_issue_343_tool_metadata.py`); `hybrid_search_impl` docstring follows
+
+## 3. Harness (`scripts/search_eval_arms/hybrid.py`)
+
+- [ ] 3.1 `make_arm_alt` accepts `hybrid_alt_any_offset` ∈ {0, 50} (default 50); any other value → `UsageError` (exit 64) before the generation is reserved; `required_options` unchanged (`hybrid_alt_k`)
+- [ ] 3.2 With 0, the arm sets `_any_fill_offset_override` to 0 around its service call (`set` / `reset(token)`); module docstring updated
+- [ ] 3.3 AST guard test: no module under `src/` assigns or `.set()`s `_any_fill_offset_override`
+
+## 4. Tests
+
+- [ ] 4.1 `fuse` unit tests: the spec scenarios (1/110 vs 1/111; E before J; fill-only below semantic-only rank 50; unoffset tie-break; `any_offset=0` equals the old `fuse` on random inputs)
+- [ ] 4.2 Byte-identity: every existing fixture with `keyword_any = 0` renders identically to origin/main (pin with the current offline and integration fixtures); the keyword-only path with `any` rows renders identically
+- [ ] 4.3 Identity oracle (integration, `tests/integration/test_hybrid_search_pg.py`): a corpus with `all` and `any` rows, `limit=50`, incumbent (override 0) vs candidate: same fused path set; the subsequence of rows without a `match: any` keyword rank in the same order with byte-identical lines
+- [ ] 4.4 The issue's shape, synthetic (no vault data in the repo): job-posting-like titles matching one query word plus an opinion note with all words in a near paraphrase; assert the fill-only rows fall below the semantic-only rows and that the explain terms sum to the score
+- [ ] 4.5 Harness: `make_arm_alt` with `hybrid_alt_any_offset=0` equals the pre-#403 fusion; invalid value exits 64; a `make_arm` query running concurrently with an alt query sees no override (`tests/test_hybrid_search_eval.py`)
+
+## 5. Bounds re-measure
+
+- [ ] 5.1 `test_the_fixed_bounds` and the rerank arithmetic in `tests/test_hybrid_rerank.py`: worst rows carry `match: any` with fusion rank 100 on the both-arms path; assert the `rerank=false` structure ≤ 345 (projected 338 from the measured 337) and the `rerank=true` structure ≤ 367; constants unchanged
+- [ ] 5.2 Re-measure the pinned worst cases (projected: keyword-only 981 / 1,008 → 989 unchanged; both arms `rerank=false` cut 1,000; both arms `rerank=true` omitted 1,008, `explain omitted` 988); the both-arms `rerank=false` minimum-cap test still keeps the 40–45 cut; if a figure differs from the spec delta, correct the delta first
+- [ ] 5.3 Header bounds 405 / 444 re-asserted unchanged
+
+## 6. Docs
+
+- [ ] 6.1 `docs/architecture/search.md`: "Hybrid search (#354)": the fill offset, D1's bound, the unoffset tie-break and preview, the keyword-only exemption, the rerank-window effect, the identity oracle, L1–L3; the "Bounds (D5)" figures; "Measuring it (D9)": `hybrid_alt_any_offset`
+- [ ] 6.2 CLAUDE.md `hybrid_search` bullet: one clause, "a `match: any` keyword row enters RRF at `rank + 50` (`HYBRID_ANY_FILL_OFFSET` = arm depth; never on the keyword-only path; tie-break unoffset) (#403)"; the floor figures if they moved
+- [ ] 6.3 README hybrid bullet: one sentence that a keyword note matching only some words counts below every all-words match
+- [ ] 6.4 DEPLOYMENT.md "Measuring search quality": the `make_arm_alt` `hybrid_alt_any_offset=0` baseline invocation (design D6)
+- [ ] 6.5 Public-repo grep: no host paths or vault content in the diff; no new setting, so `.env.example` unchanged (verify)
+
+## 7. Gates
+
+- [ ] 7.1 `openspec validate hybrid-any-fill --strict`; offline suite, `make test-integration`, `make search-eval` (fixture)
+- [ ] 7.2 Search-eval gate (CLAUDE.md row): restore a `BACKUP_FULL=1` copy, `make search-eval-snapshot`, then one generation at the candidate commit with `ARMS="keyword semantic scripts.search_eval_arms.hybrid:make_arm scripts.search_eval_arms.hybrid:make_arm_alt" ARM_OPTS="hybrid_alt_k=60 hybrid_alt_any_offset=0" BASELINE=scripts.search_eval_arms.hybrid:make_arm_alt`; `USER_ID=` export on multi-user; attach `report.json` only if `attachable: true`; `CORPUS_LOSS` invalidates; expected movement in the hybrid arm only
+- [ ] 7.3 Release bar: no regression in hybrid recall@20 and recall@50 beyond the 95% CI against the baseline arm; the issue's query added as one named judgment in `.search-eval/manual.jsonl` (tenant data, git-ignored; relevant = the opinion note), and its rank reported for both arms. The "top 3" bar is pending owner decision (design D7: live data projects 5th under B)
+- [ ] 7.4 `openspec-verifier` subagent (not an implementer) against the deltas; iterate to zero blocking gaps
+- [ ] 7.5 Adversarial Codex (mandatory: a ranking change an agent acts on without a human seeing the query), framed per CLAUDE.md (silently wrong search results); attack the D1 bound, D3's keyword-only exemption, the override seam and the oracle; two rounds by default, triage per the workflow file, declined findings recorded as accepted limitations
+- [ ] 7.6 `openspec archive hybrid-any-fill -y` and the docs above as the last commits; one PR, `Closes #403`
+
+## 8. After merge
+
+- [ ] 8.1 Watch the rollout (CI → image → Flux)
+- [ ] 8.2 Live end-to-end (no `user-representative` pass, MCP-only change): re-run `hybrid_search("My opinion on AI replacing software engineers", limit=12)` and compare with design D7's recorded page (expect the two fill-only rows gone from the top 12, the fill rows' `explain` terms at `rank + 50`); a query with `keyword_any = 0` (unchanged page); `hybrid_search(rerank=true)` on the issue's query; report which tools were called
