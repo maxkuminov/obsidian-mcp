@@ -51,4 +51,4 @@
 
 #### Scenario: The rerank=true projection carve-out
 - **WHEN** the statements of `semantic_search` and `hybrid_search` are captured with `rerank=false`, with `rerank=true`, and for `find_related`
-- **THEN** the `rerank=false` and `find_related` statements SHALL project neither `embed_prefix` nor the vector, and the `rerank=true` overfetch statement SHALL project exactly those two columns more than the `rerank=false` one, with identical predicates, ordering, limit, settings and statement count
+- **THEN** the `rerank=false` and `find_related` statements SHALL project neither `embed_prefix` nor the vector, and the `rerank=true` overfetch statement SHALL project exactly `note_embeddings.embed_prefix` and `notes_metadata.embedded_chunking_version` in addition to the `rerank=false` projection, and never the stored vector, with identical predicates, ordering, limit, settings and statement count
