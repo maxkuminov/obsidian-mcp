@@ -67,6 +67,7 @@ from src.services.fts import (
     excerpt_of,
     index_tsvector_sql,
     rehead_tsvector_sql,
+    tags_text,
 )
 from src.services import change_feed, empty_prune, indexer_health
 from src.services.rate_limits import flush_expired
@@ -864,8 +865,9 @@ async def write_tsvector_bounded(
             async with session.begin_nested():
                 # The excerpt is a prefix of exactly the text this attempt
                 # binds (#344, D4), so a retreat re-binds it with the body.
-                # The title and aliases binds are the caller's and are never
-                # halved: the head is bounded by construction.
+                # The title, aliases and tags binds are the caller's and are
+                # never halved: the head is bounded by construction
+                # (`FTS_ALIASES_MAX_CHARS`, `FTS_TAGS_MAX_CHARS`).
                 attempt = content[:length]
                 result = await session.execute(
                     statement,
@@ -3668,7 +3670,12 @@ async def _index_vault_attempt(
             # Bind names of the head's own: `:title` also assigns the varchar
             # column below, and asyncpg refuses one parameter deduced as both
             # `character varying` and `text` (AmbiguousParameterError).
-            rehead_frag, rehead_params = rehead_tsvector_sql("head_title", "head_aliases")
+            # The tags part rides in the same head (#391, D6), bound from the
+            # same parsed entry as the `tags` column below; its own bind name,
+            # for the same asyncpg reason (`:tags` is `varchar[]`).
+            rehead_frag, rehead_params = rehead_tsvector_sql(
+                "head_title", "head_aliases", tags_bind="head_tags"
+            )
             move_upd_sql = (
                 "UPDATE notes_metadata "
                 "SET file_path = :new, title = :title, tags = :tags, "
@@ -3714,7 +3721,8 @@ async def _index_vault_attempt(
                 params: dict = {
                     "new": new, "old": old, "title": e["title"],
                     "head_title": e["title"],
-                    "head_aliases": aliases_text(e["frontmatter"]), **rehead_params,
+                    "head_aliases": aliases_text(e["frontmatter"]),
+                    "head_tags": tags_text(e["tags"]), **rehead_params,
                     "tags": e["tags"], "xver": CURRENT_EXTRACTION_VERSION,
                     "size": e["file_size"], "mtime": e["modified_at"],
                     "stat_size": e["stat_size"],
@@ -3978,7 +3986,13 @@ async def _index_vault_attempt(
             # statement (#344, D1/D4): the title is the entry's (the shared
             # rule), the aliases text the shared aliases rule over the same
             # parsed frontmatter the row's JSONB was sanitised from.
-            tsv_frag, tsv_params = index_tsvector_sql("content", "title", "aliases")
+            # Since #391 the head carries `B(tags)` between the aliases and the
+            # body, bound from the same entry whose `tags` column the upsert
+            # above wrote in this transaction. `tags_text`, not `tags`: the
+            # bind must not collide with a `tags` column bind.
+            tsv_frag, tsv_params = index_tsvector_sql(
+                "content", "title", "aliases", tags_bind="tags_text"
+            )
             if user_id is None:
                 tsv_sql = f"""
                     UPDATE notes_metadata
@@ -3996,7 +4010,9 @@ async def _index_vault_attempt(
                       AND user_id = :uid
                 """
             head_by_path = {
-                n["file_path"]: (n["title"], aliases_text(n["frontmatter"]))
+                n["file_path"]: (
+                    n["title"], aliases_text(n["frontmatter"]), tags_text(n["tags"])
+                )
                 for n in to_upsert
             }
             for path in paths:
@@ -4013,10 +4029,10 @@ async def _index_vault_attempt(
                     underived.add(path)  # never marked (#311, D3)
                     continue
                 content = path_to_content[path]
-                head_title, head_aliases = head_by_path[path]
+                head_title, head_aliases, head_tags = head_by_path[path]
                 params: dict = {
                     "path": path, "title": head_title, "aliases": head_aliases,
-                    **tsv_params,
+                    "tags_text": head_tags, **tsv_params,
                 }
                 if user_id is not None:
                     params["uid"] = user_id
@@ -7321,7 +7337,9 @@ async def _rebuild_tsvectors_pinned(
             ),
         )
 
-    tsv_frag, tsv_params = index_tsvector_sql("content", "title", "aliases")
+    tsv_frag, tsv_params = index_tsvector_sql(
+        "content", "title", "aliases", tags_bind="tags_text"
+    )
     # ── The rebuild certifies what it writes ──────────────────────────────
     # It used to address the UPDATE by `id` alone, over a snapshot holding only
     # `(id, file_path)`, and to treat a read failure as a silent `continue`.
@@ -7394,16 +7412,22 @@ async def _rebuild_tsvectors_pinned(
                         "content_hash the rebuild selected"
                     )
                 else:
-                    # Title and aliases from the bytes just verified — the
-                    # shared rules, so the head equals what the scan writes
-                    # for the same file (the hash matched, so the stored title
-                    # already equals this).
+                    # Title, aliases and tags from the bytes just verified —
+                    # the shared rules, so the head equals what the scan
+                    # writes for the same file (the hash matched, so the
+                    # stored title and tags already equal these). The tag
+                    # extraction runs over the whole body, so off the loop
+                    # like the read (#391, D6).
+                    rebuilt_tags = await asyncio.to_thread(
+                        extract_tags, content, frontmatter
+                    )
                     _used, rowcount = await write_tsvector_bounded(
                         session, upd_sql, content,
                         {"id": snapshot.id, "uid": owner, "path": path,
                          "hash": chash,
                          "title": _note_title(frontmatter, path.rsplit("/", 1)[-1]),
                          "aliases": aliases_text(frontmatter),
+                         "tags_text": tags_text(rebuilt_tags),
                          **tsv_params},
                         label=path,
                     )

@@ -86,13 +86,13 @@ async def _matches(conn, configs, body, query):
     orig = fts.settings.fts_configs
     fts.settings.fts_configs = configs
     try:
-        tsv_frag, params = index_tsvector_sql("content")
+        tsv_frag, params = index_tsvector_sql("content", tags_bind="tags_text")
     finally:
         fts.settings.fts_configs = orig
     sql = f"SELECT ({tsv_frag}) @@ ({_query_frag(configs)})"
     # An empty head (#344): these cases are about the body's stemming.
     row = await conn.execute(
-        text(sql), {"content": body, "title": "", "aliases": "", "q": query, **params}
+        text(sql), {"content": body, "title": "", "aliases": "", "tags_text": "", "q": query, **params}
     )
     return bool(row.scalar())
 

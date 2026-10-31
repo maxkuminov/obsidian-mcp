@@ -321,8 +321,9 @@ def _parsed(*texts):
     return [(i, t) for i, t in enumerate(texts)]
 
 
-def _snip(i, hl=None, title=False, body=True, excerpt=True, mt0=None):
-    m = {"id": i, "hl_0": hl, "matched_title": title, "matched_body": body, "has_excerpt": excerpt}
+def _snip(i, hl=None, title=False, body=True, excerpt=True, mt0=None, **pairs):
+    m = {"id": i, "hl_0": hl, "matched_title": title, "matched_body": body, "has_excerpt": excerpt,
+         **pairs}
     if mt0 is not None:
         m["mt_0"] = mt0
     return SimpleNamespace(_mapping=m)
@@ -530,7 +531,8 @@ async def test_a_headline_is_a_snippet_only_when_the_body_part_matched(monkeypat
             # Title matched; the body holds one query word, marked anyway.
             _snip(1, hl="\x02Quarterly\x03 numbers were up", title=True, body=False, mt0=2),
             # Split: one term in the title, the other in the body.
-            _snip(2, hl="the \x02review\x03 of the period", title=False, body=False, mt0=2),
+            _snip(2, hl="the \x02review\x03 of the period", title=False, body=False, mt0=2,
+                  matched_title_body=True),
         ],
         [
             SimpleNamespace(_mapping={"id": 1, "head": "\x02Quarterly\x03 numbers were up"}),
@@ -611,3 +613,196 @@ def test_to_tsvector_is_composed_only_by_the_builders_and_031():
         if "to_tsvector(" in path.read_text(encoding="utf-8") and path not in allowed
     ]
     assert offenders == []
+
+
+_TAG_BUILDERS = {"head_tsvector_sql", "index_tsvector_sql", "rehead_tsvector_sql"}
+
+
+def _builder_calls(path):
+    """`(builder name, tags_bind keyword node or None)` for every call of the
+    three builders in `path`."""
+    import ast
+
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    calls = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+        if name not in _TAG_BUILDERS:
+            continue
+        kw = next((k for k in node.keywords if k.arg == "tags_bind"), None)
+        calls.append((name, kw))
+    return calls
+
+
+def test_every_builder_call_passes_the_tags_bind():
+    """#391 task 1.5: every call of the three builders under `src/` passes a
+    non-`None` `tags_bind`; the only `None` is migration 031's; every other
+    migration call passes a bind name. 035 composes no `to_tsvector(` (the
+    guard above stays green without widening its allow-list)."""
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    fts_path = root / "src/services/fts.py"
+    src_calls = 0
+    for path in (root / "src").rglob("*.py"):
+        for name, kw in _builder_calls(path):
+            if path == fts_path:
+                # The builders forward their own `tags_bind` parameter.
+                assert kw is not None and isinstance(kw.value, ast.Name), (path, name)
+                continue
+            src_calls += 1
+            assert kw is not None, f"{path.relative_to(root)}: {name} without tags_bind"
+            assert not (isinstance(kw.value, ast.Constant) and kw.value.value is None), (
+                f"{path.relative_to(root)}: {name}(tags_bind=None) outside 031"
+            )
+    # Incremental pass, move-pair, rebuild, move_note.
+    assert src_calls >= 4
+
+    nones = []
+    for path in (root / "alembic/versions").glob("*.py"):
+        for name, kw in _builder_calls(path):
+            assert kw is not None, f"{path.name}: {name} without tags_bind"
+            if isinstance(kw.value, ast.Constant) and kw.value.value is None:
+                nones.append(path.name)
+    assert len(nones) == 1 and nones[0].startswith("031_"), nones
+    migration_035 = next((root / "alembic/versions").glob("035_*.py"))
+    assert "to_tsvector(" not in migration_035.read_text(encoding="utf-8")
+
+
+# ── #391: matched_in from six flags, tags-only rendering ───────────────────
+
+
+def _consistent_flag_sets():
+    """Every assignment of the six flags that a real row can produce, derived
+    from which parts hold which of three query terms (`x`, `y`, `z`, ANDed):
+    a part set matches when its union holds every term."""
+    import itertools
+
+    terms = frozenset("xyz")
+    subsets = [frozenset(c) for n in range(4) for c in itertools.combinations("xyz", n)]
+    parts = ("a", "b", "d")
+    seen = {}
+    for hold in itertools.product(subsets, repeat=3):
+        by_part = dict(zip(parts, hold))
+        if not (by_part["a"] | by_part["b"] | by_part["d"]) >= terms:
+            continue  # not a match over the whole vector: never on a page
+
+        def m(*ps):
+            return frozenset().union(*(by_part[p] for p in ps)) >= terms
+
+        flags = {
+            "matched_title": m("a"), "matched_tags": m("b"), "matched_body": m("d"),
+            "matched_title_tags": m("a", "b"), "matched_title_body": m("a", "d"),
+            "matched_tags_body": m("b", "d"),
+        }
+        seen[tuple(sorted(flags.items()))] = flags
+    return list(seen.values())
+
+
+def _expected_matched_in(flags):
+    singles = [n for k, n in (("matched_title", "title"), ("matched_tags", "tags"),
+                              ("matched_body", "body")) if flags[k]]
+    if singles:
+        return singles
+    for k, n in (("matched_title_tags", "title+tags"), ("matched_title_body", "title+body"),
+                 ("matched_tags_body", "tags+body")):
+        if flags[k]:
+            return [n]
+    return ["title+tags+body"]
+
+
+def test_matched_in_covers_the_eleven_values_from_consistent_flags():
+    from src.services.search import matched_in_from_flags
+
+    rendered = set()
+    for flags in _consistent_flag_sets():
+        got = matched_in_from_flags(flags)
+        assert got == _expected_matched_in(flags), flags
+        rendered.add(",".join(got))
+    assert rendered == {
+        "title", "tags", "body", "title,tags", "title,body", "tags,body",
+        "title,tags,body", "title+tags", "title+body", "tags+body", "title+tags+body",
+    }
+
+
+@pytest.mark.parametrize(
+    "true_flags,expected",
+    [
+        ({"matched_tags"}, ["tags"]),
+        ({"matched_title", "matched_tags"}, ["title", "tags"]),
+        ({"matched_tags_body"}, ["tags+body"]),
+        ({"matched_title_tags", "matched_tags_body"}, ["title+tags"]),
+        ({"matched_title_body"}, ["title+body"]),
+        (set(), ["title+tags+body"]),
+    ],
+)
+def test_matched_in_order_rules(true_flags, expected):
+    from src.services.search import MATCHED_IN_FLAGS, matched_in_from_flags
+
+    flags = {label: label in true_flags for label, _w in MATCHED_IN_FLAGS}
+    assert matched_in_from_flags(flags) == expected
+
+
+def test_the_snippet_statement_projects_the_six_flags():
+    from src.services.search import MATCHED_IN_FLAGS
+
+    assert [w for _l, w in MATCHED_IN_FLAGS] == ["{a}", "{b}", "{d}", "{a,b}", "{a,d}", "{b,d}"]
+
+
+@pytest.mark.asyncio
+async def test_a_tags_only_row_gets_the_head_and_an_empty_body_gets_nothing(monkeypatch):
+    monkeypatch.setattr(settings, "keyword_snippet_rows", 5, raising=False)
+    rows = [_row(1, "tagged.md"), _row(2, "empty.md")]
+
+    def flags(i):
+        m = {"id": i, "hl_0": "words", "matched_title": False, "matched_tags": True,
+             "matched_body": False, "matched_title_tags": True, "matched_title_body": False,
+             "matched_tags_body": True, "has_excerpt": True}
+        return SimpleNamespace(_mapping=m)
+
+    session = _Session([
+        rows,
+        _parsed("'hoa'"),
+        [flags(1), flags(2)],
+        [SimpleNamespace(_mapping={"id": 1, "head": "the siding \x02x\x03 complaint"}),
+         SimpleNamespace(_mapping={"id": 2, "head": ""})],
+    ])
+    results = await full_text_search(session, "hoa", limit=2)
+    assert results[0]["matched_in"] == ["tags"] and results[0]["head"] == "the siding x complaint"
+    assert results[1]["matched_in"] == ["tags"] and results[1]["head"] == ""
+    out = tools.render_keyword_results("hoa", results)
+    assert "without excerpt: 0" in out
+    assert "matched_in: tags — terms: 0/1\n  head: the siding x complaint\n" in out
+    # The empty-body row: its own line, then nothing — no `head:`, no `snippet:`.
+    last = out.splitlines()[-1]
+    assert last.startswith("- **empty**") and "matched_in: tags" in last
+
+
+def test_render_distinguishes_an_empty_head_from_none(monkeypatch):
+    monkeypatch.setattr(settings, "keyword_snippet_rows", 20, raising=False)
+    out = tools.render_keyword_results("q", [
+        _rendered(1, matched_in=["tags"], snippet=None, head="", has_excerpt=True, matched_terms=None),
+        _rendered(2, matched_in=["tags+body"], snippet=None, head="opening", has_excerpt=True,
+                  matched_terms=None),
+        _rendered(3, matched_in=["title"], snippet=None, head=None, has_excerpt=False,
+                  matched_terms=None),
+    ])
+    assert "without excerpt: 1" in out
+    lines = out.splitlines()
+    i1 = next(i for i, l in enumerate(lines) if "(`n1.md`)" in l)
+    assert lines[i1].endswith("matched_in: tags") and lines[i1 + 1].startswith("- **n2**")
+    assert "matched_in: tags+body\n  head: opening" in out
+    assert "head: \n" not in out + "\n"
+
+
+def test_keyword_search_docstring_states_that_tags_are_indexed():
+    doc = " ".join(_description("keyword_search").split())
+    assert "tags" in doc
+    assert "indexed below its title and aliases and above its body" in doc
+    for part in ("`title`", "`tags`", "`body`", "`title+tags+body`"):
+        assert part in doc, part
+    assert len(_description("keyword_search")) <= 4000

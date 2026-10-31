@@ -372,7 +372,7 @@ RERANK_TOKEN = "reranked: false (malformed_response)"
 def _worst_rows():
     return [HybridRow(path=f"{i}.md", title="", tags=[], score=2 / 1050, keyword_rank=50,
                       semantic_rank=50, match="any", similarity=-0.123, stale=True,
-                      embedding_truncated=True, no_excerpt=True, matched_in=["title", "body"])
+                      embedding_truncated=True, no_excerpt=True, matched_in=["title+tags+body"])
             for i in range(50)]
 
 
@@ -389,13 +389,15 @@ def _worst_result(rows, *, keyword_only: bool, low: bool):
 #: (+ 45 + 45, or 25 + 25 on rerank=true, in the cut form) + the keyword-only
 #: footer (71) or the ten-digit transition line (127) + 1 + the cap footer's
 #: bound (75) + the line breaks.
+#: Re-measured after the #391 merge with the longest `matched_in`
+#: (`title+tags+body`): every case is five characters longer.
 D5 = {
-    ("keyword_only", False, "cut"): 976,
-    ("keyword_only", True, "cut"): 1003,
-    ("keyword_only", True, "omitted"): 984,
-    ("both", False, "cut"): 994,
-    ("both", True, "omitted"): 1002,
-    ("both", True, "explain_omitted"): 983,
+    ("keyword_only", False, "cut"): 981,
+    ("keyword_only", True, "cut"): 1008,
+    ("keyword_only", True, "omitted"): 989,
+    ("both", False, "cut"): 999,
+    ("both", True, "omitted"): 1007,
+    ("both", True, "explain_omitted"): 988,
 }
 
 
@@ -445,7 +447,7 @@ def test_the_d5_worst_cases(threshold, low):
 
 def test_the_floor_arithmetic():
     assert tools.HYBRID_HEADER_MAX == 405 and tools.HYBRID_RERANK_HEADER_MAX == 444
-    assert 405 + 340 + 45 + 45 + 75 + 75 + 5 == 990 <= 1000
+    assert 405 + 345 + 45 + 45 + 75 + 75 + 5 == 995 <= 1000
 
 
 @pytest.mark.parametrize("low", [False, True])
@@ -497,7 +499,7 @@ def test_low_confidence_at_the_minimum_cap_reaches_explain_omitted(monkeypatch, 
     path = ("\x01\"\\" * 400)[:1020] + ".md"
     first = HybridRow(path=path, title=title, tags=[f"t{i}" for i in range(1000)],
                       score=2 / 1050, keyword_rank=50, semantic_rank=50, match="any",
-                      matched_in=["title", "body"], snippet="a «b»", similarity=0.123,
+                      matched_in=["title+tags+body"], snippet="a «b»", similarity=0.123,
                       chunk="x" * 500, stale=False, embedding_truncated=True,
                       section={"path": ["H" * 200] * 6, "ordinal": 99999})
     stale = dict(stale=True, embedding_truncated=True, chunk=None)

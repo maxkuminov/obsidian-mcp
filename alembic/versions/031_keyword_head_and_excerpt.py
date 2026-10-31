@@ -259,7 +259,9 @@ def _sqlstate(exc: BaseException) -> str | None:
 
 def _rehead_every_row(bind, configs: list[str]) -> tuple[int, int, int]:
     """Returns `(re-headed, already headed, left at the size limit)`."""
-    frag, cfg_params = rehead_tsvector_sql("head_title", "head_aliases", configs)
+    frag, cfg_params = rehead_tsvector_sql(
+        "head_title", "head_aliases", configs, tags_bind=None
+    )
     update = sa.text(
         f"UPDATE {TABLE} SET content_tsvector = {frag} "
         "WHERE id = :id AND content_tsvector IS NOT NULL "

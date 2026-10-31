@@ -118,12 +118,59 @@ async def _parsed_texts(session, query: str) -> list[str | None]:
     return parsed
 
 
+def _part(column, weights: str):
+    """`ts_filter(column, '<weights>')` — `weights` is one of the six fixed
+    literals of `MATCHED_IN_FLAGS`, never caller input."""
+    return func.ts_filter(column, literal_column(f"'{weights}'"))
+
+
 def _a_part(column):
-    return func.ts_filter(column, literal_column("'{a}'"))
+    return _part(column, "{a}")
 
 
 def _d_part(column):
-    return func.ts_filter(column, literal_column("'{d}'"))
+    return _part(column, "{d}")
+
+
+#: The six `matched_in` flags the snippet statement projects (#391, design
+#: D4): `ts_filter(v, W) @@ q` per label. `{a}` is the title or aliases,
+#: `{b}` the tags, `{d}` the body.
+MATCHED_IN_FLAGS = (
+    ("matched_title", "{a}"),
+    ("matched_tags", "{b}"),
+    ("matched_body", "{d}"),
+    ("matched_title_tags", "{a,b}"),
+    ("matched_title_body", "{a,d}"),
+    ("matched_tags_body", "{b,d}"),
+)
+
+_SINGLE_PARTS = (
+    ("matched_title", "title"),
+    ("matched_tags", "tags"),
+    ("matched_body", "body"),
+)
+_PAIR_PARTS = (
+    ("matched_title_tags", "title+tags"),
+    ("matched_title_body", "title+body"),
+    ("matched_tags_body", "tags+body"),
+)
+
+
+def matched_in_from_flags(flags) -> list[str]:
+    """`matched_in` from the six flags (design D4): every single part whose
+    flag is true, in the order `title`, `tags`, `body` (rendered
+    comma-joined); when none is, the first true pair in the order
+    `title+tags`, `title+body`, `tags+body`; when none is, `title+tags+body`.
+    Every id handed to the snippet statement matched the block's query over
+    the whole vector, so "no part and no pair" means the match needs all
+    three parts. `flags` is any mapping; a missing flag reads as false."""
+    singles = [name for key, name in _SINGLE_PARTS if flags.get(key)]
+    if singles:
+        return singles
+    for key, name in _PAIR_PARTS:
+        if flags.get(key):
+            return [name]
+    return ["title+tags+body"]
 
 
 async def _snippets(session, ids: list[int], tsquery, plan: FallbackPlan | None) -> dict:
@@ -133,6 +180,13 @@ async def _snippets(session, ids: list[int], tsquery, plan: FallbackPlan | None)
     `body_excerpt` is read only inside `ts_headline`; the headline is what is
     projected. A second statement supplies the `head:` text for the rows whose
     excerpt held no highlight (design D4) — one more parse for those rows only.
+
+    `head` is `None` when no head was computed (a snippet was shown, or the
+    excerpt is NULL) and a string when it was — the **empty string** for a
+    note whose stored excerpt is empty (no body, #391 Codex r1 m1): the
+    renderer shows no preview line for it and does not count it as a row
+    without an excerpt, and tells the cases apart by `is None`, never by
+    truthiness.
     """
     if not ids:
         return {}
@@ -147,8 +201,8 @@ async def _snippets(session, ids: list[int], tsquery, plan: FallbackPlan | None)
                 bindparam(f"hl_opts_{i}", value=HEADLINE_OPTIONS),
             ).label(f"hl_{i}")
         )
-    columns.append(_a_part(v).op("@@")(tsquery).label("matched_title"))
-    columns.append(_d_part(v).op("@@")(tsquery).label("matched_body"))
+    for label, weights in MATCHED_IN_FLAGS:
+        columns.append(_part(v, weights).op("@@")(tsquery).label(label))
     columns.append((NoteMetadata.body_excerpt.is_not(None)).label("has_excerpt"))
     units_by_config = matched_terms_units(plan) if plan is not None else []
     for i, units in units_by_config:
@@ -180,16 +234,9 @@ async def _snippets(session, ids: list[int], tsquery, plan: FallbackPlan | None)
                         HEADLINE_STOP, RENDER_STOP
                     )
                     break
-        matched_in = []
-        if m.get("matched_title"):
-            matched_in.append("title")
-        if m.get("matched_body"):
-            matched_in.append("body")
-        if not matched_in:
-            # Every id here matched the block's query over the whole vector,
-            # so neither part alone matching means the match needs both —
-            # one term in the title, another in the body (V-N5).
-            matched_in.append("title+body")
+        # Six flags since #391 (design D4): `tags` joins `title` and `body`
+        # as a part, and a split match names its first minimal pair (V-N5).
+        matched_in = matched_in_from_flags(m)
         pairs = [
             (int(m.get(f"mt_{i}") or 0), len(units)) for i, units in units_by_config
         ]
@@ -220,8 +267,10 @@ async def _snippets(session, ids: list[int], tsquery, plan: FallbackPlan | None)
             if m["id"] in out:
                 # Same sentinels as the fragment mode (`HEAD_OPTIONS`); the
                 # head is never highlighted, so they are removed, not rendered.
+                # PostgreSQL returns '' for an empty excerpt; a NULL here is
+                # read as the empty headline too (the row had an excerpt).
                 head = m["head"]
-                out[m["id"]]["head"] = strip_sentinels(head) if head else head
+                out[m["id"]]["head"] = "" if head is None else strip_sentinels(head)
     return out
 
 

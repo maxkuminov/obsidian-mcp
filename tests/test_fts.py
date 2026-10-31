@@ -90,40 +90,67 @@ def _head(i: int, bind: str) -> str:
     return f"setweight(to_tsvector(CAST(:fts_cfg_{i} AS regconfig), :{bind}), 'A')"
 
 
+def _tags(i: int, bind: str = "tags_text") -> str:
+    return f"setweight(to_tsvector(CAST(:fts_cfg_{i} AS regconfig), :{bind}), 'B')"
+
+
 def _body(i: int, bind: str = "content") -> str:
     return f"to_tsvector(CAST(:fts_cfg_{i} AS regconfig), :{bind})"
 
 
 def test_index_tsvector_sql_single_config(monkeypatch):
-    """`A(title) || A(aliases) || D(body)` (#344, D1): the body part is the
-    pre-031 fragment byte for byte, so a pre-031 vector is exactly the body
-    part of a post-031 one."""
+    """`A(title) || A(aliases) || B(tags) || D(body)` (#344 D1, #391 D1): the
+    body part is the pre-031 fragment byte for byte, so a pre-031 vector is
+    exactly the body part of a post-031 one."""
     fts = _set_configs(monkeypatch, ["english"])
-    frag, params = fts.index_tsvector_sql("content")
-    assert frag == f"{_head(0, 'title')} || {_head(0, 'aliases')} || {_body(0)}"
+    frag, params = fts.index_tsvector_sql("content", tags_bind="tags_text")
+    assert frag == (
+        f"{_head(0, 'title')} || {_head(0, 'aliases')} || {_tags(0)} || {_body(0)}"
+    )
     assert params == {"fts_cfg_0": "english"}
     assert fts.body_tsvector_sql("content") == (_body(0), params)
 
 
+def test_index_tsvector_sql_single_config_without_tags(monkeypatch):
+    """`tags_bind=None` (031's call only) omits the tags part: the pre-#391
+    fragment."""
+    fts = _set_configs(monkeypatch, ["english"])
+    frag, _ = fts.index_tsvector_sql("content", tags_bind=None)
+    assert frag == f"{_head(0, 'title')} || {_head(0, 'aliases')} || {_body(0)}"
+
+
 def test_index_tsvector_sql_two_configs(monkeypatch):
-    """Title parts for every config, then aliases parts, then content parts —
-    the order the design fixes, so every writer stores one shape."""
+    """Title parts for every config, then aliases parts, then tags parts,
+    then content parts — the order the design fixes, so every writer stores
+    one shape."""
     fts = _set_configs(monkeypatch, ["english", "norwegian"])
-    frag, params = fts.index_tsvector_sql("content")
+    frag, params = fts.index_tsvector_sql("content", tags_bind="tags_text")
+    assert frag == " || ".join([
+        _head(0, "title"), _head(1, "title"),
+        _head(0, "aliases"), _head(1, "aliases"),
+        _tags(0), _tags(1),
+        _body(0), _body(1),
+    ])
+    assert params == {"fts_cfg_0": "english", "fts_cfg_1": "norwegian"}
+    frag, _ = fts.index_tsvector_sql("content", tags_bind=None)
     assert frag == " || ".join([
         _head(0, "title"), _head(1, "title"),
         _head(0, "aliases"), _head(1, "aliases"),
         _body(0), _body(1),
     ])
-    assert params == {"fts_cfg_0": "english", "fts_cfg_1": "norwegian"}
 
 
 def test_index_tsvector_sql_three_configs(monkeypatch):
     fts = _set_configs(monkeypatch, ["simple", "english", "norwegian"])
-    frag, params = fts.index_tsvector_sql("content")
-    assert frag.count("to_tsvector(") == 9
-    assert frag.count("setweight(") == 6
-    assert frag.count(" || ") == 8
+    frag, params = fts.index_tsvector_sql("content", tags_bind="tags_text")
+    assert frag.count("to_tsvector(") == 12
+    assert frag.count("setweight(") == 9
+    assert frag.count("'B')") == 3
+    assert frag.count(" || ") == 11
+    untagged, _ = fts.index_tsvector_sql("content", tags_bind=None)
+    assert untagged.count("to_tsvector(") == 9
+    assert untagged.count("setweight(") == 6
+    assert untagged.count(" || ") == 8
     # The builders sort the configs (#344, V-N4): 031 builds under the
     # fingerprint's sorted list, so the writers must too, whatever order
     # `FTS_CONFIGS` names them in.
@@ -136,47 +163,154 @@ def test_index_tsvector_sql_three_configs(monkeypatch):
 
 def test_index_tsvector_sql_honors_the_bind_names(monkeypatch):
     fts = _set_configs(monkeypatch, ["english"])
-    frag, _ = fts.index_tsvector_sql("body", "t", "al")
-    assert frag == f"{_head(0, 't')} || {_head(0, 'al')} || {_body(0, 'body')}"
+    frag, _ = fts.index_tsvector_sql("body", "t", "al", tags_bind="tg")
+    assert frag == (
+        f"{_head(0, 't')} || {_head(0, 'al')} || {_tags(0, 'tg')} || {_body(0, 'body')}"
+    )
+
+
+def test_tags_tsvector_sql_is_the_tags_parts_alone(monkeypatch):
+    fts = _set_configs(monkeypatch, ["english"])
+    assert fts.tags_tsvector_sql("head_tags") == (
+        _tags(0, "head_tags"), {"fts_cfg_0": "english"}
+    )
+    frag, params = fts.tags_tsvector_sql("t", configs=["simple", "english"])
+    assert frag == f"{_tags(0, 't')} || {_tags(1, 't')}"
+    assert params == {"fts_cfg_0": "english", "fts_cfg_1": "simple"}
 
 
 def test_rehead_tsvector_sql_keeps_the_d_part_only(monkeypatch):
-    """`head || ts_filter(content_tsvector, '{d}')`: the head from stored
-    columns, the body kept, any previous head dropped."""
+    """`head || ts_filter(content_tsvector, '{d}')`: the head (title, aliases,
+    tags) from stored columns, the body kept, any previous head dropped."""
     fts = _set_configs(monkeypatch, ["english"])
-    frag, params = fts.rehead_tsvector_sql("head_title", "head_aliases")
+    frag, params = fts.rehead_tsvector_sql(
+        "head_title", "head_aliases", tags_bind="head_tags"
+    )
     assert frag == (
         f"{_head(0, 'head_title')} || {_head(0, 'head_aliases')} "
-        "|| ts_filter(content_tsvector, '{d}')"
+        f"|| {_tags(0, 'head_tags')} || ts_filter(content_tsvector, '{{d}}')"
     )
     assert params == {"fts_cfg_0": "english"}
 
 
+#: Migration 031's re-head fragment as it was built before #391, for the
+#: configs `["english", "simple"]`, written out by hand. 031 now passes
+#: `tags_bind=None`; its bytes must not move (#391, D1).
+PRE_391_031_FRAGMENT = (
+    "setweight(to_tsvector(CAST(:fts_cfg_0 AS regconfig), :head_title), 'A') || "
+    "setweight(to_tsvector(CAST(:fts_cfg_1 AS regconfig), :head_title), 'A') || "
+    "setweight(to_tsvector(CAST(:fts_cfg_0 AS regconfig), :head_aliases), 'A') || "
+    "setweight(to_tsvector(CAST(:fts_cfg_1 AS regconfig), :head_aliases), 'A') || "
+    "ts_filter(content_tsvector, '{d}')"
+)
+
+
+def test_031s_fragment_is_byte_identical_to_its_pre_391_text(monkeypatch):
+    fts = _set_configs(monkeypatch, ["english"])
+    frag, params = fts.rehead_tsvector_sql(
+        "head_title", "head_aliases", ["simple", "english"], tags_bind=None
+    )
+    assert frag == PRE_391_031_FRAGMENT
+    assert params == {"fts_cfg_0": "english", "fts_cfg_1": "simple"}
+    # And the call 031 actually makes is that call.
+    import pathlib
+
+    src = next(
+        (pathlib.Path(__file__).resolve().parent.parent / "alembic/versions")
+        .glob("031_*.py")
+    ).read_text(encoding="utf-8")
+    assert (
+        'rehead_tsvector_sql(\n        "head_title", "head_aliases", configs, '
+        "tags_bind=None\n    )"
+    ) in src
+
+
+def test_the_builders_require_the_tags_bind(monkeypatch):
+    fts = _set_configs(monkeypatch, ["english"])
+    for builder in (fts.head_tsvector_sql, fts.index_tsvector_sql, fts.rehead_tsvector_sql):
+        with pytest.raises(TypeError):
+            builder()
+
+
 def test_builders_take_explicit_configs_for_the_migration(monkeypatch):
-    """031 builds under the configs the stored fingerprint names, not the
+    """031/035 build under the configs the stored fingerprint names, not the
     environment's — the builders accept them explicitly."""
     fts = _set_configs(monkeypatch, ["english"])
-    frag, params = fts.rehead_tsvector_sql(configs=["simple", "norwegian"])
+    frag, params = fts.rehead_tsvector_sql(configs=["simple", "norwegian"], tags_bind=None)
     assert params == {"fts_cfg_0": "norwegian", "fts_cfg_1": "simple"}  # sorted
     assert frag.count("setweight(") == 4
+    frag, _ = fts.rehead_tsvector_sql(configs=["simple", "norwegian"], tags_bind="t")
+    assert frag.count("setweight(") == 6
 
 
 def test_builders_produce_one_sql_whatever_the_config_order(monkeypatch):
-    """V-N4: the writers (settings order) and 031 (the fingerprint's sorted
-    list) must build byte-equal vectors, so the builders sort."""
+    """V-N4: the writers (settings order) and the migrations (the
+    fingerprint's sorted list) must build byte-equal vectors, so the builders
+    sort."""
     fts = _set_configs(monkeypatch, ["simple", "english"])
-    from_settings = (fts.index_tsvector_sql(), fts.rehead_tsvector_sql())
+    from_settings = (
+        fts.index_tsvector_sql(tags_bind="t"), fts.rehead_tsvector_sql(tags_bind="t")
+    )
     _set_configs(monkeypatch, ["english", "simple"])
-    assert (fts.index_tsvector_sql(), fts.rehead_tsvector_sql()) == from_settings
-    assert fts.rehead_tsvector_sql(configs=["simple", "english"]) == from_settings[1]
+    assert (
+        fts.index_tsvector_sql(tags_bind="t"), fts.rehead_tsvector_sql(tags_bind="t")
+    ) == from_settings
+    assert fts.rehead_tsvector_sql(configs=["simple", "english"], tags_bind="t") == from_settings[1]
 
 
 def test_index_tsvector_sql_never_interpolates_config_name(monkeypatch):
     # A hostile config name must appear only as a bound value, never inline.
     fts = _set_configs(monkeypatch, ["english'; DROP TABLE notes_metadata; --"])
-    frag, params = fts.index_tsvector_sql("content")
+    frag, params = fts.index_tsvector_sql("content", tags_bind="tags_text")
     assert "DROP TABLE" not in frag
     assert params["fts_cfg_0"] == "english'; DROP TABLE notes_metadata; --"
+
+
+# ── tags_text (#391, design D2) ──────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "tags,expected",
+    [
+        (None, ""),
+        ([], ""),
+        (["hoa"], "hoa"),
+        (["ctx/phone", "hoa"], "ctx/phone ctx phone\nhoa"),
+        (["a/b/c"], "a/b/c a b c"),
+        (["#hoa"], "#hoa"),  # the parser reads `#` as a blank
+        (["hoa", "hoa"], "hoa\nhoa"),  # the extractor de-duplicates; this rule does not
+        (["a//b/"], "a//b/ a b"),
+        (["x\x00y", "\x02z\x03"], "xy\nz"),
+        (["\x00"], ""),
+        (["project-x"], "project-x"),
+    ],
+)
+def test_tags_text(tags, expected):
+    from src.services.fts import tags_text
+
+    assert tags_text(tags) == expected
+
+
+def test_tags_text_is_bounded_at_whole_tags():
+    from src.services.fts import FTS_TAGS_MAX_CHARS, tags_text
+
+    tags = [f"{i:04d}" + "t" * 26 for i in range(1000)]
+    out = tags_text(tags)
+    assert FTS_TAGS_MAX_CHARS == 2048
+    assert len(out) <= 2048
+    lines = out.split("\n")
+    assert lines == tags[: len(lines)]  # whole lines, in order, none cut
+    assert len(out) + 1 + 30 > 2048  # the next whole line would not fit
+
+
+def test_tags_text_drops_a_nested_line_that_would_cross_the_bound():
+    from src.services.fts import tags_text
+
+    first = "a" * 2010
+    out = tags_text([first, "b" * 10 + "/" + "c" * 10, "d"])
+    # `first` + `\n` + the 43-character nested line crosses 2,048: that line
+    # and every later one are dropped, even though `d` alone would fit.
+    assert out == first
 
 
 # ── combined_tsquery ─────────────────────────────────────────────────────
@@ -224,7 +358,7 @@ def test_default_config_reproduces_single_english_behavior(monkeypatch):
     frag, params = fts.body_tsvector_sql("content")
     assert frag == "to_tsvector(CAST(:fts_cfg_0 AS regconfig), :content)"
     assert params == {"fts_cfg_0": "english"}
-    full, _ = fts.index_tsvector_sql("content")
+    full, _ = fts.index_tsvector_sql("content", tags_bind="tags_text")
     assert full.endswith(" || " + frag)
 
     sql = _compile(fts.combined_tsquery("hello"))

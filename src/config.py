@@ -530,15 +530,17 @@ class Settings(BaseSettings):
     # validator below so the CSV form doesn't trip pydantic-settings' JSON
     # decode of complex (list) fields.
     fts_configs: Annotated[list[str], NoDecode] = ["english"]
-    # ── Keyword ranking and snippets (#344, migration 031) ─────────────────
+    # ── Keyword ranking and snippets (#344/#391, migrations 031/035) ───────
     #
     # `ts_rank_cd`'s weight array `{D, C, B, A}`, bound as `float4[]` and never
-    # interpolated. The keyword vector holds the title and aliases at `A` and
-    # the body at `D`; at the default one adjacent two-word title cover
-    # (`2/(1+1) = 1.0`) outweighs fifty body covers (`2/(50+50) = 0.02` each),
-    # where PostgreSQL's default `D = 0.1` lets ten body repetitions tie the
-    # title — the #344 failure. Changing it re-ranks title-versus-body
-    # competition only; body-only order is unchanged by any uniform `D`.
+    # interpolated. The keyword vector is `A(title) || A(aliases) || B(tags)
+    # || D(body)` (`C` unused); at the default one adjacent two-word title
+    # cover (`2/(1+1) = 1.0`) outweighs fifty body covers (`2/(50+50) = 0.02`
+    # each), where PostgreSQL's default `D = 0.1` lets ten body repetitions tie
+    # the title — the #344 failure — and one tag cover (`0.4`) ranks below a
+    # title cover and equals twenty body covers. Changing it re-ranks
+    # title-versus-tags-versus-body competition only; body-only order is
+    # unchanged by any uniform `D`.
     # Accepts `{0.02, 0.2, 0.4, 1.0}`, a JSON list or a CSV; four finite
     # numbers in [1e-6, 1] (`RANK_WEIGHT_MIN`: float4 must not round one to 0). See "Keyword ranking" in docs/architecture/search.md.
     rank_weights: Annotated[list[float], NoDecode] = [0.02, 0.2, 0.4, 1.0]

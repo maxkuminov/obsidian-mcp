@@ -640,7 +640,7 @@ async def test_the_retreat_halves_down_to_the_floor(sessionmaker, vault):
     """The arithmetic, against the real helper and a real savepoint: a
     statement that only succeeds below some length is retried at halved
     prefixes and never below the floor."""
-    frag, params = index_tsvector_sql("content")
+    frag, params = index_tsvector_sql("content", tags_bind="tags_text")
     stmt = text(
         f"UPDATE notes_metadata SET content_tsvector = {frag}, "
         "body_excerpt = :excerpt WHERE file_path = :p"
@@ -650,7 +650,7 @@ async def test_the_retreat_halves_down_to_the_floor(sessionmaker, vault):
     async with sessionmaker() as session:
         used, rowcount = await indexer.write_tsvector_bounded(
             session, stmt, OVERSIZED,
-            {"p": "n0000.md", "title": "n0000", "aliases": "", **params},
+            {"p": "n0000.md", "title": "n0000", "aliases": "", "tags_text": "", **params},
             label="n0000.md",
         )
         await session.commit()

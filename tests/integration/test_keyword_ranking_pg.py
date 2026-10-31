@@ -18,7 +18,8 @@ import time
 import pytest
 import pytest_asyncio
 import yaml
-from sqlalchemy import text
+from sqlalchemy import String, bindparam, text
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import src.database
@@ -179,37 +180,70 @@ async def test_body_only_order_is_unchanged_by_the_weight_array(sessionmaker, va
     assert ours == default and len(ours) == 4
 
 
+def _load_035():
+    import importlib.util
+    import pathlib
+
+    path = next((pathlib.Path(__file__).resolve().parents[2] / "alembic/versions").glob("035_*.py"))
+    spec = importlib.util.spec_from_file_location("migration_035_writer", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+async def _run_035_rewrite(sessionmaker, configs):
+    """Migration 035's own preflight and re-head (not a copy of them), over
+    the current table, committed."""
+    m = _load_035()
+    engine = sessionmaker.kw["bind"]
+    async with engine.begin() as conn:
+        def _go(sync_conn):
+            _total, rows = m._candidates(sync_conn)
+            work, _none = m.preflight(sync_conn, sorted(configs), rows)
+            return m.rewrite(sync_conn, sorted(configs), work)
+
+        return await conn.run_sync(_go)
+
+
 @pytest.mark.parametrize("configs", [["english"], ["simple", "english"]])
 async def test_every_writer_produces_the_same_shape(sessionmaker, vault, monkeypatch, configs):
-    """The pass's vector equals migration 031's re-head of its own D part, and
-    the rebuild's rewrite — byte for byte (the first application over a
-    D-only vector is exact). Under `simple,english` too (V-N4): the writers
-    run in `FTS_CONFIGS` order, 031 under the fingerprint's sorted list, and
-    the builders sort, so the bytes agree."""
+    """The pass's vector equals migration 035's re-head of a D-only row (the
+    first application over a D-only vector is exact), and the rebuild's
+    rewrite — byte for byte, with title, aliases and tags (#391 D6). Under
+    `simple,english` too (V-N4): the writers run in `FTS_CONFIGS` order, the
+    migration under the fingerprint's sorted list, and the builders sort."""
     monkeypatch.setattr(settings, "fts_configs", configs, raising=False)
     body = "a body with words running\n"
-    write(vault, {"Shape.md": ({"aliases": "one, two"}, body)})
+    front = {"aliases": "one, two", "tags": ["hoa", "ctx/phone"]}
+    write(vault, {"Shape.md": (front, body + "and an inline #Running/tag\n")})
     await index(vault)
-    # A row as a pre-031 build left it (a D-only vector), re-headed the way
-    # 031 does it from stored columns — under the fingerprint's configs,
-    # which are stored sorted — equals the pass's vector byte for byte.
+    stored_tags = await scalar(sessionmaker, "SELECT tags FROM notes_metadata WHERE file_path = 'Shape.md'")
+    assert stored_tags == ["Running/tag", "ctx/phone", "hoa"]
+    # A row as a pre-031 build left it (a D-only vector) with the same stored
+    # columns, re-headed by migration 035's own code.
     body_frag, body_params = fts.body_tsvector_sql("body")
-    frag, params = fts.rehead_tsvector_sql("head_title", "head_aliases", sorted(configs))
     async with sessionmaker() as session:
         await session.execute(text(
-            "INSERT INTO notes_metadata (user_id, file_path, title, frontmatter, content_hash, content_tsvector) "
-            f"VALUES (NULL, 'Raw.md', 'Shape', CAST(:fm AS jsonb), 'h', {body_frag})"
-        ), {"fm": json.dumps({"aliases": "one, two"}), "body": body, **body_params})
-        await session.execute(text(
-            f"UPDATE notes_metadata SET content_tsvector = {frag} WHERE file_path = 'Raw.md'"
-        ), {"head_title": "Shape", "head_aliases": "one\ntwo", **params})
+            "INSERT INTO notes_metadata (user_id, file_path, title, frontmatter, tags, "
+            " content_hash, content_tsvector) "
+            f"VALUES (NULL, 'Raw.md', 'Shape', CAST(:fm AS jsonb), :tags, 'h', {body_frag})"
+        ).bindparams(bindparam("tags", type_=ARRAY(String))),
+            {"fm": json.dumps({"aliases": "one, two", "tags": ["hoa", "ctx/phone"]}),
+             "tags": stored_tags, "body": body + "and an inline #Running/tag\n", **body_params})
         await session.commit()
+    assert await _run_035_rewrite(sessionmaker, configs) == 1
     same = await scalar(
         sessionmaker,
         "SELECT (SELECT content_tsvector::text FROM notes_metadata WHERE file_path = 'Shape.md') = "
         "       (SELECT content_tsvector::text FROM notes_metadata WHERE file_path = 'Raw.md')",
     )
     assert same is True
+    b_lexemes = await scalar(
+        sessionmaker,
+        "SELECT tsvector_to_array(ts_filter(content_tsvector, '{b}')) FROM notes_metadata "
+        "WHERE file_path = 'Shape.md'",
+    )
+    assert {"hoa", "ctx/phone", "ctx", "phone"} <= set(b_lexemes)
     async with sessionmaker() as session:
         await session.execute(text("DELETE FROM notes_metadata WHERE file_path = 'Raw.md'"))
         await session.commit()
@@ -220,6 +254,293 @@ async def test_every_writer_produces_the_same_shape(sessionmaker, vault, monkeyp
     assert before == after
 
 
+async def test_an_untagged_vector_is_the_pre_391_shape(sessionmaker, vault):
+    """No tags, or only tags that stem to nothing: byte-equal to `A(title) ||
+    A(aliases) || D(body)` — the shape 031's builder (`tags_bind=None`)
+    writes."""
+    write(vault, {
+        "Plain.md": ({"aliases": ["nick"]}, "plain words here\n"),
+        "Stop.md": ({"tags": ["the"]}, "stop tagged words\n"),
+    })
+    await index(vault)
+    frag, params = fts.index_tsvector_sql("content", "title", "aliases", tags_bind=None)
+    for path, title, aliases, body in (
+        ("Plain.md", "Plain", "nick", "plain words here\n"),
+        ("Stop.md", "Stop", "", "stop tagged words\n"),
+    ):
+        expected = await scalar(
+            sessionmaker, f"SELECT ({frag})::text",
+            content=body, title=title, aliases=aliases, **params,
+        )
+        got = await scalar(
+            sessionmaker, "SELECT content_tsvector::text FROM notes_metadata WHERE file_path = :p", p=path
+        )
+        assert got == expected, path
+
+
+# ── #391: tags in the vector ──────────────────────────────────────────────
+
+
+async def test_a_tag_hit_ranks_between_a_title_hit_and_a_body_hit(sessionmaker, vault):
+    write(vault, {
+        "HOA.md": "nothing relevant in this body\n",
+        "Tagged.md": ({"tags": ["hoa"]}, "the siding went up last spring\n"),
+        "Body.md": "hoa meeting, hoa dues and the hoa newsletter\n",
+    })
+    await index(vault)
+    rows = await search(sessionmaker, "hoa")
+    assert [r["path"] for r in rows] == ["HOA.md", "Tagged.md", "Body.md"]
+    assert [r["matched_in"] for r in rows] == [["title"], ["tags"], ["body"]]
+    assert all(r["match"] == "all" for r in rows)
+    tagged = rows[1]
+    assert tagged["snippet"] is None and tagged["head"].strip().startswith("the siding went up")
+    assert rows[0]["rank"] > rows[1]["rank"] > rows[2]["rank"]
+    out = await tools.search_notes_impl("hoa")
+    assert "(`Tagged.md`) [hoa] — rank: 0.4 — match: all — matched_in: tags" in out
+    assert "  head: the siding went up" in out
+
+
+async def test_the_issues_query_matches_tags_and_body(sessionmaker, vault):
+    """#391's reproduction: `HOA` only in the tags, `siding complaint` only in
+    the body."""
+    write(vault, {
+        "Neighborhood board.md": ({"tags": ["HOA"]}, "the siding complaint went in\n"),
+        "Other.md": "a siding note without the rest\n",
+    })
+    await index(vault)
+    rows = await search(sessionmaker, "HOA siding complaint")
+    assert rows[0]["path"] == "Neighborhood board.md"
+    assert rows[0]["match"] == "all" and rows[0]["matched_in"] == ["tags+body"]
+    assert rows[0]["snippet"] is None and rows[0]["head"].strip().startswith("the siding complaint")
+    out = await tools.search_notes_impl("HOA siding complaint")
+    assert "matched_in: tags+body" in out and "  head: the siding complaint went in" in out
+
+
+async def test_a_nested_tag_is_found_by_its_full_form_and_each_segment(sessionmaker, vault):
+    write(vault, {
+        "Call log.md": "call notes go here #ctx/phone\n",
+        "Fenced.md": "```\n#gamma inside a fence\n```\nand prose\n",
+        "Telephone.md": ({"tags": ["telephone"]}, "an unrelated body\n"),
+    })
+    await index(vault)
+    for q in ("phone", "ctx"):
+        rows = await search(sessionmaker, q)
+        assert [(r["path"], r["matched_in"]) for r in rows] == [("Call log.md", ["tags"])], q
+    # The inline tag's own text is body text, which PostgreSQL parses as the
+    # one `file` token `ctx/phone`: the full form also matches the body.
+    rows = await search(sessionmaker, "ctx/phone")
+    assert [(r["path"], r["matched_in"]) for r in rows] == [("Call log.md", ["tags", "body"])]
+    write(vault, {"Call log.md": ({"tags": ["ctx/phone"]}, "call notes go here\n")})
+    await index(vault)
+    for q in ("phone", "ctx", "ctx/phone"):
+        rows = await search(sessionmaker, q)
+        assert [(r["path"], r["matched_in"]) for r in rows] == [("Call log.md", ["tags"])], q
+    # The fenced `#gamma` is no tag: not in `tags`, no weight-B lexeme.
+    assert await scalar(sessionmaker, "SELECT tags FROM notes_metadata WHERE file_path = 'Fenced.md'") == []
+    assert await scalar(
+        sessionmaker,
+        "SELECT length(ts_filter(content_tsvector, '{b}')) FROM notes_metadata WHERE file_path = 'Fenced.md'",
+    ) == 0
+    rows = await search(sessionmaker, "gamma")
+    assert [(r["path"], r["matched_in"]) for r in rows] == [("Fenced.md", ["body"])]
+    # A title and a tag both carrying every term, the body none.
+    rows = await search(sessionmaker, "telephone")
+    assert [(r["path"], r["matched_in"]) for r in rows] == [("Telephone.md", ["title", "tags"])]
+    out = await tools.search_notes_impl("telephone")
+    assert "matched_in: title,tags" in out and "  head: an unrelated body" in out
+
+
+async def test_a_tag_edit_alone_updates_the_vector(sessionmaker, vault):
+    write(vault, {"Edit.md": ({"tags": ["alpha"]}, "a body that never changes\n")})
+    await index(vault)
+    assert [r["path"] for r in await search(sessionmaker, "alpha")] == ["Edit.md"]
+    xver = await scalar(sessionmaker, "SELECT extraction_version FROM notes_metadata WHERE file_path = 'Edit.md'")
+    write(vault, {"Edit.md": ({"tags": ["beta"]}, "a body that never changes\n")})
+    await index(vault)
+    rows = await search(sessionmaker, "beta")
+    assert [(r["path"], r["matched_in"]) for r in rows] == [("Edit.md", ["tags"])]
+    assert await search(sessionmaker, "alpha") == []
+    assert await scalar(
+        sessionmaker, "SELECT extraction_version FROM notes_metadata WHERE file_path = 'Edit.md'"
+    ) == xver
+
+
+async def test_a_tags_only_note_with_no_body_shows_no_preview(sessionmaker, vault):
+    write(vault, {"Bare.md": "---\ntags: [hoa]\n---\n"})
+    await index(vault)
+    assert await scalar(sessionmaker, "SELECT body_excerpt FROM notes_metadata WHERE file_path = 'Bare.md'") == ""
+    rows = await search(sessionmaker, "hoa")
+    assert rows[0]["path"] == "Bare.md" and rows[0]["matched_in"] == ["tags"]
+    assert rows[0]["snippet"] is None and rows[0]["head"] == "" and rows[0]["has_excerpt"] is True
+    out = await tools.search_notes_impl("hoa")
+    assert "— without excerpt: 0" in out
+    line = next(line for line in out.splitlines() if "(`Bare.md`)" in line)
+    assert "matched_in: tags" in line
+    assert "head:" not in out and "snippet:" not in out
+
+
+@pytest.mark.parametrize("mover", ["move_note", "indexer"])
+async def test_a_move_keeps_the_note_findable_by_its_tags(sessionmaker, vault, mover):
+    write(vault, {"Alpha.md": ({"tags": ["hoa"]}, "just a body about nothing\n")})
+    await index(vault)
+    await MOVERS[mover](vault, "Alpha.md", "Beta.md")
+    rows = await search(sessionmaker, "hoa")
+    assert [(r["path"], r["matched_in"]) for r in rows] == [("Beta.md", ["tags"])]
+    assert "hoa" in await scalar(
+        sessionmaker,
+        "SELECT tsvector_to_array(ts_filter(content_tsvector, '{b}')) FROM notes_metadata "
+        "WHERE file_path = 'Beta.md'",
+    )
+    assert [r["path"] for r in await search(sessionmaker, "Beta")] == ["Beta.md"]
+
+
+async def test_move_notes_stored_tags_fallback_is_owner_scoped(sessionmaker, vault, monkeypatch):
+    """Codex r1 #4: multi-user, two tenants each holding `Alpha.md` with
+    different tags; the destination read fails after the rename stands, so
+    the re-head binds the tags of the caller's **own** row; the tag search
+    finds `Beta.md`, and still does after the next stat-only pass."""
+    from src.auth.session import current_user_id, current_vault_root
+    from src.services import vault as vault_service, vault_overlap
+
+    roots = {}
+    async with sessionmaker() as session:
+        for uid in (7, 9):
+            roots[uid] = vault / f"mu{uid}"
+            roots[uid].mkdir()
+            await session.execute(text(
+                "INSERT INTO users (id, username, password_hash, vault_path, is_active) "
+                "VALUES (:i, :u, 'x', :v, true) ON CONFLICT (id) DO UPDATE SET vault_path = :v"),
+                {"i": uid, "u": f"user{uid}", "v": str(roots[uid])})
+        await session.commit()
+        for uid in (7, 9):
+            await vault_service.warm_user_vault_cache(session, user_id=uid)
+    monkeypatch.setattr(settings, "multi_user_mode", True, raising=False)
+    vault_overlap.publish_synthetic_snapshot()
+    write(roots[7], {"Alpha.md": ({"tags": ["hoa"]}, "the first tenant's body\n")})
+    write(roots[9], {"Alpha.md": ({"tags": ["other"]}, "the second tenant's body\n")})
+    try:
+        for uid in (7, 9):
+            await indexer.index_vault(user_id=uid)
+
+        real_read = tools.read_bytes_at
+
+        def failing_read(target, *a, label=None, **kw):
+            if label == "Beta.md":
+                raise OSError("forced destination read failure")
+            return real_read(target, *a, label=label, **kw)
+
+        monkeypatch.setattr(tools, "read_bytes_at", failing_read)
+        tokens = [(current_user_id, current_user_id.set(7)),
+                  (current_vault_root, current_vault_root.set((7, roots[7])))]
+        try:
+            out = await tools.move_note_impl("Alpha.md", "Beta.md")
+        finally:
+            for var, token in reversed(tokens):
+                var.reset(token)
+        assert "Moved" in out and "DB update failed" not in out, out
+        monkeypatch.setattr(tools, "read_bytes_at", real_read)
+
+        async def b_part(uid):
+            return set(await scalar(
+                sessionmaker,
+                "SELECT tsvector_to_array(ts_filter(content_tsvector, '{b}')) "
+                "FROM notes_metadata WHERE user_id = :u AND file_path = 'Beta.md'", u=uid,
+            ))
+
+        assert "hoa" in await b_part(7) and "other" not in await b_part(7)
+        rows = await search(sessionmaker, "hoa", user_id=7)
+        assert [(r["path"], r["matched_in"]) for r in rows] == [("Beta.md", ["tags"])]
+
+        await indexer.index_vault(user_id=7)
+        assert "hoa" in await b_part(7)
+        rows = await search(sessionmaker, "hoa", user_id=7)
+        assert [(r["path"], r["matched_in"]) for r in rows] == [("Beta.md", ["tags"])]
+        assert await search(sessionmaker, "hoa", user_id=9) == []
+    finally:
+        vault_service.clear_user_vault_cache()
+        async with sessionmaker() as session:
+            await session.execute(text("DELETE FROM notes_metadata WHERE user_id IN (7, 9)"))
+            await session.commit()
+
+
+# ── #391: the identity oracle's tag-contribution exemption ─────────────────
+
+
+async def _old_full_text_search(session, query, limit=500):
+    """The pre-#344 statement (default weights, no snippets), the oracle the
+    identity requirement compares against (`test_perf_projection_identity_pg`)."""
+    from sqlalchemy import func, select
+    from src.models.db import NoteMetadata
+
+    tsquery = fts.combined_tsquery(query)
+    rank = func.ts_rank_cd(NoteMetadata.content_tsvector, tsquery).label("rank")
+    stmt = (
+        select(NoteMetadata.file_path, rank)
+        .where(NoteMetadata.content_tsvector.op("@@")(tsquery))
+        .order_by(rank.desc(), NoteMetadata.file_path.asc()).limit(limit)
+    )
+    return [(p, float(r)) for p, r in (await session.execute(stmt)).all()]
+
+
+async def _tag_contributions(session, query) -> set[str]:
+    """Paths with a tag contribution for `query`: any lexeme of any
+    configured config's parse, positive or negated, in the row's `{b}` part."""
+    cfg_params = {f"fts_cfg_{i}": c for i, c in enumerate(settings.fts_configs)}
+    parsed = [row[1] for row in (await session.execute(
+        text(fts.tsquery_text_sql()), {"q": query, **cfg_params})).all()]
+    lexemes = set()
+    for p in parsed:
+        for kind, value in fts._tokenize(p or "") or []:
+            if kind == "lexeme":
+                lexemes.add(value.split("'")[1] if value.count("'") == 2 else value.strip("'"))
+    if not lexemes:
+        return set()
+    rows = (await session.execute(text(
+        "SELECT file_path FROM notes_metadata WHERE "
+        "tsvector_to_array(ts_filter(content_tsvector, '{b}')) && CAST(:lx AS text[])"
+    ), {"lx": sorted(lexemes)})).all()
+    return {r[0] for r in rows}
+
+
+async def test_the_identity_oracle_exempts_exactly_the_tag_contributions(sessionmaker, vault):
+    write(vault, {
+        "Hoa tagged.md": ({"tags": ["hoa"]}, "a note about forecast and siding\n"),
+        "Budget tagged.md": ({"tags": ["budget"]}, "the budget forecast for next year\n"),
+        "Untagged.md": "another budget forecast entirely\n",
+        # Distinct term frequencies (V7), so clause (b) compares real ranks.
+        "Twice.md": "forecast filler words forecast\n",
+        "Thrice.md": "forecast and forecast again, forecast\n",
+        "Many.md": "forecast " * 7 + "\n",
+    })
+    await index(vault)
+    distinct_body_ranks = 0
+    expected_exempt = {
+        "hoa": {"Hoa tagged.md"},
+        "budget forecast": {"Budget tagged.md"},
+        "forecast": set(),
+        "forecast -hoa": {"Hoa tagged.md"},
+    }
+    for query, exempt in expected_exempt.items():
+        async with sessionmaker() as session:
+            got_exempt = await _tag_contributions(session, query)
+        assert got_exempt == exempt, query
+        async with sessionmaker() as session:
+            new = await full_text_search(session, query, limit=50)
+        # The pre-change corpus: the same rows without their tags part.
+        async with sessionmaker() as session:
+            await session.execute(text(
+                "UPDATE notes_metadata SET content_tsvector = ts_filter(content_tsvector, '{a,d}')"))
+            old = await _old_full_text_search(session, query)
+            await session.rollback()
+        new_all = [r["path"] for r in new if r["match"] == "all" and r["path"] not in exempt]
+        old_paths = [p for p, _ in old if p not in exempt]
+        assert set(new_all) == set(old_paths), query          # (a)
+        body_only = [r["path"] for r in new if r["match"] == "all"
+                     and r["matched_in"] == ["body"] and r["path"] not in exempt]
+        assert body_only == [p for p in old_paths if p in body_only], query  # (b)
+        old_rank = dict(old)
+        distinct_body_ranks = max(distinct_body_ranks, len({old_rank[p] for p in body_only}))
+    assert distinct_body_ranks >= 3, "clause (b) must compare distinct ranks"
 # ── the disjunctive fill ────────────────────────────────────────────────────
 
 
@@ -448,23 +769,26 @@ async def test_the_snippet_cost_is_bounded_by_the_row_cap_not_the_limit(sessionm
 
 async def test_the_worst_case_snippet_latency_is_under_the_gate(sessionmaker, vault, monkeypatch, capsys):
     """Codex r1 #5's gate: twenty distinct 20,000-character excerpts with
-    repeated matches, `english,simple`, head-fallback rows included — the
-    snippet statements for that page in under 300 ms on the throwaway
-    container. The measurement is printed for the record."""
+    repeated matches, `english,simple`, head-fallback rows included — five
+    matching only through their title and, since #391, five only through
+    their tags — the snippet statements for that page in under 300 ms on the
+    throwaway container. The measurement is printed for the record."""
     monkeypatch.setattr(settings, "fts_configs", ["english", "simple"], raising=False)
     rng = random.Random(7)
     vocab = ["ledger", "forecast", "variance", "quarter", "review", "capital", "runway", "margin"]
     files = {}
     for i in range(20):
         words = [rng.choice(vocab) + str(rng.randint(0, 50)) for _ in range(3400)]
-        if i % 4 != 0:
+        if i % 4 not in (0, 2):
             for k in range(0, len(words), 37):
                 words[k] = "budget"
             body = " ".join(words)[:20_000]
         else:
-            body = " ".join(words)[:20_000]  # title-only rows: a head-fallback parse
+            # Title-only (i % 4 == 0) and tags-only (i % 4 == 2) rows: a
+            # head-fallback parse each.
+            body = " ".join(words)[:20_000]
         title = f"Budget Plan {i}" if i % 4 == 0 else f"Plan {i}"
-        files[f"{title}.md"] = body + "\n"
+        files[f"{title}.md"] = ({"tags": ["budget", "ledger"]}, body) if i % 4 == 2 else body + "\n"
     write(vault, files)
     await index(vault)
     lengths = await scalar(sessionmaker, "SELECT min(length(body_excerpt)) FROM notes_metadata")
@@ -481,9 +805,10 @@ async def test_the_worst_case_snippet_latency_is_under_the_gate(sessionmaker, va
             details = await _snippets(session, ids, q, fts.fallback_plan(["'budget'", "'budget'"]))
             timings.append(time.perf_counter() - started)
     assert len(details) == 20
-    assert sum(1 for d in details.values() if d["snippet"] is None and d["head"]) == 5
+    assert sum(1 for d in details.values() if d["snippet"] is None and d["head"]) == 10
+    assert sum(1 for d in details.values() if d["matched_in"] == ["tags"]) == 5
     best = min(timings) * 1000
-    print(f"\n[snippet gate] 20 × 20,000 chars, english,simple, 5 head rows: "
+    print(f"\n[snippet gate] 20 × 20,000 chars, english,simple, 10 head rows (5 tags-only): "
           f"{best:.0f} ms best of 3 ({', '.join(f'{t * 1000:.0f}' for t in timings)})")
     assert best < 300, f"snippet statements took {best:.0f} ms"
 

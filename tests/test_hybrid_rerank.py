@@ -224,7 +224,7 @@ def test_the_fixed_bounds_with_rerank():
     worst_rows = [
         HybridRow(path=f"{i}.md", title="", tags=[], score=2 / 1050, keyword_rank=50,
                   semantic_rank=50, match="any", similarity=-0.123, stale=True,
-                  embedding_truncated=True, no_excerpt=True, matched_in=["title", "body"])
+                  embedding_truncated=True, no_excerpt=True, matched_in=["title+tags+body"])
         for i in range(50)
     ]
     result = HybridResult(
@@ -239,18 +239,22 @@ def test_the_fixed_bounds_with_rerank():
     structure = tools._hybrid_row_line(
         worst_rows[0], 1000, title="", path="", tags=[], preview=("none", ""), labels=labels,
         extra=(tools._rerank_score_field(-1.234e-100),))
-    assert len(structure) <= tools.HYBRID_RERANK_ROW_STRUCTURE_MAX == 362, len(structure)
+    assert len(structure) <= tools.HYBRID_RERANK_ROW_STRUCTURE_MAX == 367, len(structure)
+    print(f"\n[hybrid bound] rerank=true abbreviated structure: {len(structure)}")
     assert max(len(tools._rerank_cap_footer(n)) for n in range(1, 51)) <= 75
-    # Before #389 the cut form summed 431 + 362 + 25 + 25 + 75 + 75 + 5 = 998.
-    # The `confidence` token (13 more header characters at the worst case)
-    # takes it past 1,000, so the keyword-only rerank=true worst case falls
-    # through to the labelled omitted form (L6); the per-case sums are pinned
-    # in `tests/test_search_confidence.py`.
-    assert 444 + 362 + 25 + 25 + 75 + 75 + 5 == 1011
+    # Before #389 and #391 the cut form summed 431 + 362 + 25 + 25 + 75 + 75 +
+    # 5 = 998. The `confidence` token (13 more header characters) and the
+    # longest `matched_in` (`title+tags+body`, 5 more) take it to 1,016, so
+    # the keyword-only rerank=true worst case falls through to the labelled
+    # omitted form (L6), 444 + 367 + 31 + 75 + 75 + 5 = 997; the per-case
+    # sums are pinned in `tests/test_search_confidence.py`.
+    assert 444 + 367 + 25 + 25 + 75 + 75 + 5 == 1016 > 1000
+    assert 444 + 367 + 31 + 75 + 75 + 5 == 997 <= 1000
 
 
+@pytest.mark.parametrize("split", [False, True])
 @pytest.mark.parametrize("mode", ["correct", "not_json"])
-async def test_the_hybrid_worst_case_with_rerank(monkeypatch, captured, fake, mode):
+async def test_the_hybrid_worst_case_with_rerank(monkeypatch, captured, fake, mode, split):
     monkeypatch.setattr(settings, "max_read_response_chars", 1000, raising=False)
     monkeypatch.setattr(settings, "hybrid_rrf_k", 1000, raising=False)
     monkeypatch.setattr(settings, "keyword_snippet_rows", 20, raising=False)
@@ -268,7 +272,9 @@ async def test_the_hybrid_worst_case_with_rerank(monkeypatch, captured, fake, mo
     session = _ExcerptSession(
         excerpts={path: "e" * 3000},
         ranked=[keyword],
-        snippet=[[snip(1, hl="a \x02b\x03")] + [snip(10 + i) for i in range(19)]])
+        snippet=[[snip(1, hl="a \x02b\x03", title=False, body=not split)]
+                 + [snip(10 + i) for i in range(19)]]
+        + ([[SimpleNamespace(_mapping={"id": 1, "head": "opening words"})]] if split else []))
     _serve(monkeypatch, session)
     fake.mode = mode
     fake.scorer = (lambda q, d: [-1.234e-05 if i == 0 else -9.0 for i in range(len(d))]) \
@@ -281,6 +287,13 @@ async def test_the_hybrid_worst_case_with_rerank(monkeypatch, captured, fake, mo
             else "reranked: false (malformed_response)") in lines[0]
     rows = [line for line in lines if line.startswith("- {")]
     assert len(rows) == 1
+    if split:
+        # `matched_in: title+tags+body` (#391). These inputs' real header is
+        # shorter than the 444 worst case, so the 20–25 cut form fits here
+        # (pinned); the arithmetic worst case (1,016 > 1,000) takes the
+        # omitted form, pinned by the direct-render test below.
+        assert "matched_in: title+tags+body" in rows[0]
+        assert '"title":""' not in rows[0] and '"path":""' not in rows[0]
     for key in ("title", "path"):
         lit = re.search(r'"%s":("(?:[^"\\]|\\.)*")' % key, rows[0]).group(1)
         assert 20 <= len(lit) - 2 <= 25, (key, lit)
@@ -349,15 +362,15 @@ def test_the_hybrid_worst_case_with_a_transition_line_and_a_locator(monkeypatch,
 def test_the_floor_arithmetic_with_the_transition_line():
     """After #355 a both-arms page reserves the `index_transition:` line
     (≤ 127 characters at a ten-digit count). With it the cut form sums to
-    1,021 at the worst case (1,004 before the #389 token), and the omitted
-    form to 1,002, so that case falls through to the last rung, `explain
+    1,026 at the worst case (1,004 before #389 and #391), and the omitted
+    form to 1,007, so that case falls through to the last rung, `explain
     omitted` (#389, D5), which fits: the 1,000 bound holds, the 20–25 cut
     does not always survive (L6)."""
     from src.services.embeddings import transition_line
 
     rows = [HybridRow(path=f"{i}.md", title="", tags=[], score=2 / 1050, keyword_rank=50,
                       semantic_rank=50, match="any", similarity=-0.123, stale=True,
-                      embedding_truncated=True, no_excerpt=True, matched_in=["title", "body"])
+                      embedding_truncated=True, no_excerpt=True, matched_in=["title+tags+body"])
             for i in range(50)]
     result = HybridResult(rows=rows, arms="both", rrf_k=1000, keyword_rows=50, keyword_all=50,
                           keyword_any=50, semantic_rows=50, semantic_chunks=50, overlap=50,
@@ -378,8 +391,36 @@ def test_the_floor_arithmetic_with_the_transition_line():
         rows[0], 1000, title="", path="", tags=[], preview=("none", ""),
         labels=[*base, "title omitted", "path omitted", "abbreviated"], extra=score,
         omit_explain=True))
-    assert (header, line, cut_form, omitted) == (388, 127, 378, 409)
-    assert header + 1 + line + 1 + cut_form + 25 + 25 + 1 + 75 == 1021
-    assert header + 1 + line + 1 + omitted + 1 + 75 == 1002
+    # With #391's longest `matched_in` (`title+tags+body`, five characters
+    # more than `title,body`) every row form is five longer.
+    assert (header, line, cut_form, omitted) == (388, 127, 383, 414)
+    assert header + 1 + line + 1 + cut_form + 25 + 25 + 1 + 75 == 1026
+    assert header + 1 + line + 1 + omitted + 1 + 75 == 1007
     assert omitted - explain_omitted == 19
-    assert header + 1 + line + 1 + explain_omitted + 1 + 75 == 983 <= 1000
+    assert header + 1 + line + 1 + explain_omitted + 1 + 75 == 988 <= 1000
+
+
+def test_the_rerank_worst_case_takes_the_omitted_form_when_the_cut_cannot_fit(monkeypatch):
+    """#391 V6: with `matched_in: title+tags+body` the cut-form floor sum is
+    444 + 367 + 25 + 25 + 75 + 75 + 5 = 1,016 > 1,000 (#389's
+    token and #391's `matched_in` together), so at the arithmetic
+    worst case the first row must take the labelled omitted form. Pinned by
+    rendering at the budget the omitted form needs, which the cut form
+    exceeds."""
+    from tests.test_hybrid_search_offline import _worst_case
+
+    query, _title, _path, result = _worst_case(monkeypatch, keyword_only=True, split=True)
+    n = len(result.rows)
+    outcome = rerank.RerankOutcome(False, list(range(n)), n, reason="malformed_response")
+    omitted, _ = tools.render_hybrid_results(query, result, rerank=outcome, budget=1)
+    cut, _ = tools.render_hybrid_results(query, result, rerank=outcome, budget=1000)
+    assert '"title":""' in omitted and '"title":""' not in cut
+    L_omit = len(omitted)
+    assert len(cut) > L_omit
+    text, _ = tools.render_hybrid_results(query, result, rerank=outcome, budget=L_omit)
+    row = next(line for line in text.splitlines() if line.startswith("- {"))
+    assert "matched_in: title+tags+body" in row
+    assert '"title":""' in row and '"path":""' in row
+    for label in ("title_cut", "title omitted", "path_cut", "path omitted", "abbreviated"):
+        assert label in row, label
+    assert len(text) <= L_omit

@@ -91,7 +91,9 @@ async def corpus(sessionmaker):
     rng = random.Random(SEED)
     # The head's binds get their own names: `:title` also fills the varchar
     # column, and asyncpg refuses one parameter deduced as two types.
-    fragment, cfg_params = index_tsvector_sql("content", "head_title", "aliases")
+    fragment, cfg_params = index_tsvector_sql(
+        "content", "head_title", "aliases", tags_bind="tags_text"
+    )
 
     async with sessionmaker() as session:
         user = (await session.execute(
@@ -119,6 +121,7 @@ async def corpus(sessionmaker):
                 "head_title": f"note {i}",
                 "aliases": "",
                 "tags": ["work"] if i % 4 == 0 else ["personal"],
+                "tags_text": "work" if i % 4 == 0 else "personal",
                 "fm": '{"status": "open"}' if i % 7 == 0 else '{"status": "done"}',
                 "hash": f"h{i}",
                 "content": _body(rng, i),

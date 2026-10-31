@@ -19,8 +19,9 @@
   plan change would otherwise change *which* tied rows survive the LIMIT.
   Index usage is the expected plan for rare terms on a production-sized
   corpus, not a guarantee; a tiny table or a very common term may legitimately
-  seq-scan. Since #344 the vector is `A(title) || A(aliases) || D(body)`,
-  ranking is `ts_rank_cd(RANK_WEIGHTS, …)`, an under-filled page is filled
+  seq-scan. Since #344 and #391 (migrations 031/035) the vector is
+  `A(title) || A(aliases) || B(tags) || D(body)` — a tag hit ranks below a
+  title hit and above a body hit — ranking is `ts_rank_cd(RANK_WEIGHTS, …)`, an under-filled page is filled
   from a disjunction derived from PostgreSQL's own parse, and each row
   carries a page-bounded snippet — see the section below.
 - Vector search via a pgvector HNSW **expression** index over
@@ -37,11 +38,13 @@
 `keyword_search("<exact two-word title of an existing note>")` returned ten
 rows without that note, live, on 2026-10-28. Three causes, three changes.
 
-**The vector weights the title and aliases above the body.** Every writer
-builds `content_tsvector` through `fts.index_tsvector_sql` as *title parts for
-every config, then aliases parts, then the content parts* (configs in sorted
-order — the fingerprint's order, so 031 and the writers agree byte for byte) — `setweight(…,
-'A')` on the first two, the pre-031 `to_tsvector(cfg, body)` fragment byte for
+**The vector weights the title and aliases above the tags, and the tags
+above the body.** Every writer builds `content_tsvector` through
+`fts.index_tsvector_sql` as *title parts for every config, then aliases
+parts, then tags parts, then the content parts* (configs in sorted order —
+the fingerprint's order, so the migrations and the writers agree byte for
+byte) — `setweight(…, 'A')` on the first two, `setweight(…, 'B')` on the
+tags (#391, below), the pre-031 `to_tsvector(cfg, body)` fragment byte for
 byte on the last, so a pre-031 vector is exactly the body part of a post-031
 one. Ranking is `ts_rank_cd(RANK_WEIGHTS, vector, query)` with the array bound
 as `float4[]` (a setting, default `{0.02, 0.2, 0.4, 1.0}` for `D, C, B, A`,
@@ -53,7 +56,8 @@ value binds as float4 zero, and PostgreSQL refuses one above 1). `calc_rank_cd` 
 `1.0` against `3.725` under PostgreSQL's default array (the hub wins) and
 `1.0` against `0.745` under ours (the title wins; the crossover is near forty
 adjacent repetitions, fifty for a one-word title — L8). The array moves only
-title-versus-body competition: body-only order is identical under any uniform
+title-versus-tags-versus-body competition (a tag cover scores `B = 0.4`,
+twenty body covers): body-only order is identical under any uniform
 `D`, which the identity suite pins. Normalisation flags were rejected (flag 1
 still loses the issue's case; flag 2 makes every short note beat every long
 one) and would re-rank body-only matches.
@@ -193,6 +197,98 @@ positions; snippets for the first `KEYWORD_SNIPPET_ROWS` rows only. (The
 former "no hybrid fusion (#354)" limitation is closed by `hybrid_search`,
 below.)
 
+## Tags in the keyword vector (#391)
+
+`hybrid_search("HOA siding complaint")` ranked the HOA note second, carried
+by its semantic arm alone: `HOA` was only in the note's tags, and no
+`tsvector` held tags. Since migration 035 the vector is **`A(title) ||
+A(aliases) || B(tags) || D(body)`** per config — title parts, aliases parts,
+**tags parts**, content parts, configs sorted — from the one builder in
+`src/services/fts.py`. Every builder takes a required keyword `tags_bind`;
+every writer under `src/` passes a bind name and only migration 031's call
+passes `None` (its fragment is pinned byte-identical to the pre-#391 text),
+which an AST test enforces. Weight `C` is unused.
+
+- **The tags text** is `fts.tags_text(tags)` over the list
+  `vault.extract_tags` returns — exactly `notes_metadata.tags`, so the vector
+  and the `tags` filter, `get_tags` and every displayed row agree. One line
+  per tag: the tag, then, for a nested tag, each non-empty `/`-segment
+  (`ctx/phone` → `ctx/phone ctx phone`), because PostgreSQL parses
+  `ctx/phone` as one `file` token and `@@ websearch_to_tsquery('phone')` was
+  false (measured). Both forms, because `websearch_to_tsquery('ctx/phone')`
+  is `'ctx/phone'`, which only the full form matches. NUL/U+0002/U+0003
+  removed, cut at `FTS_TAGS_MAX_CHARS` (2,048, a constant) on a whole line.
+- **Placement between the head and the body**, not at the tail: positions
+  saturate at 16,383, so a tail on a long note puts every tag word at one
+  position, and a cover joining a tag with the body's first words (the
+  issue's own query) would span the whole body. An empty tags part shifts
+  nothing (`A(t) || B('') || D(b) = A(t) || D(b)`, measured), so an untagged
+  note's vector is byte-equal under the old and new builder.
+- **Rank**: `RANK_WEIGHTS` is unchanged; its third slot (`B`) is already
+  `0.4`. A single-word cover scores 1.0 in the title, 0.4 in the tags and
+  0.02 per body cover — one tag cover equals twenty body covers (L2).
+- **`matched_in`** comes from six flags in the snippet statement,
+  `ts_filter(v, W) @@ q` for `{a}`, `{b}`, `{d}`, `{a,b}`, `{a,d}`, `{b,d}`
+  (`search.MATCHED_IN_FLAGS`, `matched_in_from_flags`): every single part
+  that alone matches, in the order `title` (title or aliases), `tags`,
+  `body`, rendered comma-joined; else the first matching pair `title+tags`,
+  `title+body`, `tags+body`; else `title+tags+body`. Eleven values:
+  `title`, `tags`, `body`, `title,tags`, `title,body`, `tags,body`,
+  `title,tags,body`, `title+tags`, `title+body`, `tags+body`,
+  `title+tags+body`. Every pre-#391 value keeps its meaning for a note with
+  no tag hit. The worst-case snippet latency gate now includes tags-only
+  rows (five title-only and five tags-only head rows of twenty) and stays
+  under 300 ms.
+- **The snippet rule is unchanged** — a headline only when the body part
+  matched — so a tags-only or `tags+body` match renders `head:` (tags are not
+  in `body_excerpt`). A note with an **empty body** stores an empty excerpt;
+  its computed head is the empty string, and the row renders **no second
+  line** and is not counted as a row without an excerpt. The service's
+  `head` is `None` when no head was computed and a string when one was; the
+  renderer decides by `is None`, never by truthiness.
+- **Writers**: the incremental pass (the same entry whose `tags` the upsert
+  wrote), the indexer move-pair (the entry parsed for the new path), the
+  rebuild (`extract_tags` over the verified bytes), `move_note` (the
+  destination read's body and frontmatter; when that read or parse fails,
+  the caller's **own** row's stored `tags`, owner-predicated, in the same
+  statement as the stored frontmatter) and migration 035 (stored `tags`). A
+  tag edit changes the content hash, so the note is re-upserted and its
+  vector rewritten in the same pass; no extraction-version bump.
+- **`hybrid_search`** inherits everything through `keyword_arm_rows` /
+  `keyword_snippets`; the only visible difference is the new `matched_in`
+  values in `keyword_rank (…)`. The longest value grew from `title+body` to
+  `title+tags+body` (five characters), so the pinned bounds moved:
+  `HYBRID_ROW_STRUCTURE_MAX` 340 → 345 (with #389's 405-character header the
+  floor sum is 995, the 40–45 cut still guaranteed at `rerank=false`) and
+  `HYBRID_RERANK_ROW_STRUCTURE_MAX` 362 → 367, where the cut-form sum
+  `444 + 367 + 25 + 25 + 75 + 75 + 5 = 1,016` exceeds 1,000 and that worst
+  case continues to the labelled omitted form (≤ 997). The per-case sums,
+  re-measured with both #389 and #391, are under "Bounds (D5)" below.
+- **The identity oracle** additionally exempts rows with a *tag
+  contribution* — any lexeme of any config's parse of the query, positive or
+  negated, present in `ts_filter(v, '{b}')` — and keeps (a) conjunctive
+  membership and (b) body-only order over every other row.
+
+**035** re-heads every tagged vector in SQL (see [schema and
+migrations](schema-and-migrations.md#035-tags-in-the-keyword-vector-391)):
+a read-only size preflight, then an all-or-nothing rewrite, skipping a row
+that already carries a `B` lexeme and a row whose tags produce none.
+
+Accepted limitations (the change's design, L1–L10): a tagged row that already
+had a head is not byte-exact after 035 (body positions shift by the old
+head's length; matching and single-part scores are invariant — `make
+rebuild-tsvectors` makes it exact); one tag cover equals twenty body covers
+(L2); phrase adjacency crosses the aliases/tags and tags/body boundaries and
+consecutive tag lines (L3); tags past 2,048 characters of tags text are
+filterable but not searchable (L4); a parent segment matches every child,
+`ctx` finds every `ctx/*` note (L5, Obsidian's semantics); 035 uses the
+stored tags, so a row last upserted under an older extractor keeps those
+until re-upserted (L6); a tag that stems to nothing contributes no lexeme,
+and tags are stemmed like the body (L8); `matched_in` names the first
+minimal split, not every one (L9); a hand-migrated compose stack that lets
+the old image write after 035 leaves untagged vectors until `make
+rebuild-tsvectors` (L10).
+
 ## Hybrid search (#354)
 
 `hybrid_search(query, limit=10, folder?, tags?, frontmatter?)` is a **third
@@ -294,8 +390,9 @@ not fit is abbreviated in order — `tags omitted`, `preview omitted`,
 to ≥ 40, i.e. 40–45; a value ≤ 45 is not cut), then the empty omitted forms
 — then, last (#389), `explain omitted` in place of the `explain` field (its
 terms follow from the ranks and `rrf_k`) — and marked `abbreviated`. The
-cut-form structure is ≤ 340, so the floor is
-405 + 340 + 45 + 45 + 75 + 75 + 5 = 990 ≤ 1,000.
+cut-form structure is ≤ 345 (340 before #391, whose longest `matched_in` is
+`title+tags+body`), so the floor is
+405 + 345 + 45 + 45 + 75 + 75 + 5 = 995 ≤ 1,000.
 
 **Telemetry and class (D5, D7).** `embed_ms`, `db_ms`, `exact_fallback`,
 `fallback`, `any_rows`, `snippet_ms`, `arms`, `semantic_unavailable`,
@@ -424,19 +521,24 @@ rendered length by hybrid's rules; when the cap drops rows, the footer is
 the quoted encoding can show fewer rows than the legacy page). Pinned
 worst cases at 1,000: semantic header ≤ 199 (185 before the #389
 `confidence` token), abbreviated structure ≤ 235; hybrid header ≤ 444 (431
-before #389) and structure ≤ 362 with a 20–25 character title/path cut
-floor on `rerank=true` pages. Before #389 that summed 431 + 362 + 25 + 25 +
-75 + 75 + 5 = 998; with the token the keyword-only cut form measures 1,003,
-so that case falls through to the labelled omitted form (984): the bound
-holds, the 20–25 cut is not guaranteed there (#389 L6).
+before #389) and structure ≤ 367 (362 before #391's longest `matched_in`,
+`title+tags+body`) with a 20–25 character title/path cut floor on
+`rerank=true` pages. Before #389 and #391 that summed 431 + 362 + 25 + 25 +
+75 + 75 + 5 = 998; with both the cut form sums to 444 + 367 + 25 + 25 + 75 +
+75 + 5 = 1,016 (the keyword-only case measures 1,008), so that case falls
+through to the labelled omitted form (≤ 997, measured 989): the bound
+holds, the 20–25 cut is not guaranteed there (#389 L6). The both-arms
+rerank=true case with the transition line measures 1,026 cut, 1,007
+omitted and 988 at the last rung, `explain omitted`.
 Since #355 both tools' `rerank=true` pages carry the `index_transition:`
 line directly after the header and the `§` locator as a server field after
 the separator (after `rerank_score`), exactly as their `rerank=false`
 pages; the line is reserved in the budget, and an abbreviated first row
 drops the locator with `section omitted`. On a both-arms hybrid page the
 line (≤ 127 characters) makes the cut form sum 1,004 at the worst case
-(1,021 with the #389 token), so that case falls through to the labelled
-omitted form (1,002 with the token) and then to `explain omitted` (983):
+(1,026 with the #389 token and #391's longest `matched_in`), so that case
+falls through to the labelled omitted form (1,007) and then to `explain
+omitted` (988):
 the 1,000 bound holds, the 20–25 cut is not guaranteed there. The
 `rerank=false` byte-identity baseline is the search-confidence page since
 #389: the pre-#389 page plus ` — confidence: ok` before the header's
@@ -538,12 +640,14 @@ low-plus-`any` case (no `all` row, 50 `any` rows — `all 0` is one character
 shorter than `all 50`, `low` one longer than `ok`, so the two headers are
 equal): hybrid header 405 (`rerank=false`) and 444 (`rerank=true`),
 `semantic_search(rerank=true)` header 199, floor arithmetic
-405 + 340 + 45 + 45 + 75 + 75 + 5 = 990. Measured worst cases at the floor
+405 + 345 + 45 + 45 + 75 + 75 + 5 = 995 (340 and 990 before #391's longest
+`matched_in`, `title+tags+body`). Measured worst cases at the floor
 (8,192-control query, `HYBRID_RRF_K=1000`, the ten-digit transition line
-where both arms ran): keyword-only `rerank=false` cut form 976;
-keyword-only `rerank=true` cut 1,003 → omitted 984; both arms
-`rerank=false` cut 994; both arms `rerank=true` omitted 1,002 → `explain
-omitted` 983. These are the structural sums the tests pin; a page actually
+where both arms ran, `matched_in: title+tags+body`; each five more than
+#389 measured with `title,body`): keyword-only `rerank=false` cut form 981;
+keyword-only `rerank=true` cut 1,008 → omitted 989; both arms
+`rerank=false` cut 999; both arms `rerank=true` omitted 1,007 → `explain
+omitted` 988. These are the structural sums the tests pin; a page actually
 rendered from the worst-case fixtures fits in an earlier form (the sum mixes
 the fallback token with a `rerank_score`, and the reserved header's
 full-page counts with the shown header's), so the new rung is a guarantee

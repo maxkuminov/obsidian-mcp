@@ -563,7 +563,7 @@ def _field_literal(line: str, key: str) -> str:
 CONTROLS = "".join(chr(c) for c in (1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 14, 15))
 
 
-def _worst_case(monkeypatch, *, keyword_only: bool):
+def _worst_case(monkeypatch, *, keyword_only: bool, split: bool = False):
     monkeypatch.setattr(settings, "max_read_response_chars", 1000, raising=False)
     monkeypatch.setattr(settings, "hybrid_rrf_k", 1000, raising=False)
     monkeypatch.setattr(settings, "keyword_snippet_rows", 20, raising=False)
@@ -581,15 +581,24 @@ def _worst_case(monkeypatch, *, keyword_only: bool):
     semantic = [sem_row(1, path, title=title, tags=tags, chunk="x" * 500)] + [
         sem_row(100 + i, f"s{i}.md") for i in range(49)]
     session = _Session(ranked=[keyword], semantic=[semantic],
-                       snippet=[[snip(1, hl="a \x02b\x03")] + [snip(10 + i) for i in range(19)]])
+                       snippet=[[snip(1, hl="a \x02b\x03", title=False, body=not split)]
+                                + [snip(10 + i) for i in range(19)]]
+                       # A split row gets a computed head (V5), so its keyword
+                       # preview exists and `preview omitted` is asserted.
+                       + ([[SimpleNamespace(_mapping={"id": 1, "head": "opening words"})]]
+                          if split else []))
     result = _search(session, query, limit=50)
     assert result.rows[0].path == path
+    if split:
+        # No part and no pair matched: the longest value (#391, D4).
+        assert result.rows[0].matched_in == ["title+tags+body"]
     return query, title, path, result
 
 
+@pytest.mark.parametrize("split", [False, True])
 @pytest.mark.parametrize("keyword_only", [False, True])
-def test_the_worst_case_at_the_minimum_cap(monkeypatch, keyword_only):
-    query, title, path, result = _worst_case(monkeypatch, keyword_only=keyword_only)
+def test_the_worst_case_at_the_minimum_cap(monkeypatch, keyword_only, split):
+    query, title, path, result = _worst_case(monkeypatch, keyword_only=keyword_only, split=split)
     text, paths = _render(query, result)
     assert len(text) <= 1000, len(text)
     lines = text.splitlines()
@@ -608,6 +617,8 @@ def test_the_worst_case_at_the_minimum_cap(monkeypatch, keyword_only):
     for label in ("title_cut", "path_cut", "tags omitted", "preview omitted", "abbreviated"):
         assert label in row, label
     assert '"tags":[]' in row
+    if split:
+        assert "matched_in: title+tags+body" in row
     if keyword_only:
         assert "arms: keyword-only (semantic unavailable: provider_input_rejected)" in header
         assert tools.HYBRID_KEYWORD_ONLY_FOOTER in lines
@@ -677,15 +688,21 @@ def test_query_cut():
 
 def test_the_fixed_bounds():
     """The constants the floor arithmetic (D7) rests on: header ≤ 405 (400
-    before the #389 `confidence` token), abbreviated structure ≤ 340, both
-    footers ≤ 75, and 990 ≤ 1,000. The low-plus-`any` header is pinned in
+    before the #389 `confidence` token), abbreviated structure ≤ 345 (340
+    before #391: the longest `matched_in` is now `title+tags+body`), both
+    footers ≤ 75, and 995 ≤ 1,000. The low-plus-`any` header is pinned in
     `tests/test_search_confidence.py`."""
     worst_rows = [
         HybridRow(path=f"{i}.md", title="", tags=[], score=2 / 1050, keyword_rank=50,
                   semantic_rank=50, match="any", similarity=-0.123, stale=True,
-                  embedding_truncated=True, no_excerpt=True, matched_in=["title", "body"])
+                  embedding_truncated=True, no_excerpt=True, matched_in=["title+tags+body"])
         for i in range(50)
     ]
+    # The longest rendered `matched_in` of the eleven values (#391, D4).
+    longest = max(["title", "tags", "body", "title,tags", "title,body", "tags,body",
+                   "title,tags,body", "title+tags", "title+body", "tags+body",
+                   "title+tags+body"], key=len)
+    assert len(longest) == len("title+tags+body") == len("title,tags,body")
     result = HybridResult(
         rows=worst_rows, arms="keyword_only", semantic_unavailable="provider_input_rejected",
         rrf_k=1000, keyword_rows=50, keyword_all=50, keyword_any=50, semantic_rows=50,
@@ -700,14 +717,15 @@ def test_the_fixed_bounds():
     structure = tools._hybrid_row_line(
         worst_rows[0], 1000, title="", path="", tags=[], preview=("none", ""),
         labels=cut_labels)
-    assert len(structure) <= tools.HYBRID_ROW_STRUCTURE_MAX == 340, len(structure)
+    assert len(structure) <= tools.HYBRID_ROW_STRUCTURE_MAX == 345, len(structure)
+    print(f"\n[hybrid bound] rerank=false abbreviated structure: {len(structure)}")
     omitted = tools._hybrid_row_line(
         worst_rows[0], 1000, title="", path="", tags=[], preview=("none", ""),
         labels=cut_labels[:4] + ["title omitted", "path omitted", "abbreviated"])
     assert len(omitted) < len(structure) + 80
     assert len(tools.HYBRID_KEYWORD_ONLY_FOOTER) <= tools.HYBRID_FOOTER_MAX == 75
     assert max(len(tools._hybrid_cap_footer(n)) for n in range(1, 51)) <= 75
-    assert 405 + 340 + 45 + 45 + 75 + 75 + 5 == 990 <= 1000
+    assert 405 + 345 + 45 + 45 + 75 + 75 + 5 == 995 <= 1000
 
 
 # ── telemetry from rendered rows ────────────────────────────────────────────

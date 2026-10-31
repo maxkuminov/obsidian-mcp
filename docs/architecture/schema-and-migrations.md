@@ -1035,3 +1035,59 @@ constraints and columns. The 033 build reuses a vector on exact `chunk_text`
 alone, so a vector of a prefixed input left behind would be reused as the bare
 chunk's. Those notes are absent from semantic search until the old build
 re-embeds them (L7). Both tables stay **derived** for backups (#348).
+
+## 035: tags in the keyword vector (#391)
+
+035 adds, alters and drops **no schema object**; `alembic check` stays clean.
+It is a data step on 031's model, in one transaction: `lock_timeout 10s`,
+`statement_timeout 15min`, `search_path` pinned and the qualified table
+asserted (all `RESET`), the generation lock (`pg_advisory_xact_lock(
+8029183045093649969)`, literal, pinned by `tests/test_migration_035_literals.py`)
+before the first row is read, and the configs from the stored
+`fts_fingerprint` (present → its `configs`; absent → the environment's;
+unreadable → refuse naming the key, nothing changed).
+
+**The rewrite.** Per row with a vector, in id order, `content_tsvector =
+head(title, aliases, tags) || ts_filter(content_tsvector, '{d}')` through the
+shared `rehead_tsvector_sql`, from the stored `title`, `aliases_text(
+frontmatter)` and `tags_text(tags)` — no file access. Two predicates in the
+UPDATE's own `WHERE`: `length(ts_filter(content_tsvector, '{b}')) = 0` (a row
+already carrying a tags part is skipped — `rehead` is not
+position-idempotent, so this is what makes a stamp-back re-run byte-equal)
+and `length(<tags part>) > 0` (a row whose tags produce no lexeme is already
+what the new builder writes, since an empty `B` part shifts nothing). 035
+composes no `to_tsvector(` itself: `fts.tags_tsvector_sql` gives the
+predicate's tags part. A D-only row (031 left it at the size limit) is
+re-headed byte-exactly; a headed tagged row keeps body positions shifted by
+the old head's length (#391 L1).
+
+**The size preflight, then all-or-nothing.** Before the first UPDATE, a
+read-only estimate per row the rewrite would change: `S(ts_filter(v, '{d}'))
++ S(head(title, aliases, tags))`, with `S(v)` = Σ over `unnest(v)` of the
+lexeme's bytes rounded up to even plus `2 + 2 × npos` when it has positions
+(`size_sql` in the migration). Measured on the gate: for a concatenation
+that crosses the limit, `S` equalled the size PostgreSQL reported (1,049,880
+both); the design measured four under on another case. `S` is within four
+bytes of PostgreSQL's count — not a strict upper bound — and the 64-byte
+margin absorbs that. Any estimate above 1,048,511 (the 1,048,575 limit less 64) aborts
+naming the count and every id, before anything is written. The rewrite has no
+savepoints: any row error, 54000 included, fails the migration naming the
+row id and SQLSTATE (never the path, the bound parameters or text — the
+driver error is not chained), with nothing committed. The operator's
+read-only pre-merge statement in `DEPLOYMENT.md` sums `S(a) + S(d) + S(b)`
+over the stored parts separately (never `S` of the merged vector, where a
+lexeme shared by title and body is stored once), strips U+0002/U+0003 from
+the tags as `tags_text` does, and additionally flags every candidate with no
+`A` lexeme (`d_only`), since such a row gains its whole head in 035. The gate
+runs that statement verbatim and asserts that every id 035's preflight
+rejects (a D-only row, a shared-lexeme row, a sentinel-tag row, Codex's position-saturation row) is flagged. The tags part is bounded per tag — each tag's full form and its `/`-expanded form parsed as separate documents — and the multi-config form combines the per-config parses with `UNION ALL` (a deduplicating `UNION` under-counts; an `english,simple` case pins it).
+
+**Downgrade** takes the generation lock and sets `ts_filter(content_tsvector,
+'{a,d}')` on every row carrying a `B` lexeme; a lexeme in both the tags and
+the body keeps its body positions.
+
+**Cost.** Measured on the gate container (PostgreSQL 16, local): 4,265
+synthetic rows of 1,800 words and three tags each — preflight ≈ 10 s,
+rewrite ≈ 27 s, the alembic run 28–41 s. Every rewritten row is a new tuple
+version (027's vacuum thresholds). Only table ownership is needed
+(`test_nonsuperuser_migrations_pg.py`).

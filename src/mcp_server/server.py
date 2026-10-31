@@ -209,19 +209,23 @@ async def keyword_search(
     `"exact phrase"` (adjacent words), `budget OR forecast` (either), `-draft`
     (exclude; honoured in the `any` block too). A note's title and frontmatter
     `aliases` are indexed above its body, so a query that is a note's title
-    ranks that note first.
+    ranks that note first. A note's tags (frontmatter and inline `#tags`; a
+    nested `#a/b` also as `a` and `b`) are indexed below its title and
+    aliases and above its body.
 
     Each result carries `rank` (a relative score: a body-only match scores in
     the thousandths, a title match near 1, and an `any` row is scored against
     the fallback query, so ranks compare only within one block of one page),
-    `match`, `matched_in` (`title` — title or aliases — and/or
-    `body`, or `title+body` when the terms are split between them), `terms`
-    (`k/n`: how many of the query's terms the note contains), and a second
-    line: `snippet:` — the matching body text with the matches in `«»` — or
-    `head:` — the note's opening words when the body alone does not match
-    or the match is beyond the stored excerpt. Snippets are computed for the
-    first rows of the page (the header says `snippets: first N` when the page
-    is longer). The header always carries the `all`/`any` counts and how many
+    `match`, `matched_in` (the parts that alone match: `title` — title or
+    aliases — `tags`, `body`, comma-joined; or, when the terms are split
+    between parts, the first of `title+tags`, `title+body`, `tags+body`,
+    `title+tags+body` that matches), `terms` (`k/n`: how many of the query's
+    terms the note contains), and a second line: `snippet:` — the matching
+    body text with the matches in `«»` — or `head:` — the note's opening
+    words when the body alone does not match or the match is beyond the
+    stored excerpt (a note with no body has no second line). Snippets are
+    computed for the first rows of the page (the header says
+    `snippets: first N` when the page is longer). The header always carries the `all`/`any` counts and how many
     rows have no stored excerpt yet (notes indexed before this version; the
     footer names the one-time rebuild). Call `read_note` on a result's path
     for the full note.
