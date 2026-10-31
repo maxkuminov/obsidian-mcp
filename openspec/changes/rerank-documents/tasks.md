@@ -24,13 +24,13 @@ Refs #402. Read `proposal.md`, `design.md` (D1–D10, the owner decisions, L1–
 ## 2. Candidate services
 
 - [ ] 2.1 `semantic_arm_rows(with_rerank_text=True)`: project `NoteEmbedding.embed_prefix` and `NoteMetadata.embedded_chunking_version` **only** under the flag (D6). Before the dedup discards rows, attach `rerank_chunks` to each deduped row: the note's fetched rows in re-sort order, cosine-best first, and `[]` for a single-title-document note (stale, unknown stamp). Keep `rerank_text` only if the incumbent arm needs it (D10), and never put it on a `rerank=false` row. `rows`, `chunk_rows`, `exact_fallback` and every legacy field are unchanged.
-- [ ] 2.2 Statement-capture test: the `rerank=false` overfetch SQL is byte-identical to c491326's, and the `rerank=true` SQL differs only by the two projected columns (same `WHERE`, `ORDER BY`, `LIMIT`, `SET LOCAL`s and statement count), for both `semantic_search` and `hybrid_search`.
+- [ ] 2.2 Statement-capture test: the `rerank=false` overfetch SQL is byte-identical to c491326's, and the `rerank=true` SQL differs only by the two projected columns (same `WHERE`, `ORDER BY`, `LIMIT`, `SET LOCAL`s and statement count), for both `semantic_search` and `hybrid_search`. **Projection assertion:** the `rerank=true` overfetch projects exactly `embed_prefix` and `embedded_chunking_version` in addition and never the vector, while `rerank=false` and `find_related` project neither (the `search-quality` carve-out).
 - [ ] 2.3 `hybrid.py`: `HybridRow.rerank_chunks`, set from the semantic-arm row when `rerank_candidates` (D7). `_fill_excerpts` is untouched. No new statement.
 
 ## 3. Tools: per-chunk candidates, per-note max, preview and locator parity
 
 - [ ] 3.1 `_semantic_search_reranked`: build the primary and secondary documents per candidate (D1/D2), call `allocate_documents(…, settings.rerank_max_documents)`, then `rerank_candidates`. On success, for each page row whose `best` is a non-primary chunk, set the preview `chunk` and `chunk_index` from that row, and `section = section_of(winner, stale=False)`. That is `None` for a winner without section metadata, and **never** the primary's section. Leave every other field alone. On fallback, render the unchanged baseline.
-- [ ] 3.2 `_hybrid_search_reranked`: the same over `result.rows` in fused order, with `rerank_scores` keyed by path from the per-note max. On a chunk winner, the row's preview becomes that chunk's preview **even where the incumbent selection would show the keyword snippet**, and its locator follows the 3.1 rule. A primary, title or excerpt winner, and every fallback row, keeps the incumbent preview selection (D4).
+- [ ] 3.2 `_hybrid_search_reranked`: the same over `result.rows` in fused order, with `rerank_scores` keyed by path from the per-note max. On **any** chunk winner, the primary included, the row's preview becomes that chunk's preview **even where the incumbent selection would show the keyword snippet**, and its locator is that chunk's section (absent if none). A title or excerpt winner, and every fallback row, keeps the incumbent preview selection (D4). Build the candidate documents by the explicit partition (a) known stamp → embedding input, (b) NULL or unknown stamp → title only, (c) stale or keyword-only → title + excerpt, with no catch-all.
 - [ ] 3.3 `_record_rerank`: add `rerank_documents`.
 - [ ] 3.4 Grep for production callers of `allocate_documents`, `embedding_document` and `rerank_chunks` in both tools and both harness arms (own the seams).
 
@@ -54,6 +54,8 @@ Refs #402. Read `proposal.md`, `design.md` (D1–D10, the owner decisions, L1–
   - a keyword-only hybrid row sends its excerpt;
   - `count_mismatch` when the fake answers one result per note;
   - the hybrid "Every fused candidate is scored" case sends `candidates: 50` with ≤ 80 documents;
+  - **hybrid rollback**: a fresh both-arms candidate with stamp 3 and a non-NULL excerpt sends exactly its title (no excerpt, no stored chunk or prefix);
+  - **one-chunk both-arms**: a both-arms row whose incumbent preview is the keyword snippet and whose single (primary) chunk wins shows that chunk as `preview_kind: chunk` with its locator, and the fallback page shows the snippet (D5 oracle 4);
   - the security scenarios (a forged title, tag or chunk) still pass with the swapped preview.
 - [ ] 4.6 Update the existing tests whose one-document-per-note assumption changes (`tests/test_rerank_exchange.py`, `tests/test_hybrid_rerank.py`, `tests/test_semantic_rerank.py`, `tests/test_rerank_eval.py`, `tests/_rerank_support.py`). Justify each change against a spec scenario and weaken no assertion. Settings tests: `RERANK_TIMEOUT_MS=20000` accepted and `30001` refused; `RERANK_MAX_DOCUMENTS` defaults to 100, and 49 and 201 are refused.
 - [ ] 4.7 `pytest tests` and `make test-integration` (real Postgres; the statement-capture and snapshot tests must actually run).
