@@ -2961,9 +2961,16 @@ async def _semantic_search_reranked(query, limit, folder, tags, frontmatter, uid
     # #389 (D1, D6): taken from the candidate list before rerank, so
     # `rerank=true` and `rerank=false` carry the same value.
     confidence = _semantic_confidence(candidates[0]["similarity"] if candidates else None)
-    outcome = await rerank_service.rerank_candidates(
-        query, [(r["title"], r.get("rerank_text")) for r in candidates]
-    )
+    # #402 (rerank-documents D1–D4): per-chunk documents, every candidate's
+    # primary first, the per-note maximum; the winning chunk's preview and
+    # locator on a reranked row.
+    groups = rerank_service.semantic_document_groups(candidates)
+    outcome = await rerank_service.rerank_groups(query, [[d.text for d in g] for g in groups])
+    if outcome.reranked:
+        candidates = [
+            _semantic_winner_row(r, g[b]) if b > 0 else r
+            for r, g, b in zip(candidates, groups, outcome.best)
+        ]
     page = [candidates[i] for i in outcome.order][:limit]
     scores = [outcome.scores[i] for i in outcome.order][:limit] if outcome.reranked else None
     rendered, paths = render_semantic_rerank_results(query, page, outcome, scores=scores,
@@ -2991,6 +2998,20 @@ def _semantic_confidence(top_similarity: float | None) -> str:
     return value
 
 
+def _semantic_winner_row(r: dict, doc) -> dict:
+    """#402 (D4): a reranked `semantic_search` row whose winning document is a
+    non-primary chunk shows that chunk's preview and locator — its recorded
+    section, or none (never the primary's). Every other field is kept."""
+    if doc.chunk is None:
+        return r
+    return {
+        **r,
+        "chunk": doc.chunk["chunk_text"],
+        "chunk_index": doc.chunk["chunk_index"],
+        "section": doc.chunk["section"],
+    }
+
+
 def _record_rerank(outcome) -> None:
     """D10: the rerank keys on the usage row. `reranked: false` is not an
     error marker — the call returned an honest, labelled page."""
@@ -3000,6 +3021,8 @@ def _record_rerank(outcome) -> None:
     if outcome.ms is not None:
         timing.record("rerank_ms", int(outcome.ms))
     timing.record("rerank_candidates", outcome.candidates)
+    # #402: the documents allocated (≤ RERANK_MAX_DOCUMENTS).
+    timing.record("rerank_documents", outcome.documents)
 
 
 def _semantic_provider_refusal(exc: refusals.ProviderInputTooLarge):
@@ -3128,7 +3151,13 @@ def _hybrid_preview(r) -> tuple[str, str]:
     """`(preview_kind, preview)`: the arm with the smaller rank supplies it;
     on equal ranks the keyword highlight when there is one, otherwise the
     chunk; the other arm's when the chosen one has none (D6). A stale row's
-    chunk is never shown — the semantic arm's preview is then the notice."""
+    chunk is never shown — the semantic arm's preview is then the notice.
+
+    #402 (D4): a reranked row whose winning document is a semantic chunk
+    shows that chunk, whatever the arm ranks."""
+    if getattr(r, "rerank_chunk_winner", False) and r.chunk is not None:
+        chunk = _preview_line(r.chunk, HYBRID_CHUNK_PREVIEW_CHARS)
+        return ("chunk", chunk) if chunk else ("none", "")
     kw = None
     if r.snippet:
         kw = ("snippet", r.snippet)
@@ -3705,9 +3734,21 @@ async def _hybrid_search_reranked(query, limit, folder, tags, frontmatter, uid) 
         )
     candidates = result.rows
     _record_confidence(hybrid_confidence(result), result.top_similarity)
-    outcome = await rerank_service.rerank_candidates(
-        query, [(r.title, r.rerank_text) for r in candidates]
-    )
+    # #402 (D1/D2/D7): the partition — (a) fresh semantic, known stamp: its
+    # fetched chunks; (b) fresh semantic, NULL/unknown stamp: the title;
+    # (c) stale or keyword-only: title + excerpt (`rerank_text` from
+    # `_fill_excerpts`). Every candidate's primary first.
+    groups = rerank_service.hybrid_document_groups(candidates)
+    outcome = await rerank_service.rerank_groups(query, [[d.text for d in g] for g in groups])
+    if outcome.reranked:
+        for r, g, b in zip(candidates, groups, outcome.best):
+            doc = g[b]
+            if doc.chunk is not None:
+                # D4: any chunk winner, the primary included — its preview
+                # (over the keyword snippet) and its locator, or none.
+                r.chunk = doc.chunk["chunk_text"]
+                r.section = doc.chunk["section"]
+                r.rerank_chunk_winner = True
     result.rows = [candidates[i] for i in outcome.order][:limit]
     scores = (
         {candidates[i].path: outcome.scores[i] for i in range(len(candidates))}

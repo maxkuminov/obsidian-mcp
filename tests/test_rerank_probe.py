@@ -32,14 +32,28 @@ def test_the_defaults():
     assert s.rerank_timeout_ms == 1500 and s.rerank_allow_plaintext is False
 
 
-@pytest.mark.parametrize("value, ok", [(100, True), (10000, True), (50, False),
-                                       (99, False), (10001, False)])
+@pytest.mark.parametrize("value, ok", [(100, True), (10000, True), (20000, True),
+                                       (30000, True), (50, False), (99, False),
+                                       (30001, False)])
 def test_the_timeout_range(value, ok):
+    # #402: the ceiling is 30,000 so the reference deployment's 20 s is accepted.
     if ok:
         assert _settings(rerank_timeout_ms=value).rerank_timeout_ms == value
     else:
         with pytest.raises(pydantic.ValidationError):
             _settings(rerank_timeout_ms=value)
+
+
+@pytest.mark.parametrize("value, ok", [(50, True), (100, True), (200, True),
+                                       (49, False), (201, False)])
+def test_the_document_budget_range(value, ok):
+    # #402: RERANK_MAX_DOCUMENTS, default 100, range 50–200.
+    assert _settings().rerank_max_documents == 100
+    if ok:
+        assert _settings(rerank_max_documents=value).rerank_max_documents == value
+    else:
+        with pytest.raises(pydantic.ValidationError):
+            _settings(rerank_max_documents=value)
 
 
 @pytest.mark.parametrize("model", ["m" * 201, "bge\nreranker", "bge\x7f"])

@@ -609,8 +609,17 @@ class Settings(BaseSettings):
     rerank_model: str = Field("", max_length=200)
     # One wall-clock deadline per rerank exchange (pool wait, connect, write
     # and read); past it the page falls back with `reranked: false (timeout)`.
-    rerank_timeout_ms: int = Field(1500, ge=100, le=10000)
+    # Up to 30 s (#402): size it together with `rerank_max_documents` from
+    # DEPLOYMENT.md's latency table. Under `MCP_CONCURRENCY_MODE` queue or
+    # enforce it must not exceed the tool wait unless the concurrency report
+    # passes with rerank traffic: the call holds its `embedding` slot.
+    rerank_timeout_ms: int = Field(1500, ge=100, le=30000)
     rerank_allow_plaintext: bool = False
+    # #402: the most documents one rerank call sends. Every candidate note
+    # (≤ 50) gets its primary document first, then further fetched chunks in
+    # distance order, at most 4 per note; 50 reproduces the incumbent count.
+    # Latency scales with it (see DEPLOYMENT.md, "Reranker (optional)").
+    rerank_max_documents: int = Field(100, ge=50, le=200)
 
     # Caps for the raw file-access tools (read_file / write_file). Read is
     # checked against on-disk size before reading; write against the decoded

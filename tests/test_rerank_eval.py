@@ -264,3 +264,84 @@ def test_any_other_unreranked_reason_still_fails_the_run(tmp_path, monkeypatch, 
     assert out.exit_code == EXIT_FAILURE
     m = manifest_of(d)
     assert m["status"] == "failed" and m["error"].startswith("UnrerankedAnswer")
+
+
+# ── rerank-documents (#402, D10): the frozen incumbent arms ────────────────
+
+SEM_INC = "scripts.search_eval_arms.rerank:make_semantic_arm_incumbent"
+HYB_INC = "scripts.search_eval_arms.rerank:make_hybrid_arm_incumbent"
+
+
+def test_the_incumbent_factories_resolve_with_their_memberships():
+    sem, hyb = resolve_arm(SEM_INC, **H), resolve_arm(HYB_INC, **H)
+    assert (sem.membership, sem.requires_db) == ("semantic", True)
+    assert (hyb.membership, hyb.requires_db) == ("keyword_or_semantic", True)
+    assert rerank_arm.make_hybrid_arm_incumbent.preflight is rerank_arm.preflight
+
+
+def _two_chunk_rows():
+    """Five notes, two fetched chunks each, with stored prefixes."""
+    out = []
+    for i in range(5):
+        for j in range(2):
+            r = row(i, chunk=f"n{i} chunk {j}", chunk_index=j, distance=0.01 * i + 0.001 * j)
+            r.embed_prefix = f"n{i:02d} > H{j}"
+            r.embedded_chunking_version = 2
+            out.append(r)
+    return out
+
+
+@pytest.mark.parametrize("depth", [10, 20])
+def test_incumbent_and_candidate_requests(monkeypatch, reranker, depth):
+    rows = _two_chunk_rows()
+
+    async def go():
+        await rerank_arm.preflight({})
+        ctx = ArmContext(lambda: _Session(rows), Corpus({}))
+        inc = await rerank_arm.make_semantic_arm_incumbent(ctx)(_query(), depth)
+        inc_docs = reranker.requests[-1]["documents"]
+        cand = await rerank_arm.make_semantic_arm(ctx)(_query(), depth)
+        cand_docs = reranker.requests[-1]["documents"]
+        await rerank.close_rerank_client()
+        return inc, inc_docs, cand, cand_docs
+
+    inc, inc_docs, cand, cand_docs = asyncio.run(go())
+    # The incumbent: one title-led document per candidate note, no prefix.
+    assert inc_docs == [f"n{i:02d}\n\nn{i} chunk 0" for i in range(5)]
+    # The candidate: every primary plus the further fetched chunks, prefixed.
+    assert len(cand_docs) == 10 <= settings.rerank_max_documents
+    assert all(d.startswith(f"n{d[1:3]} > H") for d in cand_docs)
+    assert len(inc) == len(cand) == 5
+
+
+def test_the_hybrid_incumbent_sends_the_excerpt_or_the_chunk(monkeypatch, reranker):
+    async def fake_hybrid(session, query, **kw):
+        rows = [
+            hybrid_service.HybridRow(path="sem.md", title="Sem", tags=[], score=0.2,
+                                     semantic_rank=1, chunk="cosine best",
+                                     rerank_text="cosine best",
+                                     rerank_chunks=[{"chunk_text": "cosine best",
+                                                     "chunk_index": 0, "section": None,
+                                                     "distance": 0.1, "file_path": "sem.md",
+                                                     "embed_prefix": "Sem > H"}],
+                                     rerank_stamp=2),
+            hybrid_service.HybridRow(path="kw.md", title="Kw", tags=[], score=0.1,
+                                     keyword_rank=1, rerank_text="the excerpt"),
+        ]
+        return hybrid_service.HybridResult(rows=rows)
+
+    monkeypatch.setattr(hybrid_service, "hybrid_search", fake_hybrid)
+
+    async def go():
+        await rerank_arm.preflight({})
+        ctx = ArmContext(lambda: _Session([]), Corpus({}))
+        await rerank_arm.make_hybrid_arm_incumbent(ctx)(_query(), 10)
+        inc = reranker.requests[-1]["documents"]
+        await rerank_arm.make_hybrid_arm(ctx)(_query(), 10)
+        cand = reranker.requests[-1]["documents"]
+        await rerank.close_rerank_client()
+        return inc, cand
+
+    inc, cand = asyncio.run(go())
+    assert inc == ["Sem\n\ncosine best", "Kw\n\nthe excerpt"]
+    assert cand == ["Sem > H\n\ncosine best", "Kw\n\nthe excerpt"]

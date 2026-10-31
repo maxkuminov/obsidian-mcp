@@ -221,7 +221,23 @@ async def test_rerank_false_issues_the_same_statements_as_rerank_true(monkeypatc
     await tools.semantic_search_impl("consensus", limit=3)
     await tools.semantic_search_impl("consensus", limit=3, rerank=True)
     a, b = _Session.instances
-    assert a.log == b.log
+    # #402 (the search-quality carve-out): the same statements, except that
+    # the rerank=true overfetch projects exactly `embed_prefix` and
+    # `embedded_chunking_version` more — same predicates, order, limit,
+    # settings and statement count; never the stored vector.
+    assert len(a.log) == len(b.log)
+    extra = ", note_embeddings.embed_prefix, notes_metadata.embedded_chunking_version"
+    vector_stmts = [i for i, sql in enumerate(a.log) if "AS distance" in sql]
+    assert len(vector_stmts) == 1
+    for i, (x, y) in enumerate(zip(a.log, b.log)):
+        if i in vector_stmts:
+            assert "embed_prefix" not in x and "embedded_chunking_version" not in x
+            assert y.replace(extra, "", 1) == x
+            head = y.split("FROM", 1)[0]
+            assert "note_embeddings.embedding," not in head.replace(
+                "note_embeddings.embedding <=>", "")
+        else:
+            assert x == y
 
 
 # ── candidates and the scored unit (D4) ─────────────────────────────────────
@@ -232,13 +248,19 @@ async def test_candidates_are_the_untruncated_dedupe_capped_at_50(monkeypatch, c
     _serve(monkeypatch, rows)
     out = await tools.semantic_search_impl("q", limit=10, rerank=True)
     body = fake.requests[-1]
-    assert len(body["documents"]) == 50 and body["top_n"] == 50
+    # #402: 50 candidate notes, each with its primary, plus the 5 further
+    # fetched chunks of notes 0–4 (secondaries, within the 100 budget).
+    assert len(body["documents"]) == 55 and body["top_n"] == 55
     assert "reranked: true (candidates: 50)" in out.splitlines()[0]
     # Every note of the unreranked page is among the candidates.
     legacy = await tools.semantic_search_impl("q", limit=10)
+    docs = body["documents"]
     for i in range(10):
         assert f"Notes/n{i:02d}.md" in legacy
-        assert body["documents"][i].startswith(f"n{i:02d}\n\n")
+        assert any(d.startswith(f"n{i:02d}\n\n") for d in docs)
+    # Groups are contiguous in candidate order: notes 0–4 hold two documents.
+    assert [d.split("\n", 1)[0] for d in docs[:15]] == (
+        [f"n{i:02d}" for i in range(5) for _ in (0, 1)] + [f"n{i:02d}" for i in range(5, 10)])
 
 
 async def test_forty_candidates_for_limit_ten(monkeypatch, captured, fake):

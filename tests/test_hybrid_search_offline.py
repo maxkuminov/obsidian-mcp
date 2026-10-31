@@ -48,7 +48,8 @@ def _kind(sql: str) -> str:
     u = sql.lstrip().upper()
     if u.startswith("SET"):
         return "set"
-    if "EMBEDDED_CHUNKING_VERSION" in u:
+    if "EMBEDDED_CHUNKING_VERSION" in u and " AS DISTANCE" not in u:
+        # (#402: the rerank=true overfetch also projects the stamp.)
         # The #355 transition count, after the snippets.
         return "rechunk"
     if "NOTE_EMBEDDINGS" in u:
