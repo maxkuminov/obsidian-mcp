@@ -343,3 +343,33 @@ What changed, per finding (owner decisions, 2026-10-31):
    state the same reciprocal-rank formula for semantic and all-terms ranks,
    with fill ranks offset by 50. The description measures 3,976 characters.
 
+## Codex spec review — round 2
+
+Verdict, verbatim:
+
+1. Identity oracle — VERIFIED. Union identity is checked before slicing; page and reranker-window exchanges are explicitly tested.
+2. Snippet/provenance movement — VERIFIED. Assignment follows the new fused order, with the exact boundary fixture and permitted row-field differences specified.
+3. Default-page release gate — REGRESSED. The recall@10/ndcg@10 gate closes the original failure, but its publishable output omits the existing single-tenant attachability control.
+4. Explain-omitted arithmetic — VERIFIED. The scenario now states 1,008 → 988 and cites D4.
+5. “Equal votes” description — VERIFIED. The text now distinguishes semantic/all-terms ranks from offset fill ranks.
+
+The remaining scoped pass found one MAJOR: an unfiltered multi-user report can produce a PR-ready gate table containing cross-tenant aggregate evaluation evidence.
+
+```json
+{"verdict":"FAIL","round1":[{"claim":"Union identity must be tested before slicing, with page and reranker-window exchanges explicitly permitted.","status":"VERIFIED","note":"The modified requirement, scenarios, oracle and tasks now compare the full union before slicing and pin the 1-all/49-any/50-semantic window change."},{"claim":"Snippet and matched_in assignment can move when fusion reorders rows.","status":"VERIFIED","note":"Design D2 and the specification deliberately follow the new fused order and test the KEYWORD_SNIPPET_ROWS=1 boundary, limiting the non-fill row exception to preview_kind, preview and matched_in."},{"claim":"The release bar must detect default-page and class:identifier regressions.","status":"REGRESSED","note":"recall@10 and ndcg@10, both required slices, the exact inequality and an executable gate now close the original failing input; however, the new PR-ready gate output fails to enforce report attachability and can publish multi-tenant aggregate evidence."},{"claim":"The explain-omitted intermediate figure must be 1,008 rather than 1,007.","status":"VERIFIED","note":"The scenario now states 1,008 → 988 and references hybrid-any-fill design D4."},{"claim":"The tool description must not call the arms' votes equal.","status":"VERIFIED","note":"The requirement and task now state the shared formula only for semantic and all-terms keyword ranks and separately disclose the fill-rank offset."}],"findings":[{"severity":"MAJOR","file":"openspec/changes/hybrid-any-fill/specs/search-evaluation/spec.md","line":37,"claim":"The new gate writes a table expressly ready for a public PR while validating only verdict, baseline, arm, metric and slice. It does not require attachable:true or single-user provenance, contradicting the existing search-evaluation tenant boundary and task 7.3's unconditional instruction to put that table in the PR body.","failing_input":"Run the gate on an unfiltered two-tenant report with verdict OK, a baseline and all eight requested delta cells. The existing harness correctly marks report.json attachable:false, but this requirement still makes the gate print and write the cross-tenant delta means and confidence intervals with PASS/FAIL, after which task 7.3 requires that table in the public PR body.","fix":"Make attachable:true and provenance.users=1 mandatory gate inputs. Otherwise exit 64, print no cell or PASS result, and do not create or replace --out. Add a multi-user-report scenario and require task 7.3 to publish only a table produced by a successful attachable gate run."}]}
+```
+
+What changed (owner decision, 2026-10-31):
+
+- Round-1 items 1, 2, 4 and 5 were VERIFIED. No change.
+- Round-1 item 3 REGRESSED (MAJOR, tenant boundary): fixed. `gate`
+  requires `attachable: true` and `provenance.users == 1` on the
+  candidate's and the baseline's report (`--baseline-report` for a
+  `runfile:` baseline). Otherwise it exits 64, prints no cell and no
+  PASS/FAIL, and neither creates nor replaces `--out`. New scenarios cover
+  the multi-user report (verdict OK, baseline, eight cells,
+  `attachable: false` → 64, no file) and a non-attachable runfile
+  baseline. Task 7.3 publishes only a table from a successful gate run on
+  an attachable report (`USER_ID=` export on multi-user). Round 3 is
+  verification-only for this item.
+

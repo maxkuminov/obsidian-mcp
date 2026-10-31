@@ -34,7 +34,7 @@
 ## ADDED Requirements
 
 ### Requirement: The harness SHALL provide a gate step that prints PASS or FAIL per metric and slice from a scored report
-`python -m scripts.search_eval gate --report <report.json> --arm <label> --metrics <m,…> --slices <s,…> --min-ci-lower <x> --out <file>` SHALL read the `deltas` of a scored report for one candidate arm against the report's `baseline`, and SHALL print one line per (metric × slice) cell with the delta mean, the bootstrap CI95 and `PASS` or `FAIL`. A cell SHALL be `FAIL` when its CI95 lower bound is below `--min-ci-lower`, or when its CI95 is null (no delta could be computed). The step SHALL write the same table to `--out` as Markdown, ready to paste into a PR body. It SHALL exit 0 when every cell passes, 1 when any cell fails, and 64 on a usage error (an unknown arm, metric or slice, a report without a baseline, or a report whose verdict is not `OK`). It SHALL read only the report and write only `--out`.
+`python -m scripts.search_eval gate --report <report.json> --arm <label> --metrics <m,…> --slices <s,…> --min-ci-lower <x> --out <file>` SHALL read the `deltas` of a scored report for one candidate arm against the report's `baseline`, and SHALL print one line per (metric × slice) cell with the delta mean, the bootstrap CI95 and `PASS` or `FAIL`. A cell SHALL be `FAIL` when its CI95 lower bound is below `--min-ci-lower`, or when its CI95 is null (no delta could be computed). The step SHALL write the same table to `--out` as Markdown, ready to paste into a PR body. **The gate SHALL respect the tenant boundary.** It SHALL require `attachable: true` and `provenance.users == 1` on the candidate's report and on the baseline's report: the one `--report` when it holds both arms, and, when the baseline arm is a `runfile:` arm, also the report of the generation that staged it, named by `--baseline-report` (required in that case). When any of these checks fails, the gate SHALL exit 64, print no cell and no `PASS` or `FAIL`, and SHALL neither create nor replace `--out`. These checks SHALL run before any cell is computed. It SHALL exit 0 when every cell passes, 1 when any cell fails, and 64 on a usage error (an unknown arm, metric or slice, a report without a baseline, a report whose verdict is not `OK`, or a report that is not attachable single-user evidence). It SHALL read only the reports and write only `--out`.
 
 #### Scenario: The hybrid-any-fill release gate
 - **WHEN** the gate runs with `--arm scripts.search_eval_arms.hybrid:make_arm --metrics recall@10,recall@20,recall@50,ndcg@10 --slices overall,class:identifier --min-ci-lower -0.01` on a report whose baseline is the alt arm
@@ -43,3 +43,11 @@
 #### Scenario: A report that is not evidence
 - **WHEN** the report's verdict is `CORPUS_LOSS` or `INSUFFICIENT`
 - **THEN** the gate SHALL exit 64 and print no PASS
+
+#### Scenario: A multi-user report is refused
+- **WHEN** the gate runs on an unfiltered two-tenant report with verdict `OK`, a baseline and all eight requested delta cells, which the harness marked `attachable: false` (`provenance.users` is `"multi"`)
+- **THEN** the gate SHALL exit 64, print no cell and no `PASS` or `FAIL`, and SHALL NOT create the `--out` file; and when `--out` already exists, it SHALL be left unchanged
+
+#### Scenario: A runfile baseline from a multi-user generation is refused
+- **WHEN** `--report` is attachable and single-user but the baseline is a `runfile:` arm whose `--baseline-report` is `attachable: false`, or `--baseline-report` is missing
+- **THEN** the gate SHALL exit 64 with no cell printed and `--out` neither created nor replaced

@@ -67,7 +67,9 @@ where the fill leads.
   and `ndcg@10` on the `overall` and `class:identifier` slices. Any of
   those eight cells with a candidate-minus-baseline bootstrap CI95 lower
   bound below −0.01 is a FAIL. A new `search_eval gate` step prints
-  PASS/FAIL per cell, and the PR body carries the table. The fixture
+  PASS/FAIL per cell. It runs only on an attachable single-user report
+  (otherwise exit 64, with no output), and the PR body carries only a
+  table from a successful gate run. The fixture
   must also prove that a fill row can never outrank an all-terms row
   through the keyword arm alone. There is no rank target for the
   issue's query.
