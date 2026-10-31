@@ -1052,7 +1052,10 @@ harness's `runfile:` arms carry the baseline across:
    `legacy_chunked_notes`, counted for the export's owner. That count must
    be 0 for the report to be evidence. Since #390 it also carries
    `chunk_lengths` (`chunks`, `p10`/`p50`/`p90`, `whole_short`, `under_min`,
-   `raw_over_window`), and `under_min` must be 0 too. It is exactly this
+   `raw_over_window`), and `under_min` must be 0 too. The report's count is
+   scoped to the export's owner; the statement below is the same predicate
+   **tenant-wide** (every owner on the copy), so a non-zero value there with
+   a zero in the report is another tenant's chunks. It is exactly this
    statement, with the effective minimum (200 at the default `CHUNK_SIZE`):
    `SELECT count(*) FROM note_embeddings ne WHERE length(btrim(regexp_replace(ne.chunk_text, '[\t\n\v\f\r ]+', ' ', 'g'))) < 200 AND (SELECT count(*) FROM note_embeddings o WHERE o.note_id = ne.note_id) > 1`
 5. **The release rule for a chunking change (#390).** For the candidate

@@ -198,9 +198,12 @@ bullet under "Indexing decisions" below.
 
 ### Chunk-vector reuse (#281, D16)
 
-A stored vector is reused for a chunk whose text is **byte-identical** to a
-stored chunk of the same note, so an append or a metadata-only edit no longer
-re-embeds the whole note. A reused vector attached to text it was not computed
+A stored vector is reused for a chunk whose **provider input** is
+byte-identical to the one a stored chunk of the same note was embedded from —
+since #390, equal `embed_prefix` and `fmt[stored version](stored chunk_text)
+== fmt[current version](new chunk_text)` over the frozen
+`EMBEDDED_TEXT_FORMATTERS`, any version in that table being eligible — so an
+append or a metadata-only edit no longer re-embeds the whole note. A reused vector attached to text it was not computed
 from — or computed by another model — would be a silently wrong search result,
 so reuse is gated three ways, and a doubt anywhere re-embeds:
 
@@ -245,11 +248,15 @@ numeric noise, so a note mixing reused and fresh vectors is not bit-identical
 to a from-scratch embed. The vector is assumed to be a function of (model,
 text) alone; the fingerprint names the model.
 
-**Since #355 the key is the exact embedded input.** Reuse requires, in
-addition to the three gates above, that the note's `embedded_chunking_version`
-equal `CHUNKING_VERSION` and that the row's `(embed_prefix, chunk_text)` pair
-equal the new chunk's; a row with a NULL prefix (pre-034) is never a
-candidate, and the under-lock check compares the pair, not the text alone.
+**The key is the exact embedded input (#355, amended by #390).** Reuse
+requires, in addition to the three gates above, that the note's
+`embedded_chunking_version` be a key of `EMBEDDED_TEXT_FORMATTERS` (NULL never
+is; at #355 this was "equal to `CHUNKING_VERSION`"), that the row's
+`embed_prefix` equal the new chunk's, and that the row's `chunk_text` under
+its stamped version's formatter equal the new chunk's text under the current
+one. A row with a NULL prefix (pre-034) is never a candidate, and the
+under-lock check compares the stored row's own `(chunk_text, embed_prefix)`
+pair, not the text alone.
 The locator (`heading_path`, `section_ordinal`) is not in the key: a reused
 vector is re-inserted with the new chunk's locator, so a heading inserted above
 a section re-embeds nothing and still records the shifted ordinals. See
@@ -410,21 +417,31 @@ boundary, leaving four-character tails. Both are fixed at chunking time.
   word start, within `L = min(200, W // 10)` of its limit, and hard only when
   that range holds none (L4). A cut is taken only when *admissible* (the
   window before it reaches `m`); a window that is mostly whitespace extends
-  to the first admissible word start, or position, past the limit. When the
-  text after a cut falls below `m`, the last two windows are **re-balanced**
-  over their span `S`: at `S ≥ 2m + 1` two windows, cut at the admissible word
-  start nearest the collapsed midpoint with both sides within `W` raw, else
-  the midpoint hard cut; at `S ≤ 2m` one window. With overlap the next start
+  to the first admissible word start past the limit whose window keeps
+  `clen ≤ W`, else the first admissible position. When the text after a cut
+  falls below `m`, the last two windows are **re-balanced** over their span
+  `S`. A *valid split* leaves both **actual** slices at `clen ≥ m` (measured
+  after their own boundary whitespace is stripped — the implementation
+  review's `A×199 + space×1700 + "x " + B×199` stranded a 199 otherwise). The
+  cut is the valid split nearest the collapsed midpoint from the first
+  non-empty tier of: word starts within `W` raw on both sides; any position
+  within `W` raw on both sides (the hard cut clamped into `[end − W, a + W]`,
+  so `A×300 + space×1822 + B×175` gives 249/2048, not a 2,059-raw chunk); word
+  starts; positions. At `S ≤ 2m` the span is one window unless that exceeds
+  `W` raw and an in-bound valid split exists. With no valid split at all
+  (which needs `S ≤ 2m + 1`) the span is one window when `S ≤ W`; only at
+  `W ≤ 400` can `S > W` too, leaving the pure midpoint cut (L10). With overlap the next start
   is `max(cut − overlap × 4, a + 1)`, and after a balance
   `min(cut, max(cut − overlap × 4, end − W, a + 1))`, each snapped forward to
   a word start **never past the cut**, so every non-heading cleaned character
   is in some chunk (Codex r1 B2's skipped `B`s).
 - **The bound.** Every chunk has `clen ≤ W`; its raw length exceeds `W` only
-  by whitespace, when no in-bound choice meets the minimum (L3), counted as
+  by whitespace, when no valid in-bound split exists (L3), counted as
   `raw_over_window`. The provider never receives those runs: `embedded_text`
   collapses every run longer than 8 whitespace characters to one space
-  (stored text untouched), so an ordinary chunk's input stays within #355's
-  `W + 302`.
+  (stored text untouched), so a chunk within `W` raw keeps #355's `W + 302`,
+  and an over-window one exceeds it by at most `7r + 2` (`r` interior runs of
+  2–8, plus kept leading and trailing whitespace).
 - **The locator** is the deepest heading `N` whose `read_note(section="#N")`
   body span (`vault._section_body_span`, imported) contains the chunk's raw
   span, recovered through the cleaned-to-raw offset map; 0 when none does, and
@@ -455,7 +472,10 @@ without spaces) is cut hard; L5 lengths are code points, not tokens; L6 the
 second transition repeats #355's L1; L7 a note whose whole cleaned text is
 below `m` keeps its one short chunk (`whole_short`); L8 a rollback to a
 version-1 build re-embeds every note stamped 2; L9 the live "lves" row was not
-traced to its note.
+traced to its note; L10 at `CHUNK_SIZE ≤ 100` single-character words around a
+tail's midpoint can leave one chunk below `m` (never at the default window).
+A note whose cleaned body is only NBSP (Unicode, not ASCII, whitespace) now
+yields one chunk where #355 yielded none.
 
 ## Indexing decisions
 

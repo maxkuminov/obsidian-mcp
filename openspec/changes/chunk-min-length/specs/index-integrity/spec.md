@@ -20,23 +20,23 @@
 **One length.** Every length in this requirement SHALL be the *collapsed length* `clen(t)`. That is the code-point length of `t` after every maximal run of the whitespace characters U+0009–U+000D and U+0020 is replaced by one space and leading and trailing spaces are removed. This applies to the minimum, section shortness, cut admissibility, tail balancing and the evaluation harness's `under_min`. The stored `chunk_text` SHALL be the raw window, unstripped, so previews are unaffected. The provider input is defined by the prefix requirement. A window SHALL be stored only when its `clen` is non-zero.
 
 **Windowing.** Each group's text SHALL be windowed with `L = min(200, W // 10)`. A *word start* is a non-whitespace character at the start of the text or after a whitespace character. A *line start* is a word start whose preceding whitespace contains a line break. A cut `c` for a window starting at `a` is *admissible* when `clen(text[a:c]) ≥ m`.
-- **Cut.** A window starting at `a` whose limit `a + W` falls before the end of the text SHALL be cut at the first admissible choice of these, in order: the last line start in `(a + W − L, a + W]`; the last word start in that range; `a + W`. Only when `clen(text[a:a+W]) < m`, it SHALL be cut at the first word start after `a + W` that is admissible, or else at the first admissible position. The next window SHALL start at the cut.
+- **Cut.** A window starting at `a` whose limit `a + W` falls before the end of the text SHALL be cut at the first admissible choice of these, in order: the last line start in `(a + W − L, a + W]`; the last word start in that range; `a + W`. Only when `clen(text[a:a+W]) < m`, it SHALL be cut at the first word start after `a + W` that is admissible and whose window has `clen ≤ W`, or else at the first admissible position. The next window SHALL start at the cut.
 - **Overlap.** With overlap above zero, the next start SHALL be `max(cut − overlap × 4, a + 1)`, moved forward to the first word start at or before the cut. It SHALL NOT be moved beyond the cut.
-- **Tail balancing.** When the text after a window's cut has `clen < m`, the last two windows SHALL be re-decided over the span from that window's start to the end, with `S` the span's `clen`.
-  - When `S ≥ 2m + 1`, the span SHALL be cut into two windows, each with `clen ≥ m`. The cut SHALL be the word start nearest the span's collapsed midpoint (the earlier on a tie) whose two sides both have `clen ≥ m` and raw length at most `W`. If there is none, the cut SHALL be the smallest position at which the left side's `clen` equals `⌊S/2⌋`.
-  - When `S ≤ 2m`, the span SHALL be one window.
+- **Tail balancing.** When the text after a window's cut has `clen < m`, the last two windows SHALL be re-decided over the span from that window's start to the end, with `S` the span's `clen`. A *valid split* is a position whose two actual slices both have `clen ≥ m`, each measured on the slice itself. Among valid splits the cut SHALL be chosen from the first non-empty tier of: word starts with both sides at most `W` raw; positions with both sides at most `W` raw (the hard cut clamped into `[end − W, a + W]`); word starts; positions. Within a tier it SHALL be the split nearest the collapsed midpoint (least `|clen(left) − clen(right)|`, the earlier on a tie).
+  - When `S ≤ 2m`, the span SHALL be one window, unless its raw length exceeds `W` and a valid split of the first two tiers exists, in which case it SHALL be split there.
+  - When no valid split exists, the span SHALL be one window when `S ≤ W`. Only when `S > W` as well (possible only at `W ≤ 400`) SHALL the cut be the smallest position at which the left side's `clen` reaches `⌊S/2⌋`.
   - With overlap above zero, the right window of a split SHALL start at `s = min(cut, max(cut − overlap × 4, end − W, a + 1))`, then move forward to the first word start in `[s, cut]`. It SHALL NOT start beyond the cut. It SHALL stay within `W` raw whenever the split itself was within `W` raw, and coverage SHALL hold.
 - **Bounds.** Every chunk SHALL have `clen ≤ W`. Its raw length SHALL be at most `W`, except where no choice above both meets the minimum and stays within `W` raw. In that case the excess SHALL be whitespace only.
-- **Minimum.** Every chunk SHALL have `clen ≥ m`, except the only chunk of a note whose whole cleaned body has `clen < m`.
+- **Minimum.** Every chunk SHALL have `clen ≥ m`, except the only chunk of a note whose whole cleaned body has `clen < m`, and the accepted residue at `W ≤ 400` where single-character words around the midpoint leave no valid split and the span exceeds `W` collapsed.
 - **Coverage.** Every non-heading cleaned character of a section SHALL be inside at least one chunk.
 
-**Locator.** Each chunk's `section_ordinal` SHALL be the deepest heading ordinal N whose `read_note(section="#N")` body span contains the chunk's raw span, or 0 when none does.
+**Locator.** Each chunk's `section_ordinal` SHALL be the deepest heading ordinal N whose `read_note(section="#N")` body span contains the chunk's raw span, or 0 when none does. Every chunk of a whole-body group (the outline fallback and the headings-only fallback) SHALL record 0.
 - Its `heading_path` SHALL be that section's enclosing headings, outermost first, each component trimmed and cut at 200 characters with a marked cut. The path is empty for 0.
 - Its prefix SHALL be built from that path.
 - A chunk drawn from one section's own text SHALL therefore record that section's ordinal.
 - Every chunk SHALL be a substring of its locator section's body with the whole-body fence spans removed.
 
-**No sections.** If no section is non-empty while the whole-body chunker would yield a chunk for the cleaned body, the note SHALL be chunked as one group of the whole cleaned body at ordinal 0. A note SHALL therefore yield zero chunks exactly when the pre-#355 chunker yields zero.
+**No sections.** If no section is non-empty while the cleaned body has `clen > 0`, the note SHALL be chunked as one group of the whole cleaned body at ordinal 0. A note SHALL therefore yield at least one chunk whenever its cleaned body has `clen > 0`, and zero chunks only when it is empty in that sense. (A note of only NBSP, which the pre-#355 chunker's `str.strip()` treated as empty, now yields one chunk.)
 
 **Cap and version.** The per-note chunk cap SHALL count across all groups in document order, and the truncation marker SHALL keep its meaning. These rules are chunking format version 2.
 
@@ -137,7 +137,7 @@ For every chunk, the input `embed_note` sends to the provider SHALL be `embed_pr
 
 The row SHALL store `embed_prefix` and the raw, un-prefixed `chunk_text`, which is never collapsed. Previews SHALL be drawn from `chunk_text` only. `embedded_input_digest` SHALL be computed over the provider inputs as sent.
 
-**The bound this gives.** A chunk of raw length at most `W` has embedded text of at most `W`, so its provider input stays within #355's maximum of `W + 302`. The one exception is a chunk that exceeds `W` raw by whitespace (the chunking requirement's bound). Its embedded text is at most `clen + 7r`, where `r` is the number of whitespace runs of 2 to 8 characters it holds. Because `clen ≤ W`, its input exceeds #355's maximum by at most `7r` characters.
+**The bound this gives.** A chunk of raw length at most `W` has embedded text of at most `W`, so its provider input stays within #355's maximum of `W + 302`. The one exception is a chunk that exceeds `W` raw by whitespace (the chunking requirement's bound). Its embedded text is at most `clen + 7r + 2`, where `r` is the number of interior whitespace runs of 2 to 8 characters it holds and the 2 is its kept leading and trailing whitespace. Because `clen ≤ W`, its input exceeds #355's maximum by at most `7r + 2` characters.
 
 #### Scenario: Prefix shape
 - **WHEN** a chunk of section `## Plan` under `# Project` in a note titled `Alpha` tagged `work` is embedded

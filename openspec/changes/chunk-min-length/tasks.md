@@ -48,7 +48,7 @@
   - For every chunk, `read_note(section="#N")` resolves and the chunk is a substring of that body after the whole-body fence spans are removed.
   - Every non-heading cleaned character is in some chunk.
   - Every window except a whole-short note's only chunk has `clen ≥ m` and `clen ≤ W`.
-  - The raw length is at most `W` whenever the generated text has no whitespace run longer than `W − 2m`. Otherwise any excess is whitespace only.
+  - A chunk exceeds `W` raw only when no valid split within `W` raw on both sides exists (the clamp rule), and then by whitespace only (its non-whitespace count is at most `W`).
   - D8's `under_min` (`clen < m` in a note with more than one chunk) is 0.
   - A note has zero chunks exactly when `chunk_text_bounded(clean_for_embedding(body))` has zero.
 - [x] 2.8 Golden formatter test: every `EMBEDDED_TEXT_FORMATTERS` entry, `embedding_input` and `build_embed_prefix` on fixed inputs match committed outputs. On a mismatch it fails with "frozen formatter changed: add an entry or clear the table".
@@ -98,7 +98,7 @@
   - Run the candidate. It needs `legacy_chunked_notes: 0` and `under_min: 0`.
   - Apply the CI95 release rule over `deltas[<label>][overall|class:prose][recall@10|ndcg@10].ci95`. `INSUFFICIENT_DATA`, a null CI or `CORPUS_LOSS` means re-measure.
   - Attach `report.json` only if `attachable: true`.
-- [ ] 5.3 Run the `openspec-verifier` subagent, not as the author, until there are zero blocking gaps.
+- [x] 5.3 Run the `openspec-verifier` subagent, not as the author, until there are zero blocking gaps. — Done 2026-10-31: 0 blockers; 1 MAJOR + 4 minor, all folded; 430k-chunk property run clean.
 - [ ] 5.4 Adversarial Codex review: mandatory, `gpt-daybreak-blue-latest`, read-only, on the committed tree.
   - Framing: silently wrong search results and a broken live path.
   - Targets: containment and parity under merges, coverage with overlap, the window bound, compatible-set reuse, the zero-chunk invariant, the cap, and the `under_min` predicate.

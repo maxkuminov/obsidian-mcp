@@ -404,10 +404,13 @@ whitespace makes that incompatible with the minimum.
   `a + W`. Tail balancing prefers in-bound splits. Merging joins *sections*
   into a group, which is then windowed, so it never appends text to an
   already-cut chunk.
-- **The exception.** A window goes over `W` raw only through D1 step 4, a
-  midpoint hard cut, or the one-window merge when no in-bound choice meets
-  the minimum. In each case the excess is whitespace only, because collapsed
-  content stays at most `W`.
+- **The exception.** A window goes over `W` raw only through D1 step 4, or
+  through tail balancing when **no valid split within `W` raw on both sides
+  exists** (amended by the implementation review, round 1: the hard cut is
+  clamped into `[end − W, a + W]` before any out-of-bound split is
+  considered, and the `S ≤ 2m` merge splits at an in-bound valid cut rather
+  than exceed `W`). In each case the excess is whitespace only, because
+  collapsed content stays at most `W`.
 - **The exception is unavoidable.** Take `A×100 + space×3000 + B×100`. Any
   window of at most `W` raw that holds the `A`s has `clen ≤ 101 < m`. So
   either the minimum or the raw bound must give way. This change gives up the
@@ -415,8 +418,9 @@ whitespace makes that incompatible with the minimum.
   `raw_over_window`.
 
 The only chunks under `m` are therefore those of L7, a note whose whole text
-is short. There is no case in which a tiny chunk must remain because no
-neighbour can take it.
+is short, and L10's residue at `W ≤ 404`. Every split is validated on its two
+actual slices, so stripping the boundary whitespace can no longer strand one
+side below `m` (implementation review r1 M1).
 
 A test builds the maximum case: a 300-character prefix, a group of
 `W + m − 1` characters of prose, and tail balancing. It asserts:
@@ -512,8 +516,9 @@ truncation M2 removed.
   run carries no meaning.
 - **Bound.** A chunk of at most `W` raw has embedded text of at most `W`, so
   #355's maximum (`W + 302`) holds exactly. An L3 chunk's embedded text is at
-  most `clen + 7r`, where `r` is the number of whitespace runs of 2 to 8
-  characters in it. Its input therefore exceeds #355's maximum by at most `7r`.
+  most `clen + 7r + 2`, where `r` is the number of interior whitespace runs of
+  2 to 8 characters in it and the 2 is its kept leading and trailing
+  whitespace. Its input therefore exceeds #355's maximum by at most `7r + 2`.
   **Pinned:** for `A×100 + space×3000 + B×100` under prefix `P`, the embedded
   text is `A×100 + " " + B×100` and the input length is `len(P) + 203`.
 - **Reuse cost.** Only chunks that contain a run longer than 8 miss version-1
@@ -653,6 +658,19 @@ Declined: none.
 - **L8** — Rolling back to a v1 build fully re-embeds the notes stamped 2.
 - **L9** — The live "lves" row was not traced to its note. The fixtures
   reproduce both mechanisms, not the exact note.
+- **L10** (implementation review r1) — At `W ≤ 404` (`CHUNK_SIZE ≤ 101`),
+  where `2m + 2 > W`, a balanced span can have `S > W` and no valid split:
+  single-character words around the midpoint, so every cut leaves one side
+  below `m`. Example at `CHUNK_SIZE = 2` (W = 8, m = 4): a span `a b c d e`
+  (`S = 9`) — every word-start split gives (3, 5) or (5, 3), and a cut on a
+  space strips to the same. The pure midpoint cut stays, so one chunk is
+  below `m` and `under_min` can be non-zero on such a deployment. Why the
+  residue is that narrow: a valid split always exists when `S ≥ 2m + 2` (at
+  the first position where the left side reaches `m` it holds `m` or `m + 1`,
+  leaving the right at least `S − m − 2 ≥ m`), and with none the span is one
+  window when `S ≤ W`. So the residue needs `W < S ≤ 2m + 1`, i.e. `W ≤ 2m`,
+  which holds only at `W ≤ 400` (`CHUNK_SIZE ≤ 100`; the brief's "≤ 404" is
+  a safe over-statement). Never at the default window.
 
 ## Implementation notes (2026-10-30)
 
@@ -687,23 +705,14 @@ read it one way. None changes a pinned output: all four pinned cases (W=400
    grouping and "No sections" clauses say ("at ordinal 0"), rather than the
    deepest containing section. Both satisfy parity; a later window of a
    whole-body group may lie inside one section's body and still reports 0.
-7. **Task 2.7's raw-bound condition is not sufficient, so the test asserts a
-   weaker true property.** "Raw length ≤ W whenever no whitespace run is
-   longer than `W − 2m`" fails on a generated note at the default window: a
-   1,098-character unbroken run followed by a 1,428-space run (shorter than
-   `W − 2m` = 1,648). The last window cuts hard inside the space run, tail
-   balancing finds no word start leaving both sides `≥ m` within `W` raw
-   (the run has no word starts), and the midpoint hard cut lands outside the
-   in-bound range, giving a chunk of 2,071 raw, `clen` 619. An in-bound hard
-   cut existed, but the spec's fallback is the midpoint. At `W ≤ 400`,
-   `W − 2m` is 0. The property test therefore asserts `clen ≤ W` for every
-   chunk (the excess is whitespace only, as the spec's Bounds clause
-   requires), and `raw ≤ W` at the default window for ordinary text (no
-   whitespace run over 8, no unbroken run over the lookback); a second
-   generator of headings and prose asserts `raw ≤ W` and the `W + 302` input
-   bound on every chunk. A candidate for the adversarial pass: whether the
-   hard-cut fallback should clamp into `[end − W, a + W]` (no pinned output
-   would change); left as specified.
+7. **Task 2.7's raw-bound condition** ("no whitespace run longer than
+   `W − 2m`") was not sufficient under the first implementation: a
+   1,098-character unbroken run followed by a 1,428-space run gave a chunk of
+   2,052 raw because the fallback was the pure midpoint although an in-bound
+   cut at 628 existed. **Resolved by the review round 1 clamp rule** (tail
+   balancing prefers any valid split within `W` raw on both sides), and task
+   2.7 is reworded to that rule: a chunk exceeds `W` raw only when no valid
+   in-bound split exists, and then by whitespace only. That case is pinned.
 8. **`S` in the completion line is summed over the same certified notes as
    `X`** (`EMBEDDED` and `CERTIFIED_EMPTY`), so `R = X − S` is never
    negative. Provider work spent on a note that then failed or lost its
@@ -727,3 +736,31 @@ read it one way. None changes a pinned output: all four pinned cases (W=400
 13. #355's offline tests were updated, not deleted: their sections were
     padded to at least `m`, and the "byte-identical to the pre-change
     chunker" test now compares with `chunk_text_bounded(…, min_chars=m)`.
+
+## Codex implementation review, round 1 (2026-10-31)
+
+FAIL on ee2e152: 3 MAJOR + 1 MINOR, all accepted and fixed. No tenant-boundary
+or destructive-write finding. The `openspec-verifier` pass on the same head
+found 0 blockers and 1 MAJOR + 4 MINOR (the MAJOR the same root cause as M1),
+all folded in below; its 430k-chunk property run was otherwise clean.
+
+| # | Severity | Finding | Resolution |
+|---|---|---|---|
+| M1 | MAJOR | The midpoint fallback measured the right side as `S − left − 1`; stripping boundary whitespace stranded it: `A×199 + space×1700 + "x " + B×199` gave (raw 1900, clen 201), (raw 200, clen 199). The verifier reproduced it under a heading (`"# Notes\n" + A×199 + space×1900 + "a " + B×199`). | Every split is validated on its two **actual** slices (prefix sums, O(span)). With no valid split and `S ≤ W` the span is one window (always possible at the default window). Both inputs pinned: one chunk, `clen` 401. |
+| M2 | MAJOR | The pure midpoint could exceed `W` raw although an in-bound split existed: `A×300 + space×1822 + B×175` gave a 2,059-raw chunk. | Tiered choice: valid word starts within `W` raw on both sides, then any valid position within `W` (the hard cut clamped into `[end − W, a + W]`), then out-of-bound word starts, then positions; nearest the midpoint within a tier. Pinned (249, 249), (2048, 227); implementation note 7's case pinned (628, 628), (2048, 621). |
+| M3 | MAJOR | The unconditional `S ≤ 2m` merge exceeded the input bound: W=400, `space×8 + A×400 + space×8` under a 300-char prefix sent 718 > 702 + 14. | The merge splits at an in-bound valid cut when its raw length exceeds `W`. Pinned (208, 200), (208, 200), every input ≤ 702. |
+| m1 | MINOR | The main reuse section of the indexing note still said byte-identical raw text and an equal chunking version. | Rewritten: equal prefix and `fmt[stored](stored) == fmt[current](new)`, any formatter-table version eligible. |
+
+Verifier MINORs, folded: the Cut clause states the `clen ≤ W` condition on
+the word start (note 5); the Locator clause says a whole-body group records 0
+(note 6); D9's bound is `clen + 7r + 2`; "No sections" no longer claims
+parity with the pre-#355 chunker for NBSP-only notes (one chunk; an NBSP test
+added); note 7 resolved by the clamp rule (D7 and task 2.7 reworded). Lesser
+items: DEPLOYMENT.md says its `under_min` statement is tenant-wide while the
+report's is owner-scoped; the backstop's strict `= :cv` carries its
+justifying comment (task 2.5); the task 1.2 test compares the fingerprint
+literal byte for byte. The verifier's generator is now
+`test_the_verifier_property` (12 size/overlap pairs × 25 notes). New
+limitation **L10** records the small-window residue (`W ≤ 400`).
+
+Declined: none.

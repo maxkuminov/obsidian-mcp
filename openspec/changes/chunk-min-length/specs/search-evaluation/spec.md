@@ -10,7 +10,7 @@ For every database-backed arm whose membership includes `semantic`, the harness'
   - `m` SHALL be the running effective minimum and `W` the running window in characters.
   - The percentiles SHALL be discrete percentiles of `clen`.
   - `whole_short` SHALL count chunks with `clen < m` whose note holds exactly one chunk.
-  - `under_min` SHALL count chunks with `clen < m` whose note holds more than one chunk, with no other exception, and SHALL be 0 for a conforming chunker.
+  - `under_min` SHALL count chunks with `clen < m` whose note holds more than one chunk, with no other exception, and SHALL be 0 for a conforming chunker at any `CHUNK_SIZE` above 100 (below it, index-integrity's small-window residue may count).
   - `raw_over_window` SHALL count chunks whose raw `length(chunk_text)` exceeds `W`.
 
 **Provenance owner.** It is the `user_id` the export was filtered to (`USER_ID=` or `mine --user-id`), read from the `user_id` of the report's queries. The miner guarantees one owner for a single-user report. It SHALL be compared NULL-safe, so the ownerless scope is covered. A single-user report with no queries records null for both counts. Only when the report's provenance is `"multi"`, and the report is therefore not attachable, SHALL the counts cover all owners.
