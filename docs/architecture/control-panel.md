@@ -30,7 +30,7 @@
   object-src 'none'
   base-uri 'none'
   frame-ancestors 'none'
-  form-action 'self'        (the consent page: 'self' https:)
+  form-action 'self'        (the consent page: 'self' https: http://localhost:* http://127.0.0.1:*)
   ```
 
   Each source is there for something the templates do. `script-src` lists
@@ -174,6 +174,24 @@
   go is decided by the HTTPS-only registration rule and `authorize_post`'s
   exact-match re-validation, never by this header. `authorize_get` calls
   `mark_consent` before rendering; every other page keeps `'self'`.
+  **#357 adds `http://localhost:*` and `http://127.0.0.1:*`**
+  (`panel_csp.CONSENT_FORM_ACTION`, still a constant). A Client ID Metadata
+  Document client such as Claude Code receives its code on an RFC 8252
+  loopback callback on an ephemeral port, and the 302 to it is a
+  form-submission hop. Without the two sources the approve completes
+  server-side and the browser blocks the delivery. Where a code may go is
+  still decided server-side (`cimd.redirect_uri_allowed`: loopback http only
+  for those exact host literals, port-agnostic, path and query exact). CSP
+  host-source syntax cannot name an IPv6 literal, so a `[::1]` callback is
+  matched by the server but may be blocked here. No known client declares it
+  (L3 in [oauth and grants](oauth-and-grants.md)).
+
+- **The CIMD consent card (#357)** shows the client identifier URL's host as
+  the application, the full URL as the client ID, and "First approved".
+  The document's self-declared `client_name` is **not rendered** on the
+  consent page. The OAuth panel lists a CIMD row by host and URL, with the
+  name labelled "Self-described as". Both use existing utility classes, so
+  no `style=` and no handler are involved.
 
 - **`PANEL_CSP` is the rollback lever** (`enforce` | `report-only` | `off`,
   default `enforce`, boot-validated — an unknown value refuses startup).

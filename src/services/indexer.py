@@ -7683,6 +7683,7 @@ async def cleanup_expired_tokens():
     # transaction that removed rows from them would have the sweep act on a
     # snapshot no other session has seen yet.
     await _expire_unused_oauth_clients()
+    await _expire_unreferenced_cimd_clients()
 
 
 #: How many never-used registrations one pass may delete. A bound, not a
@@ -7731,6 +7732,8 @@ async def _expire_unused_oauth_clients() -> int:
                     OAuthClient.last_used_at.is_(None),
                     OAuthClient.user_id.is_(None),
                     OAuthClient.created_at < cutoff,
+                    # Never a CIMD row (#357): those have their own rule.
+                    OAuthClient.client_id_metadata_url.is_(None),
                 )
                 # A stable order so a contended row is retried in the same
                 # place on the next pass rather than the batch reshuffling
@@ -7759,6 +7762,7 @@ async def _expire_unused_oauth_clients() -> int:
                     OAuthClient.last_used_at.is_(None),
                     OAuthClient.user_id.is_(None),
                     OAuthClient.created_at < cutoff,
+                    OAuthClient.client_id_metadata_url.is_(None),
                     # Any code row and any token row of any state — live,
                     # expired or revoked — disqualifies. A revoked token the
                     # operator can still see in the panel must never be
@@ -7792,6 +7796,82 @@ async def _expire_unused_oauth_clients() -> int:
         logger.info(
             "OAuth client cleanup: %d never-used registration(s) older than "
             "%d days removed",
+            deleted,
+            days,
+        )
+    return deleted
+
+
+async def _expire_unreferenced_cimd_clients() -> int:
+    """Delete synthetic CIMD client rows nothing references (#357, D9).
+
+    A CIMD row is a cache of a public document: it holds no secret and is
+    re-derived from the document at the user's next consent, so — unlike a
+    DCR registration (#194) — its owner is irrelevant. It qualifies when it
+    holds no code and no token row of any state and its use marker is older
+    than `OAUTH_CLIENT_UNUSED_EXPIRY_DAYS` (the same age and the same `null`
+    kill switch). Tokens are retained seven days past expiry, so a row is
+    never swept while any grant row references it. Same protocol as the DCR
+    sweep: `SKIP LOCKED` batch, in-lock re-read in a separate statement,
+    delete what still qualifies.
+    """
+    days = settings.oauth_client_unused_expiry_days
+    if days is None:
+        return 0
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    async with async_session() as session:
+        candidates = (
+            await session.execute(
+                select(OAuthClient.client_id)
+                .where(
+                    OAuthClient.client_id_metadata_url.is_not(None),
+                    OAuthClient.last_used_at < cutoff,
+                    # In the candidate query too, not only the re-read: a
+                    # referenced row must never be selected or row-locked, or
+                    # a full batch of referenced rows would starve the sweep.
+                    ~select(OAuthCode.id)
+                    .where(OAuthCode.client_id == OAuthClient.client_id)
+                    .exists(),
+                    ~select(OAuthToken.id)
+                    .where(OAuthToken.client_id == OAuthClient.client_id)
+                    .exists(),
+                )
+                .order_by(OAuthClient.id)
+                .limit(OAUTH_CLIENT_EXPIRY_BATCH)
+                .with_for_update(skip_locked=True)
+            )
+        ).scalars().all()
+        if not candidates:
+            return 0
+        still_eligible = (
+            await session.execute(
+                select(OAuthClient.client_id).where(
+                    OAuthClient.client_id.in_(candidates),
+                    OAuthClient.client_id_metadata_url.is_not(None),
+                    OAuthClient.last_used_at < cutoff,
+                    ~select(OAuthCode.id)
+                    .where(OAuthCode.client_id == OAuthClient.client_id)
+                    .exists(),
+                    ~select(OAuthToken.id)
+                    .where(OAuthToken.client_id == OAuthClient.client_id)
+                    .exists(),
+                )
+            )
+        ).scalars().all()
+        if not still_eligible:
+            await session.commit()
+            return 0
+        result = await session.execute(
+            delete(OAuthClient).where(OAuthClient.client_id.in_(still_eligible))
+        )
+        deleted = result.rowcount
+        await session.commit()
+
+    if deleted:
+        logger.info(
+            "OAuth client cleanup: %d unreferenced Client ID Metadata Document "
+            "row(s) unused for %d days removed",
             deleted,
             days,
         )

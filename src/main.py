@@ -9,6 +9,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy import text
@@ -23,6 +25,7 @@ from src.database import async_session, engine
 from src.limiter import limiter
 from src.mcp_server.auth import APIKeyMiddleware
 from src.mcp_server.server import mcp
+from src.oauth import resource as oauth_resource
 from src.oauth.routes import router as oauth_router
 from src.services import error_log, panel_csp, security_events, vault, vault_overlap
 from src.services.index_state import (
@@ -752,6 +755,10 @@ def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
     except Exception:  # noqa: BLE001 - never let telemetry break a 429
         pass
     address = security_events.client_ip(request)
+    # The /token 429 carries the RFC 8707 class without reading the body
+    # (#357): a refused request spends nothing, so parsing its form here
+    # would hand an attacker CPU at the moment the limiter says no.
+    token_route = _route_path(request) == "/token"
     security_events.emit(
         "rate_limit_exceeded",
         subject=security_events.subject_for(ip=address),
@@ -760,12 +767,40 @@ def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
         client_ip=address,
         limit_count=limit_count,
         window_seconds=window_seconds,
+        resource_class=(
+            oauth_resource.UNCLASSIFIED_RATE_LIMITED if token_route else None
+        ),
     )
     return _rate_limit_exceeded_handler(request, exc)
 
 
+def _route_path(request: Request) -> str | None:
+    try:
+        return request.url.path
+    except Exception:  # noqa: BLE001 - telemetry may not raise
+        return None
+
+
+async def _validation_error_handler(request: Request, exc: RequestValidationError):
+    """FastAPI's 422, plus the RFC 8707 class on the OAuth routes (#357).
+
+    Route-aware: only `/authorize` and `/token` are touched. A `GET /authorize`
+    is classified from its **query string only**; `POST /authorize` and
+    `/token` are `unclassified_malformed` and their body is never read.
+    """
+    path = _route_path(request)
+    if path in ("/authorize", "/token"):
+        if path == "/authorize" and request.method == "GET":
+            oauth_resource.begin(request, request.query_params.getlist("resource"))
+        else:
+            oauth_resource.set_fixed(request, oauth_resource.UNCLASSIFIED_MALFORMED)
+        oauth_resource.finish(request)
+    return await request_validation_exception_handler(request, exc)
+
+
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
+app.add_exception_handler(RequestValidationError, _validation_error_handler)
 
 def _install_proxy_headers(target: FastAPI) -> list[str]:
     """Honour `X-Forwarded-Proto`/`-For` from the peers `TRUSTED_PROXY_IPS` names.

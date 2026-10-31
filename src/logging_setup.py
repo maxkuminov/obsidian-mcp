@@ -170,6 +170,17 @@ ALLOWED_FIELDS: dict[str, _FieldSpec] = {
     "window_seconds": _S(int),
     "duration_ms": _S(int),
     "cleared_user_id": _S(bool),
+    # ── Client ID Metadata Documents and RFC 8707 (#357) ──
+    # Server-derived values, a provenance class of their own: computed from a
+    # parsed request value, neither read from a row nor caller text verbatim.
+    # None is ever a suppression subject. A CIMD client_id URL is never logged
+    # (it may carry anything); `cimd_host` and the 16-hex `cimd_ref` (SHA-256
+    # prefix of the submitted value) stand in for it.
+    "registration_kind": _S(str, 8),
+    "cimd_host": _S(str, 253),
+    "cimd_ref": _S(str, 16),
+    "resource_class": _S(str, 32),
+    "resource_host": _S(str, 253),
 }
 
 #: Sentinel for "this value did not survive its type check".

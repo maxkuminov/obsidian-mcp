@@ -272,6 +272,27 @@ update it in the same change.** What stays here is the short list:
   to an unknown code — and so does **every failed revalidation of a spent
   code** (reason only in the log). A live code keeps its specific refusals
   and the pre-#325 check order (expiry first). See [oauth and grants](docs/architecture/oauth-and-grants.md).
+- **OAuth Client ID Metadata Documents, DCR as the fallback** (#357,
+  migration 036). An `https://` `client_id` at `/authorize` is fetched through
+  `transfer.fetch_url_guarded` (no redirects, 10 s, 64 KiB, the SSRF deny list,
+  pinned). Admission: cache, then **join an in-progress fetch before any
+  charge**, a 30 s failure cooldown, the failed-auth salted 4,096-slot table
+  (`OAUTH_CIMD_FETCHES_PER_ADDRESS_PER_MINUTE`, 10), 1 in flight per slot and
+  8 per process. The URL must be canonical with **no `?`/`#`**, and the
+  document's `client_id` byte-equal to it. One synthetic `oauth_clients` row
+  per (URL, user), `cimd_` + HMAC under a `SECRET_KEY`-derived key, written
+  only by an approve. The consent POST is pinned to the **authorization hash**
+  (client_id, sorted redirect URIs, scope; never `client_name`). **The
+  `cimd_` id is never caller input, and where it is refused differs by
+  endpoint.** At `/authorize` it is refused before any lookup. At `/token`
+  the credential and the unchanged #182/#325/#326 processing run first,
+  then it is refused. At `/revoke` it is a concealed 200 (`{}`). `/token` never
+  fetches. Consent shows the document's host and URL, never its
+  `client_name`. Loopback redirects match on any port for CIMD only. `iss` is
+  on every authorization redirect. RFC 8707 `resource` is **classified, never
+  refused** (`resource_class` on every record; `invalid_target` waits for a
+  14-day gate). CIMD rows with no code or token are swept after the #194
+  age, whoever owns them. See [oauth and grants](docs/architecture/oauth-and-grants.md).
 - **Machine-facing paths refuse plaintext HTTP** (#196): a priority-200
   Traefik router on the `http` entrypoint, in `docker-compose.yml`'s labels,
   answers 403 via `ipAllowList` on `192.0.2.0/32` for `/mcp`, `/transfer`,
@@ -285,8 +306,9 @@ update it in the same change.** What stays here is the short list:
   closed. No inline `style=` anywhere (#289): `style-src-attr 'none'`, dynamic
   presentation through `el.style.*` or classes, SVG colours via classes, no
   `!important`; `_utilities.html` is generated. The consent page's
-  `form-action` is `'self' https:` by owner decision (multi-hop OAuth
-  callbacks). Scope is a marker set by the context
+  `form-action` is `'self' https: http://localhost:* http://127.0.0.1:*` by
+  owner decision (multi-hop OAuth callbacks; the two loopback sources since
+  #357 for native RFC 8252 callbacks). Scope is a marker set by the context
   processor on the four panel/auth/consent template instances — not a path, so
   transfer pages and `/docs` are untouched. `PANEL_CSP=report-only|off` is the
   rollback (recreate, no rebuild). htmx is deliberately absent: its `hx-*`

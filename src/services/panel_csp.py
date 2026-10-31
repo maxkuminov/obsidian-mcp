@@ -123,11 +123,20 @@ def is_consent(request: Request) -> bool:
     return getattr(request.state, _CONSENT, False) is True
 
 
+#: The consent page's `form-action` (#195, #357). `https:` for every hosted
+#: connector callback; the two loopback sources so a native client's RFC 8252
+#: `http://localhost:PORT` / `http://127.0.0.1:PORT` callback (Claude Code)
+#: receives its code — the 302 from `POST /authorize` is a form-submission
+#: hop. A constant: nothing from the request reaches the header. CSP
+#: host-source syntax cannot name an IPv6 literal, so `[::1]` is not here (L3).
+CONSENT_FORM_ACTION = "'self' https: http://localhost:* http://127.0.0.1:*"
+
+
 def build_policy(nonce: str, consent: bool) -> str:
     """The panel policy for one response. `nonce` is the only variable part."""
     if not _NONCE_RE.match(nonce):
         raise ValueError("panel CSP nonce is not a server-generated token")
-    form_action = "'self' https:" if consent else "'self'"
+    form_action = CONSENT_FORM_ACTION if consent else "'self'"
     return (
         "default-src 'self'; "
         f"script-src 'nonce-{nonce}'; "
