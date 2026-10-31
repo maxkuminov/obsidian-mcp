@@ -313,6 +313,13 @@ the wire, so none is cut off by a client's description limit.
   marked `arms: keyword-only (semantic unavailable: …)`, never silently
   degraded: the marker is on every return path, so a keyword-only page
   cannot pass for a fused one.
+- Every page of `semantic_search` and `hybrid_search` carries a
+  `confidence: ok | low` header token. `low` means no keyword note matched
+  all the terms and the closest semantic candidate is under
+  `SEARCH_LOW_CONFIDENCE_SIMILARITY`, with a one-line hint to try
+  `keyword_search` or `get_neighborhood` when it costs no row. Nothing is
+  filtered. The threshold ships at 0 (off: always `ok`) until you calibrate
+  it.
 - `rerank=true` on either of the last two asks an optional,
   operator-configured reranker (`RERANK_URL`) to reorder the candidates
   the call already fetched (at most 50 notes). The response is either
@@ -966,7 +973,23 @@ naming conventions, and YAML schema before it writes anything.
 ## Upgrading
 
 Pull, then `make deploy` (or rebuild your compose stack); migrations
-run on start. Across the reranker release (#367):
+run on start. Across the search-confidence release (#389):
+
+- **No migration.** Every `semantic_search` and `hybrid_search` page gains
+  one header token: ` — confidence: ok` (at the default threshold 0 that is
+  the only byte that changes). A parser that matched the old header
+  exactly needs to allow it. Usage rows gain `confidence`,
+  `top_similarity` and (hybrid) `keyword_all`. One optional setting,
+  `SEARCH_LOW_CONFIDENCE_SIMILARITY` (default 0 = off); leave it at 0 until
+  the calibration recipe in `DEPLOYMENT.md` passes for both tools.
+- **The search-eval harness** reports recall@20 and recall@50, runs at
+  `--depth` 50 by default and writes `report.json` `schema_version` 2; a
+  `runfile:` baseline staged at depth 20 scores a null recall@50, so re-run
+  it for a delta. It gains a `confidence` subcommand.
+- **Rollback** is a redeploy of the previous image; the new usage keys stay
+  and are ignored.
+
+Across the reranker release (#367):
 
 - **No migration, nothing re-derived or re-embedded.** `semantic_search`
   and `hybrid_search` gain an optional `rerank` argument (default false,
@@ -1313,6 +1336,7 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `RANK_WEIGHTS` | `{0.02, 0.2, 0.4, 1.0}` | `keyword_search`'s `ts_rank_cd` weight array `{D, C, B, A}`: the title and aliases are indexed at `A`, the body at `D`. At the default one two-word title match outweighs fifty body repetitions; PostgreSQL's own `D=0.1` lets ten tie it. Four finite numbers, each in [1e-6, 1]; only title-versus-body order moves. |
 | `KEYWORD_EXCERPT_CHARS` | `20000` | Leading characters of each note's indexed text stored for `keyword_search` snippets (1000–100000). Applies to notes indexed afterwards; `make rebuild-tsvectors` rewrites the rest. The snippet cost grows roughly linearly with this; the 300 ms budget was measured at the defaults. |
 | `KEYWORD_SNIPPET_ROWS` | `20` | Rows per `keyword_search` page that get a snippet, whatever `limit` is (0–100; 0 turns snippets off). Bounds the per-call `ts_headline` cost, which grows roughly linearly with this; the 300 ms budget was measured at the defaults. |
+| `SEARCH_LOW_CONFIDENCE_SIMILARITY` | `0` | Where `semantic_search` and `hybrid_search` start reading `confidence: low` (#389): no keyword note matched all terms and the best similarity of the call's candidates is strictly below this value. **0 is off** (the shipped default: the token is still on every page and always reads `ok`, which means "not judged"). Range 0–1; out of range or non-finite refuses to start. Model-dependent: bge-m3's candidate value is 0.50 (live probes: gibberish 0.36–0.49, paraphrases 0.61–0.67), OpenAI `text-embedding-3-*` cosines run lower, so re-choose it when the embedding model changes. Ranks nothing and is not part of the retrieval fingerprint. Set it only after both tools pass the calibration recipe in `DEPLOYMENT.md`, "Calibrating search confidence". |
 | `HYBRID_RRF_K` | `60` | `hybrid_search`'s reciprocal-rank-fusion constant (1–1000; out of range refuses to start): a note scores the sum over the two arms of `1/(k + rank)`. Smaller lets each arm's top ranks dominate; larger flattens toward counting votes. Measure a change with the harness arms `scripts.search_eval_arms.hybrid:make_arm` / `make_arm_alt` (`ARM_OPTS="hybrid_k=60 hybrid_alt_k=20"`, see `DEPLOYMENT.md`, "Measuring search quality"); there is no per-call argument. |
 | `TRANSFER_TOKEN_TTL_SECONDS` | `600` | Default life of a transfer link. Per-call `expires_in` is clamped to 60–3600. |
 | `TRANSFER_MAX_UPLOAD_SECONDS` | `600` | How long one claimed upload may stream before the token is spent |

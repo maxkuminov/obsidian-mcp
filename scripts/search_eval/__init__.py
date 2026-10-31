@@ -4,6 +4,7 @@
     python -m scripts.search_eval snapshot --data DIR [--database-url URL]
     python -m scripts.search_eval run      --data DIR --arm NAME... [--generation ID]
     python -m scripts.search_eval score    --data DIR [--arm NAME...] [--baseline ARM]
+    python -m scripts.search_eval confidence --data DIR --threshold T   (#389)
 
 See `docs/architecture/search.md`, "Search evaluation harness (#356)".
 Nothing in this package imports `src.*` at module scope: the built-in database

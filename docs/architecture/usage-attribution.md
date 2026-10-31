@@ -775,6 +775,20 @@ this table.
   considered). `result_paths` are the rendered rows in final, reranked order.
   **`reranked: false` is not an error marker**: the call returned the honest,
   labelled unreranked page, so the row stays analysable and minable.
+- **Search confidence (#389) reserves three keys**, on every **page** of
+  `semantic_search` and `hybrid_search` (the zero-result and keyword-only
+  pages included) and whatever `SEARCH_LOW_CONFIDENCE_SIMILARITY` is:
+  `confidence` (string, `"ok"` or `"low"`, the header token the page
+  carried), `top_similarity` (float rounded to three decimals: the best
+  similarity of the call's candidate set before rerank and the cap, present
+  only when a candidate existed — so absent on a keyword-only page and an
+  empty one) and, on `hybrid_search` only, `keyword_all` (int, the
+  `match: all` keyword note count, the rule's evidence). They are recorded
+  with the threshold at its default 0 so the calibration recipe has evidence
+  from day one. **None is an `error` marker**, and a refusal — including
+  `semantic_search`'s provider-input rejection — records none of them. A row
+  is "post-change" for the harness's `confidence` tabulation exactly when it
+  carries `confidence`; the search-eval export projects all three.
 
 **The identity rule for anything reading these keys: `(usage_logs.user_id,
 path)`, matched NULL-safely.** A path is unique only within an owner —

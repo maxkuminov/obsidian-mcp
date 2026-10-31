@@ -390,6 +390,20 @@ update it in the same change.** What stays here is the short list:
   fingerprint re-read** — the title is inside the vector — and `make deploy`
   stops the app before a pending migration. See
   [search](docs/architecture/search.md).
+- **`semantic_search` / `hybrid_search` pages carry `confidence: ok | low`**
+  (#389). One pure rule (`src/services/search_confidence.py`): `low` ⇔
+  `SEARCH_LOW_CONFIDENCE_SIMILARITY > 0` ∧ `keyword_all == 0` (`match: any`
+  is not evidence; semantic passes 0) ∧ the best similarity of the call's
+  candidate set (semantic: first overfetched row; hybrid: max over its
+  50-chunk arm, `HybridResult.top_similarity`; both before rerank and the
+  cap) is none or strictly below it. **Ships at 0 = off** — set a value only
+  after both tools' `confidence` tabulation lines PASS (DEPLOYMENT.md). The
+  token is base budget like `arm_depth` (a displaced boundary row is
+  disclosed by the cap footer, L14); the hint line is kept only when it
+  leaves every row byte-identical. A refusal carries neither; usage rows
+  always record `confidence`, `top_similarity`, `keyword_all`. Bounds:
+  hybrid header 405 / 444 (`rerank=true`), semantic rerank header 199, floor
+  990, last rung `explain omitted`. See [search](docs/architecture/search.md).
 - **The vector index is a `halfvec` expression index** (#283, migration 027),
   defined once in `src/services/vector_index.py` and excluded from `alembic
   check` by `include_object`; queries cast to match it and re-rank by
