@@ -15,6 +15,15 @@ match. This is the "silently wrong search result" failure CLAUDE.md
 ranks second: an agent acts on the fused order and no person sees the
 query.
 
+**This change does not fix the issue's query.** A read-only re-run on the
+live server (design D7) shows that query is led by the **semantic** arm:
+it ranks the job notes 3–5 and the opinion note 7th, and the fill terms
+only add a small amount on top. Under this change the opinion note stays
+5th. The query is addressed by the re-test after the `CHUNKING_VERSION` 2
+drain and by #402's reranker path, not here. This change is fusion
+hygiene: it removes the fill's equal vote, which is wrong on any query
+where the fill leads.
+
 ## What Changes
 
 - **Fill rows enter RRF with their keyword rank offset by the arm depth
@@ -53,6 +62,10 @@ query.
   the harness sets. The release A/B is then one generation:
   `make_arm` (candidate) against `make_arm_alt` with
   `hybrid_alt_k=60 hybrid_alt_any_offset=0` as `BASELINE`.
+- **Release bar:** no regression in hybrid recall@20 and recall@50
+  (95% CI) on the real-data report, and a fixture test that proves a
+  fill row can never outrank an all-terms row through the keyword arm
+  alone. There is no rank target for the issue's query.
 - Docs: `docs/architecture/search.md` (fusion, bounds, harness),
   CLAUDE.md's `hybrid_search` bullet, one README sentence, and
   DEPLOYMENT.md's eval recipe (`hybrid_alt_any_offset`).

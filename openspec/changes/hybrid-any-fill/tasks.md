@@ -1,7 +1,7 @@
 ## 0. Pre-flight
 
 - [ ] 0.1 Base check: the branch `hybrid-any-fill` contains c491326 (#391); `git ls-files .venv` is empty
-- [ ] 0.2 Owner answers to design "Open questions" (release bar, `explain` form) recorded in `design.md` before 7.3 is judged
+- [x] 0.2 Owner decisions recorded in `design.md` (2026-10-31): bar narrowed, `explain` uses `1/(k+55)`
 
 ## 1. Fusion (`src/services/hybrid.py`)
 
@@ -24,7 +24,7 @@
 
 ## 4. Tests
 
-- [ ] 4.1 `fuse` unit tests: the spec scenarios (1/110 vs 1/111; E before J; fill-only below semantic-only rank 50; unoffset tie-break; `any_offset=0` equals the old `fuse` on random inputs)
+- [ ] 4.1 `fuse` unit tests (release-bar fixture proof: a fill row can never outrank an all-terms row through the keyword arm alone, for k ∈ {1, 60, 1000} and every fill and all-terms rank in 1–50): the spec scenarios (1/110 vs 1/111; E before J; fill-only below semantic-only rank 50; unoffset tie-break; `any_offset=0` equals the old `fuse` on random inputs)
 - [ ] 4.2 Byte-identity: every existing fixture with `keyword_any = 0` renders identically to origin/main (pin with the current offline and integration fixtures); the keyword-only path with `any` rows renders identically
 - [ ] 4.3 Identity oracle (integration, `tests/integration/test_hybrid_search_pg.py`): a corpus with `all` and `any` rows, `limit=50`, incumbent (override 0) vs candidate: same fused path set; the subsequence of rows without a `match: any` keyword rank in the same order with byte-identical lines
 - [ ] 4.4 The issue's shape, synthetic (no vault data in the repo): job-posting-like titles matching one query word plus an opinion note with all words in a near paraphrase; assert the fill-only rows fall below the semantic-only rows and that the explain terms sum to the score
@@ -48,7 +48,7 @@
 
 - [ ] 7.1 `openspec validate hybrid-any-fill --strict`; offline suite, `make test-integration`, `make search-eval` (fixture)
 - [ ] 7.2 Search-eval gate (CLAUDE.md row): restore a `BACKUP_FULL=1` copy, `make search-eval-snapshot`, then one generation at the candidate commit with `ARMS="keyword semantic scripts.search_eval_arms.hybrid:make_arm scripts.search_eval_arms.hybrid:make_arm_alt" ARM_OPTS="hybrid_alt_k=60 hybrid_alt_any_offset=0" BASELINE=scripts.search_eval_arms.hybrid:make_arm_alt`; `USER_ID=` export on multi-user; attach `report.json` only if `attachable: true`; `CORPUS_LOSS` invalidates; expected movement in the hybrid arm only
-- [ ] 7.3 Release bar: no regression in hybrid recall@20 and recall@50 beyond the 95% CI against the baseline arm; the issue's query added as one named judgment in `.search-eval/manual.jsonl` (tenant data, git-ignored; relevant = the opinion note), and its rank reported for both arms. The "top 3" bar is pending owner decision (design D7: live data projects 5th under B)
+- [ ] 7.3 Release bar: no regression in hybrid recall@20 and recall@50 beyond the 95% CI against the baseline arm; the issue's query added as one named judgment in `.search-eval/manual.jsonl` (tenant data, git-ignored; relevant = the opinion note), and its rank reported for both arms, for information only (no rank target: the query is semantic-led, design D7)
 - [ ] 7.4 `openspec-verifier` subagent (not an implementer) against the deltas; iterate to zero blocking gaps
 - [ ] 7.5 Adversarial Codex (mandatory: a ranking change an agent acts on without a human seeing the query), framed per CLAUDE.md (silently wrong search results); attack the D1 bound, D3's keyword-only exemption, the override seam and the oracle; two rounds by default, triage per the workflow file, declined findings recorded as accepted limitations
 - [ ] 7.6 `openspec archive hybrid-any-fill -y` and the docs above as the last commits; one PR, `Closes #403`

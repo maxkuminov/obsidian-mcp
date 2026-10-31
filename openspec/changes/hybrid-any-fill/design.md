@@ -204,14 +204,19 @@ fill ranks 8–15. E is semantic 7, fill 25. Recomputed:
 | 8–10 | conjunctive C1 (k1) 0.016393, semantic-only (s2) 0.016129, conjunctive C2 (k2) 0.016129 | same |
 | 11–12 | fill-only (k3) 0.015873, fill-only (k4) 0.015625 | drop to 0.008850 / 0.008772, below every semantic-only note |
 
-So on the real query, option B **does not move E into the top 3**. The
-semantic arm itself ranks the job notes above E, and all five leading notes
+So on the real query, option B **does not move E into the top 3, and
+this change does not fix that query**. The query is semantic-led: the
+semantic arm itself ranks the job notes (3–5) above E (7), and all five leading notes
 carry fill terms of similar size. What B does change on this page: two
 fill-only notes (11–12) stop outranking semantic-only notes, and the
 fill's ±0.002 swing no longer reorders the semantic leaders (J1 and J2
-swap). The release bar as briefed ("the opinion note
-in the top 3") is therefore not reachable by this change on current data.
-See Open questions. Task 7.3 records E's rank in both arms of the report.
+swap). Owner decision (2026-10-31): B ships as a fusion-hygiene change. The
+release bar is no regression in recall@20/@50 (95% CI) on the real-data
+report, plus the fixture proof that a fill row can never outrank an
+all-terms row through the keyword arm alone (task 4.1). The "top 3"
+bar is dropped. The issue's query is addressed by the re-test after the
+`CHUNKING_VERSION` 2 drain and by #402's reranker path. Task 7.3 still
+records E's rank in both arms of the report, for information only.
 
 ## D8 — Alternatives
 
@@ -246,8 +251,8 @@ Against the incumbent, on the same corpus, filters and arguments:
 
 ## Risks / Trade-offs
 
-- [The issue's query is not fixed by B on live data] → stated in D7; owner
-  question below. The change is still correct on its own terms: it removes
+- [The issue's query is not fixed by B on live data] → stated in D7;
+  addressed by the post-drain re-test and #402's reranker path. The change is still correct on its own terms: it removes
   the fill's equal vote.
 - [Weaker keyword arm when `all = 0`] → every keyword term is then offset,
   and the fused order is mostly semantic, with the fill as a bonus.
@@ -277,13 +282,10 @@ Against the incumbent, on the same corpus, filters and arguments:
 No migration, no setting. Ships through the normal merge → CI → image →
 Flux path. Rollback is the previous image.
 
-## Open questions (Max)
+## Owner decisions (2026-10-31)
 
-1. **Release bar.** On the live page B leaves the opinion note 5th (D7).
-   Options: keep B and drop the "top 3" bar (gate on recall@20/@50 CI95
-   only, report E's rank); also reconsider the semantic arm on this query
-   (a reranker run with `rerank=true` is the existing remedy); or move to
-   option A for the `all > 0` case.
-2. Should `explain` use `1/(k+55)` (chosen, +1 character) or the
-   self-describing `1/(k+5+50)` (+3 characters, which loses the 40–45 cut at
-   the both-arms floor)?
+1. **Release bar.** Keep option B as fusion hygiene. The gate is no
+   regression in recall@20/@50 (95% CI) on the real-data report, plus the
+   fixture proof (task 4.1). The "top 3" bar for the issue's query is
+   dropped (D7).
+2. **`explain` form.** `1/(k+55)`: the fusion rank, +1 character (D4).
