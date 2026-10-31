@@ -1067,15 +1067,20 @@ read-only estimate per row the rewrite would change: `S(ts_filter(v, '{d}'))
 lexeme's bytes rounded up to even plus `2 + 2 × npos` when it has positions
 (`size_sql` in the migration). Measured on the gate: for a concatenation
 that crosses the limit, `S` equalled the size PostgreSQL reported (1,049,880
-both). Any estimate above 1,048,511 (the 1,048,575 limit less 64) aborts
-naming the count and the ids, before anything is written. The rewrite has no
+both); the design measured four under on another case. `S` is within four
+bytes of PostgreSQL's count — not a strict upper bound — and the 64-byte
+margin absorbs that. Any estimate above 1,048,511 (the 1,048,575 limit less 64) aborts
+naming the count and every id, before anything is written. The rewrite has no
 savepoints: any row error, 54000 included, fails the migration naming the
 row id and SQLSTATE (never the path, the bound parameters or text — the
 driver error is not chained), with nothing committed. The operator's
-read-only pre-merge statement in `DEPLOYMENT.md` additionally flags every
-candidate with no `A` lexeme (`d_only`), since such a row gains its whole
-head in 035; the gate runs that statement verbatim against a D-only row it
-would otherwise pass and asserts 035 aborts on the same id.
+read-only pre-merge statement in `DEPLOYMENT.md` sums `S(a) + S(d) + S(b)`
+over the stored parts separately (never `S` of the merged vector, where a
+lexeme shared by title and body is stored once), strips U+0002/U+0003 from
+the tags as `tags_text` does, and additionally flags every candidate with no
+`A` lexeme (`d_only`), since such a row gains its whole head in 035. The gate
+runs that statement verbatim and asserts that every id 035's preflight
+rejects (a D-only row, a shared-lexeme row, a sentinel-tag row) is flagged.
 
 **Downgrade** takes the generation lock and sets `ts_filter(content_tsvector,
 '{a,d}')` on every row carrying a `B` lexeme; a lexeme in both the tags and

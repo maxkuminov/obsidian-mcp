@@ -191,8 +191,10 @@ the shared builder (per-row or batched read-only statements; the head is at
 most a few KiB, so building it cannot itself hit the limit). `S(v)` is
 PostgreSQL's own accounting of the string area, summed over `unnest(v)`:
 the lexeme's bytes rounded up to even, plus `2 + 2 × npos` when it has
-positions. It is an upper bound for a concatenation (a lexeme in two parts
-is stored once). Measured on PG16: a stored vector with `S = 1,048,174`
+positions. Summed over the parts of a concatenation it is within four bytes
+of PostgreSQL's own count — it over-counts a lexeme the parts share (stored
+once), and is otherwise not a strict upper bound — and the 64-byte margin
+absorbs the difference. Measured on PG16: a stored vector with `S = 1,048,174`
 failed at the twelfth added 32-character tag word with PostgreSQL reporting
 1,048,610 against the formula's 1,048,606 — within four bytes — so the
 abort threshold is 1,048,575 − 64 = **1,048,511**. Any row over it aborts
@@ -202,9 +204,14 @@ rewrite's all-or-nothing rule stays as the backstop.
 
 The operator runs the SQL equivalent against the live 034 database before
 merging (`DEPLOYMENT.md`, read-only, counts and ids only). It approximates
-`tags_text` in SQL (full forms plus `/` replaced by spaces, no cut — an
-over-estimate) and takes the existing head from the vector itself, which
-the re-head replaces with an equal `A` part. That holds only for a row
+`tags_text` in SQL (U+0002/U+0003 stripped as `tags_text` strips them,
+full forms plus `/` replaced by spaces, no cut — an over-estimate) and takes
+the existing head from the vector itself, which the re-head replaces with an
+equal `A` part. It sums `S(ts_filter(v, '{a}')) + S(ts_filter(v, '{d}')) +
+S(b)` — the parts separately, as 035's preflight counts them, never `S(v)`
+of the merged vector, where a lexeme in both title and body is stored once
+(verifier V1: `A('Quarterly Review Budget') || D('quarterly review budget
+numbers')` has `S(v)` 48 against `S(a) + S(d)` 74). That holds only for a row
 that *has* an `A` part: a D-only row 031 left at the limit (#344 L10)
 gains its whole title-and-aliases head in 035, which the stored vector
 does not contain and the aliases rule cannot be computed in one portable
@@ -220,22 +227,29 @@ add one `to_tsvector` per config to `b`. Prototyped on PG16:
 ```sql
 WITH tagged AS (
   SELECT id, content_tsvector AS v,
-         setweight(to_tsvector('english',
-           array_to_string(tags, E'\n') || E'\n' ||
-           replace(array_to_string(tags, E'\n'), '/', ' ')), 'B') AS b
+         translate(array_to_string(tags, E'\n'), chr(2) || chr(3), '') AS t
   FROM notes_metadata
   WHERE content_tsvector IS NOT NULL AND cardinality(tags) > 0
     AND length(ts_filter(content_tsvector, '{b}')) = 0
+), parts AS (
+  SELECT id,
+         ts_filter(v, '{a}') AS a,
+         ts_filter(v, '{d}') AS d,
+         setweight(to_tsvector('english', t || E'\n' || replace(t, '/', ' ')), 'B') AS b
+  FROM tagged
 ), est AS (
   SELECT id,
     (SELECT coalesce(sum((octet_length(lexeme) + 1) / 2 * 2
        + CASE WHEN cardinality(positions) > 0 THEN 2 + 2 * cardinality(positions) ELSE 0 END), 0)
-     FROM unnest(v))
+     FROM unnest(a))
+  + (SELECT coalesce(sum((octet_length(lexeme) + 1) / 2 * 2
+       + CASE WHEN cardinality(positions) > 0 THEN 2 + 2 * cardinality(positions) ELSE 0 END), 0)
+     FROM unnest(d))
   + (SELECT coalesce(sum((octet_length(lexeme) + 1) / 2 * 2
        + CASE WHEN cardinality(positions) > 0 THEN 2 + 2 * cardinality(positions) ELSE 0 END), 0)
      FROM unnest(b)) AS bytes
-    , length(ts_filter(v, '{a}')) = 0 AS d_only
-  FROM tagged WHERE length(b) > 0
+    , length(a) = 0 AS d_only
+  FROM parts WHERE length(b) > 0
 )
 SELECT count(*) AS tagged_rows,
        count(*) FILTER (WHERE bytes > 1048511 OR d_only) AS flagged,
@@ -559,7 +573,9 @@ angle. Nothing here changes a requirement.
 Measurements (gate container, PostgreSQL 16, local):
 
 - **`S` against PostgreSQL**: a concatenation crossing the limit, `S` =
-  1,049,880, PostgreSQL reported 1,049,880 (exact for positional lexemes).
+  1,049,880, PostgreSQL reported 1,049,880 (exact here; four under on the
+  design's case). The gate asserts `|reported − S| ≤ 4`: within four bytes,
+  absorbed by the 64-byte margin, not an upper bound (V4).
 - **035 cost**: 4,265 synthetic rows, 1,800-word bodies, three tags each —
   candidates 0.3 s, preflight 9.7 s, rewrite 26.7 s; the alembic run 28–41 s
   end to end. The design's "seconds" was a set-based probe; per-row UPDATEs
@@ -576,3 +592,61 @@ Gates run by the implementer (2026-10-30): `openspec validate --all
 test-integration` 1,167 passed; `make audit` clean. Not run here: the
 verifier, the adversarial Codex rounds, the search-eval gate on a restored
 copy (operator, runfile workflow) and the live end-to-end pass.
+
+## Codex implementation review, round 1 (2026-10-31)
+
+Codex implementation review, round 1 (2026-10-31): PASS, 3 MINOR, all folded.
+
+1. **MINOR — the operator SQL did not strip U+0002/U+0003** before parsing
+   tags (`the\x02a` is stop words to it, `thea` to `tags_text`). → it
+   `translate`s both away exactly as `tags_text` does.
+2. **MINOR — the preflight refusal truncated its id list at 50.** →
+   `PREFLIGHT_REPORT_LIMIT` removed; every id is named (schema case with 51
+   rows).
+3. **MINOR — the opening keyword section of `search.md` and the
+   `RANK_WEIGHTS` comments in `.env.example` and `src/config.py` described the
+   three-part vector.** → updated to `A(title) || A(aliases) || B(tags) ||
+   D(body)` and the title/tags/body competition.
+
+## Verifier, round 1 (2026-10-31)
+
+0 code blockers; 1 operator-SQL MAJOR + text items, all folded.
+
+- **V1 (MAJOR) — the operator SQL summed `S(v) + S(b)` over the merged
+  vector**, where a lexeme in both title and body is stored once while 035's
+  preflight counts the head and the body separately (`A('Quarterly Review
+  Budget') || D('quarterly review budget numbers')`: `S(v)` 48 vs `S(a) +
+  S(d)` 74), so a headed near-limit row could pass it and abort 035. → the
+  statement sums `S(ts_filter(v,'{a}')) + S(ts_filter(v,'{d}')) + S(b)` (≥
+  the preflight, since the stored `A` part equals the head 035 rebuilds from
+  the same columns); one schema case asserts every id the preflight rejects
+  (D-only, shared-lexeme, sentinel-tag rows) is flagged.
+- **V2** — the nested-tag scenario now uses frontmatter `tags: [ctx/phone]`,
+  with the corollary that an inline-only full form also renders `body`.
+- **V3** — `alembic check` "after downgrade" became "after downgrade then
+  re-upgrade" in the scenario and task 2.4.
+- **V4** — one size-accuracy statement: `S` is within four bytes of
+  PostgreSQL's count for a concatenation (four under on the design's case,
+  exact on the gate's), not a strict upper bound; the 64-byte margin absorbs
+  it. The gate asserts `|reported − S| ≤ 4`. Spec, design, migration
+  docstring and schema note aligned.
+- **V5–V8** — the split keyword-only hybrid case has a computed head and
+  asserts `preview omitted`; the rerank worst case pins the cut form for its
+  real inputs and a direct-render test pins the omitted form at the
+  arithmetic worst case (1,003 > 1,000); the identity-oracle corpus has
+  distinct body term frequencies (≥ 3 distinct ranks compared); two 035
+  cases: a headed row with an empty body (A + B only, byte-exact) and a tag
+  word that is also a title word (`A` and `B` on one lexeme, skipped on
+  re-run).
+
+Verifier readings recorded (no code change): `head == ""` also for a body
+of punctuation only (its excerpt is non-empty but its headline is empty —
+no preview line, not counted missing, which is right: there are no words to
+show); a single tag longer than 2,048 characters yields an empty tags text
+(the line would cross the bound), so its row counts "without tag lexemes"
+in 035 and is filterable but not searchable by it (L4); `hybrid_search`
+treats `head == ""` as no keyword preview, falling back to the semantic
+chunk or `none` under the existing preview rule; `move_note`'s fallback
+re-derives the title from the stored frontmatter as well (implementation
+note 3); 035's timing wording is "tens of seconds" (measured 28–41 s for
+4,265 synthetic rows), not the design's original "seconds".

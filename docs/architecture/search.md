@@ -19,8 +19,9 @@
   plan change would otherwise change *which* tied rows survive the LIMIT.
   Index usage is the expected plan for rare terms on a production-sized
   corpus, not a guarantee; a tiny table or a very common term may legitimately
-  seq-scan. Since #344 the vector is `A(title) || A(aliases) || D(body)`,
-  ranking is `ts_rank_cd(RANK_WEIGHTS, …)`, an under-filled page is filled
+  seq-scan. Since #344 and #391 (migrations 031/035) the vector is
+  `A(title) || A(aliases) || B(tags) || D(body)` — a tag hit ranks below a
+  title hit and above a body hit — ranking is `ts_rank_cd(RANK_WEIGHTS, …)`, an under-filled page is filled
   from a disjunction derived from PostgreSQL's own parse, and each row
   carries a page-bounded snippet — see the section below.
 - Vector search via a pgvector HNSW **expression** index over

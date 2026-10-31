@@ -75,8 +75,9 @@ Accepted limitation: at the default array one tag cover equals twenty body cover
 
 #### Scenario: A nested tag is found by its full form and by each segment
 
-- **WHEN** a note carries the inline tag `#ctx/phone` and no other occurrence of `ctx` or `phone`
+- **WHEN** a note's frontmatter declares `tags: [ctx/phone]` and its title, aliases and body contain no occurrence of `ctx` or `phone`
 - **THEN** `keyword_search("phone")`, `keyword_search("ctx")` and `keyword_search("ctx/phone")` SHALL each return it with `matched_in: tags`
+- **AND** when the same tag is only inline (`#ctx/phone` in the body), `phone` and `ctx` SHALL return it with `matched_in: tags` alone, while `ctx/phone` SHALL return it with `matched_in: tags,body`, because the inline tag's text is body text that PostgreSQL parses as the one token `ctx/phone`
 
 #### Scenario: Body-only order is unchanged by the weight array
 
