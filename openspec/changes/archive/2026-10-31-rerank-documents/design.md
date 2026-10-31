@@ -22,6 +22,44 @@ These are the 12 stored chunks of *Virtue by Circumstance*, replayed against the
 
 Today the note is scored −8.87, below real prose from weaker notes, so it falls out of the top 6. Under this change it is scored on the maximum over its **allocated** documents. That reaches +0.33 **only if chunk 10 is allocated**: it must be among the call's fetched rows, and among the note's first 4 rows by distance or within the secondary budget. **Whether that holds for the live queries is not known.** The issue replayed all 12 chunks, not the call's fetched and allocated set, so the #402 case is a measurement task (task 7.4), not a claim of this design. Timing on the P4000, uncontended, 50 documents: about 410 characters each takes 1.6 s, and about 2,000 characters each takes 7.3 s, roughly 75 µs per character. The two live `timeout` pages were 50 long chunks at the 10 s deadline, while the GPU was shared with the indexer's embedding batch.
 
+#### Real-data replay and eval gate (tasks 7.1–7.4, 2026-10-31)
+
+Numbers only. These come from a read-only copy of the production database, snapshot 2026-10-31. The scope is one user (`USER_ID=1`, `attachable: true`, `provenance.users: 1`): 3,835 notes, all at chunking version 2, and 32,395 chunks with `chunk_lengths.under_min` 0. There are 199 scored queries (66 identifier, 133 prose: 197 mined plus the 2 named judgments of task 7.3) and 198 judged paths. Every report has verdict `OK` and `corpus_loss` 0. The replay used bge-reranker-v2-m3 with `RERANK_TIMEOUT_MS=20000` (#367 L11) and `RERANK_MAX_DOCUMENTS=100`. Each report runs the incumbent arm (`BASELINE`) against the candidate arm, gated with `--slices overall,class:identifier --min-ci-lower -0.01` on the D10 metrics.
+
+| tool | depth | verdict | worst cell (mean Δ, CI95 lower bound) |
+| --- | --- | --- | --- |
+| semantic | 10 | PASS | recall@10 overall (+0.033, +0.007) |
+| semantic | 20 | PASS | recall@20 overall (+0.018, −0.004) |
+| semantic | 50 | PASS | recall@50 (+0.000, +0.000); lowest non-zero cell: recall@20 overall (+0.047, +0.018) |
+| hybrid | 10 | PASS | ndcg@10 class:identifier (+0.070, +0.019) |
+| hybrid | 20 | **FAIL** (1 of 6) | recall@20 class:identifier (+0.051, **−0.0114**) |
+| hybrid | 50 | **FAIL** (1 of 8) | recall@20 class:identifier (+0.051, **−0.0114**) |
+
+Both FAILs are the same cell (n = 66). Every mean Δ is ≥ 0. The release decision belongs to the owner.
+
+**Allocation replay** (`scripts/rerank_allocation_report.py --score`, limits 10 and 20, both tools):
+
+- **Documents per call:** semantic 41 at limit 10 (24 candidates), 77–83 at limit 20 (42–46 candidates); hybrid 67–68 at both limits (50 candidates). No call exceeds the budget of 100.
+- **Victimhood note.** 12 chunks are fetched. The per-note cap of 4 is filled by the chunks at fetched ranks 1, 2, 3 and 6. The best-scoring chunk (+0.12, fetched rank 7) is **not allocated** at either limit on either tool. This is the L1 case. The note is still ranked #1, on the chunk at fetched rank 6, with a max of −1.49 (−1.46 at limit 20) against −4.47 for the cosine-best chunk.
+- **Free will, RRF #1 note.** Its winning chunk is allocated, with a max of +2.94.
+- **Free will, the card #402 describes.** It has a single chunk, allocated, which scores +3.85.
+
+**Named-judgment ranks** (for information only). "—" means the note is not in the top `depth`.
+
+| "Victimhood as a status game" | depth 10 | depth 20 | depth 50 |
+| --- | --- | --- | --- |
+| semantic incumbent → candidate | — → 1 | — → 1 | 33 → 1 |
+| hybrid incumbent → candidate | — → 1 | — → 1 | 36 → 1 |
+
+| "Free will and determinism" (judged: the unreranked RRF #1) | depth 10 | depth 20 | depth 50 |
+| --- | --- | --- | --- |
+| semantic incumbent → candidate | 6 → 3 | 8 → 3 | 8 → 3 |
+| hybrid incumbent → candidate | 6 → 3 | 6 → 3 | 6 → 3 |
+
+The harness records no per-call `rerank_ms`, so task 7.3's latency distribution was **not measured**. The only per-call measure is the document counts above.
+
+Context (**different query sets, not a gate cell**). An earlier real-data run at 16:43Z the same day measured unreranked `hybrid_search` overall recall@10 at 0.662 on 197 queries. The reranked hybrid candidate here scores 0.637 on 199 queries.
+
 ### Constraints
 
 - No second retrieval, no extra statement, no extra round trip (#367 D4, owner decision 2).
@@ -291,6 +329,7 @@ These are shifts from the design's wording. None of them changes the contract.
 - **`--depth` is the call limit.** The arms call with `limit = min(depth, 50)`, so the `rerank-l10` / `rerank-l20` runs are `--depth 10` / `--depth 20`, with no arm option. A test pins `limit=10` and the null recall@20/@50 at depth 10.
 - `rerank_text` stays on candidate rows. The hybrid incumbent arm reads the excerpt from it, and nothing renders it.
 - `scripts/rerank_allocation_report.py` (task 7.4) buffers every line until the whole run succeeds. On any failure it prints one fixed line with the exception class only (Codex impl round 1).
+- **The free-will judgment is ambiguous (task 7.3).** The spec judges the free-will query against "the RRF #1 note". On the 2026-10-31 snapshot, the unreranked RRF #1 is a different note from the card #402 describes (the one whose version-1 matched chunk was a two-wikilink section). The judgment follows the spec and uses the current RRF #1. The card is reported alongside: rank 1 under both candidate arms, a single allocated chunk at +3.85.
 
 ## Verifier — implementation (10fa0b6)
 
