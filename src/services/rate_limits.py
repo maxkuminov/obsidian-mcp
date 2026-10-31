@@ -748,12 +748,22 @@ def _slot_index(address: str | None, size: int) -> int:
     two addresses into one budget, which only makes the control stricter, and
     the per-process random salt means nobody can choose whom to collide with.
     """
+    return salted_slot_index(address, size, _address_salt)
+
+
+def salted_slot_index(address: str | None, size: int, salt: bytes) -> int:
+    """The salted fixed-slot mapping, for any table that wants it.
+
+    One definition, so the CIMD fetch budget (#357, `src/oauth/cimd.py`) uses
+    exactly this algorithm with its own table and its own salt: slot 0 for
+    a request with no address, and a keyed BLAKE2b digest modulo the rest.
+    """
     if not address:
         return 0
     if size <= 1:
         return 0
     digest = hashlib.blake2b(
-        address.encode("utf-8", "replace"), key=_address_salt, digest_size=8
+        address.encode("utf-8", "replace"), key=salt, digest_size=8
     ).digest()
     return 1 + int.from_bytes(digest, "big") % (size - 1)
 

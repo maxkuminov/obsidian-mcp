@@ -480,7 +480,7 @@ def test_panel_surface_carries_the_enforced_policy(case, client, monkeypatch):
     assert directives["style-src"] == [f"'nonce-{nonce}'", "https://fonts.googleapis.com"]
 
     if consent:
-        assert directives["form-action"] == ["'self'", "https:"]
+        assert directives["form-action"] == ["'self'", "https:", "http://localhost:*", "http://127.0.0.1:*"]
     else:
         assert directives["form-action"] == ["'self'"]
 
@@ -600,7 +600,7 @@ def test_multi_user_consent_after_login_keeps_the_https_form_action(client, monk
     assert consent.status_code == 200
     policy = consent.headers["content-security-policy"]
     assert policy == panel_csp.build_policy(_nonce_of(policy), consent=True)
-    assert policy.endswith("form-action 'self' https:")
+    assert policy.endswith("form-action 'self' https: http://localhost:* http://127.0.0.1:*")
 
 
 # ── the mode switch ─────────────────────────────────────────────────────────
@@ -759,7 +759,7 @@ def test_build_policy_interpolates_nothing_but_the_nonce():
     other = panel_csp.build_policy(nonce, consent=False)
     consent = panel_csp.build_policy(nonce, consent=True)
     assert other.endswith("form-action 'self'")
-    assert consent.endswith("form-action 'self' https:")
+    assert consent.endswith("form-action 'self' https: http://localhost:* http://127.0.0.1:*")
     assert other.replace(nonce, "N") == panel_csp.build_policy("B" * 22, consent=False).replace("B" * 22, "N")
 
 

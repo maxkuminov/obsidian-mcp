@@ -324,10 +324,16 @@ def test_the_periodic_cleanup_actually_calls_the_sweep(monkeypatch):
             pass
 
     monkeypatch.setattr(indexer, "async_session", lambda: _Session())
+    async def _cimd_spy():
+        called.append("cimd")
+        return 0
+
     monkeypatch.setattr(indexer, "_expire_unused_oauth_clients", _spy)
+    # The CIMD branch (#357) runs on the same tick.
+    monkeypatch.setattr(indexer, "_expire_unreferenced_cimd_clients", _cimd_spy)
     asyncio.run(indexer.cleanup_expired_tokens())
 
-    assert called == [True]
+    assert called == [True, "cimd"]
 
 
 # ── the setting ────────────────────────────────────────────────────────────

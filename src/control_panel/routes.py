@@ -52,6 +52,7 @@ from src.oauth.grants import (
     revoke_grant_family,
     set_grant_family_scope,
 )
+from src.oauth import cimd
 from src.oauth.scope import (
     clamp_scope,
     client_can_write,
@@ -1669,9 +1670,15 @@ async def oauth_page(
             grants.append(view)
         grants.sort(key=lambda g: g["last_seen_at"], reverse=True)
 
+        metadata_url = getattr(c, "client_id_metadata_url", None)
         clients.append({
             "client_id": c.client_id,
             "client_name": c.client_name,
+            # A Client ID Metadata Document client (#357): its URL and host
+            # identify it; `client_name` is the document's self-description.
+            "kind": "cimd" if metadata_url else "dcr",
+            "metadata_url": metadata_url,
+            "metadata_host": cimd.host_for_log(metadata_url) if metadata_url else None,
             "created_at": c.created_at.isoformat(),
             # The registered scope caps everything this client's grants may
             # hold, so the panel must not offer an option above it (issue #67).

@@ -1104,6 +1104,25 @@ class Settings(BaseSettings):
     # OAUTH_GRANT_ABSOLUTE_LIFETIME_DAYS.
     oauth_grant_absolute_lifetime_days: int = Field(90, ge=1, le=365)
 
+    # Client ID Metadata Documents (#357, MCP 2026-07-28). When true the AS
+    # metadata advertises `client_id_metadata_document_supported` and an
+    # `https://` client_id at /authorize is fetched as a metadata document
+    # through the transfer subsystem's hardened fetch. When false the flag is
+    # absent and such a client_id is an unknown client, so clients fall back
+    # to DCR; existing CIMD grants keep refreshing (the token endpoint never
+    # fetches). Env: OAUTH_CIMD_ENABLED.
+    oauth_cimd_enabled: bool = True
+    # Ceiling, in seconds, on how long a validated document is cached (its
+    # `Cache-Control: max-age`, 300 s when absent). 0 = never cache.
+    # Env: OAUTH_CIMD_CACHE_MAX_SECONDS.
+    oauth_cimd_cache_max_seconds: int = Field(86400, ge=0, le=86400)
+    # Document fetches each client address slot may start per 60 s window —
+    # the outbound hop an unauthenticated caller can drive. Same salted
+    # fixed-slot algorithm as the /mcp failed-auth budget; cache hits and
+    # joins of an in-progress fetch spend nothing.
+    # Env: OAUTH_CIMD_FETCHES_PER_ADDRESS_PER_MINUTE.
+    oauth_cimd_fetches_per_address_per_minute: int = Field(10, ge=1, le=120)
+
     # Registry-eval only: when true, lifespan skips the DB dim check,
     # indexer, and embedding provider, and the /mcp auth middleware
     # short-circuits. Lets Glama's sandbox build the image and validate
