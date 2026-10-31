@@ -398,7 +398,7 @@ def test_the_claim_is_conditional_on_the_row_still_being_unowned():
     """`WHERE user_id IS NULL` is what makes the database the arbiter."""
     import inspect
 
-    source = inspect.getsource(oauth.authorize_post)
+    source = inspect.getsource(oauth._authorize_post)  # the body since #357 wrapped the route
     assert "OAuthClient.user_id.is_(None)" in source
     assert ".returning(" in source
 

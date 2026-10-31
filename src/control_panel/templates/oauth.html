@@ -44,8 +44,16 @@
         <div class="card anim-1">
             <div class="card-header">
                 <div>
+                    {% if client.kind == "cimd" %}
+                    {# A Client ID Metadata Document client (#357): identified by the host and
+                       URL of its document; the name is what the document says about itself. #}
+                    <div class="u-font-size-15px u-font-weight-500 u-color-text">{{ client.metadata_host }}</div>
+                    <div class="mono u-font-size-10px u-color-text-3 u-margin-top-3px">Client ID Metadata Document · {{ client.metadata_url }}</div>
+                    <div class="u-font-size-11px u-color-text-3 u-margin-top-3px">Self-described as: {{ client.client_name }}</div>
+                    {% else %}
                     <div class="u-font-size-15px u-font-weight-500 u-color-text">{{ client.client_name }}</div>
                     <div class="mono u-font-size-10px u-color-text-3 u-margin-top-3px">{{ client.client_id }}</div>
+                    {% endif %}
                 </div>
                 <div class="u-display-flex u-align-items-center u-gap-14px">
                     {# The registered scope is the ceiling on every grant below. Showing it
