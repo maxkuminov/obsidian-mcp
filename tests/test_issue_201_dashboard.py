@@ -60,6 +60,9 @@ from starlette.templating import Jinja2Templates  # noqa: E402
 from src.control_panel import routes  # noqa: E402
 from src.control_panel.flash import FLASH_SESSION_KEY  # noqa: E402
 from src.models.db import NoteMetadata  # noqa: E402
+# The running chunking version; every fixture row is on it unless a test
+# says otherwise.
+from src.services.embeddings import CHUNKING_VERSION as _CV  # noqa: E402
 from src.services.index_state import (  # noqa: E402
     KEY_EMBEDDING_FINGERPRINT,
     embedding_fingerprint,
@@ -101,7 +104,7 @@ def _conn(rows=_ROWS):
         " chunks_truncated INTEGER NOT NULL DEFAULT 0,"
         # #355: every row here is on the current chunking version unless a
         # test says otherwise.
-        " embedded_chunking_version INTEGER DEFAULT 1)"
+        f" embedded_chunking_version INTEGER DEFAULT {_CV})"
     )
     conn.executemany(
         "INSERT INTO notes_metadata"
@@ -146,9 +149,9 @@ def test_a_chunking_transition_is_counted_as_pending():
     conn = _conn([(1, f"h{i}", f"h{i}", 0) for i in range(4)])
     assert _run(conn, _pending_stmt(uid=1)) == 0
     conn.execute("UPDATE notes_metadata SET embedded_chunking_version = NULL WHERE id = 1")
-    conn.execute("UPDATE notes_metadata SET embedded_chunking_version = 2 WHERE id = 2")
+    conn.execute(f"UPDATE notes_metadata SET embedded_chunking_version = {_CV + 1} WHERE id = 2")
     assert _run(conn, _pending_stmt(uid=1)) == 2
-    conn.execute("UPDATE notes_metadata SET embedded_chunking_version = 1 WHERE id = 1")
+    conn.execute(f"UPDATE notes_metadata SET embedded_chunking_version = {_CV} WHERE id = 1")
     assert _run(conn, _pending_stmt(uid=1)) == 1
 
 
@@ -159,7 +162,7 @@ def test_the_sql_text_and_the_expression_agree():
 
     conn = _conn()
     conn.execute("UPDATE notes_metadata SET embedded_chunking_version = NULL WHERE id = 1")
-    conn.execute("UPDATE notes_metadata SET embedded_chunking_version = 3 WHERE id = 4")
+    conn.execute(f"UPDATE notes_metadata SET embedded_chunking_version = {_CV + 1} WHERE id = 4")
     by_text = {
         r[0] for r in conn.execute(
             "SELECT id FROM notes_metadata nm WHERE "

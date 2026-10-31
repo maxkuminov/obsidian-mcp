@@ -130,10 +130,33 @@ async def test_the_lookup_keys_on_prefix_and_text_and_skips_null_prefixes():
     found = await embeddings._lookup_reusable_vectors(
         _LookupSession(CHUNKING_VERSION, rows), 5
     )
-    assert found == {("T > H", "chunk"): (1, [0.1])}
+    assert found == {("T > H", "chunk"): (1, [0.1], "chunk")}
 
 
-@pytest.mark.parametrize("version", [None, CHUNKING_VERSION + 1, CHUNKING_VERSION - 1])
+async def test_a_version_1_row_is_keyed_by_its_own_frozen_formatter():
+    """#390 (D6, D9): a v1 row's key is its text under the v1 formatter, so
+    it matches a v2 chunk only when no whitespace run longer than 8 is in it."""
+    run = "a" + " " * 12 + "b"
+    rows = [(1, "plain chunk", "T > H", [0.1]), (2, run, "T > H", [0.2])]
+    found = await embeddings._lookup_reusable_vectors(_LookupSession(1, rows), 5)
+    assert ("T > H", embeddings.embedded_text("plain chunk")) in found
+    assert ("T > H", embeddings.embedded_text(run)) not in found
+    assert found[("T > H", run)] == (2, [0.2], run)
+
+
+async def test_a_version_2_row_reuses_across_equal_embedded_inputs():
+    """Two raw texts that the v2 formatter maps to one input share a vector;
+    the stored text is carried for the under-lock re-check."""
+    stored = "a" + " " * 9 + "b"
+    found = await embeddings._lookup_reusable_vectors(
+        _LookupSession(2, [(1, stored, "T > H", [0.1])]), 5
+    )
+    assert found[("T > H", embeddings.embedded_text("a" + " " * 20 + "b"))] == (
+        1, [0.1], stored
+    )
+
+
+@pytest.mark.parametrize("version", [None, CHUNKING_VERSION + 1, 0, -1])
 async def test_another_chunking_version_never_reuses(version):
     rows = [(1, "chunk", "T > H", [0.1])]
     session = _LookupSession(version, rows)

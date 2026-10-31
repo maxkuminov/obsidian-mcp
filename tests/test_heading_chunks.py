@@ -32,6 +32,14 @@ from src.services.vault import (
 )
 
 WINDOW = 512 * 4
+#: The effective minimum at the default window (#390): sections below it are
+#: grouped, so the shapes below give each section at least this much text.
+MIN = embeddings.effective_min_chars(WINDOW)
+
+
+def long(tag: str) -> str:
+    """A section body of at least `MIN` collapsed characters, tagged."""
+    return (f"{tag} words " * (MIN // 8 + 2)).strip()
 
 
 def chunks(body, **kw):
@@ -102,49 +110,50 @@ def assert_parity(body: str):
 # ── basics ─────────────────────────────────────────────────────────────────
 
 
-def test_chunking_version_is_one():
-    assert CHUNKING_VERSION == 1
+def test_chunking_version_is_two():
+    assert CHUNKING_VERSION == 2
 
 
 def test_sections_and_paths():
-    body = "pre\n# A\n\nalpha\n## B\nbeta\n### C\n# D\ndelta"
+    pre, alpha, beta, delta = long("pre"), long("alpha"), long("beta"), long("delta")
+    body = f"{pre}\n# A\n\n{alpha}\n## B\n{beta}\n### C\n# D\n{delta}"
     specs, truncated = chunks(body)
     assert not truncated
     assert [(s.text, s.heading_path, s.section_ordinal) for s in specs] == [
-        ("pre\n", (), 0),
-        ("\nalpha\n", ("A",), 1),
-        ("beta\n", ("A", "B"), 2),
-        ("delta", ("D",), 4),
+        (f"{pre}\n", (), 0),
+        (f"\n{alpha}\n", ("A",), 1),
+        (f"{beta}\n", ("A", "B"), 2),
+        (delta, ("D",), 4),
     ]
     assert_parity(body)
 
 
 def test_heading_lines_are_not_chunk_text():
-    body = "# Title\nbody one\n## Sub\nbody two\n"
+    body = f"# Title\n{long('one')}\n## Sub\n{long('two')}\n"
     for spec in chunks(body)[0]:
         assert "#" not in spec.text
 
 
 def test_preamble_is_section_zero():
-    specs, _ = chunks("intro text\n\n## Real\nreal body\n")
-    assert specs[0] == ChunkSpec("intro text\n\n", (), 0)
+    specs, _ = chunks(f"{long('intro')}\n\n## Real\n{long('real')}\n")
+    assert specs[0] == ChunkSpec(f"{long('intro')}\n\n", (), 0)
     assert specs[1].section_ordinal == 1
 
 
 def test_parent_with_only_subsections():
-    specs, _ = chunks("## Parent\n### Child\nchild text\n")
+    specs, _ = chunks(f"## Parent\n### Child\n{long('child')}\n")
     assert [(s.heading_path, s.section_ordinal) for s in specs] == [
         (("Parent", "Child"), 2)
     ]
 
 
 def test_empty_sections_yield_nothing():
-    specs, _ = chunks("# A\n\n   \n# B\nb\n# C\n\t\n")
+    specs, _ = chunks(f"# A\n\n   \n# B\n{long('b')}\n# C\n\t\n")
     assert ordinals(specs) == [2]
 
 
 def test_duplicate_sibling_headings_have_distinct_ordinals():
-    body = "# P\n## Same\none\n## Same\ntwo\n"
+    body = f"# P\n## Same\n{long('one')}\n## Same\n{long('two')}\n"
     specs, _ = chunks(body)
     assert [(s.heading_path, s.section_ordinal) for s in specs] == [
         (("P", "Same"), 2),
@@ -161,8 +170,8 @@ def test_a_slash_in_a_heading_is_harmless():
 
 
 def test_a_long_heading_component_is_cut_and_marked():
-    long = "H" * 300
-    specs, _ = chunks(f"# {long}\ntext\n")
+    heading = "H" * 300
+    specs, _ = chunks(f"# {heading}\n{long('text')}\n")
     (component,) = specs[0].heading_path
     assert len(component) == 200 and component.endswith("…")
 
@@ -181,7 +190,7 @@ def test_a_long_heading_component_is_cut_and_marked():
     ids=["backtick", "tilde", "longer_closer", "indented"],
 )
 def test_a_heading_inside_a_fence_is_not_a_boundary(fence):
-    body = f"## Real\nbefore\n{fence}after\n"
+    body = f"## Real\n{long('before')}\n{fence}after\n"
     specs, _ = chunks(body)
     assert {s.section_ordinal for s in specs} == {1}
     assert all("Not a heading" not in s.text for s in specs)
@@ -208,10 +217,13 @@ def test_inline_code_holding_a_heading_is_text():
 
 @pytest.mark.parametrize("nl", ["\n", "\r\n", "\r"], ids=["lf", "crlf", "cr"])
 def test_terminators(nl):
-    body = nl.join(["pre", "# A", "alpha", "## B", "beta", "```", "# x", "```", "# C", "c"])
+    body = nl.join(
+        [long("pre"), "# A", long("alpha"), "## B", long("beta"), "```", "# x", "```",
+         "# C", long("c")]
+    )
     specs, _ = chunks(body)
     assert ordinals(specs) == [0, 1, 2, 3]
-    assert specs[1].text.strip() == "alpha"
+    assert specs[1].text.strip() == long("alpha")
     assert_parity(body)
 
 
@@ -250,9 +262,11 @@ NO_HEADING_CORPUS = [
 
 
 @pytest.mark.parametrize("body", NO_HEADING_CORPUS)
-def test_no_headings_is_byte_identical_to_the_pre_change_chunker(body):
+def test_no_headings_is_the_text_chunker_with_the_minimum(body):
+    """#390 replaced #355's "byte-identical to the pre-change chunker": a note
+    with no headings is one group, windowed with the effective minimum."""
     assert not _scan_headings(body)
-    legacy, legacy_cut = chunk_text_bounded(clean_for_embedding(body))
+    legacy, legacy_cut = chunk_text_bounded(clean_for_embedding(body), min_chars=MIN)
     specs, cut = chunks(body)
     assert [s.text for s in specs] == legacy
     assert cut == legacy_cut
@@ -293,25 +307,25 @@ def test_a_long_section_spans_three_windows():
 
 
 def test_the_cap_counts_across_sections():
-    body = "".join(f"# S{i}\ntext {i}\n" for i in range(1, 8))
+    body = "".join(f"# S{i}\n{long(f'text{i}')}\n" for i in range(1, 8))
     specs, truncated = chunks(body, max_chunks=5)
     assert ordinals(specs) == [1, 2, 3, 4, 5]
     assert truncated is True
 
 
 def test_exactly_at_the_cap_is_not_truncated():
-    body = "".join(f"# S{i}\ntext {i}\n" for i in range(1, 6))
+    body = "".join(f"# S{i}\n{long(f'text{i}')}\n" for i in range(1, 6))
     specs, truncated = chunks(body, max_chunks=5)
     assert len(specs) == 5 and truncated is False
 
 
 def test_the_cap_inside_a_section():
-    specs, truncated = chunks("# A\na\n# B\n" + "x" * (WINDOW * 4), max_chunks=3)
+    specs, truncated = chunks(f"# A\n{long('a')}\n# B\n" + "x" * (WINDOW * 4), max_chunks=3)
     assert ordinals(specs) == [1, 2, 2] and truncated is True
 
 
 def test_empty_sections_after_the_cap_do_not_mark_truncation():
-    body = "".join(f"# S{i}\ntext {i}\n" for i in range(1, 6)) + "# E\n\n# F\n"
+    body = "".join(f"# S{i}\n{long(f'text{i}')}\n" for i in range(1, 6)) + "# E\n\n# F\n"
     specs, truncated = chunks(body, max_chunks=5)
     assert len(specs) == 5 and truncated is False
 

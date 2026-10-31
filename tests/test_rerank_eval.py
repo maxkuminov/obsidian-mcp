@@ -55,8 +55,12 @@ def _stub_replay_db(monkeypatch, rows, membership):
     async def fake_membership(session):
         return membership
 
+    async def fake_chunk_lengths(_session, _owner, _m, _w):
+        return None  # #390: the stub copy has no chunk table to measure
+
     monkeypatch.setattr(db, "open_readonly", fake_open)
     monkeypatch.setattr(db, "fetch_membership", fake_membership)
+    monkeypatch.setattr(db, "chunk_lengths", fake_chunk_lengths)
     monkeypatch.setenv("SEARCH_EVAL_DATABASE_URL", "postgresql+asyncpg://u:p@127.0.0.1:1/x")
 
 

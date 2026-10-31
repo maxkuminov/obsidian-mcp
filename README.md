@@ -294,7 +294,10 @@ the wire, so none is cut off by a client's description limit.
   Notes are chunked at their headings, and each chunk is embedded under a
   `Title > Heading > Subheading` context prefix. A fresh row names the
   section it matched: `§ "Plan/Risks" (#7)` or `§ (top of note)`, and
-  `read_note(path, section="#7")` reads exactly that section. Stale rows,
+  `read_note(path, section="#7")` reads exactly that section. Previews start
+  on a word; a section too short to stand alone (under 200 characters) is
+  grouped with its neighbour, so a preview can include an inner heading line
+  and its `§` names the enclosing section. Stale rows,
   and rows not yet re-embedded since the upgrade to heading-aware chunks,
   carry no locator. While any of your notes is still on the old chunking,
   each response says so on an `index_transition:` line under its header
@@ -1421,9 +1424,11 @@ provider switch. That is every one of:
 
 Two things are deliberately **not** on that list. `EMBEDDING_QUERY_INSTRUCTION`
 touches only queries, so no stored vector depends on it. And the chunking
-format itself (heading-aware sections and the context prefix) is versioned
-per note: when it changes, the indexer re-embeds notes in the background over
-several passes, without a refused startup or a reset.
+format itself (heading-aware sections, the context prefix, and the
+200-character minimum chunk length, which is a constant tied to the chunking
+version rather than a setting) is versioned per note: when it changes, the
+indexer re-embeds notes in the background over several passes, without a
+refused startup or a reset.
 
 The server stores a fingerprint of that configuration and compares it at
 startup. On a mismatch it logs both fingerprints and the fields that

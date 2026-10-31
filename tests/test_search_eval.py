@@ -1067,3 +1067,7 @@ def test_a_semantic_runfile_from_an_older_harness_scores_with_nulls(tmp_path, ar
     assert "retrieval_fingerprint" not in lexical and "legacy_chunked_notes" not in lexical
     assert semantic["retrieval_fingerprint"] is None
     assert semantic["legacy_chunked_notes"] is None
+    # #390 (D8): and the chunk-length distribution, also null; fixture arms
+    # gain no key.
+    assert semantic["chunk_lengths"] is None
+    assert "chunk_lengths" not in lexical and "chunk_lengths" not in meta

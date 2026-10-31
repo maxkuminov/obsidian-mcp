@@ -42,6 +42,12 @@ pytestmark = [
 DIM = int(settings.embedding_dimensions)
 
 
+def long(tag: str) -> str:
+    """A section body of at least the effective minimum chunk length (#390),
+    so the section is a chunk of its own rather than grouped."""
+    return " ".join([f"{tag} words"] * 24)
+
+
 def sha(body: str) -> str:
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
@@ -212,7 +218,7 @@ async def not_current(sessionmaker):
 async def test_legacy_rows_serve_unstale_then_converge(sessionmaker, world):
     root = world["root"]
     await seed_legacy(sessionmaker, root, {
-        "A.md": "intro\n# Alpha\nalpha body\n",
+        "A.md": f"{long('intro')}\n# Alpha\n{long('alpha')}\n",
         "B.md": "no headings at all, just prose\n",
         "C.md": "# Gamma\n## Delta\ndelta body\n",
     })
@@ -249,7 +255,9 @@ async def test_legacy_rows_serve_unstale_then_converge(sessionmaker, world):
     assert by_path["C.md"][0].heading_path == ["Gamma", "Delta"]
     assert by_path["C.md"][0].section_ordinal == 2
     notes = await note_rows(sessionmaker)
-    assert {n.embedded_chunking_version for n in notes.values()} == {1}
+    assert {n.embedded_chunking_version for n in notes.values()} == {
+        embeddings_service.CHUNKING_VERSION
+    }
     assert all(n.embedded_input_digest for n in notes.values())
     assert await pending(sessionmaker) == 0
     assert await not_current(sessionmaker) == 0
@@ -313,25 +321,35 @@ async def test_a_rollback_to_a_lower_version_is_still_a_transition(
         {"A.md": "# A\nalpha\n", "B.md": "# B\nbravo\n", "C.md": "# C\ncharlie\n"},
         ages={"A.md": 300, "B.md": 20, "C.md": 10},
     )
-    await indexer.embed_vault(user_id=None)  # everything at version 1
+    cv = embeddings_service.CHUNKING_VERSION
+    await indexer.embed_vault(user_id=None)  # everything at the current version
     assert await pending(sessionmaker) == 0
 
-    # A version-2 build re-embeds B and C (the two newest), then stops.
-    monkeypatch.setattr(embeddings_service, "CHUNKING_VERSION", 2)
+    # A next-version build re-embeds B and C (the two newest), then stops. It
+    # is modelled as a prefix-builder change, so its formatter table is
+    # cleared to its own entry and it reuses nothing (#390, D6).
+    formatters = embeddings_service.EMBEDDED_TEXT_FORMATTERS
+    monkeypatch.setattr(embeddings_service, "CHUNKING_VERSION", cv + 1)
+    monkeypatch.setattr(
+        embeddings_service, "EMBEDDED_TEXT_FORMATTERS", {cv + 1: formatters[cv]}
+    )
     monkeypatch.setattr(settings, "embed_chunk_budget_per_user", 2, raising=False)
     await indexer.embed_vault(user_id=None)
     stamps = {p: n.embedded_chunking_version for p, n in (await note_rows(sessionmaker)).items()}
-    assert stamps == {"A.md": 1, "B.md": 2, "C.md": 2}
+    assert stamps == {"A.md": cv, "B.md": cv + 1, "C.md": cv + 1}
 
-    # Recreate rollback to version 1, no schema downgrade.
-    monkeypatch.setattr(embeddings_service, "CHUNKING_VERSION", 1)
+    # Recreate rollback to the current version, no schema downgrade: that
+    # build's table has no entry for the higher version.
+    monkeypatch.setattr(embeddings_service, "CHUNKING_VERSION", cv)
+    monkeypatch.setattr(embeddings_service, "EMBEDDED_TEXT_FORMATTERS", formatters)
     monkeypatch.setattr(settings, "embed_chunk_budget_per_user", 0, raising=False)
     assert await pending(sessionmaker) == 2
     out = await tools.semantic_search_impl("bravo", limit=5)
     assert out.splitlines()[1].startswith("index_transition: 2 notes not yet re-chunked")
     provider.documents.clear()
     await indexer.embed_vault(user_id=None)
-    # Re-selected and re-embedded under version 1 — no reuse of version-2 rows.
+    # Re-selected and re-embedded under the lower version — no reuse of the
+    # higher version's rows.
     assert sorted(d.split("\n")[0] for d in provider.documents) == ["B > B", "C > C"]
     assert await pending(sessionmaker) == 0
     assert "index_transition" not in await tools.semantic_search_impl("bravo", limit=5)
@@ -410,19 +428,23 @@ async def _settle(sessionmaker, root, rel, body, provider):
 
 async def test_reuse_append_inserted_heading_and_tag_change(sessionmaker, world):
     root, provider = world["root"], world["provider"]
-    sent = await _settle(sessionmaker, root, "R.md", "# One\nfirst\n# Two\nsecond\n", provider)
+    first, second, third, zeroth = long("first"), long("second"), long("third"), long("zeroth")
+    sent = await _settle(
+        sessionmaker, root, "R.md", f"# One\n{first}\n# Two\n{second}\n", provider
+    )
     assert len(sent) == 2
 
     sent = await _settle(
-        sessionmaker, root, "R.md", "# One\nfirst\n# Two\nsecond\n# Three\nthird\n", provider
+        sessionmaker, root, "R.md",
+        f"# One\n{first}\n# Two\n{second}\n# Three\n{third}\n", provider,
     )
-    assert sent == ["R > Three\n\nthird\n"], "an append sends only the new tail"
+    assert sent == [f"R > Three\n\n{third}\n"], "an append sends only the new tail"
 
     sent = await _settle(
         sessionmaker, root, "R.md",
-        "# Zero\nzeroth\n# One\nfirst\n# Two\nsecond\n# Three\nthird\n", provider,
+        f"# Zero\n{zeroth}\n# One\n{first}\n# Two\n{second}\n# Three\n{third}\n", provider,
     )
-    assert sent == ["R > Zero\n\nzeroth\n"], "an inserted heading reuses the rest"
+    assert sent == [f"R > Zero\n\n{zeroth}\n"], "an inserted heading reuses the rest"
     rows = [r for r in await embedding_rows(sessionmaker) if r.file_path == "R.md"]
     assert [(r.heading_path, r.section_ordinal) for r in rows] == [
         (["Zero"], 1), (["One"], 2), (["Two"], 3), (["Three"], 4)
@@ -430,7 +452,8 @@ async def test_reuse_append_inserted_heading_and_tag_change(sessionmaker, world)
 
     sent = await _settle(
         sessionmaker, root, "R.md",
-        "---\ntags: [fresh]\n---\n# Zero\nzeroth\n# One\nfirst\n# Two\nsecond\n# Three\nthird\n",
+        f"---\ntags: [fresh]\n---\n# Zero\n{zeroth}\n# One\n{first}\n# Two\n{second}\n"
+        f"# Three\n{third}\n",
         provider,
     )
     assert len(sent) == 4 and all("tags: fresh" in s for s in sent), (
@@ -500,10 +523,15 @@ async def test_the_full_hash_backstop_catches_a_corrupted_digest(sessionmaker, w
 # ══════════════════════════════════════════════════════════════════════════
 
 PARITY_NOTES = {
-    "p1.md": "---\ntitle: P\n---\nintro\n# A\na text\n## B\nb text\n```\n# fenced\n```\nafter\n## B\nsecond b\n",
-    "p2.md": "pre\r\n# X\r\nx body\r\n### Y\r\ny body\r\n",
-    "p3.md": "lone\r# R\rr body\r## S\rs body\r",
-    "p4.md": "# Only\n" + ("long line of words " * 400) + "\n# Next\nnext\n",
+    # Long sections stand alone; the short ones are grouped (#390), so these
+    # also exercise merged locators.
+    "p1.md": (
+        f"---\ntitle: P\n---\nintro\n# A\n{long('a')}\n## B\nb text\n```\n# fenced\n```\n"
+        f"after\n## B\n{long('second b')}\n"
+    ),
+    "p2.md": f"pre\r\n# X\r\n{long('x')}\r\n### Y\r\n{long('y')}\r\n",
+    "p3.md": f"lone\r# R\r{long('r')}\r## S\rs body\r",
+    "p4.md": "# Only\n" + ("long line of words " * 400) + f"\n# Next\n{long('next')}\n",
 }
 
 

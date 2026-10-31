@@ -241,12 +241,250 @@ def clean_at_version(version: int, body: str) -> str | None:
     return cleaner(body) if cleaner is not None else None
 
 
+# ── Chunk length and window boundaries (#390, design D1–D3, D7) ────────────
+#
+# **One length.** Every rule below — the minimum, a section's shortness, cut
+# admissibility, tail balancing, and the evaluation harness's `under_min` —
+# measures text with `clen`: every maximal run of the six ASCII whitespace
+# characters (U+0009–U+000D, U+0020) replaced by one space, then stripped of
+# spaces, counted in code points. `CLEN_SQL` is its SQL twin, used by
+# `scripts/search_eval/db.py` and the DEPLOYMENT.md recipe; a test checks the
+# two agree. The stored `chunk_text` stays the raw window; only lengths are
+# collapsed.
+
+#: The minimum chunk length, in collapsed characters (#390, design D2). A
+#: **module constant**: not a setting, not a fingerprint field, no validator.
+#: The effective minimum is `effective_min_chars(W)`, so every previously
+#: valid `CHUNK_SIZE` keeps working. **Changing it changes the chunking format
+#: and bumps `CHUNKING_VERSION`.**
+CHUNK_MIN_CHARS = 200
+#: How far back from a window's limit a cut may move to reach a line or word
+#: start (#390, design D1). **Changing it bumps `CHUNKING_VERSION`.**
+CHUNK_BOUNDARY_LOOKBACK_CHARS = 200
+
+_CLEN_WS_RUN_RE = re.compile(r"[\t\n\v\f\r ]+")
+_CLEN_WORD_RE = re.compile(r"[^\t\n\v\f\r ]+")
+#: A word start: a non-whitespace character at index 0 or after whitespace.
+_WORD_START_RE = re.compile(r"(?<![^\t\n\v\f\r ])[^\t\n\v\f\r ]")
+_CLEN_WS = frozenset("\t\n\v\f\r ")
+
+#: The SQL twin of `clen`, over a column or expression substituted for
+#: `{col}`. Kept beside `clen` on purpose: the two are one pair
+#: (`tests/test_chunk_min_length_pg.py` checks they agree).
+CLEN_SQL = "length(btrim(regexp_replace({col}, '[\\t\\n\\v\\f\\r ]+', ' ', 'g')))"
+
+
+def clen(text: str) -> int:
+    """The collapsed length of `text` (#390, design D1): ASCII whitespace runs
+    collapsed to one space, then stripped, in code points."""
+    return len(_CLEN_WS_RUN_RE.sub(" ", text).strip(" "))
+
+
+def effective_min_chars(window: int) -> int:
+    """`m = min(CHUNK_MIN_CHARS, W // 2)` for a window of `W` characters."""
+    return min(CHUNK_MIN_CHARS, window // 2)
+
+
+def lookback(window: int) -> int:
+    """`L = min(CHUNK_BOUNDARY_LOOKBACK_CHARS, W // 10)`."""
+    return min(CHUNK_BOUNDARY_LOOKBACK_CHARS, window // 10)
+
+
+def _first_reaching(t: str, a: int, end: int, target: int) -> int | None:
+    """The smallest `p` in `(a, end]` with `clen(t[a:p]) >= target`, or None.
+
+    Walks words, so it stops as soon as the target is met: a whitespace-heavy
+    tail is never collapsed whole just to learn it is long enough.
+    """
+    count = 0
+    for mo in _CLEN_WORD_RE.finditer(t, a, end):
+        ws, we = mo.span()
+        sep = 1 if count else 0
+        if count + sep + (we - ws) >= target:
+            # Including the word's first character also includes the space
+            # before it, so `clen` jumps by two there; at least one character.
+            return ws + max(target - count - sep, 1)
+        count += sep + (we - ws)
+    return None
+
+
+def _after_line_break(t: str, p: int) -> bool:
+    """Whether the whitespace run before word start `p` holds a line break."""
+    j = p - 1
+    while j >= 0 and t[j] in _CLEN_WS:
+        if t[j] in "\n\r":
+            return True
+        j -= 1
+    return False
+
+
+def _cut_at(t: str, a: int, n: int, w: int, lb: int, m: int) -> int:
+    """Where the window starting at `a` ends, when `a + w < n` (design D1).
+
+    The first **admissible** choice — `clen(t[a:c]) >= m` — of: the last line
+    start in `(a + w - lb, a + w]`; the last word start there; the hard cut
+    `a + w`. Only when even `t[a:a + w]` is below `m` (a window that is mostly
+    whitespace): the first admissible word start after the limit, or else the
+    first admissible position, or the end of the text.
+    """
+    limit = a + w
+    starts = [mo.start() for mo in _WORD_START_RE.finditer(t, limit - lb + 1, limit + 1)]
+    for p in reversed(starts):
+        if _after_line_break(t, p):
+            if clen(t[a:p]) >= m:
+                return p
+            break
+    if starts and clen(t[a:starts[-1]]) >= m:
+        return starts[-1]
+    if clen(t[a:limit]) >= m:
+        return limit
+    first = _first_reaching(t, a, n, m)
+    if first is None:
+        return n
+    mo = _WORD_START_RE.search(t, max(first, limit + 1), n)
+    # The word start is preferred, but never at the price of a window whose
+    # collapsed length exceeds one window (D7's bound): past a long
+    # unbroken run the first admissible position is taken instead.
+    if mo is not None and clen(t[a:mo.start()]) <= w:
+        return mo.start()
+    return first
+
+
+def _snap_forward(t: str, s: int, cut: int) -> int:
+    """The first word start in `[s, cut]`, or `s` when there is none. Never
+    beyond the cut, so coverage holds (Codex r1 B2)."""
+    mo = _WORD_START_RE.search(t, s, cut + 1)
+    return mo.start() if mo is not None else s
+
+
+def _balance(
+    t: str, a: int, n: int, w: int, m: int, overlap_chars: int
+) -> list[tuple[int, int]]:
+    """The last two windows, re-decided over `[a, n)` (design D3, tail
+    balancing; Codex implementation review r1).
+
+    A *valid* split leaves both **actual** slices with `clen >= m` (measured
+    after their own boundary whitespace is stripped, never inferred from the
+    span's total). Among valid splits the preference is: a word start within
+    `W` raw on both sides; any position within `W` raw on both sides (the
+    hard cut clamped into `[end − W, a + W]`); a word start; any position —
+    in each tier the one nearest the collapsed midpoint (`|clen(left) −
+    clen(right)|` least, the earlier on a tie). At `S <= 2m` the span is one
+    window unless that window would exceed `W` raw and an in-bound valid
+    split exists. With no valid split at all, the span is one window when
+    `S <= W` (always possible at the default window); only when `S > W` too
+    (`W <= 404`, single-character words around the midpoint, L10) does the
+    pure midpoint hard cut remain.
+    """
+    seg = t[a:n]
+    k = len(seg)
+    nonws = [ch not in _CLEN_WS for ch in seg]
+    # `starts[j]`: a word starts at j within `t` (j >= 1; j = 0 is the span's
+    # own start). Prefix sums make every slice's `clen` O(1).
+    starts = [False] + [nonws[j] and not nonws[j - 1] for j in range(1, k)]
+    pn = [0] * (k + 1)
+    ps = [0] * (k + 1)
+    for j in range(k):
+        pn[j + 1] = pn[j] + nonws[j]
+        ps[j + 1] = ps[j] + starts[j]
+
+    def cl(x: int, y: int) -> int:
+        count = pn[y] - pn[x]
+        if count == 0:
+            return 0
+        # A slice that opens mid-word opens a word of its own.
+        words = ps[y] - ps[x] + (1 if nonws[x] and not starts[x] else 0)
+        return count + words - 1
+
+    total = cl(0, k)
+    if total <= 2 * m and k <= w:
+        return [(a, n)]
+    tiers: list[tuple[int, int] | None] = [None, None, None, None]
+    for j in range(1, k):
+        left = cl(0, j)
+        if left < m:
+            continue
+        right = cl(j, k)
+        if right < m:
+            continue
+        d = abs(left - right)
+        inb = j <= w and k - j <= w
+        word = starts[j]
+        for tier, ok in ((0, inb and word), (1, inb), (2, word), (3, True)):
+            if ok and (tiers[tier] is None or d < tiers[tier][0]):
+                tiers[tier] = (d, j)
+    if total <= 2 * m:
+        allowed = tiers[:2]
+    else:
+        allowed = tiers
+    chosen = next((c for c in allowed if c is not None), None)
+    if chosen is None:
+        if total <= w:
+            return [(a, n)]
+        # L10: no valid split and no single window within `W` collapsed.
+        cut = _first_reaching(t, a, n, total // 2)
+    else:
+        cut = a + chosen[1]
+    right_start = cut
+    if overlap_chars > 0:
+        # Codex r3, normative: clamped so the right window stays within one
+        # window raw whenever the split itself did, and never past the cut.
+        s = min(cut, max(cut - overlap_chars, n - w, a + 1))
+        right_start = _snap_forward(t, s, cut)
+    return [(a, cut), (right_start, n)]
+
+
+def _window_spans(
+    t: str,
+    *,
+    window: int,
+    min_chars: int,
+    overlap_chars: int,
+    ceiling: int | None,
+) -> list[tuple[int, int]]:
+    """`(start, end)` of every window of `t`, in order, stopping once
+    `ceiling` windows exist (design D1, D3). A window is kept only when its
+    `clen` is non-zero."""
+    n = len(t)
+    if n <= window:
+        # One window, unstripped — the long-standing single-window shape, so
+        # an unchanged single-window section keeps its exact stored text.
+        return [(0, n)] if clen(t) else []
+    lb = lookback(window)
+    out: list[tuple[int, int]] = []
+    a = 0
+    while True:
+        if a + window >= n:
+            if clen(t[a:n]):
+                out.append((a, n))
+            break
+        cut = _cut_at(t, a, n, window, lb, min_chars)
+        if cut >= n:
+            if clen(t[a:n]):
+                out.append((a, n))
+            break
+        if min_chars > 0 and _first_reaching(t, cut, n, min_chars) is None:
+            out.extend(_balance(t, a, n, window, min_chars, overlap_chars))
+            break
+        if clen(t[a:cut]):
+            out.append((a, cut))
+        if ceiling is not None and len(out) >= ceiling:
+            break
+        if overlap_chars > 0:
+            # Termination: the next start is at least `a + 1`.
+            a = _snap_forward(t, max(cut - overlap_chars, a + 1), cut)
+        else:
+            a = cut
+    return out
+
+
 def chunk_text_bounded(
     content: str,
     *,
     chunk_size: int = 512,
     overlap: int = 0,
     max_chunks: int = MAX_CHUNKS_PER_NOTE,
+    min_chars: int = 0,
 ) -> tuple[list[str], bool]:
     """The first `max_chunks` chunks in DOCUMENT order, and whether it capped.
 
@@ -256,6 +494,17 @@ def chunk_text_bounded(
     them one sequential, 30 s-bounded provider call, under `index_pass_lock`,
     with no LIMIT on the backlog behind it. Re-editing one such note kept every
     later tenant's notes out of the index indefinitely (#202).
+
+    **Windows (#390, design D1).** A window of `W = chunk_size × 4` characters
+    is cut at the last line start, else the last word start, within
+    `lookback(W)` of its limit, and hard only when that range holds none. A cut
+    is taken only when it is *admissible* — the window before it reaches
+    `min_chars` in `clen` — and when the text after a cut falls below
+    `min_chars` the last two windows are re-balanced (design D3). The stored
+    text is the raw window, **unstripped**; a window is kept only when its
+    `clen` is non-zero. `min_chars=0` disables the minimum (a zero-chunk probe
+    needs only the windows' existence); `chunk_note_bounded` passes the
+    effective minimum.
 
     **Document order, and the head rather than an arbitrary window**, so a
     capped note keeps the part a reader would call the note. A capped note is a
@@ -271,43 +520,45 @@ def chunk_text_bounded(
     extra window, never the unbounded chunking the cap exists to prevent, which
     is also why nothing here can ever report the note's true chunk count.
 
-    `step = max(char_size - char_overlap, 1)` is #10's infinite-loop guard and
-    stays. It is a floor, not a sane configuration: `Settings` refuses
-    `CHUNK_OVERLAP >= CHUNK_SIZE` at startup, because at the floor ~3 KB of
-    prose becomes ~3,000 chunks and every ordinary note in the vault would be
-    silently truncated here (D3b).
+    With overlap, the next start is `max(cut - overlap × 4, a + 1)` snapped
+    forward to a word start no later than the cut: the `a + 1` floor is #10's
+    infinite-loop guard and stays. It is a floor, not a sane configuration:
+    `Settings` refuses `CHUNK_OVERLAP >= CHUNK_SIZE` at startup, because near
+    the floor ~3 KB of prose becomes thousands of chunks and every ordinary
+    note in the vault would be silently truncated here (D3b).
     """
-    char_size = chunk_size * 4
-    char_overlap = overlap * 4
-    # Guard against overlap >= chunk_size, which would make the window
-    # never advance (start <= previous start) and loop forever.
-    step = max(char_size - char_overlap, 1)
+    spans = _text_windows(
+        content,
+        chunk_size=chunk_size,
+        overlap=overlap,
+        max_chunks=max_chunks,
+        min_chars=min_chars,
+    )
+    chunks = [content[a:b] for a, b in spans[0]]
+    return chunks, spans[1]
 
-    if len(content) <= char_size:
-        # Deliberately unstripped, which is this branch's long-standing
-        # behaviour: the emptiness test is `strip()`, the stored chunk is the
-        # content. One chunk can never exceed a cap of at least one.
-        return ([content] if content.strip() else []), False
 
+def _text_windows(
+    content: str,
+    *,
+    chunk_size: int,
+    overlap: int,
+    max_chunks: int,
+    min_chars: int,
+) -> tuple[list[tuple[int, int]], bool]:
+    """`chunk_text_bounded`'s windows as spans, and whether the cap bit."""
     # One past the cap: if that chunk materialises, something was dropped.
     ceiling = max_chunks + 1 if max_chunks > 0 else None
-
-    chunks: list[str] = []
-    start = 0
-    while start < len(content):
-        end = start + char_size
-        chunk = content[start:end]
-        if chunk.strip():
-            chunks.append(chunk.strip())
-            if ceiling is not None and len(chunks) >= ceiling:
-                break
-        if end >= len(content):
-            break
-        start += step
-
-    if ceiling is not None and len(chunks) >= ceiling:
-        return chunks[:max_chunks], True
-    return chunks, False
+    spans = _window_spans(
+        content,
+        window=chunk_size * 4,
+        min_chars=min_chars,
+        overlap_chars=overlap * 4,
+        ceiling=ceiling,
+    )
+    if ceiling is not None and len(spans) >= ceiling:
+        return spans[:max_chunks], True
+    return spans, False
 
 
 def chunk_text(content: str, chunk_size: int = 512, overlap: int = 0) -> list[str]:
@@ -349,7 +600,11 @@ def chunk_text(content: str, chunk_size: int = 512, overlap: int = 0) -> list[st
 #: scan, to `build_embed_prefix` or to `embedding_input` bumps it** (the
 #: embedding-providers requirement), so a note's stored vectors are never
 #: reused, or certified current, under a format they were not built with.
-CHUNKING_VERSION = 1
+#: Version 2 (#390) adds the minimum chunk length (`CHUNK_MIN_CHARS`), the
+#: grouping and tail rules, word-boundary windows (`CHUNK_BOUNDARY_LOOKBACK_
+#: CHARS`), the deepest-containing-section locator, raw window text, and the
+#: embedded-text formatter that collapses whitespace runs longer than 8.
+CHUNKING_VERSION = 2
 
 # ── The one "not current" predicate (#355, design D4; tasks 5.1) ──────────
 #
@@ -463,9 +718,17 @@ def _note_sections(body: str) -> list[tuple[int, int, tuple[str, ...], int]]:
     `_path_chain_match`'s rule — each enclosing step to a strictly shallower
     heading — by a stack, which is that rule's single-pass form.
     """
-    from src.services.vault import _LINE_BREAK_RE, _scan_headings
+    from src.services.vault import _scan_headings
 
-    headings = _scan_headings(body)
+    return _sections_from_headings(body, _scan_headings(body))
+
+
+def _sections_from_headings(
+    body: str, headings: list[dict]
+) -> list[tuple[int, int, tuple[str, ...], int]]:
+    """`_note_sections` over an already-scanned heading list."""
+    from src.services.vault import _LINE_BREAK_RE
+
     if not headings:
         return [(0, len(body), (), 0)]
     sections: list[tuple[int, int, tuple[str, ...], int]] = [
@@ -505,6 +768,106 @@ def _clean_span(body: str, start: int, end: int, spans) -> str:
     return "".join(out)
 
 
+def _clean_span_mapped(
+    body: str, start: int, end: int, spans
+) -> tuple[str, list[tuple[int, int]]]:
+    """`_clean_span(body, start, end, spans)` and its cleaned-to-raw map: one
+    `(cleaned_offset, raw_offset)` per kept piece, in order (#390, D4)."""
+    out: list[str] = []
+    pieces: list[tuple[int, int]] = []
+    cleaned = 0
+    cursor = start
+    for a, b in spans:
+        if b <= start or a >= end:
+            continue
+        a, b = max(a, start), min(b, end)
+        if a > cursor:
+            pieces.append((cleaned, cursor))
+            out.append(body[cursor:a])
+            cleaned += a - cursor
+        cursor = max(cursor, b)
+    if cursor < end:
+        pieces.append((cleaned, cursor))
+        out.append(body[cursor:end])
+    return "".join(out), pieces
+
+
+def _raw_offset(pieces: list[tuple[int, int]], i: int) -> int:
+    """The raw-body offset of cleaned character `i`."""
+    import bisect
+
+    k = bisect.bisect_right(pieces, (i, float("inf"))) - 1
+    cleaned, raw = pieces[k]
+    return raw + (i - cleaned)
+
+
+#: `(clen, leading whitespace, trailing whitespace)` of a cleaned piece, or
+#: None for the empty string, so a group's `clen` grows by concatenation
+#: without re-collapsing the whole group on every extension.
+_Summary = tuple[int, bool, bool]
+
+
+def _summary(text: str) -> _Summary | None:
+    if not text:
+        return None
+    c = clen(text)
+    if c == 0:
+        return (0, True, True)
+    return (c, text[0] in _CLEN_WS, text[-1] in _CLEN_WS)
+
+
+def _join(x: _Summary | None, y: _Summary | None) -> _Summary | None:
+    if x is None:
+        return y
+    if y is None:
+        return x
+    if x[0] == 0:
+        return (y[0], True, y[2]) if y[0] else (0, True, True)
+    if y[0] == 0:
+        return (x[0], x[1], True)
+    return (x[0] + y[0] + (1 if (x[2] or y[1]) else 0), x[1], y[2])
+
+
+def _group_sections(
+    body: str, sections, spans, m: int
+) -> list[tuple[int, int]] | None:
+    """Design D3's grouping: `[(first_section, last_section)]` over the
+    non-empty sections, or None for "chunk the whole cleaned body as one
+    group at ordinal 0".
+
+    A group opens at a non-empty section and extends forward while its text —
+    the contiguous cleaned span, inner heading lines included — is short
+    (`clen < m`). A group still short at the end of the body joins the last
+    closed group; with none, it stands alone only when the whole cleaned body
+    is short too (Codex r1 M1), else the whole body is one group.
+    """
+    own = [_summary(_clean_span(body, s, e, spans)) for s, e, _p, _o in sections]
+    nonempty = [k for k, sm in enumerate(own) if sm is not None and sm[0] > 0]
+    groups: list[list[int]] = []
+    idx = 0
+    while idx < len(nonempty):
+        first = last = nonempty[idx]
+        summ = own[first]
+        while summ[0] < m and idx + 1 < len(nonempty):
+            idx += 1
+            nxt = nonempty[idx]
+            summ = _join(
+                summ,
+                _summary(_clean_span(body, sections[last][1], sections[nxt][1], spans)),
+            )
+            last = nxt
+        idx += 1
+        if summ[0] >= m:
+            groups.append([first, last])
+        elif groups:
+            groups[-1][1] = last
+        elif clen(_remove_spans(body, spans)) < m:
+            groups.append([first, last])
+        else:
+            return None
+    return [(f, l) for f, l in groups]
+
+
 def chunk_note_bounded(
     body: str,
     *,
@@ -512,54 +875,107 @@ def chunk_note_bounded(
     overlap: int = 0,
     max_chunks: int = MAX_CHUNKS_PER_NOTE,
 ) -> tuple[list[ChunkSpec], bool]:
-    """A note body's chunks, split at its ATX headings (design D1).
+    """A note body's chunks: sections at its ATX headings (#355, design D1),
+    grouped to the minimum length and windowed (#390, design D1–D4).
 
     `body` is the frontmatter-stripped body — the text `read_note` scans.
-    Heading lines are not part of any chunk. A section whose cleaned text is
-    whitespace-only yields nothing; a long section yields several chunks that
-    share its path and ordinal. A note with no headings chunks byte-identically
-    to `chunk_text_bounded(clean_for_embedding(body))`, all at ordinal 0. The
-    cap is one counter across sections in document order and stops one chunk
-    past it, so the second element keeps `chunk_text_bounded`'s meaning.
+    Sections come from `_note_sections`, unchanged. A section is *short* when
+    its cleaned `clen` is non-zero and below `m = effective_min_chars(W)`; a
+    short section is grouped with the following non-empty section(s), a short
+    group at the end joins the previous group, and a sole short group stands
+    alone only in a note whose whole cleaned body is short — otherwise the
+    whole cleaned body is one group at ordinal 0 (`_group_sections`). A
+    group's text is its contiguous raw span cleaned with the whole-body fence
+    spans, so a merged group includes the heading lines it absorbed and is
+    still one substring of the note; a one-section group is exactly that
+    section's cleaned text. Each group is windowed by `_window_spans` with the
+    minimum.
 
-    **The zero-chunk invariant.** If every section yields nothing while the
-    whole-body chunker yields something (a note of headings only), the note
-    falls back to that whole-body chunking as section 0, so a note has zero
-    chunks exactly when the pre-change chunker gives it zero.
+    **The locator (design D4)** of each chunk is the deepest heading `N` whose
+    `read_note(section="#N")` body span (`_section_body_span`, imported)
+    contains the chunk's raw span, else 0; its path is `N`'s. An unmerged chunk
+    therefore keeps its own section, a short lead merged into its first child
+    keeps the parent, and siblings merged together take their common parent or
+    0. The whole-body groups (the fallbacks) record 0.
+
+    **The zero-chunk invariant.** If no section is non-empty while the cleaned
+    body has text (a note of headings only), the whole cleaned body is one
+    group at ordinal 0, so a note has zero chunks exactly when
+    `chunk_text_bounded(clean_for_embedding(body))` gives it zero. A note with
+    no headings chunks exactly like `chunk_text_bounded(clean_for_embedding(
+    body), min_chars=m)`. The cap is one counter across groups in document
+    order and stops one chunk past it, so the second element keeps
+    `chunk_text_bounded`'s meaning.
 
     Pure and CPU-bound: call sites run it under `asyncio.to_thread`.
     """
+    specs, _raw_spans, truncated = _chunk_note(
+        body, chunk_size=chunk_size, overlap=overlap, max_chunks=max_chunks
+    )
+    return specs, truncated
+
+
+def _chunk_note(
+    body: str, *, chunk_size: int, overlap: int, max_chunks: int
+) -> tuple[list[ChunkSpec], list[tuple[int, int]], bool]:
+    """`chunk_note_bounded`, plus each chunk's raw-body span (the span its
+    locator is decided on; the coverage property test reads it)."""
+    import bisect
+
+    from src.services.vault import _scan_headings, _section_body_span
+
+    window = chunk_size * 4
+    m = effective_min_chars(window)
     spans = scan_fences(body, context=BODY).spans
+    headings = _scan_headings(body)
+    sections = _sections_from_headings(body, headings)
+    grouped = _group_sections(body, sections, spans, m)
+    if grouped is not None and not grouped:
+        # Nothing non-empty in any section: headings only (or nothing).
+        grouped = None if clen(_remove_spans(body, spans)) else []
+    if grouped is None:
+        groups = [(0, len(body), True)]
+    else:
+        groups = [(sections[f][0], sections[l][1], False) for f, l in grouped]
+
+    bodies = [_section_body_span(body, headings, k) for k in range(len(headings))]
+    body_starts = [s for s, _e in bodies]
+
+    def locate(raw_start: int, raw_end: int) -> int:
+        k = bisect.bisect_right(body_starts, raw_start) - 1
+        while k >= 0:
+            if bodies[k][1] >= raw_end:
+                return k + 1
+            k -= 1
+        return 0
+
     capped = max_chunks > 0
     out: list[ChunkSpec] = []
+    raw_spans: list[tuple[int, int]] = []
     truncated = False
-    for start, end, path, ordinal in _note_sections(body):
-        cleaned = _clean_span(body, start, end, spans)
-        if not cleaned.strip():
-            continue
+    for g_start, g_end, whole in groups:
         if capped and len(out) >= max_chunks:
             # One chunk past the cap materialises here: something is dropped.
             truncated = True
             break
-        chunks, cut = chunk_text_bounded(
-            cleaned,
+        text, pieces = _clean_span_mapped(body, g_start, g_end, spans)
+        windows, cut = _text_windows(
+            text,
             chunk_size=chunk_size,
             overlap=overlap,
             max_chunks=(max_chunks - len(out)) if capped else 0,
+            min_chars=m,
         )
-        out.extend(ChunkSpec(c, path, ordinal) for c in chunks)
+        for a, b in windows:
+            raw = (_raw_offset(pieces, a), _raw_offset(pieces, b - 1) + 1)
+            ordinal = 0 if whole else locate(*raw)
+            path = sections[ordinal][2] if ordinal else ()
+            out.append(ChunkSpec(text[a:b], path, ordinal))
+            raw_spans.append(raw)
         if cut:
             truncated = True
             break
-    if out:
-        return out, truncated
-    whole, cut = chunk_text_bounded(
-        _remove_spans(body, spans),
-        chunk_size=chunk_size,
-        overlap=overlap,
-        max_chunks=max_chunks,
-    )
-    return [ChunkSpec(c, (), 0) for c in whole], cut
+    return out, raw_spans, truncated
 
 
 def _prefix_component(text: str) -> str:
@@ -592,10 +1008,50 @@ def build_embed_prefix(
     return breadcrumb
 
 
+#: A run of MORE than 8 of the six ASCII whitespace characters (#390, D9).
+_LONG_WS_RUN_RE = re.compile(r"[\t\n\v\f\r ]{9,}")
+
+
+def _embedded_text_v1(chunk: str) -> str:
+    """Version 1 (#355): the chunk as stored. Frozen."""
+    return chunk
+
+
+def _embedded_text_v2(chunk: str) -> str:
+    """Version 2 (#390, D9): every run of more than 8 whitespace characters
+    (U+0009–U+000D, U+0020) becomes one space; shorter runs, NBSP and every
+    other character are kept. Frozen."""
+    return _LONG_WS_RUN_RE.sub(" ", chunk)
+
+
+#: The embedded-text formatter of every chunking version whose vectors this
+#: build may reuse (#390, design D6/D9), in the pattern of
+#: `_EXTRACTION_CLEANERS`. **A frozen entry is never edited.** A version that
+#: changes the embedded-text formatter ADDS an entry; a version that changes
+#: `build_embed_prefix` or the `"\n\n"` separator CLEARS the table to its own
+#: entry, because a stored vector's input could no longer be reconstructed.
+#: `tests/test_chunk_min_length.py` pins every entry with golden outputs.
+#: Reuse compares `fmt[stamped version](stored text)` with
+#: `fmt[CHUNKING_VERSION](new text)`, so a stored vector is reused exactly when
+#: the input it was built from equals the input that would now be sent.
+EMBEDDED_TEXT_FORMATTERS: dict[int, Callable[[str], str]] = {
+    1: _embedded_text_v1,
+    2: _embedded_text_v2,
+}
+
+
+def embedded_text(chunk: str) -> str:
+    """The current version's embedded text of a stored chunk (D9). The stored
+    `chunk_text` itself is never collapsed."""
+    return EMBEDDED_TEXT_FORMATTERS[CHUNKING_VERSION](chunk)
+
+
 def embedding_input(prefix: str, chunk: str) -> str:
-    """The one formatter of a provider document input. Changing it bumps
-    `CHUNKING_VERSION`."""
-    return f"{prefix}\n\n{chunk}"
+    """The one formatter of a provider document input:
+    `prefix + "\n\n" + embedded_text(chunk)`. Changing the separator or the
+    prefix rule bumps `CHUNKING_VERSION` and clears
+    `EMBEDDED_TEXT_FORMATTERS`."""
+    return f"{prefix}\n\n{embedded_text(chunk)}"
 
 
 def input_digest(inputs: list[str]) -> str:
@@ -1617,17 +2073,19 @@ async def embed_note(
 
     # ── Chunk-vector reuse: the lookup (#281, D16; #355 D3) ──────────────
     # A stored vector is reused for a chunk whose **embedded input** is
-    # byte-identical to a stored row's — `(embed_prefix, chunk_text)` equal —
-    # and only while the stored embedding fingerprint is present and equal to
-    # this process's and the note's stored chunking version is
-    # `CHUNKING_VERSION`. A pre-034 row (NULL prefix) is never reused. The
+    # byte-identical to the stored row's — equal prefixes, and the stored
+    # text under its stamped version's frozen formatter equal to the new text
+    # under the current one (#390, D6) — and only while the stored embedding
+    # fingerprint is present and equal to this process's and the note's
+    # stamp is a key of `EMBEDDED_TEXT_FORMATTERS`. A pre-034 row (NULL
+    # prefix) and a NULL stamp are never reused. The
     # locator is not in the key: a reused vector is re-inserted with the new
     # chunk's heading path and ordinal. The lookup's
     # transaction is **ended before any provider I/O on every path** — see
     # `_lookup_reusable_vectors`. Only the certified path reuses: ending the
     # transaction is only safe for a caller that has already ended its own,
     # which both production callers do before they call this function.
-    reusable: dict[tuple[str, str], tuple[int, object]] = {}
+    reusable: dict[tuple[str, str], tuple[int, object, str]] = {}
     if certified_hash is not None:
         reusable = await _lookup_reusable_vectors(session, note.id)
 
@@ -1637,13 +2095,18 @@ async def embed_note(
     reused_rows: dict[int, tuple[str, str]] = {}
     to_send: list[int] = []
     for i, (spec, prefix) in enumerate(zip(specs, prefixes)):
-        hit = reusable.get((prefix, spec.text))
+        # Keyed by the embedded input as it would now be sent (#390, D6): the
+        # prefix and the current formatter's embedded text.
+        hit = reusable.get((prefix, embedded_text(spec.text)))
         if hit is None:
             to_send.append(i)
             continue
-        row_id, stored_vector = hit
+        row_id, stored_vector, stored_text = hit
         vectors[i] = stored_vector
-        reused_rows[row_id] = (spec.text, prefix)
+        # The STORED row's own text, which is what the under-lock re-check
+        # compares; it can differ from the new chunk's when the formatter
+        # maps both to one input.
+        reused_rows[row_id] = (stored_text, prefix)
     reusable.clear()
     sent = [inputs[i] for i in to_send]
 
@@ -1792,15 +2255,18 @@ async def embed_note(
 
 async def _lookup_reusable_vectors(
     session: AsyncSession, note_id: int
-) -> dict[tuple[str, str], tuple[int, object]]:
+) -> dict[tuple[str, str], tuple[int, object, str]]:
     """This note's stored vectors that may be reused, keyed by the exact
-    embedded input `(embed_prefix, chunk_text)`.
+    embedded input `(embed_prefix, fmt[stamp](chunk_text))`, each with its row
+    id, vector and stored `chunk_text`.
 
     Empty — reuse disabled — unless the stored embedding fingerprint is
     **present** and equal to `embedding_fingerprint()` **and** the note's
-    `embedded_chunking_version` is `CHUNKING_VERSION` (#355, D3: all of a
-    note's rows are written under one version, so this also covers a change
-    to the input formatter that leaves prefix and chunk byte-equal). An absent
+    `embedded_chunking_version` is a key of `EMBEDDED_TEXT_FORMATTERS` (#390,
+    D6; a NULL stamp never is). All of a note's rows are written under one
+    version, so the stamped version's frozen formatter reconstructs the
+    embedded text each stored vector was built from; the table's rule (a
+    prefix or separator change clears it) covers the rest of the input. An absent
     fingerprint claims nothing about the stored rows, an absent state table
     the same, and a differing or unreadable one says they were built under
     something else. A row with a NULL prefix (pre-034) is never a candidate.
@@ -1814,7 +2280,7 @@ async def _lookup_reusable_vectors(
     pass has.
     """
     try:
-        found: dict[tuple[str, str], tuple[int, object]] = {}
+        found: dict[tuple[str, str], tuple[int, object, str]] = {}
         if await state_table_exists(session):
             verdict = compare_fingerprint(
                 await get_state(session, KEY_EMBEDDING_FINGERPRINT),
@@ -1829,7 +2295,8 @@ async def _lookup_reusable_vectors(
                         )
                     )
                 ).scalar_one_or_none()
-            if verdict.status is FingerprintStatus.MATCH and version == CHUNKING_VERSION:
+            stamped = EMBEDDED_TEXT_FORMATTERS.get(version) if version is not None else None
+            if verdict.status is FingerprintStatus.MATCH and stamped is not None:
                 rows = (
                     await session.execute(
                         select(
@@ -1850,7 +2317,7 @@ async def _lookup_reusable_vectors(
                         continue
                     # First occurrence wins; a duplicate input has one vector
                     # per (model, input), so either would do.
-                    found.setdefault((prefix, chunk), (row_id, vector))
+                    found.setdefault((prefix, stamped(chunk)), (row_id, vector, chunk))
     except BaseException:
         try:
             await session.rollback()
