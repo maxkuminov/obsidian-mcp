@@ -52,14 +52,15 @@
 ## 8. `iss` and `resource`
 
 - [ ] 8.1 `_append_query(..., iss=<metadata issuer>)` on both `POST /authorize` redirects, for every client kind.
-- [ ] 8.2 `resource` validation (D11) at `GET`/`POST /authorize`, on both `/token` grants, against every value present. Refusal is `invalid_target` (JSON 400). The consent form carries `resource` as a hidden field.
+- [ ] 8.2 `resource` check (D11), log-only, at `GET`/`POST /authorize` and on both `/token` grants, against every value present. An unexpected value emits one `oauth_resource_unexpected` (host only) and the request proceeds. No code path refuses on `resource`.
 
 ## 9. Security events
 
-- [ ] 9.1 `src/logging_setup.py`: `registration_kind` (str 8) and `cimd_host` (str 253) in `ALLOWED_FIELDS`.
-- [ ] 9.2 `src/services/security_events.py`: `EVENT_FIELDS["oauth_client_registration_path"]`; add `cimd_host` to `oauth_authorize_refused`. Emit after the commit from `/register` and the CIMD approve.
+- [ ] 9.1 `src/logging_setup.py`: `registration_kind` (str 8), `cimd_host` (str 253) and `resource_host` (str 253) in `ALLOWED_FIELDS`.
+- [ ] 9.2 `src/services/security_events.py`: `EVENT_FIELDS["oauth_client_registration_path"]` and `EVENT_FIELDS["oauth_resource_unexpected"]`; add `cimd_host` to `oauth_authorize_refused`. Emit after the commit from `/register` and the CIMD approve.
 - [ ] 9.3 Every CIMD refusal answers the constant `{"error":"invalid_client"}` 400 and emits one `oauth_authorize_refused` with `client_metadata.<sub>` (design D12). No address, error text or document bytes in any record.
-- [ ] 9.4 Before merge: read the live Traefik/app access logs for `/authorize` and `/token` requests carrying `resource`, and list the values seen. If any falls outside the D11 accepted set, stop and ask Max (Open Question 2).
+- [ ] 9.4 After deploy: watch `oauth_resource_unexpected` and the access logs for `/authorize` and `/token` requests carrying `resource`, and record the values seen (hosts only). This is the evidence for 9.5.
+- [ ] 9.5 File the follow-up issue "OAuth: refuse foreign RFC 8707 `resource` with `invalid_target`". Its gate is 14 consecutive days of live logs showing only the four accepted spellings, and it links L9 and this change.
 
 ## 10. Tests
 
@@ -73,7 +74,7 @@
 - [ ] 10.8 Token/revoke matching with the URL as `client_id`; a different URL is a mismatch that revokes nothing. Grant family, #325 replay and #326 lifetime behave the same for a CIMD client (integration).
 - [ ] 10.9 Sweep: a CIMD row with a token of any state is kept; an unreferenced old row is deleted; the `null` age disables it; the race with a concurrent approve leaves a consistent row (integration).
 - [ ] 10.10 Consent rendering: host shown, hostile `client_name` absent, loopback warning, CIMD notice, CSP header exact, no inline style or handler (existing CSP template scanners pass).
-- [ ] 10.11 `iss` on approve and deny; `resource` accept set and `invalid_target`.
+- [ ] 10.11 `iss` on approve and deny; `resource`: the accepted set emits nothing; a foreign value (with a query) emits one host-only record and the request still succeeds at `/authorize` and `/token`.
 - [ ] 10.12 Event catalogue parity test and the allow-list AST sweep cover the new event and fields. The canary test confirms no secret in any new record.
 - [ ] 10.13 `pytest tests` plus `make test-integration` green, with the integration suite actually executed.
 
@@ -82,9 +83,9 @@
 - [ ] 11.1 `docs/architecture/oauth-and-grants.md`: new section "Client ID Metadata Documents (#357)" covering D1–D11, the threat model and L1–L8. Cross-reference the #194 section for the CIMD sweep branch and #183 for consent.
 - [ ] 11.2 `docs/architecture/file-transfer.md`: note that the guarded fetch has a second caller (CIMD, `max_redirects=0`) and that its SSRF policy changes now affect OAuth.
 - [ ] 11.3 `docs/architecture/control-panel.md`: consent `form-action` loopback sources and the CIMD identity block.
-- [ ] 11.4 `docs/architecture/security-event-logging.md`: catalogue row for `oauth_client_registration_path`, the `client_metadata.*` reasons on `oauth_authorize_refused`, the `invalid_target` reasons, and the `cimd_host` provenance class.
+- [ ] 11.4 `docs/architecture/security-event-logging.md`: catalogue row for `oauth_client_registration_path`, the `oauth_resource_unexpected` row, the `client_metadata.*` reasons on `oauth_authorize_refused`, and the `cimd_host`/`resource_host` provenance class.
 - [ ] 11.5 `docs/architecture/schema-and-migrations.md`: migration 036.
-- [ ] 11.6 README: the three settings in the settings table; connector docs (Claude, Claude Code and ChatGPT use CIMD; DCR remains); an upgrade note for `resource` enforcement and `iss`.
+- [ ] 11.6 README: the three settings in the settings table; connector docs (Claude, Claude Code and ChatGPT use CIMD; DCR remains); an upgrade note for `iss` and the log-only `resource` check.
 - [ ] 11.7 `.env.example`: the three settings, commented, with no host paths.
 - [ ] 11.8 CLAUDE.md: a key-decisions bullet (CIMD rows per (URL, user), no fetch at `/token`, constant `invalid_client`, sweep rule, consent shows the host) and migration 036 in the model list if referenced.
 - [ ] 11.9 Grep check: every new setting appears in README and `.env.example`; no host path or hostname in tracked files.

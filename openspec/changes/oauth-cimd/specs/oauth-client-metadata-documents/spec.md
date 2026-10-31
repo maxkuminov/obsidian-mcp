@@ -198,16 +198,18 @@ Every redirect issued by `POST /authorize`, approval and denial alike, SHALL car
 - **WHEN** a user denies
 - **THEN** the redirect SHALL carry `error=access_denied` and `iss`
 
-### Requirement: An RFC 8707 resource parameter SHALL be accepted only when it names this server
-At `GET` and `POST /authorize` and on both `/token` grant types, every `resource` value present SHALL equal this server's protected-resource URL or its base URL, each with or without one trailing slash; otherwise the request SHALL be refused with `invalid_target` and nothing minted. An absent `resource` SHALL be accepted.
+### Requirement: An RFC 8707 resource parameter SHALL be checked and an unexpected value SHALL be recorded without refusing the request
+At `GET` and `POST /authorize` and on both `/token` grant types, every `resource` value present SHALL be compared against this server's protected-resource URL and its base URL, each with or without one trailing slash. A value outside that set SHALL cause exactly one `oauth_resource_unexpected` record per request carrying only the value's host, and the request SHALL proceed exactly as if the parameter were absent. This change MUST NOT refuse a request because of its `resource` value, and an absent `resource` SHALL be accepted.
 
-#### Scenario: The advertised resource is accepted
+#### Scenario: The advertised resource is accepted silently
 - **WHEN** `resource` equals the `resource` field of the protected-resource metadata
-- **THEN** the request SHALL proceed
+- **THEN** the request SHALL proceed and no `oauth_resource_unexpected` record SHALL be emitted
 
-#### Scenario: A foreign resource is refused
-- **WHEN** `resource=https://other.example/mcp` is sent at `/authorize` or `/token`
-- **THEN** the response SHALL be `invalid_target`
+#### Scenario: A foreign resource is logged and the request proceeds
+- **WHEN** `resource=https://other.example/mcp?k=secret` is sent at `/authorize` or `/token`
+- **THEN** the request SHALL proceed as if `resource` were absent
+- **AND** one `oauth_resource_unexpected` record SHALL carry `resource_host` `other.example`
+- **AND** the serialised record SHALL NOT contain `/mcp`, `k=` or `secret`
 
 ### Requirement: Every CIMD refusal SHALL answer a constant invalid_client and record its reason only in the log
 Every refusal arising from CIMD detection, fetching, budgeting or validation at `/authorize` SHALL answer HTTP 400 with the body `{"error": "invalid_client"}` and no description, before any redirect, and SHALL record the specific reason in the security log.

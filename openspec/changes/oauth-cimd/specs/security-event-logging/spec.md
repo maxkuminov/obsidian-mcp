@@ -16,7 +16,7 @@ The server SHALL declare an `oauth_client_registration_path` event at INFO with 
 - **THEN** both SHALL contain `oauth_client_registration_path` with exactly its declared fields
 
 ### Requirement: A CIMD refusal SHALL be recorded once as an authorization refusal with a closed client_metadata reason
-Every refusal at `/authorize` arising from Client ID Metadata Document handling SHALL emit exactly one `oauth_authorize_refused` record whose `reason` is `client_metadata.` followed by one of `url_invalid`, `url_not_canonical`, `fetch_cooldown`, `fetch_budget_exhausted`, `fetch_busy`, `ssrf_refused`, `fetch_failed`, `fetch_timeout`, `http_status`, `too_large`, `content_encoded`, `not_json`, `client_id_mismatch`, `document_invalid`, `redirect_uris_invalid`, `auth_method_unsupported`, `secret_present`, `grant_types_invalid`, `scope_invalid` or `metadata_changed`, with the submitted URL only in the 64-character-bounded `client_id_submitted` field and the canonical host, when the URL passed its syntax checks, in a new `cimd_host` field. The record SHALL NOT carry a resolved address, SSRF error text, a response status line or any document content. A foreign RFC 8707 `resource` SHALL be recorded as `invalid_target` on `oauth_authorize_refused` and as `invalid_target.resource_mismatch` on `oauth_token_refused`.
+Every refusal at `/authorize` arising from Client ID Metadata Document handling SHALL emit exactly one `oauth_authorize_refused` record whose `reason` is `client_metadata.` followed by one of `url_invalid`, `url_not_canonical`, `fetch_cooldown`, `fetch_budget_exhausted`, `fetch_busy`, `ssrf_refused`, `fetch_failed`, `fetch_timeout`, `http_status`, `too_large`, `content_encoded`, `not_json`, `client_id_mismatch`, `document_invalid`, `redirect_uris_invalid`, `auth_method_unsupported`, `secret_present`, `grant_types_invalid`, `scope_invalid` or `metadata_changed`, with the submitted URL only in the 64-character-bounded `client_id_submitted` field and the canonical host, when the URL passed its syntax checks, in a new `cimd_host` field. The record SHALL NOT carry a resolved address, SSRF error text, a response status line or any document content.
 
 #### Scenario: An SSRF refusal does not leak the address
 - **WHEN** a CIMD URL resolving to `10.0.0.5` is refused
@@ -27,9 +27,16 @@ Every refusal at `/authorize` arising from Client ID Metadata Document handling 
 - **WHEN** CIMD refusals naming many distinct hosts arrive from one address
 - **THEN** they SHALL share one suppression subject, the trusted client address
 
+### Requirement: An unexpected RFC 8707 resource SHALL be recorded with its host only
+The server SHALL declare an `oauth_resource_unexpected` event at INFO with the fields `resource_host`, `route`, `client_id_submitted` and `client_ip`, emitted at most once per request at `/authorize` or `/token` when a `resource` value names neither this server's protected-resource URL nor its base URL. `resource_host` SHALL be the value's host in ASCII form, or the constant `<unparseable>`; the record SHALL NOT carry the value's scheme, path, query or fragment, and its subject SHALL be the trusted client address.
+
+#### Scenario: Only the host is recorded
+- **WHEN** `resource=https://other.example/x?token=abc` is sent
+- **THEN** the record SHALL carry `resource_host` `other.example` and SHALL NOT contain `token=abc`
+
 ### Requirement: The new fields SHALL be allow-listed with declared types and bounds
-`ALLOWED_FIELDS` SHALL declare `registration_kind` as a string of at most 8 characters and `cimd_host` as a string of at most 253 characters; `cimd_host` SHALL be documented as a server-derived value taken from a URL that passed validation, distinct from both a database-read identifier and a `_submitted` value, and SHALL never be a suppression subject. The existing bound on `client_id` and `client_id_submitted` SHALL be unchanged.
+`ALLOWED_FIELDS` SHALL declare `registration_kind` as a string of at most 8 characters and `cimd_host` and `resource_host` as strings of at most 253 characters; `cimd_host` and `resource_host` SHALL be documented as a server-derived host taken from a parsed URL, distinct from both a database-read identifier and a `_submitted` value, and SHALL never be a suppression subject. The existing bound on `client_id` and `client_id_submitted` SHALL be unchanged.
 
 #### Scenario: The allow-list sweep covers the new fields
 - **WHEN** the field allow-list AST sweep runs over `src/`
-- **THEN** every emission of `registration_kind` and `cimd_host` SHALL be in an event that declares it
+- **THEN** every emission of `registration_kind`, `cimd_host` and `resource_host` SHALL be in an event that declares it

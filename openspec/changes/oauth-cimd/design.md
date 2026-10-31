@@ -138,13 +138,14 @@ The standing notice for CIMD reads: "This application identified itself with a d
 
 - Metadata adds `client_id_metadata_document_supported: true` (only while enabled) and `authorization_response_iss_parameter_supported: true`. A test pins that `none` stays in `token_endpoint_auth_methods_supported`, because Claude needs both values.
 - **`iss`:** every redirect `POST /authorize` issues (approve with `code`, deny with `error`) appends `iss=<metadata issuer>` through `_append_query`. The value is the exact `issuer` string the metadata serves. Errors answered as JSON (pre-redirect-validation) are not redirects and carry none.
-- **`resource` (RFC 8707):** accepted at `GET`/`POST /authorize` and on both `/token` grants. Every `resource` value present must equal one of `{base}/mcp`, `{base}/mcp/`, `{base}`, `{base}/`. Otherwise the request is refused `invalid_target`: a JSON 400 at `/authorize` (the redirect is not yet validated on GET, and the POST re-checks) and an RFC 6749 JSON 400 at `/token`. Absent is accepted. Nothing is stored, since there is one resource and every token is for it. The consent form carries `resource` through as a hidden field so the POST re-validates.
+- **`resource` (RFC 8707), log-only in this change (owner decision, 2026-10-31):** checked at `GET`/`POST /authorize` and on both `/token` grants. A value counts as expected when it equals one of `{base}/mcp`, `{base}/mcp/`, `{base}` or `{base}/`. Absence is expected too. Any other value emits one `oauth_resource_unexpected` (INFO) per request, and **the request proceeds unchanged**: nothing is refused and nothing is stored. The record carries `resource_host`, which is the value's host via `trust.to_ascii_host`, or the constant `<unparseable>`. It never carries the full value, path or query, because a query can carry anything. Since there is one resource, every token is for it whatever the client sent. Refusing with `invalid_target` is a documented follow-up (L9, task 9.5). It is gated on task 9.4's live-log check showing only the four accepted spellings for 14 consecutive days.
 
 ### D12. Security events
 
 - New `oauth_client_registration_path` (INFO), fields `registration_kind` (`dcr`|`cimd`), `client_id` (row), `cimd_host`, `outcome` (`created`|`refreshed`|`unchanged`; DCR always `created`), `user_id`, `client_ip`. It is emitted after the commit: by `/register` beside `oauth_client_registered`, and by the CIMD approve. Live verification greps for this.
-- CIMD refusals at `/authorize` emit the existing `oauth_authorize_refused` with `reason = client_metadata.<sub>`, where `<sub>` is one of `url_invalid`, `url_not_canonical`, `fetch_cooldown`, `fetch_budget_exhausted`, `fetch_busy`, `ssrf_refused`, `fetch_failed`, `fetch_timeout`, `http_status`, `too_large`, `content_encoded`, `not_json`, `client_id_mismatch`, `document_invalid`, `redirect_uris_invalid`, `auth_method_unsupported`, `secret_present`, `grant_types_invalid`, `scope_invalid` or `metadata_changed`. The field set adds `cimd_host`, the canonical host of a URL that passed D1, or absent. `invalid_redirect_uri` stays its own reason. `invalid_target` refusals use `reason = invalid_target` there and `invalid_target.resource_mismatch` in `oauth_token_refused`.
-- New allow-listed fields: `registration_kind` (str, 8) and `cimd_host` (str, 253). Provenance: `cimd_host` is derived by the server from a validated URL. It is not a database read, so it is declared as its own class in the field-policy table, and it is never a suppression subject (the subject stays the address). The URL itself appears only as `client_id_submitted` (64-character bound) on refusals. SSRF error text, resolved addresses and document bytes are never logged.
+- CIMD refusals at `/authorize` emit the existing `oauth_authorize_refused` with `reason = client_metadata.<sub>`, where `<sub>` is one of `url_invalid`, `url_not_canonical`, `fetch_cooldown`, `fetch_budget_exhausted`, `fetch_busy`, `ssrf_refused`, `fetch_failed`, `fetch_timeout`, `http_status`, `too_large`, `content_encoded`, `not_json`, `client_id_mismatch`, `document_invalid`, `redirect_uris_invalid`, `auth_method_unsupported`, `secret_present`, `grant_types_invalid`, `scope_invalid` or `metadata_changed`. The field set adds `cimd_host`, the canonical host of a URL that passed D1, or absent. `invalid_redirect_uri` stays its own reason. There is no `invalid_target` refusal in this change (D11). An unexpected `resource` is recorded as its own event.
+- New `oauth_resource_unexpected` (INFO), fields `resource_host`, `route`, `client_id_submitted`, `client_ip`. The subject is the trusted address, and the record goes through the ordinary suppressor.
+- New allow-listed fields: `registration_kind` (str, 8), `cimd_host` (str, 253) and `resource_host` (str, 253, the same server-derived provenance class as `cimd_host`). Provenance: `cimd_host` is derived by the server from a validated URL. It is not a database read, so it is declared as its own class in the field-policy table, and it is never a suppression subject (the subject stays the address). The URL itself appears only as `client_id_submitted` (64-character bound) on refusals. SSRF error text, resolved addresses and document bytes are never logged.
 - **The response to every CIMD refusal is `{"error": "invalid_client"}` 400**, constant, with no description that says which check failed. A metadata publisher debugs against the log of an operator who can read it, not the response.
 
 ### D13. Settings
@@ -192,7 +193,7 @@ The SSRF test is parameterised over the deny list (loopback v4/v6, RFC 1918, ULA
 
 ## Risks / Trade-offs
 
-- **[RFC 8707 enforcement breaks a live DCR connector that sends a foreign `resource`]** → The accepted set covers every spelling of this server's resource. Before merge, task 9.4 checks the live access log for the `resource` values connectors actually send. If one is outside the set, stop and ask Max (Open Question 2).
+- **[A future `resource` refusal breaks a live connector]** → This change only logs (D11). The refusal ships separately, after 14 days of logs show only the accepted spellings.
 - **[`iss` confuses a client that validates it against a differently-spelled issuer]** → `iss` is the exact metadata `issuer`; RFC 9207 clients compare against that.
 - **[The form-action relaxation]** → It applies only on the consent page, as constants. Where a code may go is still decided server-side (D5).
 - **[In-process cache and budgets]** → Per worker, per the `--workers 1` contract. A restart empties the cache, which costs one fetch per URL.
@@ -209,22 +210,20 @@ The SSRF test is parameterised over the deny list (loopback v4/v6, RFC 1918, ULA
 3. Migration 036 adds `client_id_metadata_url` and a shape CHECK. Kind is derived from the column; there is no `registration_kind` column.
 4. Rows are written only on approve, never on GET or deny.
 5. `/token` and refresh never fetch. A withdrawn document does not end live grants (L2).
-6. Consent shows the client host and the full URL, and does not render `client_name`.
+6. Consent shows the client host and the full URL. `client_name` is panel-only (Max, 2026-10-31).
 7. Absent `token_endpoint_auth_method` is accepted as `none`.
 8. Port-agnostic loopback matching applies to `localhost`, `127.0.0.1` and `[::1]`, same literal only, CIMD clients only. DCR still requires https.
 9. Cache: `max-age` clamped to 24 h, 300 s when absent, `no-store`/`no-cache` uncached. 30 s failure cooldown.
 10. Budgets: 10 fetches/min/address, 4 in flight.
-11. `resource` enforced with the four-spelling accepted set; `iss` on every POST redirect.
+11. `resource` is checked log-only against the four-spelling set and the request proceeds; the `invalid_target` refusal is a follow-up (Max, 2026-10-31). `iss` on every POST redirect.
 12. Every CIMD refusal answers a constant `invalid_client` 400; the reason goes only to the log.
 13. CIMD sweep: no child rows + marker older than the #194 age, owner ignored, same kill switch.
 14. 64 KiB cap (brief) over the draft's 5 KB recommendation.
-15. No trust policy or host allow-list for CIMD URLs; any public https host may publish a document, as anyone may `/register` today.
+15. No trust policy or host allow-list for CIMD URLs (Max, 2026-10-31): the fetch is hardened and `/register` is open anyway.
 
-## Open Questions (only Max can answer)
+## Open Questions
 
-1. Should CIMD be restricted to an operator allow-list of `client_id` hosts (e.g. `claude.ai, chatgpt.com, openai.com`)? This proposal says no (decision 15). An allow-list would defeat the point for other clients while DCR stays open anyway.
-2. `resource` enforcement: is `invalid_target` for a foreign `resource` right at deploy, or should the first release log only (shadow) and enforce later?
-3. Should `client_name` appear on consent at all, as a subordinate "calls itself …" line, or stay panel-only as proposed?
+None open. Max answered all three on 2026-10-31: no CIMD host allow-list (decision 15); `resource` ships log-only (D11, L9); `client_name` stays panel-only (decision 6).
 
 ## Accepted limitations
 
@@ -236,3 +235,4 @@ The SSRF test is parameterised over the deny list (loopback v4/v6, RFC 1918, ULA
 - **L6** The cache, cooldown and budgets are per process and reset on restart.
 - **L7** Timing distinguishes a cache hit from a fetch, and one refusal sub-reason from another. The response body does not.
 - **L8** A local program can claim a loopback callback. This is inherent to RFC 8252. The page warns, and PKCE binds the exchange.
+- **L9** The RFC 8707 `resource` parameter is checked but not enforced. A token requested for a foreign resource is still issued for this server, and the mismatch is only logged (`oauth_resource_unexpected`). Every token is for the one resource this server has, so the residual is a client misconfiguration going unrefused, not a token usable elsewhere. The `invalid_target` refusal is a follow-up issue (task 9.5), gated on 14 days of live logs showing only the accepted spellings.
