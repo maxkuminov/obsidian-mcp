@@ -60,7 +60,7 @@
 
 ## 6. Gates
 
-- [ ] 6.1 `pytest tests` green offline. Also green: `make test-integration`, `make search-eval` (fixture) and `openspec validate search-confidence --strict`
+- [x] 6.1 `pytest tests` green offline. Also green: `make test-integration`, `make search-eval` (fixture) and `openspec validate search-confidence --strict`
 - [ ] 6.2 `openspec-verifier` (non-author), iterated to zero blocking gaps
 - [ ] 6.3 Adversarial Codex (mandatory: search-path change), `-m gpt-daybreak-blue-latest`, read-only, on the committed tree. Framing:
   - a false `low` on a good page pushes an agent away from the right notes;
