@@ -13,7 +13,7 @@
 - **AND** it SHALL still contain `registration_endpoint`
 
 ### Requirement: A client_id beginning with https:// SHALL be treated only as a Client ID Metadata Document URL
-At `GET` and `POST /authorize`, a `client_id` whose first bytes are `https://` SHALL be handled as a CIMD client identifier and SHALL NOT be looked up as a registered client identifier. While CIMD is disabled such a value SHALL be refused as an unknown client. The URL SHALL be refused, before any DNS resolution or connection, unless it is at most 2,048 printable ASCII characters without whitespace, parses, carries no userinfo and no fragment, has a path other than empty or `/`, contains no `.` or `..` path segment (literal or percent-encoded), uses port 443 or 8443, and is byte-equal to the canonical form the hardened fetch would request.
+At `GET` and `POST /authorize`, a `client_id` whose first bytes are `https://` SHALL be handled as a CIMD client identifier and SHALL NOT be looked up as a registered client identifier. While CIMD is disabled such a value SHALL be refused as an unknown client. The URL SHALL be refused, before any DNS resolution or connection, unless it is at most 2,048 printable ASCII characters without whitespace, parses, contains no `?` and no `#` anywhere, carries no userinfo, has a path other than empty or `/`, contains no `.` or `..` path segment (literal or percent-encoded), uses port 443 or 8443, and is byte-equal to the canonical form the hardened fetch would request.
 
 #### Scenario: A non-canonical spelling is refused without a fetch
 - **WHEN** `/authorize` receives `client_id=https://Claude.AI/oauth/x`
@@ -23,6 +23,11 @@ At `GET` and `POST /authorize`, a `client_id` whose first bytes are `https://` S
 #### Scenario: A bare origin is refused
 - **WHEN** `client_id` is `https://example.com/` or `https://example.com`
 - **THEN** the response SHALL be `invalid_client` and nothing SHALL be fetched
+
+#### Scenario: Query strings are refused and never logged
+- **WHEN** `client_id` is `https://a.example/x?token=secret` or `https://a.example/x?`
+- **THEN** the response SHALL be `invalid_client` before any connection
+- **AND** no security record SHALL contain `token=secret`
 
 #### Scenario: Userinfo, fragments and dot segments are refused
 - **WHEN** `client_id` is `https://a@example.com/c`, `https://example.com/c#f` or `https://example.com/a/../c`
@@ -56,11 +61,25 @@ The server SHALL fetch a CIMD URL only through the transfer subsystem's guarded 
 - **THEN** the fetch SHALL connect directly to the validated address
 
 ### Requirement: Document fetches MUST be bounded per address, globally and per URL
-A fetch SHALL be attempted only on a cache miss. Before it, the server SHALL refuse with `invalid_client` and without fetching when the URL's previous fetch failed less than 30 seconds ago, when the trusted client address has spent `OAUTH_CIMD_FETCHES_PER_ADDRESS_PER_MINUTE` fetches in the current minute, or when 4 fetches are already in flight for other URLs. Concurrent requests for the same URL SHALL share one fetch. The per-address state SHALL be bounded and an evicted entry SHALL NOT be treated as a refilled budget.
+A fetch SHALL be attempted only on a cache miss. A request naming a URL whose fetch is already in progress SHALL await that fetch's result and SHALL be charged nothing, and this join SHALL be evaluated before every refusal below. Otherwise the server SHALL refuse with `invalid_client` and without fetching when the URL's previous fetch failed less than 30 seconds ago; when the client address's slot has admitted `OAUTH_CIMD_FETCHES_PER_ADDRESS_PER_MINUTE` fetches in its current 60-second window; when a fetch is already in flight for that slot; or when 8 fetches are already in flight process-wide. The per-address state SHALL use the same algorithm as the `/mcp` failed-authentication budget: a fixed table of 4,096 slots allocated once; slot 0 reserved for requests without a resolvable address; every other address mapped by a keyed BLAKE2b digest under a per-process random salt modulo the remaining slots; a fixed window started by the first charge into an empty or expired slot. Addresses sharing a slot SHALL share its budget and in-flight allowance, and no slot SHALL ever be evicted or reset except by its own window expiring.
+
+#### Scenario: One address cannot block another client's authorization
+- **WHEN** one address names four distinct valid CIMD URLs whose origins respond slowly for 10 seconds, and during that time a Claude authorization from another address names an uncached valid CIMD URL
+- **THEN** the first hostile fetch SHALL be admitted, the other three SHALL be refused without a connection
+- **AND** the Claude authorization SHALL fetch its document and render the consent page
+
+#### Scenario: Joining a flight is never refused by the caps
+- **WHEN** a URL's fetch is in progress, the requesting address's slot already has a fetch in flight, and the global cap is full
+- **THEN** a second request naming the same URL SHALL await that fetch and SHALL be charged nothing
 
 #### Scenario: The per-address budget refuses the eleventh fetch
-- **WHEN** one address triggers 11 cache-missing fetches of distinct URLs within a minute under the default budget
+- **WHEN** one address triggers 11 cache-missing fetches of distinct URLs, one at a time, within a minute under the default budget
 - **THEN** the eleventh SHALL be refused without a connection
+
+#### Scenario: Address churn does not refill a spent slot
+- **WHEN** an address spends its budget and then 4,097 distinct addresses each trigger a fetch within the same window
+- **THEN** the first address SHALL still be refused until its slot's window expires
+- **AND** the table SHALL still hold 4,096 slots
 
 #### Scenario: A failing URL is fetched at most once per cooldown
 - **WHEN** a URL's fetch fails and 50 requests from different addresses name it within the next 30 seconds
@@ -105,7 +124,7 @@ A validated projection SHALL be cached in process, keyed by the exact URL, for t
 - **THEN** the request SHALL be refused, and the expired projection SHALL NOT be used
 
 ### Requirement: Redirect URIs SHALL match exactly except for port-agnostic loopback on CIMD clients
-`GET` and `POST /authorize` SHALL use one matching function. For a registered client it SHALL be exact string membership, unchanged. For a CIMD client a requested `redirect_uri` SHALL be accepted when it equals a document entry exactly, or when the entry is `http` with host `localhost`, `127.0.0.1` or `[::1]` and the request is `http` with the same host literal, no userinfo, no fragment, any numeric port from 1 to 65535 or none, and a path and query byte-equal to the entry's. The authorization code SHALL store the exact requested URI, so the token endpoint's exact comparison is unchanged.
+`GET` and `POST /authorize` SHALL use one matching function. For a registered client it SHALL be exact string membership, unchanged, and a mismatch SHALL keep its existing `invalid_redirect_uri` response; for a CIMD client a mismatch SHALL be answered with the constant `invalid_client` response. For a CIMD client a requested `redirect_uri` SHALL be accepted when it equals a document entry exactly, or when the entry is `http` with host `localhost`, `127.0.0.1` or `[::1]` and the request is `http` with the same host literal, no userinfo, no fragment, any numeric port from 1 to 65535 or none, and a path and query byte-equal to the entry's. The authorization code SHALL store the exact requested URI, so the token endpoint's exact comparison is unchanged.
 
 #### Scenario: Claude Code's ephemeral port is accepted
 - **WHEN** the document lists `http://localhost/callback` and the request names `http://localhost:3118/callback`
@@ -113,26 +132,31 @@ A validated projection SHALL be cached in process, keyed by the exact URL, for t
 
 #### Scenario: Loopback literals do not cross-match
 - **WHEN** the document lists only `http://127.0.0.1/callback` and the request names `http://localhost:3118/callback`
-- **THEN** it SHALL be refused `invalid_redirect_uri`
+- **THEN** it SHALL be refused with the constant `invalid_client` response
+- **AND** the security record SHALL carry `reason` `client_metadata.redirect_uri_mismatch`
 
 #### Scenario: Path and query are exact on loopback
 - **WHEN** the request names `http://localhost:3118/callback/x` or `http://localhost:3118/callback?a=1`
-- **THEN** it SHALL be refused
+- **THEN** it SHALL be refused with the constant `invalid_client` response
 
 #### Scenario: https entries stay exact
 - **WHEN** the document lists `https://claude.ai/api/mcp/auth_callback` and the request names `https://claude.ai:8443/api/mcp/auth_callback`
-- **THEN** it SHALL be refused
+- **THEN** it SHALL be refused with the constant `invalid_client` response
 
 #### Scenario: The exchange compares the stored URI exactly
 - **WHEN** a code minted for `http://localhost:3118/callback` is exchanged with `redirect_uri=http://localhost:4000/callback`
 - **THEN** the token endpoint SHALL refuse it as a redirect mismatch
 
-### Requirement: The consent approval SHALL be pinned to the document the consent page rendered
-The consent page SHALL bind the SHA-256 of the validated projection it rendered into the signed consent state, and the approval SHALL re-resolve the document and refuse with `invalid_client`, minting nothing, when the projection's hash differs. The token endpoint and the refresh path MUST NOT fetch the document; the code row's client, exact redirect URI and clamped scope SHALL be all that the exchange depends on.
+### Requirement: The consent approval SHALL bind the projection the consent page showed
+The consent page SHALL bind the SHA-256 of the validated projection it rendered into the signed consent state. The approval SHALL re-resolve the document under the cache and admission rules and SHALL refuse with `invalid_client`, minting and writing nothing, when the re-resolved projection's hash differs from the bound one; whatever an approval writes SHALL be exactly the projection that was shown. Detecting a change at the origin while the cached projection is still fresh is not required. The token endpoint and the refresh path MUST NOT fetch the document; the code row's client, exact redirect URI and clamped scope SHALL be all that the exchange depends on.
 
-#### Scenario: A document changed between render and approve is refused
-- **WHEN** the document's `redirect_uris` change after the consent page renders and before the user approves
-- **THEN** the approval SHALL be refused and no code SHALL be minted
+#### Scenario: An expired re-resolution returning a different projection is refused
+- **WHEN** the consent page rendered a projection, its cache entry has expired or was never cached, and the approval's fetch returns a document whose `redirect_uris` differ
+- **THEN** the approval SHALL be refused with `invalid_client` and no code or client row SHALL be written
+
+#### Scenario: A fresh cached projection is approved as shown
+- **WHEN** the origin's document changes while the cached projection the page rendered is still fresh, and the user approves
+- **THEN** the approval SHALL succeed and SHALL write the projection that was shown
 
 #### Scenario: The token endpoint never fetches
 - **WHEN** a code minted for a CIMD client is exchanged, or its refresh token rotated
@@ -198,25 +222,29 @@ Every redirect issued by `POST /authorize`, approval and denial alike, SHALL car
 - **WHEN** a user denies
 - **THEN** the redirect SHALL carry `error=access_denied` and `iss`
 
-### Requirement: An RFC 8707 resource parameter SHALL be checked and an unexpected value SHALL be recorded without refusing the request
-At `GET` and `POST /authorize` and on both `/token` grant types, every `resource` value present SHALL be compared against this server's protected-resource URL and its base URL, each with or without one trailing slash. A value outside that set SHALL cause exactly one `oauth_resource_unexpected` record per request carrying only the value's host, and the request SHALL proceed exactly as if the parameter were absent. This change MUST NOT refuse a request because of its `resource` value, and an absent `resource` SHALL be accepted.
+### Requirement: An RFC 8707 resource parameter SHALL be classified on every request and SHALL NOT cause a refusal
+At `GET` and `POST /authorize` and on both `/token` grant types, the server SHALL classify the request's `resource` parameter as exactly one of `absent`; `accepted_1` (`{base}/mcp`), `accepted_2` (`{base}/mcp/`), `accepted_3` (`{base}`) or `accepted_4` (`{base}/`) when every value present equals that one spelling; or `unexpected` otherwise. The classification SHALL be recorded as `resource_class` on the one outcome event the request emits, with `resource_host` (the first unexpected value's host, or `<unparseable>`) only when the class is `unexpected`. The request SHALL proceed exactly as if the parameter were absent; this change MUST NOT refuse a request because of its `resource` value.
 
-#### Scenario: The advertised resource is accepted silently
-- **WHEN** `resource` equals the `resource` field of the protected-resource metadata
-- **THEN** the request SHALL proceed and no `oauth_resource_unexpected` record SHALL be emitted
+#### Scenario: The advertised resource is classified accepted
+- **WHEN** `resource` equals the `resource` field of the protected-resource metadata, `{base}/mcp`, on a code exchange
+- **THEN** the exchange SHALL succeed and `oauth_token_issued` SHALL carry `resource_class` `accepted_1` and no `resource_host`
 
-#### Scenario: A foreign resource is logged and the request proceeds
+#### Scenario: Absence is classified
+- **WHEN** an approval carries no `resource`
+- **THEN** `oauth_consent_granted` SHALL carry `resource_class` `absent`
+
+#### Scenario: A foreign resource is classified and the request proceeds
 - **WHEN** `resource=https://other.example/mcp?k=secret` is sent at `/authorize` or `/token`
 - **THEN** the request SHALL proceed as if `resource` were absent
-- **AND** one `oauth_resource_unexpected` record SHALL carry `resource_host` `other.example`
+- **AND** its outcome record SHALL carry `resource_class` `unexpected` and `resource_host` `other.example`
 - **AND** the serialised record SHALL NOT contain `/mcp`, `k=` or `secret`
 
 ### Requirement: Every CIMD refusal SHALL answer a constant invalid_client and record its reason only in the log
-Every refusal arising from CIMD detection, fetching, budgeting or validation at `/authorize` SHALL answer HTTP 400 with the body `{"error": "invalid_client"}` and no description, before any redirect, and SHALL record the specific reason in the security log.
+Every refusal arising from CIMD detection, fetching, admission, validation or redirect matching at `/authorize` SHALL answer HTTP 400 with the body `{"error": "invalid_client"}` and no description, before any redirect, and SHALL record the specific reason in the security log.
 
 #### Scenario: Two different failures answer identically
-- **WHEN** one request fails on a 404 document and another on a `client_id` mismatch
-- **THEN** both responses SHALL be byte-identical in status and body
+- **WHEN** one request fails on a 404 document, another on a `client_id` mismatch and a third on a redirect URI mismatch
+- **THEN** all three responses SHALL be byte-identical in status and body
 
 ### Requirement: The OAuth panel SHALL identify CIMD clients by their metadata URL
 The OAuth panel SHALL mark a client row that carries a metadata URL as a Client ID Metadata Document client, SHALL show its URL and the URL's host, and SHALL label `client_name` as the application's self-description, rendered as text, without inline handlers or styles.
@@ -226,7 +254,11 @@ The OAuth panel SHALL mark a client row that carries a metadata URL as a Client 
 - **THEN** it SHALL show the metadata URL, its host, and the name labelled as self-described
 
 ### Requirement: CIMD settings SHALL be validated at startup and documented
-`OAUTH_CIMD_ENABLED` SHALL default to true; `OAUTH_CIMD_CACHE_MAX_SECONDS` SHALL default to 86,400 and refuse values outside 0–86,400; `OAUTH_CIMD_FETCHES_PER_ADDRESS_PER_MINUTE` SHALL default to 10 and refuse values outside 1–120. Each SHALL be documented in the README settings table and `.env.example`.
+`OAUTH_CIMD_ENABLED` SHALL default to true; `OAUTH_CIMD_CACHE_MAX_SECONDS` SHALL default to 86,400 and refuse values outside 0–86,400; `OAUTH_CIMD_FETCHES_PER_ADDRESS_PER_MINUTE` SHALL default to 10 and refuse values outside 1–120. The guarded fetch SHALL expose the response's caching directive to its caller only as a parsed `max-age` and a no-store flag, never as a raw header. Each SHALL be documented in the README settings table and `.env.example`.
+
+#### Scenario: Only the parsed cache directive leaves the fetch
+- **WHEN** a document responds with `Cache-Control: public, max-age=300` and other headers
+- **THEN** the fetch result SHALL expose `max_age` 300 and `no_store` false, and SHALL expose no raw header value
 
 #### Scenario: An out-of-range ceiling is refused
 - **WHEN** `OAUTH_CIMD_CACHE_MAX_SECONDS=90000`
