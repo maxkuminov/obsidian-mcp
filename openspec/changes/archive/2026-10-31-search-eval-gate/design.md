@@ -90,3 +90,27 @@ What changed, per finding:
 4. MINOR, `search.md`: fixed. Schema 3 is current, and 2 is historical
    #389 output that `gate` refuses.
 
+## Adversarial Codex — implementation round 2
+
+Verdict, verbatim:
+
+PASS. All four Round-1 findings are fixed, and the focused offline suite passes: 190 passed, 1 skipped.
+
+Against `06a76e0`, every semantic difference is accounted for:
+
+- Gate now requires candidate `schema_version == 3`.
+- Runfile paths are resolved before source-report discovery.
+- `deltas_baseline` and `source_generation` are exact-only leak fields.
+- The removed hybrid-offset test section is replaced by a synthetic `check_options` test.
+- Added tests cover schema rejection, candidate-equals-baseline refusal, `..` paths, and both leak-scanner regressions. Other differences are comments or neutral naming.
+
+`--generation` is operator-selectable, with a harness timestamp only as its default. Exact-only matching permits a substring such as query `2026` within `R2026`, but still rejects exact equality. This does not introduce a new weakening: generation, arm, and baseline labels already use the same policy, and the runfile baseline label already contains that source generation. Restoring substring matching would reinstate the demonstrated false-positive failure.
+
+round1:[{"claim":"deltas_baseline and source_generation caused leak-scanner false positives","status":"FIXED"},{"claim":"gate accepted reports whose schema_version was not exactly 3","status":"FIXED"},{"claim":"runfile paths containing .. recorded a null source digest","status":"FIXED"},{"claim":"search.md incorrectly called schema 2 current","status":"FIXED"}]
+
+```json
+{"verdict":"PASS","findings":[]}
+```
+
+No change.
+

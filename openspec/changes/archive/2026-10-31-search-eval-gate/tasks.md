@@ -17,4 +17,4 @@
 
 - [x] 3.1 `pytest tests/test_search_eval_gate.py tests/test_search_eval_depth_confidence.py tests/test_search_eval*.py tests/test_issue_358_scoped_tools_list.py -q` (182 passed, 1 skipped)
 - [x] 3.2 Full offline `pytest tests` (7,874 passed, 1,180 skipped, with `OMCP_ALLOW_SKIP_TRANSFER_INTEGRATION=1`); `make search-eval` on the fixture (exit 0, golden regenerated once for schema 3); `make audit` (clean); `openspec validate --all --strict` (41/41). No integration run: nothing under `src/` changed
-- [ ] 3.3 Archive after review (`openspec archive search-eval-gate -y`), one PR
+- [x] 3.3 (verifier PASS, 2 MINOR folded; Codex r1 FAIL 1 MAJOR 3 MINOR folded, r2 PASS) Archive after review (`openspec archive search-eval-gate -y`), one PR
