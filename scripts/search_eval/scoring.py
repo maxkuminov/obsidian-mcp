@@ -84,7 +84,9 @@ METRICS = ("recall@5", "recall@10", "recall@20", "recall@50", "mrr", "ndcg@10")
 #: The recall depths, by metric name (#389): a recall@k with k above an arm's
 #: `staged_depth` is null, never computed on a shorter run.
 RECALL_K = {"recall@5": 5, "recall@10": 10, "recall@20": 20, "recall@50": 50}
-SCHEMA_VERSION = 2
+#: 3 since #403: `deltas_baseline`, and `source_generation` / `source_report_sha256`
+#: on a `runfile:` arm.
+SCHEMA_VERSION = 3
 SLICES = ("overall", *(f"class:{c}" for c in CLASSES), "source:mined", "source:manual")
 NOT_ATTACHABLE_LINE = "NOT ATTACHABLE (multi-user provenance)"
 
@@ -458,6 +460,11 @@ def score(data_dir: Path, arms: list[str] | None = None, *, baseline: str | None
             **{k: meta.get(k)
                for k in ("retrieval_fingerprint", "legacy_chunked_notes", "chunk_lengths")
                if k in meta},
+            # #403: a `runfile:` arm carries its source generation and that
+            # generation's report digest, which `gate` binds to.
+            **({"source_generation": meta.get("source_generation"),
+                "source_report_sha256": meta.get("source_report_sha256")}
+               if meta.get("source") == "runfile" else {}),
         })
 
     label_of = {spec: rep["arm"] for spec, rep in zip(arms, arm_reports)}
@@ -539,6 +546,9 @@ def score(data_dir: Path, arms: list[str] | None = None, *, baseline: str | None
         )},
         "arms": arm_reports,
         "baseline": label_of[baseline] if baseline is not None else None,
+        # #403: the arm every entry of `deltas` was computed against; `gate`
+        # requires it to equal `baseline` and to occur once in `arms`.
+        "deltas_baseline": label_of[baseline] if baseline is not None else None,
         "deltas": deltas,
     }
 

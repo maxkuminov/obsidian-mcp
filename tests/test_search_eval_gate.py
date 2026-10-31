@@ -109,6 +109,7 @@ def _report(*, lower=-0.005, verdict="OK", attachable=True, users=1, baseline=BA
         "verdict": verdict, "attachable": attachable,
         "provenance": {"users": users, "basis": "user_filter"},
         "arms": [{"arm": a} for a in arms], "baseline": baseline,
+        "deltas_baseline": baseline, "schema_version": 3,
         "deltas": {a: by_slice for a in arms if a != baseline},
     }
 
@@ -199,9 +200,27 @@ RF = f"runfile:{RF_LABEL}@{RF_GEN}"
 HASHES = {"qrels_sha256": "q" * 64, "snapshot_sha256": "s" * 64, "selected_qids_hash": "h" * 64}
 
 
-def _rf_candidate(tmp_path):
-    return _write(tmp_path, "r.json", {**_report(baseline=RF, arms=(CAND, RF)),
-                                       "generation": "20261101T000000Z", **HASHES})
+def _sha(path):
+    import hashlib
+
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _rf_candidate(tmp_path, source=None, *, digest=..., source_generation=RF_GEN,
+                  name="r.json", **over):
+    """A candidate report whose baseline is the runfile arm RF, carrying the
+    source generation and the digest the harness records when it stages RF
+    (by default the digest of `source`)."""
+    report = {**_report(baseline=RF, arms=(CAND, RF)), "generation": "20261101T000000Z",
+              **HASHES}
+    entry = report["arms"][1]
+    entry["source_generation"] = source_generation
+    if digest is ...:
+        digest = _sha(source) if source is not None else None
+    if digest is not None:
+        entry["source_report_sha256"] = digest
+    report.update(over)
+    return _write(tmp_path, name, report)
 
 
 def _rf_source(tmp_path, name="src.json", **over):
@@ -211,12 +230,96 @@ def _rf_source(tmp_path, name="src.json", **over):
 
 
 def test_a_runfile_baseline_needs_its_own_attachable_report(tmp_path, capsys):
-    report = _rf_candidate(tmp_path)
+    good = _rf_source(tmp_path)
+    report = _rf_candidate(tmp_path, good)
     _refused(tmp_path, capsys, report)                              # missing
     bad = _rf_source(tmp_path, "b.json", attachable=False, provenance={"users": "multi"})
-    _refused(tmp_path, capsys, report, "--baseline-report", str(bad))
-    code, out = _gate(tmp_path, report, "--baseline-report", str(_rf_source(tmp_path)))
+    _refused(tmp_path, capsys, _rf_candidate(tmp_path, bad, name="rb.json"),
+             "--baseline-report", str(bad))
+    code, out = _gate(tmp_path, report, "--baseline-report", str(good))
     assert code == EXIT_OK and out.exists()
+
+
+# ── Codex implementation round 2: the baseline label and the source digest ──
+
+
+def test_a_relabeled_baseline_not_among_the_arms_is_refused(tmp_path, capsys):
+    """Codex round 2's failing input: deltas computed against a multi-user
+    runfile arm, `baseline` relabeled to a safe one that is not an arm."""
+    safe_label = "runfile:hybrid-safe@20261030T000000Z"
+    safe = _rf_source(tmp_path, generation="20261030T000000Z", arms=[{"arm": "hybrid-safe"}])
+    report = {**_report(baseline=RF, arms=(CAND, RF)), **HASHES, "baseline": safe_label,
+              "deltas_baseline": safe_label}
+    report["arms"][1]["source_report_sha256"] = _sha(safe)
+    err = _refused(tmp_path, capsys, _write(tmp_path, "r.json", report),
+                   "--baseline-report", str(safe), existing="old table\n")
+    assert "occurs 0 times" in err
+
+
+def test_a_baseline_listed_twice_is_refused(tmp_path, capsys):
+    good = _rf_source(tmp_path)
+    report = _rf_candidate(tmp_path, good, arms=[{"arm": CAND}, {"arm": RF,
+                           "source_generation": RF_GEN, "source_report_sha256": _sha(good)},
+                           {"arm": RF}])
+    err = _refused(tmp_path, capsys, report, "--baseline-report", str(good))
+    assert "occurs 2 times" in err
+
+
+@pytest.mark.parametrize("deltas_baseline", [BASE, None, "missing"])
+def test_deltas_baseline_must_equal_the_baseline(tmp_path, capsys, deltas_baseline):
+    good = _rf_source(tmp_path)
+    over = {} if deltas_baseline == "missing" else {"deltas_baseline": deltas_baseline}
+    path = _rf_candidate(tmp_path, good, **over)
+    if deltas_baseline == "missing":
+        body = json.loads(path.read_text())
+        body.pop("deltas_baseline")
+        path.write_text(json.dumps(body))
+    err = _refused(tmp_path, capsys, path, "--baseline-report", str(good))
+    assert "deltas_baseline" in err
+
+
+def test_a_missing_source_digest_is_refused(tmp_path, capsys):
+    good = _rf_source(tmp_path)
+    err = _refused(tmp_path, capsys, _rf_candidate(tmp_path, good, digest=None),
+                   "--baseline-report", str(good))
+    assert "digest" in err
+
+
+def test_a_source_digest_mismatch_is_refused(tmp_path, capsys):
+    """A forged-but-consistent source report (same generation, hashes, arm)
+    whose bytes are not the report the harness recorded."""
+    good = _rf_source(tmp_path)
+    report = _rf_candidate(tmp_path, good)
+    forged = _rf_source(tmp_path, "forged.json", mine={"forged": True})
+    err = _refused(tmp_path, capsys, report, "--baseline-report", str(forged),
+                   existing="old table\n")
+    assert "sha256" in err
+
+
+def test_a_source_generation_mismatch_on_the_arm_is_refused(tmp_path, capsys):
+    good = _rf_source(tmp_path)
+    err = _refused(tmp_path, capsys,
+                   _rf_candidate(tmp_path, good, source_generation="20261029T000000Z"),
+                   "--baseline-report", str(good))
+    assert "source_generation" in err
+
+
+def test_the_harness_records_the_source_report_digest(tmp_path):
+    """`run` stages a `runfile:` arm with the digest of its source data
+    directory's `report.json` when that report scores the source generation,
+    and null otherwise; `score` carries both fields into the arm entry."""
+    from scripts.search_eval.runner import _source_report_sha256
+
+    data = tmp_path / "src"
+    runfile = data / "runs" / RF_GEN / "arm.json"
+    runfile.parent.mkdir(parents=True)
+    runfile.write_text("{}")
+    assert _source_report_sha256(runfile, RF_GEN) is None          # no report
+    (data / "report.json").write_text(json.dumps({"generation": "other"}))
+    assert _source_report_sha256(runfile, RF_GEN) is None          # another generation
+    (data / "report.json").write_text(json.dumps({"generation": RF_GEN}))
+    assert _source_report_sha256(runfile, RF_GEN) == _sha(data / "report.json")
+    assert _source_report_sha256(runfile, None) is None
 
 
 @pytest.mark.parametrize("over", [
@@ -230,12 +333,14 @@ def test_a_runfile_baseline_needs_its_own_attachable_report(tmp_path, capsys):
 def test_a_baseline_report_that_is_not_the_runfiles_source_is_refused(tmp_path, capsys, over):
     """Codex implementation round 1: an attachable single-user report that
     is not the runfile's source generation cannot vouch for it."""
-    report = _rf_candidate(tmp_path)
-    err = _refused(tmp_path, capsys, report, "--baseline-report",
-                   str(_rf_source(tmp_path, **over)))
+    source = _rf_source(tmp_path, **over)
+    # The digest matches the supplied file, so the round-1 binding is what
+    # refuses it.
+    report = _rf_candidate(tmp_path, source)
+    err = _refused(tmp_path, capsys, report, "--baseline-report", str(source))
     assert "--baseline-report" in err
-    _refused(tmp_path, capsys, report, "--baseline-report",
-             str(_rf_source(tmp_path, "s2.json", **over)), existing="old table\n")
+    _refused(tmp_path, capsys, report, "--baseline-report", str(source),
+             existing="old table\n")
 
 
 def test_a_runfile_label_without_a_generation_is_refused(tmp_path, capsys):

@@ -438,3 +438,43 @@ FAIL. The ranking, offset, rendering, and ContextVar paths matched the specifica
 ```
 
 Fixed as above (implementation notes).
+
+## Adversarial Codex — implementation round 2
+
+Verdict, verbatim:
+
+FAIL. The hash fields are correct for schema version 2, and ranking/rendering paths show no regression; 444 focused offline tests passed and OpenSpec validation succeeded. However, the round-1 tenant-boundary bypass remains reachable through inconsistent candidate baseline metadata.
+
+```json
+{"verdict":"FAIL","round1":[{"claim":"A runfile baseline report must be bound to the generation that produced the baseline so unrelated safe evidence cannot authorize multi-user deltas.","status":"NOT_FIXED"}],"findings":[{"severity":"BLOCKER","file":"scripts/search_eval/gate.py","line":132,"claim":"The gate validates --baseline-report against the candidate report's baseline string but never requires that baseline to be an arm in the candidate report. Relabeling only that field can therefore make an unrelated safe report authorize deltas actually computed against a multi-user runfile baseline.","failing_input":"Use an attachable candidate report with arms [candidate, runfile:hybrid-old@GEN_MULTI] and deltas computed against that multi-user baseline, but set baseline to runfile:hybrid-safe@GEN_SAFE. Supply an attachable single-user report for GEN_SAFE with matching qrels_sha256, snapshot_sha256 and selected_qids_hash and arm hybrid-safe. Reproduced result: baseline_in_arms=false, exit 0, gate: PASS, and --out is created. The success fixture at tests/test_search_eval_gate.py:202 always makes baseline an arm, so it misses this behavior.","fix":"Before examining a runfile source, require the baseline label to occur exactly once in the candidate report's arms and refuse otherwise without touching --out. For sufficient protection against a forged-but-consistent report pair, also carry the source report's digest/provenance through runfile staging into the candidate report and require --baseline-report to match it; generation plus the three data hashes and arm label are not a unique report identity. Add relabeled-baseline and source-digest mismatch tests with an existing --out."}]}
+```
+
+Fixed (2026-10-31):
+
+- The report gains `deltas_baseline`, the arm every delta was computed
+  against, and `schema_version` goes 2 → 3; the golden is updated. Before
+  examining any runfile source, the gate requires `baseline ==
+  deltas_baseline`, the baseline to occur exactly once in `arms`, and the
+  candidate arm to occur exactly once. A pre-#403 report (no
+  `deltas_baseline`) is refused, to be re-scored.
+- **The source report's digest is carried through staging.** `run` records
+  `source_generation` and `source_report_sha256` on a staged `runfile:` arm.
+  The digest is the SHA-256 of `<source data>/report.json` when that report
+  scores the source generation, else null. `score` copies both into the
+  arm entry. The gate requires a recorded digest, `source_generation` equal
+  to `--baseline-report`'s generation, and `--baseline-report`'s file
+  SHA-256 equal to the digest. A forged-but-consistent pair then needs the
+  very bytes the harness hashed, and the attachable check still applies to
+  those bytes.
+- Tests (`tests/test_search_eval_gate.py`): the relabeled baseline not
+  among the arms (Codex's failing input), listed twice, `deltas_baseline`
+  disagreeing / null / missing, a missing digest, a digest mismatch with an
+  existing `--out`, a `source_generation` mismatch, the helper's three cases,
+  and the success case. End to end (`tests/test_search_eval_depth_confidence.py`):
+  a scored source generation's digest rides the runfile arm, and an unscored
+  one records null.
+- Operator consequence: to use a `runfile:` baseline, score the source
+  generation **before** staging the runfile. Re-scoring the source data
+  directory afterwards changes `report.json` and the digest no longer
+  matches.
+

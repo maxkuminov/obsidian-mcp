@@ -678,6 +678,7 @@
       }
     }
   },
+  "deltas_baseline": "fixture-lexical",
   "depth": 50,
   "min_queries": 1,
   "mine": {
@@ -705,7 +706,7 @@
     "users": "multi"
   },
   "qrels_sha256": "325d8650180de3322fe67e4e949c0c25851b0a521399a17f40b8c70ce2187db7",
-  "schema_version": 2,
+  "schema_version": 3,
   "seed": 0,
   "selected_qids_hash": "cb504fb2a9ccdcb094921a19b21137944db75af5a80357022824bd642273839b",
   "selection": {

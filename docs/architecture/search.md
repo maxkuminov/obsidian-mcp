@@ -1487,7 +1487,9 @@ run, 1 anything else. **`score` has no metric threshold** (E2): the report
 is for the reviewer to judge, with the incumbent as `--baseline`. A change
 that needs a mechanical bar uses the `gate` step. The golden
 was regenerated once by #389 (the new metric keys, `staged_depth`, depth 50,
-`schema_version` 2).
+`schema_version` 2), and by #403 (`schema_version` 3, `deltas_baseline`;
+a `runfile:` arm also carries `source_generation` and
+`source_report_sha256`).
 
 **The gate step (#403).** `python -m scripts.search_eval gate --report
 R --arm A --metrics m,… --slices s,… --min-ci-lower X --out F
@@ -1505,9 +1507,14 @@ required), must each have verdict `OK`, `attachable: true` and
 PASS/FAIL printed, and F is neither created nor replaced. A
 `runfile:<label>@<generation>` baseline's report must also be **that**
 generation's report: the same `generation`, the same qrels, snapshot and
-selection hashes as the candidate report, and an arm `<label>`. Otherwise
-an unrelated safe report could vouch for a multi-user runfile (Codex,
-#403 implementation round 1).
+selection hashes as the candidate report, and an arm `<label>`, and its
+file's sha256 must equal the `source_report_sha256` that `run` recorded on
+the runfile arm when it staged it. `run` records that digest only when the
+source data directory's `report.json` scores the source generation, and
+null otherwise, in which case the gate refuses. Before any of this, the
+report's `baseline` must equal its `deltas_baseline` and occur exactly once
+in its `arms`. Otherwise an unrelated safe report could vouch for a
+multi-user runfile (Codex, #403 implementation rounds 1 and 2).
 
 #403's bar is eight cells: `--metrics
 recall@10,recall@20,recall@50,ndcg@10 --slices overall,class:identifier

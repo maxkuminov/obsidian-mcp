@@ -1013,7 +1013,10 @@ and needs nothing; the real run is this path, from a checkout with
    `provenance.users == 1`. On a multi-user deployment, export with
    `USER_ID=` first. The two paths are the scored `report.json` and the
    gate's Markdown table, and the PR body carries only a table from a
-   successful run.
+   successful run. With a `runfile:` baseline, also pass `--baseline-report`
+   with the source generation's `report.json`. Score that generation
+   **before** staging the runfile, and do not re-score it afterwards: the
+   gate checks the file against the digest `run` recorded at staging.
 7. **Attach `report.json` to the PR only if it says `attachable: true`.** It
    carries metrics, counts and hashes, no query text and no note paths. A
    `CORPUS_LOSS` verdict means the candidate lost searchable notes for that

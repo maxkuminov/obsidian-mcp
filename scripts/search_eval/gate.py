@@ -11,9 +11,14 @@ same table goes to `--out` as Markdown, ready for a PR body.
 **The tenant boundary comes first.** The candidate's report, and the
 baseline's (the same report when it holds both arms; `--baseline-report`,
 required, when the baseline is a `runfile:` arm), must each be `attachable:
-true` with `provenance.users == 1` and verdict `OK`. Otherwise the gate exits
-64 having printed no cell and no PASS/FAIL, and `--out` is neither created
-nor replaced. Every check runs before any cell is computed.
+true` with `provenance.users == 1` and verdict `OK`. The report's `baseline`
+must equal its `deltas_baseline` (schema 3) and occur exactly once in its
+`arms`. A `runfile:` baseline's report must be that generation's report:
+the same generation and qrels / snapshot / selection hashes, the source arm
+present, and its file sha256 equal to the `source_report_sha256` the harness
+recorded on the runfile arm when it staged it. Otherwise the gate exits 64
+having printed no cell and no PASS/FAIL, and `--out` is neither created nor
+replaced. Every check runs before any cell is computed.
 
 Exit 0 when every cell passes, 1 when any fails, 64 on a usage error. It
 reads only the reports and writes only `--out`.
@@ -26,7 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scripts.search_eval import EXIT_FAILURE, EXIT_OK, UsageError
-from scripts.search_eval._io import atomic_write
+from scripts.search_eval._io import atomic_write, sha256_file
 from scripts.search_eval.scoring import METRICS, SLICES, VERDICT_OK
 
 RUNFILE_PREFIX = "runfile:"
@@ -127,24 +132,47 @@ def run_gate(*, report_path: Path, arm: str, metrics: str, slices: str,
     report = _load(report_path, "report")
     _require_evidence(report, "the report")
     baseline = report.get("baseline")
-    if not baseline:
+    if not baseline or not isinstance(baseline, str):
         raise UsageError("the report has no baseline arm; score it with --baseline")
-    labels = [a.get("arm") for a in report.get("arms") or [] if isinstance(a, dict)]
-    if arm not in labels:
-        raise UsageError(f"arm {arm!r} is not in the report (arms: {', '.join(map(str, labels))})")
+    # Codex implementation round 2: the baseline label must be the arm the
+    # deltas were computed against, and an arm of this report exactly once,
+    # before any runfile source is examined.
+    if report.get("deltas_baseline") != baseline:
+        raise UsageError("the report's deltas_baseline does not equal its baseline "
+                         "(a pre-#403 report, schema_version < 3, has none: re-score it)")
+    entries = [a for a in report.get("arms") or [] if isinstance(a, dict)]
+    labels = [a.get("arm") for a in entries]
+    if labels.count(baseline) != 1:
+        raise UsageError(f"the baseline {baseline!r} occurs {labels.count(baseline)} times "
+                         "among the report's arms, not once")
+    if labels.count(arm) != 1:
+        raise UsageError(f"arm {arm!r} is not in the report exactly once "
+                         f"(arms: {', '.join(map(str, labels))})")
     if arm == baseline:
         raise UsageError(f"arm {arm!r} is the report's baseline")
     if baseline.startswith(RUNFILE_PREFIX):
         # The baseline's evidence came from another generation: its own report
         # must clear the same boundary, and must BE that generation's report
-        # (Codex implementation round 1: an unrelated safe report must not
-        # vouch for a multi-user runfile).
+        # (Codex implementation rounds 1 and 2: an unrelated safe report must
+        # not vouch for a multi-user runfile). The harness recorded that
+        # report's digest on the runfile arm when it staged it.
         if baseline_report_path is None:
             raise UsageError(f"the baseline {baseline!r} is a runfile arm; pass "
                              "--baseline-report with the report of the generation that staged it")
         source = _load(baseline_report_path, "baseline report")
         _require_evidence(source, "the baseline report")
         _require_source_of(source, baseline, report)
+        base_entry = entries[labels.index(baseline)]
+        recorded = base_entry.get("source_report_sha256")
+        if not isinstance(recorded, str) or len(recorded) != 64:
+            raise UsageError(f"the runfile arm {baseline!r} records no source report digest; "
+                             "score the source generation, then re-stage the runfile")
+        if base_entry.get("source_generation") != source.get("generation"):
+            raise UsageError("the runfile arm's source_generation does not match "
+                             "--baseline-report's generation")
+        if sha256_file(Path(baseline_report_path)) != recorded:
+            raise UsageError("--baseline-report's sha256 does not match the digest the "
+                             "runfile arm recorded")
     elif baseline_report_path is not None:
         _require_evidence(_load(baseline_report_path, "baseline report"), "the baseline report")
     by_slice = (report.get("deltas") or {}).get(arm)
