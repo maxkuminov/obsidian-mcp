@@ -62,10 +62,18 @@ where the fill leads.
   the harness sets. The release A/B is then one generation:
   `make_arm` (candidate) against `make_arm_alt` with
   `hybrid_alt_k=60 hybrid_alt_any_offset=0` as `BASELINE`.
-- **Release bar:** no regression in hybrid recall@20 and recall@50
-  (95% CI) on the real-data report, and a fixture test that proves a
-  fill row can never outrank an all-terms row through the keyword arm
-  alone. There is no rank target for the issue's query.
+- **Release bar:** on the real-data report, for the hybrid arm against
+  the incumbent-fusion baseline, `recall@10`, `recall@20`, `recall@50`
+  and `ndcg@10` on the `overall` and `class:identifier` slices. Any of
+  those eight cells with a candidate-minus-baseline bootstrap CI95 lower
+  bound below −0.01 is a FAIL. A new `search_eval gate` step prints
+  PASS/FAIL per cell, and the PR body carries the table. The fixture
+  must also prove that a fill row can never outrank an all-terms row
+  through the keyword arm alone. There is no rank target for the
+  issue's query.
+- **Snippets follow the new order.** The first `KEYWORD_SNIPPET_ROWS`
+  keyword rows of the fused page get the snippets, as before, so a
+  reordering can move a snippet across that boundary.
 - Docs: `docs/architecture/search.md` (fusion, bounds, harness),
   CLAUDE.md's `hybrid_search` bullet, one README sentence, and
   DEPLOYMENT.md's eval recipe (`hybrid_alt_any_offset`).
@@ -92,7 +100,8 @@ None.
   structure, re-measured figures); the description requirement (states
   the offset).
 - `search-evaluation`: the hybrid arm requirement (`make_arm_alt`'s
-  `hybrid_alt_any_offset` option and the override seam).
+  `hybrid_alt_any_offset` option and the override seam), and an ADDED
+  `gate` step (PASS/FAIL per metric × slice from a report).
 
 `search-quality` states nothing about fusion (its keyword requirements
 govern `keyword_search` and the arm core, both unchanged), so it has no

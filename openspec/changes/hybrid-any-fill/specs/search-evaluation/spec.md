@@ -30,3 +30,16 @@
 #### Scenario: The override never leaves the harness
 - **WHEN** the source tree under `src/` is parsed
 - **THEN** no statement SHALL set the hybrid service's offset override
+
+## ADDED Requirements
+
+### Requirement: The harness SHALL provide a gate step that prints PASS or FAIL per metric and slice from a scored report
+`python -m scripts.search_eval gate --report <report.json> --arm <label> --metrics <m,…> --slices <s,…> --min-ci-lower <x> --out <file>` SHALL read the `deltas` of a scored report for one candidate arm against the report's `baseline`, and SHALL print one line per (metric × slice) cell with the delta mean, the bootstrap CI95 and `PASS` or `FAIL`. A cell SHALL be `FAIL` when its CI95 lower bound is below `--min-ci-lower`, or when its CI95 is null (no delta could be computed). The step SHALL write the same table to `--out` as Markdown, ready to paste into a PR body. It SHALL exit 0 when every cell passes, 1 when any cell fails, and 64 on a usage error (an unknown arm, metric or slice, a report without a baseline, or a report whose verdict is not `OK`). It SHALL read only the report and write only `--out`.
+
+#### Scenario: The hybrid-any-fill release gate
+- **WHEN** the gate runs with `--arm scripts.search_eval_arms.hybrid:make_arm --metrics recall@10,recall@20,recall@50,ndcg@10 --slices overall,class:identifier --min-ci-lower -0.01` on a report whose baseline is the alt arm
+- **THEN** it SHALL print eight cells, and SHALL exit 1 if any cell's CI95 lower bound is below −0.01
+
+#### Scenario: A report that is not evidence
+- **WHEN** the report's verdict is `CORPUS_LOSS` or `INSUFFICIENT`
+- **THEN** the gate SHALL exit 64 and print no PASS

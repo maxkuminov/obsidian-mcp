@@ -75,9 +75,16 @@ conjunctive-only note (D1's strict inequality), so the tie-break only
 decides between notes whose term multisets give equal sums, as before.
 Keeping it unoffset keeps the #354 "favour no arm" rule word for word.
 `_hybrid_preview` keeps comparing the unoffset `keyword_rank` with
-`semantic_rank`, so previews on pages with fill rows are unchanged. The
-offset is a fusion weight, not a claim that the keyword arm ranked the
-note lower.
+`semantic_rank` when it picks between one row's keyword and semantic
+preview. The offset is a fusion weight, not a claim that the keyword arm
+ranked the note lower. **Snippet assignment is a different matter.**
+Snippets and `matched_in` go to the first `KEYWORD_SNIPPET_ROWS`
+keyword-bearing rows *of the fused page*, and the page's order changes,
+so a snippet can move across that boundary: a non-fill row can gain or
+lose its snippet, `matched_in` and `preview_kind`. That is deliberate.
+The page stays honest about the order it shows, and keeping the
+incumbent's assignment would need a second, hidden ordering (Codex
+round 1, F2).
 
 ## D3 — Keyword-only pages: no offset
 
@@ -104,8 +111,10 @@ The header gets no new token, because the disclosure already exists:
   `explain` term now shows the offset rank;
 - in the header, `keyword: n notes (all a, any b)` gives the split and
   `arm_depth` the depth;
-- the description gains one sentence: "A `match: any` keyword row (only
-  some words matched) enters at `rank + 50`, below every all-terms row."
+- the description's fusion sentence drops "with equal votes" and states
+  that semantic and all-terms keyword ranks use the same reciprocal-rank
+  formula, while a fill (`match: any`) keyword rank enters offset by 50,
+  below every all-terms row.
 
 A header token (for example `any_offset: 50`) would cost about 16
 characters of base budget on every page, like `confidence` did (#389
@@ -119,16 +128,17 @@ so it becomes 338, inside the pinned 345. `HYBRID_RERANK_ROW_STRUCTURE_MAX`
 367 is re-measured the same way. The keyword-only measured figures do not
 move (D3). Projected both-arms figures: `rerank=false` cut form 999 →
 1,000 (still ≤ 1,000, and the 40–45 cut still holds); `rerank=true`
-omitted form 1,007 → 1,008, falling through to `explain omitted` at 988
+omitted form 1,007 → 1,008 (the spec's explain-omitted scenario cites
+this D4), falling through to `explain omitted` at 988
 (unchanged, because that rung drops the term). Task 5 measures and pins
 these figures. If any figure differs, the spec delta is corrected before
 verification. The fallback form `1/(k+rank+50)` was rejected: it costs 3
 characters and would push the both-arms `rerank=false` cut form to 1,002,
 losing the 40–45 cut guarantee at the floor.
 
-The description is 3,827 raw characters today. The added sentence fits
-under the 4,000 cap (#343) with roughly 20 characters to spare. If it does
-not, the sentence is shortened. Nothing else is removed.
+The description is 3,827 raw characters today. The rewritten fusion
+sentence (measured on a copy of the docstring, 2026-10-31) brings it to
+**3,976**, under the 4,000 cap (#343) with 24 characters to spare.
 
 ## D5 — Rerank and confidence
 
@@ -211,8 +221,8 @@ carry fill terms of similar size. What B does change on this page: two
 fill-only notes (11–12) stop outranking semantic-only notes, and the
 fill's ±0.002 swing no longer reorders the semantic leaders (J1 and J2
 swap). Owner decision (2026-10-31): B ships as a fusion-hygiene change. The
-release bar is no regression in recall@20/@50 (95% CI) on the real-data
-report, plus the fixture proof that a fill row can never outrank an
+release bar is the eight-cell gate of task 7.3 (recall@10/@20/@50 and
+ndcg@10 on `overall` and `class:identifier`), plus the fixture proof that a fill row can never outrank an
 all-terms row through the keyword arm alone (task 4.1). The "top 3"
 bar is dropped. The issue's query is addressed by the re-test after the
 `CHUNKING_VERSION` 2 drain and by #402's reranker path. Task 7.3 still
@@ -242,12 +252,18 @@ Against the incumbent, on the same corpus, filters and arguments:
    where the semantic arm was unavailable, renders a **byte-identical**
    response. This is pinned with the existing fixtures in
    `tests/test_hybrid_search_offline.py` and `test_hybrid_search_pg.py`.
-3. On a call with fused fill rows, the **relative order of the rows
-   without a `match: any` keyword rank** is unchanged (their scores and
-   tie-break keys are unchanged). Only the positions of fill-bearing rows,
-   their `score`, and their keyword `explain` term may differ. The page's
-   membership under `limit`, and the rerank window, may change only by
-   exchanging fill-bearing rows for others.
+3. **Exchange rule after slicing.** On a call with fused fill rows, the
+   relative order of the rows without a `match: any` keyword rank is
+   unchanged (their scores and tie-break keys are unchanged). The page
+   (`limit`) and the rerank window (first 50) change membership only by
+   fill-bearing rows being exchanged for other union members. The
+   rerank window **can** change: with one `all` row, 49 `any` rows and
+   50 disjoint semantic rows, the window goes from about 25 + 25 to the
+   `all` row plus semantic 1–49, and the test pins that.
+4. **Snippet boundary.** A non-fill row's line is byte-identical except
+   where snippet/`matched_in` assignment moves across
+   `KEYWORD_SNIPPET_ROWS` (D2). The fixture: `KEYWORD_SNIPPET_ROWS=1`,
+   A all-rank-1 only, F any-rank-50 plus semantic-50.
 
 ## Risks / Trade-offs
 
@@ -257,7 +273,8 @@ Against the incumbent, on the same corpus, filters and arguments:
 - [Weaker keyword arm when `all = 0`] → every keyword term is then offset,
   and the fused order is mostly semantic, with the fill as a bonus.
   `keyword_search` keeps the labelled fill for identifier-style queries. The
-  eval report's `class:identifier` slice is watched for a regression.
+  gate (task 7.3) enforces the `class:identifier` slice, not just
+  inspects it.
 - [Explain readability: `keyword_rank: 5` next to `1/(60+55)`] → the
   description sentence explains the offset, and `match: any` sits on the
   same row.
@@ -284,8 +301,45 @@ Flux path. Rollback is the previous image.
 
 ## Owner decisions (2026-10-31)
 
-1. **Release bar.** Keep option B as fusion hygiene. The gate is no
-   regression in recall@20/@50 (95% CI) on the real-data report, plus the
-   fixture proof (task 4.1). The "top 3" bar for the issue's query is
-   dropped (D7).
+1. **Release bar.** Keep option B as fusion hygiene. The gate is the
+   eight-cell `search_eval gate` (recall@10/@20/@50 and ndcg@10 ×
+   `overall` and `class:identifier`, FAIL when the CI95 lower bound is
+   below −0.01), plus the fixture proof (task 4.1). The "top 3" bar for
+   the issue's query is dropped (D7).
 2. **`explain` form.** `1/(k+55)`: the fusion rank, +1 character (D4).
+
+## Codex spec review — round 1
+
+Verdict, verbatim:
+
+The proposal is internally coherent on the offset arithmetic, confidence inputs, telemetry counts, and process-local harness override. It fails control review because its identity oracle contradicts the permitted top-50 exchanges, overlooks snippet/provenance changes caused by reordering, and uses an evaluation bar blind to default-page regressions.
+
+```json
+{"verdict":"FAIL","findings":[{"severity":"MAJOR","file":"openspec/changes/hybrid-any-fill/specs/hybrid-search/spec.md","line":55,"claim":"The identity scenario requires the same fused path set at limit=50, contradicting line 4, design D5, and the actual behavior: the pre-limit union remains identical, but the first 50 page and reranker candidates may change.","failing_input":"At k=60, use one match:all keyword row at rank 1, 49 match:any rows at ranks 2-50, and 50 disjoint semantic rows. Before the offset, the top 50 contain keyword and semantic rows through roughly rank 25. Afterward, every semantic row outranks every match:any-only row, so the top 50 become the all-terms row plus semantic ranks 1-49. The union is unchanged but the asserted limit=50 set is not.","fix":"Test union identity directly before slicing. For limit=50, assert the documented exchange rule instead: unchanged non-fill ordering, with membership changes restricted to fill-bearing rows exchanged for other union members. Explicitly pin the changed reranker window."},{"severity":"MAJOR","file":"openspec/changes/hybrid-any-fill/design.md","line":78,"claim":"The claim that previews remain unchanged, and the oracle's byte-identical non-fill row requirement, are false against the current snippet-selection code. Snippets and matched_in are assigned to the first KEYWORD_SNIPPET_ROWS keyword-bearing rows after fusion, so reordered fill rows can change a non-fill row's rendered provenance and preview.","failing_input":"Set KEYWORD_SNIPPET_ROWS=1. Let A be match:all keyword rank 1 only, and F be match:any keyword rank 50 plus semantic rank 50. Before #403, F scores 2/110 and precedes A at 1/61, so F receives the sole snippet. Afterward F scores 1/160+1/110 and follows A, so A receives the snippet. A carries no match:any rank, yet its preview_kind, preview and matched_in line change.","fix":"Specify whether snippet selection follows incumbent unoffset fusion or the new fused order. Either preserve it explicitly or relax the preview and byte-identity oracle, then add a snippet-cap boundary fixture for a non-fill row."},{"severity":"MAJOR","file":"openspec/changes/hybrid-any-fill/tasks.md","line":51,"claim":"The release bar cannot detect an important regression this ranking change can cause. It checks only recall@20 and recall@50, while the default page has limit=10; the CI comparison also does not gate automatically, and the task does not define the inspected slice or exact rejection inequality. This also leaves design.md's promised class:identifier watch unenforced.","failing_input":"A relevant fill-bearing note moves from rank 10 to 11 while all relevant notes remain within ranks 20 and 50. Both gated recall metrics and their deltas are unchanged, but the default agent-visible page silently loses the note and emits no response-cap footer because slicing happened before rendering. Confidence is unchanged.","fix":"Define exact report fields, slices and rejection inequalities. Include an existing metric sensitive to the default page, such as recall@10, and explicitly enforce the promised class:identifier check rather than merely inspecting recall@20/@50."},{"severity":"MINOR","file":"openspec/changes/hybrid-any-fill/specs/hybrid-search/spec.md","line":150,"claim":"The explain-omitted scenario retains the pre-change 1,007 omitted-form figure, contradicting the same requirement at line 126, design D4, and task 5.2, which correctly project 1,008 after the three-digit fusion rank adds one character.","failing_input":"Both arms, k=1000, keyword rank 50 match:any with fusion rank 100, semantic rank 50, maximum transition line and rerank fallback: the omitted intermediate form gains one character and measures 1,008; only explain-omitted remains 988.","fix":"Change 1,007 to 1,008 and reference the correct design section."},{"severity":"MINOR","file":"openspec/changes/hybrid-any-fill/specs/hybrid-search/spec.md","line":166,"claim":"The required tool description still calls the arms' votes equal while also saying match:any keyword rows use rank+50. That is agent-facing shorthand inconsistent with the effective contribution.","failing_input":"At arm rank 1 and k=60, a semantic-only row contributes 1/61 while a match:any keyword-only row contributes 1/111, despite the description saying equal votes.","fix":"Replace equal votes with wording that states equal reciprocal formulas for semantic and all-terms ranks, with the documented fill-rank offset."}]}
+```
+
+What changed, per finding (owner decisions, 2026-10-31):
+
+1. MAJOR, identity oracle: fixed. The union is compared before slicing.
+   After slicing the exchange rule applies (non-fill relative order
+   unchanged; membership changes only by fill-bearing rows exchanged for
+   other union members). The rerank-window change is pinned by Codex's
+   1-all + 49-any + 50-semantic construction (spec scenario "The exchange
+   rule…", design oracle 3).
+2. MAJOR, snippets: fixed. Snippet and `matched_in` assignment follows the
+   new fused order. The byte-identity oracle allows a reassignment at the
+   `KEYWORD_SNIPPET_ROWS` boundary and nothing else. Codex's boundary
+   fixture is a spec scenario and task 4.2b. The "previews unchanged"
+   claim is gone from D2.
+3. MAJOR, release bar: fixed. Eight cells (recall@10, recall@20,
+   recall@50, ndcg@10 × `overall`, `class:identifier`). FAIL when the
+   candidate-minus-baseline CI95 lower bound is below −0.01. Enforced by
+   a new `search_eval gate` step (ADDED search-evaluation requirement),
+   which prints PASS/FAIL per cell; the PR body carries the table (task
+   7.3).
+4. MINOR, 1,007: fixed. The spec scenario reads 1,008 → 988 and cites
+   design D4.
+5. MINOR, "equal votes": fixed. The description requirement and task 2.2
+   state the same reciprocal-rank formula for semantic and all-terms ranks,
+   with fill ranks offset by 50. The description measures 3,976 characters.
+

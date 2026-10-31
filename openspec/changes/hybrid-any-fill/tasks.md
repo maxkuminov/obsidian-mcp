@@ -14,19 +14,22 @@
 ## 2. Rendering and description
 
 - [ ] 2.1 `_hybrid_server_fields`: the keyword `explain` term uses `keyword_fusion_rank` (falling back to `keyword_rank` when unset, so hand-built rows in tests keep working); `keyword_rank:` and the preview choice stay unoffset; no header token
-- [ ] 2.2 `hybrid_search` description (`src/mcp_server/server.py`): one sentence that a `match: any` keyword row enters at `rank + 50`, below every all-terms row; ≤ 4,000 characters (`tests/test_issue_343_tool_metadata.py`); `hybrid_search_impl` docstring follows
+- [ ] 2.2 `hybrid_search` description (`src/mcp_server/server.py`): the fusion sentence drops "with equal votes" and states the same reciprocal-rank formula for semantic and all-terms keyword ranks, with a fill (`match: any`) keyword rank entering offset by 50, below every all-terms row (design D4's wording, 3,976 characters); ≤ 4,000 characters (`tests/test_issue_343_tool_metadata.py`); `hybrid_search_impl` docstring follows
 
 ## 3. Harness (`scripts/search_eval_arms/hybrid.py`)
 
 - [ ] 3.1 `make_arm_alt` accepts `hybrid_alt_any_offset` ∈ {0, 50} (default 50); any other value → `UsageError` (exit 64) before the generation is reserved; `required_options` unchanged (`hybrid_alt_k`)
 - [ ] 3.2 With 0, the arm sets `_any_fill_offset_override` to 0 around its service call (`set` / `reset(token)`); module docstring updated
+- [ ] 3.4 `python -m scripts.search_eval gate` (ADDED search-evaluation requirement): reads `report.json` deltas for one arm against the report's baseline, prints mean / CI95 / PASS|FAIL per (metric × slice), writes a Markdown table to `--out`, exits 0/1/64; refuses a non-`OK` verdict; offline tests for each exit code
 - [ ] 3.3 AST guard test: no module under `src/` assigns or `.set()`s `_any_fill_offset_override`
 
 ## 4. Tests
 
 - [ ] 4.1 `fuse` unit tests (release-bar fixture proof: a fill row can never outrank an all-terms row through the keyword arm alone, for k ∈ {1, 60, 1000} and every fill and all-terms rank in 1–50): the spec scenarios (1/110 vs 1/111; E before J; fill-only below semantic-only rank 50; unoffset tie-break; `any_offset=0` equals the old `fuse` on random inputs)
 - [ ] 4.2 Byte-identity: every existing fixture with `keyword_any = 0` renders identically to origin/main (pin with the current offline and integration fixtures); the keyword-only path with `any` rows renders identically
-- [ ] 4.3 Identity oracle (integration, `tests/integration/test_hybrid_search_pg.py`): a corpus with `all` and `any` rows, `limit=50`, incumbent (override 0) vs candidate: same fused path set; the subsequence of rows without a `match: any` keyword rank in the same order with byte-identical lines
+- [ ] 4.2b Snippet boundary (offline): `KEYWORD_SNIPPET_ROWS=1`, A all-rank-1 only, F any-rank-50 + semantic-50; before: F first with the snippet; after: A first with the snippet and `matched_in`; A's line differs only in `preview_kind`/`preview`/`matched_in`
+- [ ] 4.3 Identity oracle (integration, `tests/integration/test_hybrid_search_pg.py`), incumbent (override 0) vs candidate: union identity on the full fused lists **before slicing**; at `limit=50` the exchange rule (non-fill relative order unchanged, membership differences only fill-bearing rows exchanged for union members, non-fill lines byte-identical except snippet-boundary reassignment)
+- [ ] 4.3b Rerank window (offline): 1 `all` + 49 `any` keyword rows and 50 disjoint semantic rows at k=60; pin the first-50 window before (≈ 25 + 25) and after (the `all` row + semantic 1–49), and that `_hybrid_search_reranked` receives the new window
 - [ ] 4.4 The issue's shape, synthetic (no vault data in the repo): job-posting-like titles matching one query word plus an opinion note with all words in a near paraphrase; assert the fill-only rows fall below the semantic-only rows and that the explain terms sum to the score
 - [ ] 4.5 Harness: `make_arm_alt` with `hybrid_alt_any_offset=0` equals the pre-#403 fusion; invalid value exits 64; a `make_arm` query running concurrently with an alt query sees no override (`tests/test_hybrid_search_eval.py`)
 
@@ -48,7 +51,7 @@
 
 - [ ] 7.1 `openspec validate hybrid-any-fill --strict`; offline suite, `make test-integration`, `make search-eval` (fixture)
 - [ ] 7.2 Search-eval gate (CLAUDE.md row): restore a `BACKUP_FULL=1` copy, `make search-eval-snapshot`, then one generation at the candidate commit with `ARMS="keyword semantic scripts.search_eval_arms.hybrid:make_arm scripts.search_eval_arms.hybrid:make_arm_alt" ARM_OPTS="hybrid_alt_k=60 hybrid_alt_any_offset=0" BASELINE=scripts.search_eval_arms.hybrid:make_arm_alt`; `USER_ID=` export on multi-user; attach `report.json` only if `attachable: true`; `CORPUS_LOSS` invalidates; expected movement in the hybrid arm only
-- [ ] 7.3 Release bar: no regression in hybrid recall@20 and recall@50 beyond the 95% CI against the baseline arm; the issue's query added as one named judgment in `.search-eval/manual.jsonl` (tenant data, git-ignored; relevant = the opinion note), and its rank reported for both arms, for information only (no rank target: the query is semantic-led, design D7)
+- [ ] 7.3 Release bar: `python -m scripts.search_eval gate --report .search-eval/report.json --arm scripts.search_eval_arms.hybrid:make_arm --metrics recall@10,recall@20,recall@50,ndcg@10 --slices overall,class:identifier --min-ci-lower -0.01 --out .search-eval/hybrid-any-fill-gate.md` must exit 0. FAIL means any of the eight cells has a candidate-minus-baseline CI95 lower bound < −0.01. The two paths are `.search-eval/report.json` (the scored report, attached only if `attachable: true`) and `.search-eval/hybrid-any-fill-gate.md` (the PASS/FAIL table), and the PR body carries that table; the issue's query added as one named judgment in `.search-eval/manual.jsonl` (tenant data, git-ignored; relevant = the opinion note), and its rank reported for both arms, for information only (no rank target: the query is semantic-led, design D7)
 - [ ] 7.4 `openspec-verifier` subagent (not an implementer) against the deltas; iterate to zero blocking gaps
 - [ ] 7.5 Adversarial Codex (mandatory: a ranking change an agent acts on without a human seeing the query), framed per CLAUDE.md (silently wrong search results); attack the D1 bound, D3's keyword-only exemption, the override seam and the oracle; two rounds by default, triage per the workflow file, declined findings recorded as accepted limitations
 - [ ] 7.6 `openspec archive hybrid-any-fill -y` and the docs above as the last commits; one PR, `Closes #403`
