@@ -1082,7 +1082,10 @@ The output (`.search-eval/confidence-report.json` and the table) carries
 the mine run's `provenance` and `attachable`. **Only attachable output may
 leave `.search-eval/`**: a multi-user tabulation begins with `NOT
 ATTACHABLE (multi-user provenance)` and stays private. The reference
-deployment sets a non-zero value only after both lines pass.
+deployment sets a non-zero value only after both lines pass. `mine` binds the rows to
+its report by digest, so `confidence` refuses (exit 64) when
+`confidence-rows.jsonl` and `mine-report.json` come from different `mine`
+runs — re-run `mine` instead of mixing files.
 
 ### Reranker (optional)
 
