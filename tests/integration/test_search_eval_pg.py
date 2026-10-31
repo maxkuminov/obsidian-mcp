@@ -39,6 +39,7 @@ from sqlalchemy.pool import NullPool
 import _harness
 from src.config import settings
 from src.models.db import APIKey, NoteEmbedding, NoteMetadata, OAuthClient, OAuthToken, UsageLog, User
+from src.services.embeddings import CHUNKING_VERSION
 from src.services.search_analytics import analysable_sql
 from src.services.usage_stats import PRE_BODY_REFUSAL_BINDS
 
@@ -550,8 +551,8 @@ def test_legacy_chunked_notes_is_scoped_to_the_exports_owner(loss_db, tmp_path, 
 
     monkeypatch.setattr("src.services.embeddings.get_embedding", fake_get_embedding)
     # User 1 re-embedded (current version); user 2 still legacy.
-    arun(_exec(loss_db, "UPDATE notes_metadata SET embedded_chunking_version = 1 "
-                        "WHERE user_id = :u", u=users["u1"]))
+    arun(_exec(loss_db, "UPDATE notes_metadata SET embedded_chunking_version = :v "
+                        "WHERE user_id = :u", u=users["u1"], v=CHUNKING_VERSION))
     d = tmp_path / "d"
     arun(write_snapshot(data=d, database_url=loss_db))
     write_data(d, [{"user_id": users["u1"], "text": "runbook", "relevant": ["Ops/Runbook.md"]}])
@@ -564,9 +565,15 @@ def test_legacy_chunked_notes_is_scoped_to_the_exports_owner(loss_db, tmp_path, 
 
     first = staged_meta("G1")
     assert first["legacy_chunked_notes"] == 0
-    assert json.loads(first["retrieval_fingerprint"])["chunking_version"] == 1
+    assert json.loads(first["retrieval_fingerprint"])["chunking_version"] == CHUNKING_VERSION
+    # #390 (D8): user 1's chunk-length distribution, every chunk a whole
+    # (one-chunk) note, so nothing counts as under the minimum.
+    lengths = first["chunk_lengths"]
+    assert lengths is not None and lengths["under_min"] == 0
+    assert lengths["chunks"] == lengths["whole_short"] >= 1
     report = score(d, ["semantic"], min_queries=1).report
     assert report["arms"][0]["legacy_chunked_notes"] == 0
+    assert report["arms"][0]["chunk_lengths"] == lengths
     # Another tenant's legacy rows multiply; nothing of user 1's report moves.
     for i in range(37):
         arun(_exec(loss_db,

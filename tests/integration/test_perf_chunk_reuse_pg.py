@@ -157,7 +157,7 @@ async def _set_hash(maker, note_id, body):
         await session.commit()
 
 
-async def _embed(maker, note_id, body, accounting=None):
+async def _embed(maker, note_id, body, accounting=None, *, hash_of=None):
     async with maker() as session:
         note = (await session.execute(
             select(NoteMetadata).where(NoteMetadata.id == note_id)
@@ -166,7 +166,8 @@ async def _embed(maker, note_id, body, accounting=None):
         await session.commit()
         result = await embeddings_service.embed_note(
             session, note, body,
-            certified_hash=content_hash(body), certified_path="Note.md",
+            certified_hash=content_hash(body if hash_of is None else hash_of),
+            certified_path="Note.md",
             on_provider_call=accounting.issued if accounting else None,
         )
         if accounting is not None:
@@ -401,11 +402,14 @@ async def test_an_all_reuse_note_loses_a_reset_race_without_an_attempt(
     monkeypatch.setattr(
         embeddings_service, "_generation_matches", _reset_then_check
     )
-    await _set_hash(maker_a, note_id, BODY + "\n")  # same chunks, new hash
+    # Same chunks, new hash. Since #390 windows are stored raw, so a trailing
+    # newline would change the last chunk; the bytes stay BODY and only the
+    # recorded hash moves.
+    await _set_hash(maker_a, note_id, BODY + "\n")
     acc, outcome, budget = _accounting()
 
     result = await asyncio.wait_for(
-        _embed(maker_a, note_id, BODY + "\n", acc), timeout=30
+        _embed(maker_a, note_id, BODY, acc, hash_of=BODY + "\n"), timeout=30
     )
 
     assert provider.sent == []
