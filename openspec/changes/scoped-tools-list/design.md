@@ -37,8 +37,8 @@ Hidden set = `WRITE_REQUIRED_TOOLS`, **one `frozenset` literal** in a new SDK-fr
 
 It is the single source for **both** consumers:
 
-1. **Enforcement.** `_tracked` looks up its own `tool_name` in the registry once, at decoration time. For a member, at the **body boundary** — after every existing gate (argument caps, vault root, rate buckets, concurrency admission, quota), exactly where the body would start — it calls `_require_write()` and, on refusal, returns that refusal without running the body, classified exactly as the body's own refusal is today (a body refusal, executed work, the same `BodyOutcome`, usage marker and `tool_write_refused` event; `_require_write` already records both at its single definition). Rate tokens and the quota slot are therefore spent exactly as today, because today the body ran and refused as its first act.
-2. **Discovery.** `tool_visibility.hidden_names()` returns the same object.
+1. **Enforcement.** `_tracked` looks up its own `tool_name` in the registry on every call (a frozenset membership test), so the registry is the live source. For a member, at the **body boundary** — after every existing gate (argument caps, vault root, rate buckets, concurrency admission, quota), exactly where the body would start — it calls `_require_write()` and, on refusal, returns that refusal without running the body, classified exactly as the body's own refusal is today (a body refusal, executed work, the same `BodyOutcome`, usage marker and `tool_write_refused` event; `_require_write` already records both at its single definition). Rate tokens and the quota slot are therefore spent exactly as today, because today the body ran and refused as its first act.
+2. **Discovery.** `tool_permissions.hidden_names()` returns the same object.
 
 No decorator argument and no wrapper stamp defines membership (the round-0 `requires_write` stamp is dropped: Codex showed it was metadata that enforcement never consumed). `write_class` stays what it is — the rate-bucket and concurrency class — and a test pins `W == WRITE_REQUIRED_TOOLS − {request_upload}`; `request_upload` is outside the bucket because its write charge is taken at `PUT /transfer/upload` redemption (`rate-limits.md`).
 
@@ -64,7 +64,7 @@ Per the issue: an API key's permission is set by its owner in the panel and show
 ### D4. The seam: override the public `list_tools()`; the rule and the registry import no SDK
 
 ```python
-# src/mcp_server/tool_visibility.py  (no `mcp` import)
+# src/mcp_server/tool_permissions.py  (no `mcp` import; holds the registry too)
 def is_filtered(principal, permission) -> bool: ...
 def hidden_names() -> frozenset[str]:  # returns tool_permissions.WRITE_REQUIRED_TOOLS
 def visible(tools: Sequence[T], *, principal, permission) -> list[T]:  # order-preserving, by `.name`
@@ -82,7 +82,7 @@ Why this seam:
 
 - It overrides a **public** method the SDK itself dispatches to — `self.list_tools` in 1.30's `_setup_handlers`, `await self.list_tools()` in 2.x's `_handle_list_tools`. The 2.x migration (#365) changes the base class name (`FastMCP` → `mcp.server.mcpserver.MCPServer`) and nothing else here. Re-registering the low-level handler (`mcp._mcp_server.list_tools()(…)`) was rejected: it reaches a private attribute that 2.x replaces with constructor-passed `on_*` handlers.
 - The return type stays `list[MCPTool]`, so every test that calls `await mcp.list_tools()` is unaffected — they run with no principal and get the full list.
-- The rule is an ordinary function of `(tools, principal, permission)` over objects with a `.name`. **The promise is precise (Codex round 1):** `tool_visibility.py` and `tool_permissions.py` import nothing from `mcp`, directly or transitively, *including when `hidden_names()` and `visible()` are invoked* — which holds because the registry is a literal in an SDK-free module rather than an enumeration of `tools.py` (which imports `mcp.server.fastmcp.Image`). The test runs both calls in a clean subprocess and inspects `sys.modules`.
+- The rule is an ordinary function of `(tools, principal, permission)` over objects with a `.name`. **The promise is precise (Codex round 1):** `tool_permissions.py` imports nothing from `mcp`, directly or transitively, *including when `hidden_names()` and `visible()` are invoked* — which holds because the registry is a literal in an SDK-free module rather than an enumeration of `tools.py` (which imports `mcp.server.fastmcp.Image`). The test runs both calls in a clean subprocess and inspects `sys.modules`.
 - **2.x obligation, recorded for #365**: on the 2026-07-28 path a `tools/list` result carries `cacheScope`. A list that varies by authorization MUST be `"private"` (caching utility: "`private` is appropriate … for filtered list results that vary per user"; a `"public"` list "may be shared outside of the initial request's authorization context"). 2.x's default `CacheHint` is `"private"`; the migration SHALL NOT configure `cache_hints` for `tools/list` as `"public"`, and SHALL carry a test that a filtered list is `"private"`. Under 1.30 there is no `cacheScope` field; HTTP responses to the `/mcp` POSTs are not cacheable by shared caches.
 
 ### D5. Determinism, the oracle and the fixtures (revised, Codex round 1)
@@ -160,6 +160,16 @@ SDK 1.30's `FastMCP.list_tools()` takes no request and returns the complete list
 ## Verification plan
 
 Offline + integration suites; `openspec-verifier`; one mandatory adversarial Codex pass (auth/permission surface) framed on: a filter that hides a tool a grant can use, a filter that varies by anything other than the presented credential, a list that leaks across requests, and any change to call-time refusal. Live: a read-only Claude connector lists 19 and is refused on a named `edit_note`; a `readwrite` connector and an API key list 28.
+
+## Implementation notes (design shifts made while implementing)
+
+- **One module, not two.** The rule (`is_filtered`, `hidden_names`, `visible`) lives in `src/mcp_server/tool_permissions.py` beside `WRITE_REQUIRED_TOOLS` rather than in a separate `tool_visibility.py`: the registry and the rule have the same import constraint (no SDK, no `tools.py`), and one file makes "the list reads the object the gate reads" visible at a glance. The spec's "visibility module" is this module.
+- **The gate looks the registry up per call**, not once at decoration: the cost is one frozenset membership test, and it is what lets the "the gate reads the registry" test monkeypatch the live object (spec scenario "The registry is the enforcement source").
+- **The #343 fixture test is not edited.** Task 4.14's "also under an API-key principal" is met in `tests/test_issue_358_scoped_tools_list.py` (`test_in_process_listing_per_principal`, which compares names and schemas against the oracle for both API-key permissions, and the HTTP byte-identity tests), leaving the #343 module untouched.
+- **The HTTP harness stubs authentication only** (`tests/_scoped_tools_harness.py`): the real SDK transport and low-level server run, and a shim sets exactly the contextvars `APIKeyMiddleware._authenticate` sets. The real middleware is exercised where it is the subject (401 before the handler; sandbox pass-through).
+- **The concurrency test resets the in-process rate buckets between rounds** (never inside one): the read-only `delete_note` is in the write bucket (burst 30) and would otherwise be refused `rate_limited` from round 31. The injected suspension is placed in `FastMCP.list_tools` (reached through `super()`), because the SDK registered the bound override at construction.
+
+- **Two existing guards learned about the gate.** `tests/test_mcp_rate_limits.py::test_the_documented_gate_order_is_the_implemented_one` now pins the write gate between the quota and the body; `tests/test_issue_88_root_confirmed_before_publish.py`'s write-tool detector skips `_tracked` and its closures (the gate calls `_require_write` for every wrapped tool, which made every read tool look like a writer). Neither guard was weakened: both still classify by what the tool's own body does.
 
 ## Codex spec review — round 1
 

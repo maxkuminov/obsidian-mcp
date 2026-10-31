@@ -81,7 +81,13 @@ middleware, which binds a principal or answers 401/429. The failed-auth budget
 
 ## Gate order, and the invariant it preserves
 
-L2 → L3 → L4 → L5a/b → L5c (slots) → L6 (quota) → body → telemetry.
+L2 → L3 → L4 → L5a/b → L5c (slots) → L6 (quota) → write gate → body → telemetry.
+
+The **write gate** (#358) is not an admission gate: it runs `_require_write()`
+at the body boundary for the tools in `tool_permissions.WRITE_REQUIRED_TOOLS`
+and its refusal is the body's own (executed work, the `permission_denied`
+marker). Those bodies used to refuse as their first act, so the tokens and the
+quota slot a read-only write call spends are exactly what they were.
 
 - **A token is not a quota slot.** A rate token refills, so consuming one on a
   call a later gate refuses is correct — the refusal itself costs work. The

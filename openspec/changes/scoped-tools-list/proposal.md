@@ -42,8 +42,7 @@ No OAuth spec names what a scope grants in terms of tools, so `oauth-authorizati
 ## Impact
 
 - `src/mcp_server/server.py`: `mcp` is constructed from a `FastMCP` subclass whose `list_tools()` applies the visibility rule; no registration changes.
-- `src/mcp_server/tool_permissions.py` (new, SDK-free): `WRITE_REQUIRED_TOOLS`.
-- `src/mcp_server/tool_visibility.py` (new, SDK-free): the rule — which principal is filtered; the hidden names are the registry.
+- `src/mcp_server/tool_permissions.py` (new, SDK-free): `WRITE_REQUIRED_TOOLS` and the rule (`is_filtered`, `hidden_names`, `visible`) — one module (implementation shift, design "Implementation notes").
 - `src/mcp_server/tools.py`: `_tracked` runs `_require_write()` at the body boundary for registry members (after every existing gate); the in-body checks are untouched.
 - Tests: new `tests/test_issue_358_scoped_tools_list.py`; new fixtures `tests/fixtures/tools_list_full_v1.json` (complete pre-change oracle, committed first) and `tests/fixtures/tools_list_readonly_oauth.json` (19 names, in order); `tests/test_issue_343_tool_metadata.py` unchanged in what it compares.
 - Docs: `docs/architecture/vault-tools.md` ("Tool metadata" gains "Who sees which tools"), `docs/architecture/oauth-and-grants.md` (what a `read` grant lists), `CLAUDE.md` (MCP tools; one key-decisions bullet), `README.md` (OAuth: a read-only connection lists 19 tools; reconnect after changing a grant's scope).
