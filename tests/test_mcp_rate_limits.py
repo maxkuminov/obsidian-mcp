@@ -337,7 +337,8 @@ def test_an_admitted_call_still_meets_the_vault_gate(monkeypatch):
 
 
 def test_the_documented_gate_order_is_the_implemented_one():
-    """L2 → L3 → L4 → L5 → L6 → body, read off the decorator itself."""
+    """L2 → L3 → L4 → L5 → L6 → write gate (#358) → body, read off the
+    decorator itself."""
     source = inspect.getsource(tools._tracked)
     order = [
         source.index("_bucket_admission(write_class)"),
@@ -345,7 +346,8 @@ def test_the_documented_gate_order_is_the_implemented_one():
         source.index("_first_unencodable_argument(screened)"),
         source.index("_first_over_long_argument(screened"),
         source.index("await _quota_admission_error()"),
-        source.index("result = await fn(*args, **kwargs)"),
+        source.index("if tool_name in tool_permissions.WRITE_REQUIRED_TOOLS"),
+        source.index("else await fn(*args, **kwargs)"),
     ]
     assert order == sorted(order)
 
