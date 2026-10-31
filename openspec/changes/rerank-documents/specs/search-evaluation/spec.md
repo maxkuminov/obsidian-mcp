@@ -9,7 +9,11 @@
 
 #### Scenario: A/B against the incumbent document builder
 - **WHEN** `make search-eval` runs with `ARMS="scripts.search_eval_arms.rerank:make_hybrid_arm_incumbent scripts.search_eval_arms.rerank:make_hybrid_arm"` and the incumbent as `BASELINE`, against a fake reranker that records every request
-- **THEN** each incumbent request SHALL hold exactly one document per fused candidate (up to 50), each beginning with the note's title and none with an `embed_prefix`, and each candidate-arm request SHALL hold at most 50 documents
+- **THEN** each incumbent request SHALL hold exactly one document per fused candidate (up to 50), each beginning with the note's title and none with an `embed_prefix`, and each candidate-arm request SHALL hold every candidate's primary and at most `RERANK_MAX_DOCUMENTS` documents
+
+#### Scenario: A shallow depth measures the production allocation at that limit
+- **WHEN** a run uses `--depth 10` with `make_semantic_arm_incumbent` as `BASELINE` and `make_semantic_arm`
+- **THEN** both arms SHALL call the candidate service with `limit=10`, the candidate arm's requests SHALL equal those `semantic_search(limit=10, rerank=true)` sends for the same query, and recall@20 and recall@50 SHALL be null under `staged_depth`
 
 #### Scenario: A candidate deeper than the evaluation depth is promoted
 - **WHEN** the depth is 20, each note has one fetched chunk, and the fake reranker gives the highest score to the note at vector rank 23

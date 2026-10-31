@@ -22,7 +22,7 @@
 #### Scenario: Rerank timing fields
 
 - **WHEN** a `semantic_search(rerank=true)` call is reranked
-- **THEN** its usage row's `params` SHALL contain integer `embed_ms`, `db_ms` and `rerank_ms` with `embed_ms + db_ms + rerank_ms ≤ duration_ms`, `reranked: true`, an integer `rerank_documents` at most 50, and `result_paths` in reranked order
+- **THEN** its usage row's `params` SHALL contain integer `embed_ms`, `db_ms` and `rerank_ms` with `embed_ms + db_ms + rerank_ms ≤ duration_ms`, `reranked: true`, an integer `rerank_documents` at most `RERANK_MAX_DOCUMENTS`, and `result_paths` in reranked order
 
 #### Scenario: Unreranked calls carry no rerank timing
 

@@ -1,12 +1,12 @@
 ## RENAMED Requirements
 
 - FROM: `### Requirement: A rerank=true call SHALL score only the candidates the search already fetched, through one shared candidate-fetch service, one document per note, and SHALL NOT run a second retrieval`
-- TO: `### Requirement: A rerank=true call SHALL score only the candidates the search already fetched, through one shared candidate-fetch service, one document per fetched chunk, and SHALL NOT run a second retrieval`
+- TO: `### Requirement: A rerank=true call SHALL score only the candidates the search already fetched, through one shared candidate-fetch service, every candidate note with at least one document, and SHALL NOT run a second retrieval`
 
 ## MODIFIED Requirements
 
 ### Requirement: The reranker SHALL be configured by four optional settings, and an empty RERANK_URL SHALL mean the feature is absent
-The server SHALL accept `RERANK_URL` (string, default empty), `RERANK_MODEL` (string, default empty, at most 200 characters, no control characters), `RERANK_TIMEOUT_MS` (integer, default 1500, range 100–30000) and `RERANK_ALLOW_PLAINTEXT` (boolean, default false). `RERANK_URL` SHALL be the full endpoint URL. An empty or unset `RERANK_URL` SHALL mean no reranker is configured. An out-of-range `RERANK_TIMEOUT_MS` or an invalid `RERANK_MODEL` SHALL refuse startup. README's settings table and `.env.example` SHALL document all four with their defaults, and SHALL state that the endpoint receives note text. Neither SHALL contain a host path. DEPLOYMENT.md SHALL give the measured per-call rerank latency for a 50-document call (short and full-length documents) on named hardware and a rule for sizing `RERANK_TIMEOUT_MS` from it.
+The server SHALL accept `RERANK_URL` (string, default empty), `RERANK_MODEL` (string, default empty, at most 200 characters, no control characters), `RERANK_TIMEOUT_MS` (integer, default 1500, range 100–30000) and `RERANK_ALLOW_PLAINTEXT` (boolean, default false). `RERANK_URL` SHALL be the full endpoint URL. An empty or unset `RERANK_URL` SHALL mean no reranker is configured. An out-of-range `RERANK_TIMEOUT_MS` or an invalid `RERANK_MODEL` SHALL refuse startup. README's settings table and `.env.example` SHALL document all four with their defaults, and SHALL state that the endpoint receives note text. Neither SHALL contain a host path. DEPLOYMENT.md SHALL give the measured per-call rerank latency for 50-document calls (short and full-length documents) on named hardware, the latency this implies at the `RERANK_MAX_DOCUMENTS` default, a rule for sizing `RERANK_TIMEOUT_MS` together with `RERANK_MAX_DOCUMENTS`, and the rule that under `MCP_CONCURRENCY_MODE` `queue` or `enforce` `RERANK_TIMEOUT_MS` SHALL NOT exceed `MCP_CONCURRENCY_WAIT_SECONDS` unless a `make concurrency-report` over evidence including `rerank=true` traffic passes for that mode.
 
 #### Scenario: Defaults
 - **WHEN** the server starts with none of the four set
@@ -24,40 +24,48 @@ The server SHALL accept `RERANK_URL` (string, default empty), `RERANK_MODEL` (st
 - **WHEN** README.md and `.env.example` are searched for each of `RERANK_URL`, `RERANK_MODEL`, `RERANK_TIMEOUT_MS` and `RERANK_ALLOW_PLAINTEXT`
 - **THEN** each SHALL be named with its default, and `RERANK_TIMEOUT_MS` with the range 100–30000
 
-### Requirement: A rerank=true call SHALL score only the candidates the search already fetched, through one shared candidate-fetch service, one document per fetched chunk, and SHALL NOT run a second retrieval
-One internal service function, `embeddings.semantic_candidates`, SHALL return the candidates for `semantic_search(rerank=true)`, and both the tool implementation and the harness rerank arms SHALL use it. The candidate notes SHALL be the per-note deduped rows of the call's existing overfetch (the unchanged `LIMIT max(5 × limit, 50)` statement, full-precision re-sort and dedupe), taken before truncation to `limit` and capped at the first 50 notes in vector order. The statements issued to the database SHALL be the same as for `rerank=false`, except that the overfetch statement SHALL additionally project `note_embeddings.embed_prefix` and `notes_metadata.embedded_chunking_version`, with the same predicates, order, limit and settings; the `rerank=false` statement SHALL be unchanged. Each candidate note SHALL carry, internally and never rendered, the note's fetched chunk rows in the re-sort order (the cosine-best first), or none when the note is stale. A fresh chunk row with a non-NULL `embed_prefix` SHALL be sent as its **embedding input**, `embed_prefix + "\n\n" + F(chunk_text)`, where `F` is the frozen formatter of the note's `embedded_chunking_version` (`EMBEDDED_TEXT_FORMATTERS`) or the identity when that stamp is not a key, built from the stored columns only and never re-read from the vault; a fresh row with a NULL prefix SHALL be sent as its title, two newlines and its `chunk_text`; a stale note SHALL be sent as one document, its title alone. Every document SHALL be at most 2,048 characters, cut at a code-point boundary. The documents SHALL be allocated by one pure, deterministic function under a budget of 50 documents per call and a cap of 3 documents per note. First, the primary document (the cosine-best chunk, or the stale title) of each of the first `min(limit, m)` candidate notes, where `m` is the number of candidate notes. Then, while fewer than 50 documents are allocated, every remaining fetched chunk row of a fresh candidate note, in global order of `(distance, file_path, chunk_index)`, each given to its note unless the note already holds 3 documents (a note's first document SHALL be its primary). Then, while fewer than 50 are allocated, the primary documents of the notes still holding none, in vector order. A call SHALL send at most 50 documents, at most 3 per note, in one exchange. The candidates reranked SHALL be the notes holding at least one document. A note's `rerank_score` SHALL be the maximum score over its documents, and the reranked order SHALL be `rerank_score` descending, then the note's unreranked position ascending; the page SHALL be the first `limit` rows of it. On a reranked row whose maximum was reached first by a chunk other than the cosine-best chunk, the row's preview chunk and section locator SHALL be that chunk's; every other row field SHALL keep its unreranked value.
+### Requirement: A rerank=true call SHALL score only the candidates the search already fetched, through one shared candidate-fetch service, every candidate note with at least one document, and SHALL NOT run a second retrieval
+One internal service function, `embeddings.semantic_candidates`, SHALL return the candidates for `semantic_search(rerank=true)`, and both the tool implementation and the harness rerank arms SHALL use it. The candidate notes SHALL be the per-note deduped rows of the call's existing overfetch (the unchanged `LIMIT max(5 × limit, 50)` statement, full-precision re-sort and dedupe), taken before truncation to `limit` and capped at the first 50 notes in vector order. The statements issued to the database SHALL be the same as for `rerank=false`, except that the overfetch statement SHALL additionally project `note_embeddings.embed_prefix` and `notes_metadata.embedded_chunking_version`, with the same predicates, order, limit and settings; the `rerank=false` statement SHALL be unchanged. Each candidate note SHALL carry, internally and never rendered, the note's fetched chunk rows in the re-sort order (the cosine-best first). A fresh chunk row with a non-NULL `embed_prefix`, of a note whose `embedded_chunking_version` is a key of `EMBEDDED_TEXT_FORMATTERS`, SHALL be sent as its **embedding input**, `embed_prefix + "\n\n" + F(chunk_text)` with `F` that key's frozen formatter, built from the stored columns only and never re-read from the vault. A fresh row with a NULL prefix SHALL be sent as its title, two newlines and its `chunk_text`. A note that is stale, or fresh with a non-NULL prefix and a NULL or unknown stamp, SHALL be sent as exactly one document, its title alone. Every document SHALL be at most 2,048 characters, cut at a code-point boundary. The documents SHALL be allocated by one pure, deterministic function under a per-call budget of `RERANK_MAX_DOCUMENTS` and a cap of 4 documents per note. First, every candidate note SHALL receive its primary document (its cosine-best chunk, or its single title document), so that every candidate note holds at least one document and the candidates reranked are exactly the candidate notes. Then, while fewer than `RERANK_MAX_DOCUMENTS` documents are allocated, the candidates' other fetched chunk rows SHALL be allocated in global order of `(distance, file_path, chunk_index)`, each to its note unless the note already holds 4. A call SHALL send at most `min(RERANK_MAX_DOCUMENTS, 4 × candidate notes)` documents in one exchange. A note's `rerank_score` SHALL be the maximum score over its allocated documents. The reranked order SHALL be `rerank_score` descending, then the note's unreranked position ascending, and the page SHALL be the first `limit` rows of it. On a reranked row whose maximum was first reached, in allocation order, by a chunk other than its primary, the row's preview SHALL be that chunk's, and its `§` locator SHALL be that chunk's recorded section; when that chunk has no recorded section, the row SHALL carry no locator, and the primary's locator SHALL NOT be shown. Every other row field SHALL keep its unreranked value.
 
-#### Scenario: The unreranked page is contained in the candidates
-- **WHEN** `semantic_search(query, limit=10, rerank=true)` finds 40 deduped notes holding 50 fetched chunk rows, none stale and none holding more than 3 rows
-- **THEN** the reranker SHALL receive exactly those 50 rows as 50 documents, and every note on the `rerank=false` page for the same query SHALL be among the reranked candidates
+#### Scenario: The candidate set is the incumbent's
+- **WHEN** `semantic_search(query, limit=10, rerank=true)` finds 40 deduped notes holding 50 fetched chunk rows
+- **THEN** all 40 notes SHALL hold at least one document, `reranked: true (candidates: 40)` SHALL be shown, and every note on the `rerank=false` page for the same query SHALL be among them
+
+#### Scenario: Every primary before any secondary
+- **WHEN** there are 50 candidate notes, `RERANK_MAX_DOCUMENTS=60`, and the candidates hold 80 further fetched rows
+- **THEN** all 50 primaries and exactly the 10 nearest further rows (by `(distance, file_path, chunk_index)`, at most 4 documents per note) SHALL be sent
 
 #### Scenario: The per-note cap
 - **WHEN** one candidate note holds 12 of the fetched chunk rows, all nearer the query than any other row
-- **THEN** that note SHALL be sent as exactly 3 documents, its 3 nearest rows, and its `rerank_score` SHALL be the maximum of those 3 scores
+- **THEN** that note SHALL be sent as exactly 4 documents, its 4 nearest rows, and its `rerank_score` SHALL be the maximum of those 4 scores
 
-#### Scenario: Pass 2 is in distance order
-- **WHEN** `limit=1`, note A (vector rank 1) has a second chunk at distance 0.40, note B (vector rank 2) has its only chunk at distance 0.30, and the budget has room for one more document after A's primary
-- **THEN** B's chunk SHALL be allocated before A's second chunk
+#### Scenario: Secondaries are in distance order
+- **WHEN** note A has a second chunk at distance 0.40, note B a second chunk at distance 0.30, and the budget has room for one secondary
+- **THEN** B's second chunk SHALL be allocated and A's SHALL NOT
 
 #### Scenario: Equidistant rows are allocated deterministically
-- **WHEN** two remaining rows have equal distance
-- **THEN** the row with the smaller `file_path`, then the smaller `chunk_index`, SHALL be allocated first, on every call
-
-#### Scenario: The document budget binds
-- **WHEN** `semantic_search(query, limit=30, rerank=true)` fetches 150 chunk rows belonging to 50 deduped notes, none stale
-- **THEN** the reranker SHALL receive at most 50 documents, at most 3 per note, and each of the first 30 notes in vector order SHALL hold at least one
+- **WHEN** two further rows have equal distance and the budget has room for one
+- **THEN** the row with the smaller `file_path`, then the smaller `chunk_index`, SHALL be allocated, on every call
 
 #### Scenario: The heading reaches the reranker
 - **WHEN** a fresh chunk was embedded with `embed_prefix` `Virtue Note > Status Games` and its `chunk_text` does not contain the word `Status`
 - **THEN** its document SHALL begin with `Virtue Note > Status Games` followed by two newlines and the chunk's embedded text
 
-#### Scenario: A note is scored on its best fetched chunk
-- **WHEN** a note's cosine-best chunk is scored −8.87 and another of its fetched chunks +0.33, and a second note's only chunk −2.0
+#### Scenario: A note is scored on its best allocated chunk
+- **WHEN** a note has 3 fetched chunks, all allocated (the cap and budget leave room by construction), its cosine-best chunk is scored −8.87, its third-nearest chunk +0.33, and a second note's only chunk −2.0
 - **THEN** the first note SHALL be ranked above the second with `rerank_score` 0.33, and its row's preview and `§` locator SHALL be those of the +0.33 chunk
 
-#### Scenario: Equal scores within a note keep the cosine-best preview
-- **WHEN** a note's cosine-best chunk and another of its chunks receive the same, maximal score
-- **THEN** the row's preview and locator SHALL be the cosine-best chunk's
+#### Scenario: A winning chunk without section metadata
+- **WHEN** the winning secondary chunk is a pre-034 row with NULL `heading_path` and `section_ordinal`, and the note's cosine-best chunk has a recorded section
+- **THEN** the row's preview SHALL be the winning chunk's, and the row SHALL carry no `§` locator (not the cosine-best chunk's)
+
+#### Scenario: An unknown chunking version after a rollback
+- **WHEN** a fresh note with non-NULL prefixes carries `embedded_chunking_version` 3 and this build's `EMBEDDED_TEXT_FORMATTERS` has keys `{1, 2}`
+- **THEN** that note SHALL be sent as exactly one document, its title, and none of its stored chunk texts or prefixes SHALL appear in the request body
+
+#### Scenario: Equal scores within a note keep the primary preview
+- **WHEN** a note's primary chunk and another of its chunks receive the same, maximal score
+- **THEN** the row's preview and locator SHALL be the primary's
 
 #### Scenario: A deeper note is promoted
 - **WHEN** each note has one fetched chunk and the reranker gives the note at vector rank 23 the highest score
@@ -84,19 +92,19 @@ One internal service function, `embeddings.semantic_candidates`, SHALL return th
 - **THEN** the document SHALL begin with the stored prefix, and no vault file SHALL be read by the call
 
 ### Requirement: rerank on hybrid_search SHALL rerank the first 50 fused rows, with candidate text read inside the hybrid snapshot
-The `hybrid_search` tool defined by the `hybrid-search` capability SHALL accept `rerank: bool = false` with the same contract as `semantic_search`. The candidate notes SHALL be the first 50 rows of the fused list in fused order, before truncation to `limit`. A candidate that is in the semantic arm and not stale SHALL be sent as the embedding inputs of its fetched semantic-arm chunk rows (the 50-chunk overfetch), built and bounded as for `semantic_search`, its cosine-best chunk as its primary document. Any other candidate SHALL be sent as one document: its title, two newlines, and its stored `body_excerpt`, bounded to 2,048 characters in all and cut at a code-point boundary, read by one statement inside the hybrid call's transaction and snapshot under the owner predicate, issued after the keyword snippet statements and only when such a candidate exists. A NULL excerpt SHALL send the title alone. The documents SHALL be allocated, scored, maximised per note and ordered exactly as for `semantic_search`, with fused order in place of vector order for the first and third passes, the semantic-arm distance for the second, and at most 50 documents per call and 3 per note. A keyword-only hybrid call SHALL still rerank, one excerpt document per note. With `rerank=false`, `hybrid_search` SHALL issue no additional statement and its output SHALL be unchanged.
+The `hybrid_search` tool defined by the `hybrid-search` capability SHALL accept `rerank: bool = false` with the same contract as `semantic_search`. The candidate notes SHALL be the first 50 rows of the fused list in fused order, before truncation to `limit`. A candidate that is in the semantic arm, not stale and with a known stamp SHALL be sent as the embedding inputs of its fetched semantic-arm chunk rows (the 50-chunk overfetch), built and bounded as for `semantic_search`, with its cosine-best chunk as its primary document. Any other candidate SHALL be sent as one document: its title, two newlines, and its stored `body_excerpt`, bounded to 2,048 characters in all and cut at a code-point boundary, read by one statement inside the hybrid call's transaction and snapshot under the owner predicate, issued after the keyword snippet statements and only when such a candidate exists. A NULL excerpt SHALL send the title alone. The documents SHALL be allocated, scored, maximised per note and ordered exactly as for `semantic_search`: every candidate's primary first in fused order, then the secondaries in semantic-arm distance order, at most `RERANK_MAX_DOCUMENTS` per call and 4 per note. On a reranked row whose winning document is a semantic chunk other than its primary, the row's preview SHALL be that chunk, even where the keyword snippet would otherwise be selected, and its `§` locator SHALL follow the same rule as `semantic_search`. A row whose winner is its primary or an excerpt or title document, and every row of a fallback page, SHALL keep the incumbent preview selection. A keyword-only hybrid call SHALL still rerank, one excerpt document per note. With `rerank=false`, `hybrid_search` SHALL issue no additional statement and its output SHALL be unchanged.
 
 #### Scenario: A keyword-only candidate is scored on its excerpt
 - **WHEN** a fused candidate appears only in the keyword arm and has an excerpt
 - **THEN** it SHALL be sent as one document, its title, two newlines and the excerpt's leading characters up to the 2,048-character bound, read in the same snapshot as the arms
 
-#### Scenario: A both-arms note keeps its place on its best chunk
-- **WHEN** a note is first in both arms, its cosine-best chunk scores −8.87, another fetched chunk of it scores +0.33, and every other candidate scores below +0.33
-- **THEN** it SHALL be first on the reranked page with `rerank_score: 0.33`, and its `§` locator SHALL be the +0.33 chunk's
+#### Scenario: A both-arms note keeps its place on its best allocated chunk
+- **WHEN** a note is first in both arms with 2 fetched semantic chunks, both allocated by construction, its cosine-best chunk scores −8.87, its other chunk +0.33, and every other candidate scores below +0.33
+- **THEN** it SHALL be first on the reranked page with `rerank_score: 0.33`, its preview SHALL be the +0.33 chunk's (not the keyword snippet), and its `§` locator SHALL be the +0.33 chunk's
 
-#### Scenario: Mixed candidates stay within the budget
-- **WHEN** the 50 fused candidates hold 30 keyword-only notes and 20 semantic notes with 50 fetched chunks among them, and `limit=10`
-- **THEN** at most 50 documents SHALL be sent, at most 3 per note, and each of the first 10 fused notes SHALL hold at least one
+#### Scenario: Every fused candidate is scored
+- **WHEN** the 50 fused candidates hold 30 keyword-only notes and 20 semantic notes with 50 fetched chunks among them, `limit=10` and `RERANK_MAX_DOCUMENTS=100`
+- **THEN** all 50 candidates SHALL hold at least one document, at most 4 per note, at most 80 documents SHALL be sent (the 50 primaries plus at most the 30 further fetched rows), and the token SHALL read `candidates: 50`
 
 #### Scenario: Both markers on a degraded call
 - **WHEN** the embedding provider is down and `hybrid_search(rerank=true)` reranks the keyword arm successfully
@@ -134,12 +142,25 @@ A `rerank=true` response SHALL be either fully reranked, with the header token `
 - **THEN** no rerank request SHALL be sent and the zero-result line SHALL carry `reranked: false (no_candidates)`
 
 ### Requirement: The usage row SHALL record whether a call was reranked and why not, and SHALL record result paths in the final order
-For `semantic_search` and `hybrid_search`, `usage_logs.params` SHALL record the `rerank` argument. With `rerank=true` it SHALL also record `reranked` (boolean), `rerank_reason` (the code, only when `reranked` is false), `rerank_ms` (non-negative integer, only when a request was sent), `rerank_candidates` (integer, the notes holding documents, only when candidates were computed) and `rerank_documents` (integer, at most 50, the documents allocated, only when candidates were computed). `result_count` and `result_paths` SHALL be recorded once, from the rows rendered in their final order, under the existing bound of 10 paths and 2048 bytes. A `reranked: false` row SHALL NOT carry an `error` marker. `embed_ms + db_ms + rerank_ms` SHALL NOT exceed `duration_ms`.
+For `semantic_search` and `hybrid_search`, `usage_logs.params` SHALL record the `rerank` argument. With `rerank=true` it SHALL also record `reranked` (boolean), `rerank_reason` (the code, only when `reranked` is false), `rerank_ms` (non-negative integer, only when a request was sent), `rerank_candidates` (integer, the notes holding documents, only when candidates were computed) and `rerank_documents` (integer, at most `RERANK_MAX_DOCUMENTS`, the documents allocated, only when candidates were computed). `result_count` and `result_paths` SHALL be recorded once, from the rows rendered in their final order, under the existing bound of 10 paths and 2048 bytes. A `reranked: false` row SHALL NOT carry an `error` marker. `embed_ms + db_ms + rerank_ms` SHALL NOT exceed `duration_ms`.
 
 #### Scenario: Reranked telemetry
-- **WHEN** a `semantic_search(rerank=true)` call reranks 40 candidate notes holding 50 documents and renders 10 rows
+- **WHEN** a `semantic_search(rerank=true)` call reranks 40 candidate notes holding 50 documents in all and renders 10 rows
 - **THEN** its params SHALL carry `rerank: true`, `reranked: true`, an integer `rerank_ms`, `rerank_candidates: 40`, `rerank_documents: 50`, `result_count: 10`, and `result_paths` equal to the first rendered paths in rendered order
 
 #### Scenario: Fallback telemetry
 - **WHEN** the call times out
 - **THEN** its params SHALL carry `reranked: false` and `rerank_reason: "timeout"`, SHALL NOT carry `error`, and `result_paths` SHALL be in vector order
+
+## ADDED Requirements
+
+### Requirement: RERANK_MAX_DOCUMENTS SHALL bound the documents one rerank call sends
+The server SHALL accept `RERANK_MAX_DOCUMENTS` (integer, default 100, range 50–200). An out-of-range value SHALL refuse startup. The per-note document cap SHALL be the constant 4, not a setting. Because there are at most 50 candidate notes and the minimum budget is 50, every candidate's primary document SHALL always fit, and a value of 50 SHALL leave no secondary budget for a 50-candidate call. README's settings table and `.env.example` SHALL document the setting with its default and range, and SHALL state that it multiplies rerank latency together with `RERANK_TIMEOUT_MS`.
+
+#### Scenario: Default and range
+- **WHEN** the server starts with `RERANK_MAX_DOCUMENTS` unset, `=49` or `=201`
+- **THEN** it SHALL start with a budget of 100 when unset, and SHALL NOT start for 49 or 201
+
+#### Scenario: The minimum budget reproduces the incumbent count
+- **WHEN** `RERANK_MAX_DOCUMENTS=50` and a hybrid call has 50 fused candidates
+- **THEN** exactly 50 documents SHALL be sent, one per candidate
