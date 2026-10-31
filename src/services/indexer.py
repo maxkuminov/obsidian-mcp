@@ -3111,6 +3111,11 @@ async def _recheck_input_digests(
     from src.services.embeddings import CHUNKING_VERSION
 
     owner = "user_id IS NULL" if user_id is None else "user_id = :uid"
+    # Strict `= :cv`, deliberately, not the reuse table's "any formatter-table
+    # version" (#390, D5): the digest is recomputed with the CURRENT code's
+    # inputs, so it is comparable only for a note certified under the current
+    # version. A version-1 note is not cleared here; it waits in the backlog
+    # (`IS DISTINCT FROM`) and stays fresh.
     params: dict = {"ids": list(candidates), "cv": CHUNKING_VERSION}
     if user_id is not None:
         params["uid"] = user_id

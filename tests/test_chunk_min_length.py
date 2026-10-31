@@ -125,8 +125,17 @@ def test_every_previously_valid_chunk_size_loads_with_an_unchanged_fingerprint(
         "max_chunks_per_note",
     }
     assert stored["chunk_size"] == size
-    assert embedding_fingerprint() == json.dumps(
-        stored, sort_keys=True, separators=(",", ":")
+    from src.services.index_state import FINGERPRINT_VERSION, active_embedding_model
+
+    # Byte for byte the pre-change literal's spelling.
+    assert embedding_fingerprint() == (
+        '{"chunk_overlap":0,'
+        f'"chunk_size":{size},'
+        f'"dimensions":{settings.embedding_dimensions},'
+        f'"max_chunks_per_note":{MAX_CHUNKS_PER_NOTE},'
+        f'"model":"{active_embedding_model()}",'
+        f'"provider":"{settings.embedding_provider}",'
+        f'"v":{FINGERPRINT_VERSION}}}'
     )
 
 
@@ -215,6 +224,70 @@ def test_whitespace_that_defeats_the_raw_bound():
     assert only == text
     # The excess over the window is whitespace only.
     assert len(only) - clen(only) == 2999
+
+
+# ── implementation review, round 1: tail balancing on actual slices ──────
+
+
+def test_r1_m1_a_split_is_validated_on_its_actual_slices():
+    """Codex r1 M1: the old midpoint split gave (raw 1900, clen 201) and
+    (raw 200, clen 199) — the boundary space vanished from both sides. No
+    valid split exists here, and `S <= W`, so the span is one window."""
+    for gap, word in [(1700, "x "), (1900, "a ")]:
+        text = "A" * 199 + " " * gap + word + "B" * 199
+        out = windows(text)
+        assert all(clen(c) >= M for c in out), lengths(out)
+        assert out == [text]
+
+
+def test_r1_verifier_major_the_same_shape_under_a_heading():
+    body = "# Notes\n" + "A" * 199 + " " * 1900 + "a " + "B" * 199
+    specs, _ = chunks(body)
+    assert all(clen(s.text) >= M for s in specs)
+    assert len(specs) == 1 and specs[0].section_ordinal == 1
+
+
+def test_r1_m2_the_hard_cut_is_clamped_into_the_window():
+    """Codex r1 M2: the pure midpoint gave a 2,059-raw chunk although a hard
+    cut at 249 keeps both sides within `W`."""
+    out = windows("A" * 300 + " " * 1822 + "B" * 175)
+    assert lengths(out) == [(249, 249), (2048, 227)]
+
+
+def test_r1_note_7_the_unbroken_run_case_stays_in_bound():
+    out = windows("A" * 1098 + " " * 1428 + "B" * 150)
+    assert lengths(out) == [(628, 628), (2048, 621)]
+    assert all(len(c) <= W for c in out)
+
+
+def test_r1_m3_the_s_le_2m_merge_splits_rather_than_exceed_the_window():
+    """Codex r1 M3: at W = 400 the merge gave one 416-raw chunk and a
+    718-character input under a 300-character prefix."""
+    text = " " * 8 + "A" * 400 + " " * 8
+    out = windows(text, chunk_size=100)
+    assert lengths(out) == [(208, 200), (208, 200)]
+    prefix = build_embed_prefix("T", (), ["t" * 292])
+    assert len(prefix) == EMBED_PREFIX_MAX_CHARS
+    assert all(len(embedding_input(prefix, c)) <= 400 + 302 for c in out)
+
+
+def test_r1_the_small_window_residue_is_the_only_one():
+    """L10: at W = 8 (m = 4) the span `a b c d e` (S = 9 > W) has no split
+    leaving both sides at 4, so one chunk stays below the minimum."""
+    out = windows("a b c d e", chunk_size=2)
+    assert "".join(out) == "a b c d e"
+    assert any(clen(c) < 4 for c in out)
+
+
+def test_an_nbsp_only_note_yields_one_chunk():
+    """Not ASCII whitespace, so not empty under `clen`: one chunk (the
+    pre-#355 chunker's `str.strip()` gave none). Zero chunks only for an
+    empty cleaned body."""
+    for body in ["\u00a0", "\u00a0" * 500, "# H\n\u00a0\n", "\u3000"]:
+        specs, _ = chunks(body)
+        assert len(specs) == 1, repr(body)
+    for body in ["", " \n\t", "```\ncode\n```\n"]:
+        assert chunks(body)[0] == [], repr(body)
 
 
 def test_a_whitespace_window_before_a_long_run_keeps_the_window_bound():
@@ -561,3 +634,114 @@ def test_the_recipe_runs_the_harness_under_min_statement():
         body = doc.read_text(encoding="utf-8")
         assert "IS DISTINCT FROM 1`" not in body, doc
         assert not re.search(r"`CHUNK_MIN_CHARS`\s*(setting|env)", body), doc
+
+
+# ── the verifier's property test (implementation review, round 1) ────────
+
+_V_WORDS = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu".split()
+
+
+def _v_prose(rng, n):
+    out, length = [], 0
+    while length < n:
+        word = rng.choice(_V_WORDS)
+        out.append(word)
+        length += len(word) + 1
+    return " ".join(out)[:n]
+
+
+def _v_piece(rng):
+    r = rng.random()
+    if r < 0.18:
+        return "#" * rng.randint(1, 6) + " " + rng.choice(
+            ["A", "B", "Dup", "Dup", "Plan", "Long " + "h" * rng.randint(0, 300)]
+        ) + "\n"
+    if r < 0.35:
+        return _v_prose(rng, rng.choice([1, 5, 30, 150, 199, 200, 201, 350, 700, 1500, 2100, 4100])) + "\n"
+    if r < 0.40:
+        return " " * rng.randint(1, 50) + "\n"
+    if r < 0.45:
+        return " " * rng.randint(2, 4000) + rng.choice(["", "\n", "x"])
+    if r < 0.50:
+        return "\n" * rng.randint(2, 30)
+    if r < 0.55:
+        return "z" * rng.randint(10, 5000) + rng.choice([" ", "\n", ""])
+    if r < 0.62:
+        return "```\n# fenced\n" + _v_prose(rng, rng.randint(0, 500)) + "\n```\n"
+    if r < 0.64:
+        return "~~~\n" + _v_prose(rng, 100) + "\n"  # maybe unterminated
+    if r < 0.68:
+        return "\t" * rng.randint(1, 20) + "- item " + _v_prose(rng, rng.randint(1, 100)) + "\n"
+    if r < 0.70:
+        return "\v\f\r\n"
+    return rng.choice(["- [ ] task\n", "`# inline`\n", "#tag\n", "  ## indented heading\n",
+                       "text　with ideographic\n", "nb  sp\n", ""])
+
+
+def _v_note(rng):
+    body = "".join(_v_piece(rng) for _ in range(rng.randint(0, 40)))
+    return body.replace("\n", rng.choice(["\n", "\r\n", "\r"]))
+
+
+_INTERIOR_RUN_RE = re.compile(r"(?<![\t\n\v\f\r ])[\t\n\v\f\r ]{2,8}(?![\t\n\v\f\r ])")
+
+
+def _v_check(body, size, overlap):
+    from src.services.vault import _section_body_span
+
+    w = size * 4
+    m = effective_min_chars(w)
+    specs, raws, truncated = embeddings._chunk_note(
+        body, chunk_size=size, overlap=overlap, max_chunks=100_000
+    )
+    assert not truncated
+    fences = scan_fences(body, context=BODY).spans
+    cleaned = clean_for_embedding(body)
+    heads = _scan_headings(body)
+    assert bool(specs) == (clen(cleaned) > 0), "zero-chunk invariant"
+    sections = embeddings._sections_from_headings(body, heads)
+    grouped = embeddings._group_sections(body, sections, fences, m)
+    whole_body = grouped is None or not grouped
+    spans = [_section_body_span(body, heads, k) for k in range(len(heads))]
+    for spec, (rs, re_) in zip(specs, raws):
+        c = clen(spec.text)
+        assert embeddings._clean_span(body, rs, re_, fences) == spec.text
+        assert c <= w
+        if len(specs) > 1 and w > 400:
+            assert c >= m, (size, overlap, c)
+        assert len(re.sub(r"[\t\n\v\f\r ]", "", spec.text)) <= w
+        r = len(_INTERIOR_RUN_RE.findall(spec.text))
+        assert len(embedding_input(P300, spec.text)) <= 302 + w + 7 * r + 2
+        n = spec.section_ordinal
+        if n:
+            s, e = spans[n - 1]
+            assert s <= rs and re_ <= e
+            assert spec.text in embeddings._clean_span(body, s, e, fences)
+            assert not any(s2 <= rs and re_ <= e2 for s2, e2 in spans[n:]), "not deepest"
+        else:
+            assert spec.heading_path == ()
+            if not whole_body:
+                assert not any(s2 <= rs and re_ <= e2 for s2, e2 in spans), "0 but contained"
+    excluded = sorted(list(fences) + heading_line_spans(body))
+    covered = bytearray(len(body))
+    for rs, re_ in raws:
+        covered[rs:re_] = b"\x01" * (re_ - rs)
+    k = 0
+    for i, ch in enumerate(body):
+        while k < len(excluded) and excluded[k][1] <= i:
+            k += 1
+        if k < len(excluded) and excluded[k][0] <= i < excluded[k][1]:
+            continue
+        if ch not in " \t\n\v\f\r":
+            assert covered[i], ("uncovered", i)
+
+
+@pytest.mark.parametrize(
+    "size,overlap",
+    [(512, 0), (512, 50), (512, 127), (100, 0), (100, 99), (100, 13),
+     (64, 0), (64, 63), (25, 0), (25, 24), (3, 2), (1, 0)],
+)
+def test_the_verifier_property(size, overlap):
+    rng = random.Random(f"verifier-{size}-{overlap}")
+    for _ in range(25):
+        _v_check(_v_note(rng), size, overlap)

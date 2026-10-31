@@ -361,33 +361,70 @@ def _balance(
     t: str, a: int, n: int, w: int, m: int, overlap_chars: int
 ) -> list[tuple[int, int]]:
     """The last two windows, re-decided over `[a, n)` (design D3, tail
-    balancing). `S = clen(t[a:n])`; at `S <= 2m` one window, else two, each
-    with `clen >= m`: the admissible word start nearest the collapsed
-    midpoint (earlier on a tie), else the midpoint hard cut."""
-    total = clen(t[a:n])
-    if total <= 2 * m:
+    balancing; Codex implementation review r1).
+
+    A *valid* split leaves both **actual** slices with `clen >= m` (measured
+    after their own boundary whitespace is stripped, never inferred from the
+    span's total). Among valid splits the preference is: a word start within
+    `W` raw on both sides; any position within `W` raw on both sides (the
+    hard cut clamped into `[end − W, a + W]`); a word start; any position —
+    in each tier the one nearest the collapsed midpoint (`|clen(left) −
+    clen(right)|` least, the earlier on a tie). At `S <= 2m` the span is one
+    window unless that window would exceed `W` raw and an in-bound valid
+    split exists. With no valid split at all, the span is one window when
+    `S <= W` (always possible at the default window); only when `S > W` too
+    (`W <= 404`, single-character words around the midpoint, L10) does the
+    pure midpoint hard cut remain.
+    """
+    seg = t[a:n]
+    k = len(seg)
+    nonws = [ch not in _CLEN_WS for ch in seg]
+    # `starts[j]`: a word starts at j within `t` (j >= 1; j = 0 is the span's
+    # own start). Prefix sums make every slice's `clen` O(1).
+    starts = [False] + [nonws[j] and not nonws[j - 1] for j in range(1, k)]
+    pn = [0] * (k + 1)
+    ps = [0] * (k + 1)
+    for j in range(k):
+        pn[j + 1] = pn[j] + nonws[j]
+        ps[j + 1] = ps[j] + starts[j]
+
+    def cl(x: int, y: int) -> int:
+        count = pn[y] - pn[x]
+        if count == 0:
+            return 0
+        # A slice that opens mid-word opens a word of its own.
+        words = ps[y] - ps[x] + (1 if nonws[x] and not starts[x] else 0)
+        return count + words - 1
+
+    total = cl(0, k)
+    if total <= 2 * m and k <= w:
         return [(a, n)]
-    best: int | None = None
-    best_d = 0
-    count = 0
-    for mo in _CLEN_WORD_RE.finditer(t, a, n):
-        p = mo.start()
-        if p > a and count > 0:
-            left = count
-            right = total - left - 1
-            if left >= m and right >= m and p - a <= w and n - p <= w:
-                d = abs(left - right)
-                if best is None or d < best_d:
-                    best, best_d = p, d
-            if left > right and best is not None:
-                break  # every later word start is further from the midpoint
-        count += (1 if count else 0) + (mo.end() - p)
-    if best is None:
-        # The midpoint hard cut: the smallest position whose left side
-        # reaches `⌊S/2⌋` (the next value when a collapsed space makes that
-        # exact count unreachable; the right side still keeps `m`).
-        best = _first_reaching(t, a, n, total // 2)
-    cut = best
+    tiers: list[tuple[int, int] | None] = [None, None, None, None]
+    for j in range(1, k):
+        left = cl(0, j)
+        if left < m:
+            continue
+        right = cl(j, k)
+        if right < m:
+            continue
+        d = abs(left - right)
+        inb = j <= w and k - j <= w
+        word = starts[j]
+        for tier, ok in ((0, inb and word), (1, inb), (2, word), (3, True)):
+            if ok and (tiers[tier] is None or d < tiers[tier][0]):
+                tiers[tier] = (d, j)
+    if total <= 2 * m:
+        allowed = tiers[:2]
+    else:
+        allowed = tiers
+    chosen = next((c for c in allowed if c is not None), None)
+    if chosen is None:
+        if total <= w:
+            return [(a, n)]
+        # L10: no valid split and no single window within `W` collapsed.
+        cut = _first_reaching(t, a, n, total // 2)
+    else:
+        cut = a + chosen[1]
     right_start = cut
     if overlap_chars > 0:
         # Codex r3, normative: clamped so the right window stays within one
