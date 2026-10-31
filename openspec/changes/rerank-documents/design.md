@@ -322,3 +322,17 @@ What changed:
 - **BLOCKER (the report script):** `scripts/rerank_allocation_report.py` now buffers every line in memory and writes them at once only after every query on both tools has succeeded. A single top-level handler covers argument parsing (a parser subclass refuses with the fixed code `bad_arguments` instead of echoing the argument) and `main_async`. Any failure prints one line with the exception **class** only, never `str(exc)`, writes no partial report, and exits 1 (64 for a refusal). New tests: a `ProviderInputTooLarge` whose message quotes a secret query, raised on the second query; a `ProgrammingError` carrying the secret in its statement and parameters; a secret-bearing bad argument; a successful run that emits every line at once. Each asserts empty stdout on failure and no secret on stdout or stderr.
 - **MINOR (search.md):** the "Candidates and the scored unit" paragraph no longer describes the pre-#402 scored unit in the present tense. It is now "Candidates (D4, D6)", it states the rerank=true projection, and it labels the old one-document unit "*Before #402*", leading into "The documents since #402".
 
+## Adversarial Codex — implementation round 2 (c370ac2)
+
+Verdict, verbatim:
+
+````
+The round-one fixes are verified with no regression. The focused rerank suite passed 296 tests. Independently regenerating all 18 golden pages from an exported c491326 tree produced a byte-identical fixture. Failure, refusal, parser, `BaseException`/interrupt, logging, and stderr paths do not expose exception messages or partial query results.
+
+```json
+{"verdict":"PASS","round1":[{"claim":"The allocation report could emit partial results and leak tenant query or SQL data through uncaught exceptions.","status":"VERIFIED"},{"claim":"The architecture note described pre-#402 projection and document behavior as current.","status":"VERIFIED"}],"findings":[]}
+```
+````
+
+PASS. Both round-1 items are VERIFIED, and there are no new findings.
+
