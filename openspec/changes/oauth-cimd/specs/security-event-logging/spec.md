@@ -40,7 +40,7 @@ Every refusal at `/authorize` arising from Client ID Metadata Document handling 
 - **THEN** they SHALL share one suppression subject, the trusted client address
 
 ### Requirement: Every /authorize and /token terminal path SHALL carry the RFC 8707 resource classification
-Every security record emitted while handling a `GET` or `POST /authorize` or a `/token` request SHALL carry `resource_class`, one of `absent`, `accepted_1`, `accepted_2`, `accepted_3`, `accepted_4`, `unexpected` or `unclassified_rate_limited`, and SHALL carry `resource_host` only when the class is `unexpected`. This SHALL include at least `oauth_authorize_refused`, `oauth_consent_granted`, `oauth_consent_denied`, `oauth_cross_user_client_refused`, `oauth_token_issued`, `oauth_token_refreshed`, `oauth_token_refused`, `oauth_code_replay_detected`, `oauth_code_replay_revocation_failed`, `oauth_refresh_reuse_detected`, `oauth_refresh_reuse_revocation_failed` and `oauth_token_rotation_failed`. A request whose terminal path emits none of them — a successful consent render, the multi-user login redirect, the client-vanished refusal, an unhandled exception, or the `/token` rate-limiter refusal — SHALL emit exactly one `oauth_resource_classified` record at INFO carrying only `resource_class`, `route` and, when `unexpected`, `resource_host`, with the trusted address as its subject. `resource_host` SHALL be the value's host in ASCII form or the constant `<unparseable>`, and no record SHALL carry the value's scheme, path, query or fragment. The `/token` rate-limiter refusal MUST NOT read or parse the request body; its record SHALL carry `resource_class` `unclassified_rate_limited` and no `resource_host`. The later change that enforces `resource` MAY rely on exactly this evidence — no `unexpected` on any of these records for 14 consecutive days, with `unclassified_rate_limited` excluded because a rate-limited client's value is observed on its next admitted request — and on nothing weaker.
+Every security record emitted while handling a `GET` or `POST /authorize` or a `/token` request SHALL carry `resource_class`, one of `absent`, `accepted_1`, `accepted_2`, `accepted_3`, `accepted_4`, `unexpected`, `unclassified_rate_limited` or `unclassified_malformed`, and SHALL carry `resource_host` only when the class is `unexpected`. This SHALL include at least `oauth_authorize_refused`, `oauth_consent_granted`, `oauth_consent_denied`, `oauth_cross_user_client_refused`, `oauth_token_issued`, `oauth_token_refreshed`, `oauth_token_refused`, `oauth_code_replay_detected`, `oauth_code_replay_revocation_failed`, `oauth_refresh_reuse_detected`, `oauth_refresh_reuse_revocation_failed`, `oauth_token_rotation_failed` and, for `/token`, `rate_limit_exceeded`. The client-vanished refusal at `POST /authorize` SHALL emit `oauth_authorize_refused` with reason `client_vanished`. The `/token` rate-limiter refusal SHALL be recorded by the existing `rate_limit_exceeded` record with all its required fields and `resource_class` `unclassified_rate_limited`, and no other record. A request whose terminal path has no required outcome event — a successful consent render, the multi-user login redirect, an unhandled exception, or a framework validation failure — SHALL emit exactly one `oauth_resource_classified` record at INFO carrying only `resource_class`, `route` and, when `unexpected`, `resource_host`, with the trusted address as its subject. `resource_host` SHALL be the value's host in ASCII form or the constant `<unparseable>`, and no record SHALL carry the value's scheme, path, query or fragment. The `/token` rate-limiter refusal MUST NOT read or parse the request body. A framework validation failure at `GET /authorize` SHALL be classified from the query string only. One at `POST /authorize` or `/token` SHALL carry `unclassified_malformed` and MUST NOT read the body. The later change that enforces `resource` MAY rely on exactly this evidence — no `unexpected` on any of these records for 14 consecutive days, with `unclassified_rate_limited` and `unclassified_malformed` excluded, because a rate-limited client's value is observed on its next admitted request and a malformed request never reached the authorization server — and on nothing weaker.
 
 #### Scenario: Only the host is recorded
 - **WHEN** `resource=https://other.example/x?token=abc` is sent to `/token`
@@ -52,12 +52,24 @@ Every security record emitted while handling a `GET` or `POST /authorize` or a `
 
 #### Scenario: A throttled token request is classified
 - **WHEN** `/token` refuses a request by its rate limiter
-- **THEN** exactly one `oauth_resource_classified` record SHALL be emitted for it, carrying `resource_class` `unclassified_rate_limited` and no `resource_host`
+- **THEN** exactly one record SHALL be emitted for it, `rate_limit_exceeded`, carrying its required fields and `resource_class` `unclassified_rate_limited` and no `resource_host`
 - **AND** the request body SHALL NOT be read
+
+#### Scenario: A vanished client is an authorization refusal
+- **WHEN** an approval finds the client row deleted by the sweep
+- **THEN** exactly one `oauth_authorize_refused` record SHALL be emitted with reason `client_vanished` and a `resource_class`
+
+#### Scenario: A malformed consent request is classified from its query
+- **WHEN** `GET /authorize?resource=https://other.example/mcp` omits a required parameter and fails framework validation
+- **THEN** exactly one `oauth_resource_classified` record SHALL carry `resource_class` `unexpected` and `resource_host` `other.example`
+
+#### Scenario: A malformed POST is unclassified without a body read
+- **WHEN** `POST /authorize` fails framework validation
+- **THEN** exactly one `oauth_resource_classified` record SHALL carry `resource_class` `unclassified_malformed`, and the body SHALL NOT be read
 
 #### Scenario: The follow-up gate is computable from the records
 - **WHEN** the emitted `/authorize` and `/token` records of a period are counted by `resource_class`
-- **THEN** every request handled in the period SHALL be represented by at least one record, and every record SHALL fall in exactly one of the seven classes
+- **THEN** every request handled in the period SHALL be represented by at least one record, and every record SHALL fall in exactly one of the eight classes
 
 ### Requirement: The new fields SHALL be allow-listed with declared types and bounds
 `ALLOWED_FIELDS` SHALL declare `registration_kind` as a string of at most 8 characters, `cimd_ref` of at most 16, `resource_class` of at most 32, and `cimd_host` and `resource_host` of at most 253. `cimd_host`, `cimd_ref`, `resource_class` and `resource_host` SHALL be documented as server-derived values computed from a parsed request value, distinct from both a database-read identifier and a `_submitted` value, and none SHALL ever be a suppression subject. The existing bound on `client_id` and `client_id_submitted` SHALL be unchanged.

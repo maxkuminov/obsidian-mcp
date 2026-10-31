@@ -194,16 +194,25 @@ On an approval the server SHALL insert or refresh, in the transaction that inser
 - **THEN** grant families, code lineage, the absolute grant lifetime and refresh-reuse revocation SHALL behave exactly as for a registered client
 
 ### Requirement: A synthetic CIMD client identifier MUST NOT be accepted as caller input
-A caller-submitted `client_id` beginning with `cimd_` SHALL be refused before any client lookup at `GET` and `POST /authorize`, at `/token` for both grant types and at `/revoke`, with that endpoint's constant `invalid_client` response, and SHALL be recorded with the reason `internal_id_submitted`. Every client lookup by a caller-submitted identifier that is not a CIMD URL SHALL exclude rows carrying a metadata URL. A CIMD row SHALL be resolved only from a submitted, validated CIMD URL together with the authenticated user, and the consent page's prior-approval display SHALL come only from that resolution.
+A caller-submitted `client_id` beginning with `cimd_` SHALL be refused before any client lookup at `GET` and `POST /authorize` with the constant `invalid_client` response. At `/token`, for both grant types, the credential lookup and the existing replay and reuse decisions SHALL run first and unchanged, and such a value SHALL then be refused before any caller-directed client-row lookup, with the constant `invalid_client` response on a live credential and the existing unknown-code response on a spent code. At `/revoke` it SHALL be checked before the token lookup and answered with the constant HTTP 200 empty response, revoking nothing. Each SHALL be recorded with the reason `internal_id_submitted`. Every client lookup by a caller-submitted identifier that is not a CIMD URL SHALL exclude rows carrying a metadata URL. A CIMD row SHALL be resolved only from a submitted, validated CIMD URL together with the authenticated user, and the consent page's prior-approval display SHALL come only from that resolution.
 
 #### Scenario: Another user's synthetic id reveals nothing
 - **WHEN** user B submits user A's synthetic `cimd_…` id as `client_id` at `GET /authorize`
 - **THEN** the response SHALL be the constant `invalid_client` response, byte-identical to that for a nonexistent `cimd_` id
 - **AND** no consent page SHALL be rendered and no row data SHALL appear in the response
 
-#### Scenario: The synthetic id is refused at the token and revocation endpoints
-- **WHEN** a code exchange, a refresh or a revocation names a `cimd_…` client_id
-- **THEN** it SHALL be refused with that endpoint's `invalid_client` response before any lookup, and nothing SHALL be revoked
+#### Scenario: The synthetic id is refused at the token endpoint on a live credential
+- **WHEN** a live code exchange or a live refresh names a `cimd_…` client_id
+- **THEN** it SHALL be refused with the constant `invalid_client` response and nothing SHALL be minted or revoked
+
+#### Scenario: A replayed refresh token still revokes its family under a synthetic id
+- **WHEN** refresh token R is rotated and the revoked R is then presented with `client_id=cimd_nonexistent`
+- **THEN** R's grant family SHALL be revoked
+- **AND** the response SHALL be the constant `invalid_grant` response of refresh-token reuse
+
+#### Scenario: Revocation with a synthetic id is a concealed no-op
+- **WHEN** `/revoke` presents a valid token with `client_id=cimd_nonexistent`
+- **THEN** the response SHALL be HTTP 200 with an empty body, nothing SHALL be revoked, and the log SHALL record the no-op reason `internal_id_submitted`
 
 #### Scenario: The synthetic id is not computable without the deployment secret
 - **WHEN** the same URL and user id are used under two different `SECRET_KEY` values
@@ -251,7 +260,7 @@ Every redirect issued by `POST /authorize`, approval and denial alike, SHALL car
 - **THEN** the redirect SHALL carry `error=access_denied` and `iss`
 
 ### Requirement: An RFC 8707 resource parameter SHALL be classified on every request and SHALL NOT cause a refusal
-At `GET` and `POST /authorize` and on both `/token` grant types, the server SHALL classify the request's `resource` parameter as exactly one of `absent`; `accepted_1` (`{base}/mcp`), `accepted_2` (`{base}/mcp/`), `accepted_3` (`{base}`) or `accepted_4` (`{base}/`) when every value present equals that one spelling; or `unexpected` otherwise. The classification SHALL be recorded as `resource_class` on every security record the request's handling emits, and, when the request's terminal path emits no other record, on exactly one classification-only `oauth_resource_classified` record, with `resource_host` (the first unexpected value's host, or `<unparseable>`) only when the class is `unexpected`. A `/token` request refused by the rate limiter SHALL NOT be classified from its body and SHALL be recorded as `unclassified_rate_limited`. The request SHALL proceed exactly as if the parameter were absent; this change MUST NOT refuse a request because of its `resource` value.
+At `GET` and `POST /authorize` and on both `/token` grant types, the server SHALL classify the request's `resource` parameter as exactly one of `absent`; `accepted_1` (`{base}/mcp`), `accepted_2` (`{base}/mcp/`), `accepted_3` (`{base}`) or `accepted_4` (`{base}/`) when every value present equals that one spelling; or `unexpected` otherwise. The classification SHALL be recorded as `resource_class` on every security record the request's handling emits, and, when the request's terminal path emits no other record, on exactly one classification-only `oauth_resource_classified` record, with `resource_host` (the first unexpected value's host, or `<unparseable>`) only when the class is `unexpected`. A `/token` request refused by the rate limiter SHALL NOT be classified from its body and SHALL be recorded as `unclassified_rate_limited`. A framework validation failure at `GET /authorize` SHALL be classified from the query string only, and one at `POST /authorize` or `/token` SHALL be recorded as `unclassified_malformed` without reading the body. The request SHALL proceed exactly as if the parameter were absent; this change MUST NOT refuse a request because of its `resource` value.
 
 #### Scenario: The advertised resource is classified accepted
 - **WHEN** `resource` equals the `resource` field of the protected-resource metadata, `{base}/mcp`, on a code exchange
