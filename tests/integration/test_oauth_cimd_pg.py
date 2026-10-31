@@ -366,6 +366,61 @@ async def test_the_token_endpoint_and_refresh_never_fetch(db, monkeypatch):
     assert (await refresh(tokens["refresh_token"])).status_code == 200
 
 
+async def test_every_token_and_revoke_record_carries_the_cimd_fields(db, emitted):
+    """Codex impl R1: success, refresh, replay and revoke records, both grants."""
+    ref = cimd.ref_for_log(URL)
+    code = code_of(await approve())
+    tokens = body(await exchange(code))
+    rotated = body(await refresh(tokens["refresh_token"]))
+    await exchange(code)  # a fully revalidated code replay
+    tokens2 = body(await exchange(code_of(await approve())))
+    assert (await refresh(tokens2["refresh_token"])).status_code == 200
+    await refresh(tokens2["refresh_token"])  # refresh reuse
+    fresh = body(await exchange(code_of(await approve())))
+    assert (await _revoke(fresh["access_token"], URL)).status_code == 200
+    assert rotated["access_token"]
+    for event in (
+        "oauth_token_issued",
+        "oauth_token_refreshed",
+        "oauth_code_replay_detected",
+        "oauth_refresh_reuse_detected",
+        "oauth_grant_revoked",
+    ):
+        records = named(emitted, event)
+        assert records, event
+        for kw in records:
+            assert kw["cimd_host"] == "claude.ai", event
+            assert kw["cimd_ref"] == ref, event
+    assert URL not in json.dumps(emitted, default=str)
+
+
+async def test_referenced_rows_cannot_starve_the_cimd_sweep(db):
+    """Codex impl R1: 200 referenced rows ahead of one eligible row."""
+    old = datetime.now(timezone.utc) - timedelta(days=60)
+    far = datetime.now(timezone.utc) + timedelta(days=1)
+    async with db() as session:
+        for i in range(201):
+            cid = "cimd_" + format(i, "059x")
+            session.add(OAuthClient(
+                client_id=cid, client_secret_hash=None, token_endpoint_auth_method="none",
+                client_name="x", redirect_uris=[REDIRECT], scope="read",
+                client_id_metadata_url=f"https://h{i}.example.org/doc", last_used_at=old,
+            ))
+        await session.flush()
+        for i in range(200):  # the first 200 (lowest ids) are referenced
+            session.add(OAuthToken(
+                token_hash=format(i, "064x"), token_type="access",
+                client_id="cimd_" + format(i, "059x"), scope="read", grant_id=f"g{i}",
+                grant_issued_at=old, expires_at=far, revoked=True,
+            ))
+        await session.commit()
+    assert await indexer._expire_unreferenced_cimd_clients() == 1
+    async with db() as session:
+        remaining = (await session.execute(select(OAuthClient.client_id))).scalars().all()
+    assert "cimd_" + format(200, "059x") not in remaining
+    assert len(remaining) == 200
+
+
 async def test_token_terminal_paths_carry_the_resource_class(db, emitted, monkeypatch):
     base = oauth.settings.base_url.rstrip("/")
     # issued

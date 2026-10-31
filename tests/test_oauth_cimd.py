@@ -235,6 +235,30 @@ def test_invalid_documents_are_refused(overrides, reason):
     assert caught.value.reason == reason
 
 
+@pytest.mark.parametrize(
+    "overrides, reason",
+    [
+        ({"client_name": "Claude\u0000Code"}, "document_invalid"),
+        ({"scope": "read\u0000"}, "scope_invalid"),
+        ({"redirect_uris": ["http://localhost/cb\u0000tail"]}, "redirect_uris_invalid"),
+        ({"redirect_uris": ["http://localhost/cb\ttail"]}, "redirect_uris_invalid"),
+        ({"redirect_uris": ["https://a.example/cb\r\nX: y"]}, "redirect_uris_invalid"),
+    ],
+)
+def test_nul_and_control_characters_are_refused(overrides, reason):
+    with pytest.raises(cimd.CimdRefusal) as caught:
+        cimd.validate_document(CLAUDE_CODE_URL, dict(CLAUDE_CODE_DOC, **overrides))
+    assert caught.value.reason == reason
+
+
+def test_a_nul_name_is_the_constant_refusal_and_writes_no_row(client, origin):
+    origin.serve(CLAUDE_CODE_URL, dict(CLAUDE_CODE_DOC, client_name="Claude\u0000Code"))
+    response = _authorize(client, CLAUDE_CODE_URL)
+    assert response.status_code == 400
+    assert response.content == b'{"error":"invalid_client"}'
+    assert client.queries == []  # never reached a row lookup, let alone a write
+
+
 def test_absent_auth_method_is_none():
     document = dict(CLAUDE_CODE_DOC)
     del document["token_endpoint_auth_method"]
@@ -608,7 +632,10 @@ def test_joining_a_flight_is_never_refused_by_the_caps(origin, monkeypatch):
     assert slot.count == 1
 
 
-def test_the_global_cap_is_eight(origin):
+def test_the_global_cap_is_eight(origin, monkeypatch):
+    # Slot collisions between the nine addresses must not be what refuses:
+    # the per-slot cap is lifted so the only bound left is the global one.
+    monkeypatch.setattr(cimd, "PER_SLOT_IN_FLIGHT", 100)
     gate = asyncio.Event()
     urls = [_sub(f"/g{i}") for i in range(9)]
     for url in urls:
@@ -619,15 +646,20 @@ def test_the_global_cap_is_eight(origin):
             asyncio.create_task(cimd.resolve(url, f"198.51.100.{i}"))
             for i, url in enumerate(urls)
         ]
-        for _ in range(4):
+        for _ in range(200):
+            if len(origin.connections) >= 8 and sum(t.done() for t in tasks) >= 1:
+                break
             await asyncio.sleep(0)
+        connections_before_release = len(origin.connections)
         gate.set()
-        return await asyncio.gather(*tasks, return_exceptions=True)
+        return connections_before_release, await asyncio.gather(*tasks, return_exceptions=True)
 
-    outcomes = run(scenario())
+    before, outcomes = run(scenario())
+    assert before == 8, "a ninth connection opened before the gate was released"
     refused = [o for o in outcomes if isinstance(o, cimd.CimdRefusal)]
-    assert len(refused) <= 1
-    assert sum(isinstance(o, cimd.Projection) for o in outcomes) >= 8
+    assert [r.reason for r in refused] == ["fetch_busy"]
+    assert sum(isinstance(o, cimd.Projection) for o in outcomes) == 8
+    assert len(origin.connections) == 8
 
 
 def test_address_churn_does_not_refill_a_spent_slot(origin, clock, monkeypatch):

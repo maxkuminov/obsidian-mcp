@@ -180,11 +180,11 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
     ),
     # ── OAuth (Slice B) ──
     "oauth_token_issued": frozenset(
-        {"client_id", "user_id", "grant_id", "scope", "client_ip", "reason",
+        {"cimd_host", "cimd_ref", "client_id", "user_id", "grant_id", "scope", "client_ip", "reason",
          "resource_class", "resource_host"}
     ),
     "oauth_token_refreshed": frozenset(
-        {"client_id", "user_id", "grant_id", "scope", "client_ip",
+        {"cimd_host", "cimd_ref", "client_id", "user_id", "grant_id", "scope", "client_ip",
          "resource_class", "resource_host"}
     ),
     "oauth_token_refused": frozenset(
@@ -202,21 +202,21 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
         }
     ),
     "oauth_token_rotation_failed": frozenset(
-        {"client_id", "grant_id", "client_ip", "error_type",
+        {"cimd_host", "cimd_ref", "client_id", "grant_id", "client_ip", "error_type",
          "resource_class", "resource_host"}
     ),
     # The #182 refresh-reuse alarm, migrated onto the suppressor by Slice B: a
     # replayed refresh token is caller-driven and repeatable, so a bare
     # `logger.warning` was an unbounded flood channel beside the bounded one.
     "oauth_refresh_reuse_detected": frozenset(
-        {"client_id", "grant_id", "user_id", "revoked_tokens", "client_ip",
+        {"cimd_host", "cimd_ref", "client_id", "grant_id", "user_id", "revoked_tokens", "client_ip",
          "resource_class", "resource_host"}
     ),
     # No `exc_info` and no `stack` on this one, deliberately: a SQLAlchemy
     # error renders the failing statement *and its bound parameters*, one of
     # which is the token hash. Only the exception's class name is recorded.
     "oauth_refresh_reuse_revocation_failed": frozenset(
-        {"client_id", "grant_id", "user_id", "client_ip", "error_type",
+        {"cimd_host", "cimd_ref", "client_id", "grant_id", "user_id", "client_ip", "error_type",
          "resource_class", "resource_host"}
     ),
     # The #325 authorization-code replay alarm: a spent code presented again
@@ -224,13 +224,13 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
     # family its first exchange issued. Same fields and same reasoning as the
     # refresh-reuse pair above; never a code, verifier, challenge or hash.
     "oauth_code_replay_detected": frozenset(
-        {"client_id", "grant_id", "user_id", "revoked_tokens", "client_ip",
+        {"cimd_host", "cimd_ref", "client_id", "grant_id", "user_id", "revoked_tokens", "client_ip",
          "resource_class", "resource_host"}
     ),
     # Class name only, no `exc_info`: the failing statement's bound parameters
     # include the code hash.
     "oauth_code_replay_revocation_failed": frozenset(
-        {"client_id", "grant_id", "user_id", "client_ip", "error_type",
+        {"cimd_host", "cimd_ref", "client_id", "grant_id", "user_id", "client_ip", "error_type",
          "resource_class", "resource_host"}
     ),
     # `registration_kind` (#357): `dcr` or `cimd` on every approval; a CIMD
@@ -259,7 +259,7 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
     ),
     "oauth_client_registration_refused": frozenset({"reason", "client_ip"}),
     "oauth_grant_revoked": frozenset(
-        {
+        {"cimd_host", "cimd_ref", 
             "client_id",
             "user_id",
             "actor_user_id",

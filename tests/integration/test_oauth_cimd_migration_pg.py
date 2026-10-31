@@ -4,6 +4,7 @@ Skipped unless `PGVECTOR_TEST_ADMIN_URL` names a throwaway Postgres server
 (`make test-integration` sets it).
 """
 import asyncio
+from urllib.parse import urlsplit
 
 import asyncpg
 import pytest
@@ -74,6 +75,44 @@ def test_shape_check_accepts_both_kinds(db_url):
 def test_shape_check_refuses_malformed_rows(db_url, client_id, metadata_url, method, secret):
     with pytest.raises(asyncpg.CheckViolationError):
         _insert(db_url, client_id, metadata_url, method, secret)
+
+
+def test_a_decoy_schema_on_the_search_path_cannot_redirect_the_downgrade():
+    """Codex impl R1: `search_path=tenant,public` with a CIMD-free decoy table.
+
+    The downgrade pins `search_path` to `public` and asserts the unqualified
+    name is `public.oauth_clients` before it counts or alters anything, so the
+    CIMD row in the real table still refuses it.
+    """
+    gen = _harness.throwaway_database("cimd_036_decoy", 64)
+    url = next(gen)
+    try:
+        dbname = urlsplit(url).path.lstrip("/")
+        asyncio.run(_exec(url, "CREATE SCHEMA tenant"))
+        asyncio.run(_exec(url, "CREATE TABLE tenant.oauth_clients (LIKE public.oauth_clients INCLUDING ALL)"))
+        asyncio.run(_exec(url, f'ALTER DATABASE "{dbname}" SET search_path = tenant, public'))
+        _insert(url, CIMD_ID, URL)  # unqualified — but via a fresh connection: tenant first
+        asyncio.run(_exec(url, "DELETE FROM tenant.oauth_clients"))
+        asyncio.run(_exec(
+            url,
+            "INSERT INTO public.oauth_clients (client_id, client_secret_hash, "
+            "token_endpoint_auth_method, client_name, redirect_uris, scope, "
+            "client_id_metadata_url, last_used_at) "
+            "VALUES ($1, NULL, 'none', 'x', '[]'::jsonb, 'read', $2, now())",
+            CIMD_ID, URL,
+        ))
+        result = _harness.run_alembic(url, "downgrade", "035", check=False)
+        assert result.returncode != 0
+        assert "036 downgrade refused: 1 Client ID Metadata Document" in (
+            result.stdout + result.stderr
+        )
+        assert asyncio.run(_fetchval(
+            url,
+            "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'tenant' "
+            "AND table_name = 'oauth_clients' AND column_name = 'client_id_metadata_url'",
+        )) == 1, "the decoy was altered"
+    finally:
+        gen.close()
 
 
 def test_downgrade_refuses_while_cimd_rows_exist(db_url):

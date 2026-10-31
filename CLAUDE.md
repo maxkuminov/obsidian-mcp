@@ -286,7 +286,7 @@ update it in the same change.** What stays here is the short list:
   `cimd_` id is never caller input, and where it is refused differs by
   endpoint.** At `/authorize` it is refused before any lookup. At `/token`
   the credential and the unchanged #182/#325/#326 processing run first,
-  then it is refused. At `/revoke` it is a concealed 200. `/token` never
+  then it is refused. At `/revoke` it is a concealed 200 (`{}`). `/token` never
   fetches. Consent shows the document's host and URL, never its
   `client_name`. Loopback redirects match on any port for CIMD only. `iss` is
   on every authorization redirect. RFC 8707 `resource` is **classified, never

@@ -194,7 +194,7 @@ On an approval the server SHALL insert or refresh, in the transaction that inser
 - **THEN** grant families, code lineage, the absolute grant lifetime and refresh-reuse revocation SHALL behave exactly as for a registered client
 
 ### Requirement: A synthetic CIMD client identifier MUST NOT be accepted as caller input
-A caller-submitted `client_id` beginning with `cimd_` SHALL be refused before any client lookup at `GET` and `POST /authorize` with the constant `invalid_client` response. At `/token`, for both grant types, the credential lookup and the existing replay and reuse decisions SHALL run first and unchanged, and such a value SHALL then be refused before any caller-directed client-row lookup, with the constant `invalid_client` response on a live credential and the existing unknown-code response on a spent code. At `/revoke` it SHALL be checked before the token lookup and answered with the constant HTTP 200 empty response, revoking nothing. Each SHALL be recorded with the reason `internal_id_submitted`. Every client lookup by a caller-submitted identifier that is not a CIMD URL SHALL exclude rows carrying a metadata URL. A CIMD row SHALL be resolved only from a submitted, validated CIMD URL together with the authenticated user, and the consent page's prior-approval display SHALL come only from that resolution.
+A caller-submitted `client_id` beginning with `cimd_` SHALL be refused before any client lookup at `GET` and `POST /authorize` with the constant `invalid_client` response. At `/token`, for both grant types, the credential lookup and the existing replay and reuse decisions SHALL run first and unchanged, and such a value SHALL then be refused before any caller-directed client-row lookup, with the constant `invalid_client` response on a live credential and the existing unknown-code response on a spent code. At `/revoke` it SHALL be checked before the token lookup and answered with the existing constant 200 response (`{}`), revoking nothing. Each SHALL be recorded with the reason `internal_id_submitted`. Every client lookup by a caller-submitted identifier that is not a CIMD URL SHALL exclude rows carrying a metadata URL. A CIMD row SHALL be resolved only from a submitted, validated CIMD URL together with the authenticated user, and the consent page's prior-approval display SHALL come only from that resolution.
 
 #### Scenario: Another user's synthetic id reveals nothing
 - **WHEN** user B submits user A's synthetic `cimd_…` id as `client_id` at `GET /authorize`
@@ -212,7 +212,7 @@ A caller-submitted `client_id` beginning with `cimd_` SHALL be refused before an
 
 #### Scenario: Revocation with a synthetic id is a concealed no-op
 - **WHEN** `/revoke` presents a valid token with `client_id=cimd_nonexistent`
-- **THEN** the response SHALL be HTTP 200 with an empty body, nothing SHALL be revoked, and the log SHALL record the no-op reason `internal_id_submitted`
+- **THEN** the response SHALL be the existing constant 200 response (`{}`), nothing SHALL be revoked, and the log SHALL record the no-op reason `internal_id_submitted`
 
 #### Scenario: The synthetic id is not computable without the deployment secret
 - **WHEN** the same URL and user id are used under two different `SECRET_KEY` values

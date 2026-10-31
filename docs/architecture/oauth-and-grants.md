@@ -707,7 +707,7 @@ so a withdrawn document ends nothing; revocation and the 90-day lifetime do
 | `GET /authorize` | session (multi-user) → response type → PKCE → scope → **`cimd_` prefix refused before any lookup** → CIMD: URL rules → admission → fetch → validation → redirect match → render (host, URL, prior approval only from (URL, authenticated user)); DCR: lookup with `client_id_metadata_url IS NULL` |
 | `POST /authorize` | state (and the bound hash) → PKCE → scope → **`cimd_` prefix refused** → CIMD: session → re-resolve → hash pin → redirect match → clamp → deny (no row) / approve (upsert + code) |
 | `/token` | the credential **first, unchanged**: code or refresh row by hash alone → spent-code fork / #182 reuse decision / #326 precedence → **then** the caller's `client_id`: a `cimd_` value refused (`invalid_client` 401 on a live credential; the unknown-code response on a spent code, which fails #325's full revalidation and revokes nothing) → a CIMD row matches only its URL. A replayed refresh token under `client_id=cimd_nonexistent` still revokes its family |
-| `/revoke` | **`cimd_` prefix before the token lookup**, answered with RFC 7009's constant 200 and an empty body (`internal_id_submitted`, log only) → a CIMD row's `client_id` must equal its URL |
+| `/revoke` | **`cimd_` prefix before the token lookup**, answered with the existing constant 200 response (`{}`) (`internal_id_submitted`, log only) → a CIMD row's `client_id` must equal its URL |
 
 Every CIMD refusal at `/authorize` (URL, admission, fetch, validation,
 redirect mismatch, internal id, metadata changed) answers the **constant

@@ -166,6 +166,11 @@ def _token_refused(
     )
 
 
+def _submitted_now():
+    """The CIMD log fields of the caller's client_id for this /token request."""
+    return cimd.submitted_fields(_SUBMITTED_CLIENT_ID.get(), resolved=True)
+
+
 def _authorize_refused(
     request,
     reason: str,
@@ -1942,6 +1947,8 @@ async def _handle_auth_code(form, request=None):
     # public `client_id`, the owner, the grant family and the granted scope.
     security_events.emit(
         "oauth_token_issued",
+        cimd_host=_submitted_now().cimd_host,
+        cimd_ref=_submitted_now().cimd_ref,
         level=logging.INFO,
         subject=security_events.subject_for(user_id=issued_user_id, request=request),
         reason="authorization_code",
@@ -2024,6 +2031,8 @@ async def _replay_spent_code(session, oauth_code, request):
     if failure is not None:
         security_events.emit(
             "oauth_code_replay_revocation_failed",
+            cimd_host=_submitted_now().cimd_host,
+            cimd_ref=_submitted_now().cimd_ref,
             level=logging.ERROR,
             subject=security_events.subject_for(user_id=replay_user_id, request=request),
             client_id=replay_client_id,
@@ -2037,6 +2046,8 @@ async def _replay_spent_code(session, oauth_code, request):
     elif revoked_count:
         security_events.emit(
             "oauth_code_replay_detected",
+            cimd_host=_submitted_now().cimd_host,
+            cimd_ref=_submitted_now().cimd_ref,
             subject=security_events.subject_for(user_id=replay_user_id, request=request),
             client_id=replay_client_id,
             grant_id=lineage,
@@ -2255,6 +2266,8 @@ async def _handle_refresh(form, request=None):
                 if failure is not None:
                     security_events.emit(
                         "oauth_refresh_reuse_revocation_failed",
+                        cimd_host=_submitted_now().cimd_host,
+                        cimd_ref=_submitted_now().cimd_ref,
                         level=logging.ERROR,
                         subject=security_events.subject_for(
                             user_id=reused_user_id, request=request
@@ -2285,6 +2298,8 @@ async def _handle_refresh(form, request=None):
                     # outbox for one WARNING is not worth its own failure mode.
                     security_events.emit(
                         "oauth_refresh_reuse_detected",
+                        cimd_host=_submitted_now().cimd_host,
+                        cimd_ref=_submitted_now().cimd_ref,
                         subject=security_events.subject_for(
                             user_id=reused_user_id, request=request
                         ),
@@ -2548,6 +2563,8 @@ async def _handle_refresh(form, request=None):
             # itself fails; only the identifiers that resolved from rows appear.
             security_events.emit(
                 "oauth_token_rotation_failed",
+                cimd_host=_submitted_now().cimd_host,
+                cimd_ref=_submitted_now().cimd_ref,
                 level=logging.ERROR,
                 # **Class only, no `exc_info`** — the same rule as
                 # `oauth_refresh_reuse_revocation_failed` two branches away,
@@ -2579,6 +2596,8 @@ async def _handle_refresh(form, request=None):
     # pair is in hand here and appears nowhere in the record.
     security_events.emit(
         "oauth_token_refreshed",
+        cimd_host=_submitted_now().cimd_host,
+        cimd_ref=_submitted_now().cimd_ref,
         level=logging.INFO,
         subject=security_events.subject_for(user_id=rotated_user_id, request=request),
         client_id=client_id,
@@ -2618,6 +2637,7 @@ async def revoke_token(request: Request):
 
     # The synthetic CIMD id is never caller input (#357, D6): before the token
     # lookup, and still RFC 7009's constant 200 — the reason is log-only.
+    _SUBMITTED_CLIENT_ID.set(client_id)
     if cimd.is_internal_id(client_id):
         _revoke_noop(request, "internal_id_submitted", client_id)
         return JSONResponse({})
@@ -2724,6 +2744,8 @@ async def revoke_token(request: Request):
                 security_events.emit(
                     "oauth_grant_revoked",
                     level=logging.INFO,
+                    cimd_host=_submitted_now().cimd_host,
+                    cimd_ref=_submitted_now().cimd_ref,
                     subject=security_events.subject_for(
                         user_id=oauth_token.user_id, request=request
                     ),

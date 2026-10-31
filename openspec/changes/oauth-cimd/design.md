@@ -107,7 +107,7 @@ The row's `client_id` is `"cimd_" + HMAC-SHA256(key=K, msg=url + "\n" + owner).h
 - **Where the prefix guard runs differs by endpoint** (Codex round 3, finding R3-1):
   - **`GET` and `POST /authorize`:** a submitted `client_id` beginning `cimd_` is refused **before any lookup**, with the constant `invalid_client` and log reason `client_metadata.internal_id_submitted`. The refusal depends only on the prefix, so it reveals nothing about which rows exist.
   - **`/token` (both grants):** the credential is resolved and the replay/reuse decision runs **exactly as today**, before the caller's `client_id` is looked at. That means the code or refresh row by hash alone, the spent-code fork, #182 refresh-reuse revocation, #325 code-replay revocation and #326 deadline precedence. A replayed, rotated-away refresh token presented with `client_id=cimd_nonexistent` therefore still revokes its family and answers the constant `invalid_grant`. Only afterwards, at the point where the existing code compares the caller's `client_id` with the row and before any caller-directed client-row lookup, is a `cimd_` value refused. On a live code or live refresh token the response is the constant `invalid_client` 401 and `oauth_token_refused` carries `invalid_client.internal_id_submitted`. On a spent code it takes the existing spent-code path: the unknown-code response, `invalid_grant.spent_code_internal_id_submitted`. The internal id never matches a row (D8), so this can only refuse, never authenticate.
-  - **`/revoke`:** the prefix is checked before the token lookup, and the response stays RFC 7009's constant **HTTP 200 with an empty body** (R3-2). `internal_id_submitted` is the concealed no-op reason on `oauth_revoke_noop`, in the log only. The archived revocation requirement is unchanged.
+  - **`/revoke`:** the prefix is checked before the token lookup, and the response stays the existing constant 200 response (`{}`) (R3-2). `internal_id_submitted` is the concealed no-op reason on `oauth_revoke_noop`, in the log only. The archived revocation requirement is unchanged.
 - Every lookup by a caller-submitted **non-URL** identifier adds `client_id_metadata_url IS NULL`, so a CIMD row is unreachable by any non-URL path even if the prefix check were removed.
 - A CIMD row is reached only by computing its id from (the submitted, validated URL, the **authenticated** session user). "Prior approval" on the consent page is therefore that user's own row or nothing.
 - `/token` resolves the client from the code or refresh-token row, as today, which is not a caller-submitted lookup.
@@ -134,7 +134,7 @@ with `user_id` = the session user (NULL in single-user mode). Because the id inc
 
 ### D8. Client-id matching at `/token` and `/revoke`
 
-`client_id_matches(row, submitted)` returns true when `submitted == row.client_id` or (`row.client_id_metadata_url is not None` and `submitted == row.client_id_metadata_url`). It is the single definition used by the code exchange's mismatch check, the refresh mismatch check and `/revoke`'s "present and exactly equal". Every other line of those paths is unchanged: lookups by hash alone, spent-code fork, reuse detection and constant responses. The internal `cimd_…` id **never** matches as a caller value. It is refused per D6's endpoint-specific order: at `/token` after the credential lookup and the unchanged replay/reuse processing (including full #325 revalidation of a spent code, which a `cimd_` id fails), and at `/revoke` as a concealed 200 no-op. So for a CIMD row only its URL matches. `client_id_matches` therefore compares `submitted == row.client_id` only for rows with `client_id_metadata_url IS NULL`.
+`client_id_matches(row, submitted)` returns true when `submitted == row.client_id` or (`row.client_id_metadata_url is not None` and `submitted == row.client_id_metadata_url`). It is the single definition used by the code exchange's mismatch check, the refresh mismatch check and `/revoke`'s "present and exactly equal". Every other line of those paths is unchanged: lookups by hash alone, spent-code fork, reuse detection and constant responses. The internal `cimd_…` id **never** matches as a caller value. It is refused per D6's endpoint-specific order: at `/token` after the credential lookup and the unchanged replay/reuse processing (including full #325 revalidation of a spent code, which a `cimd_` id fails), and at `/revoke` as a concealed 200 (`{}`) no-op. So for a CIMD row only its URL matches. `client_id_matches` therefore compares `submitted == row.client_id` only for rows with `client_id_metadata_url IS NULL`.
 
 ### D9. The sweep rule for CIMD rows
 
@@ -201,10 +201,10 @@ The standing notice for CIMD reads: "This application identified itself with a d
 
   There is still exactly one emission per DCR registration and one per consent approval. Live verification greps `oauth_consent_granted … registration_kind=cimd`.
 - **No URL in any CIMD record** (finding 2). Wherever a submitted `client_id` begins `https://`, at `/authorize`, `/token` (both grants) and `/revoke`, the record carries **`cimd_host`** (the canonical host when the URL parses, else absent) and **`cimd_ref`** (the first 16 hex characters of SHA-256 over the full submitted string, a non-reversible correlation value) and **never `client_id_submitted`**. The OAuth helpers (`_authorize_refused`, `_token_refused`, `_revoke_noop`, the consent-denied emission) apply the rule in one place, `cimd.submitted_fields(value)`. A DCR `client_id_submitted` is unchanged. The resolved row's `client_id` (the `cimd_…` id) is a database value and is logged as today.
-- CIMD refusals at `/authorize` emit the existing `oauth_authorize_refused` with `reason = client_metadata.<sub>`, where `<sub>` is one of `url_invalid`, `url_not_canonical`, `fetch_cooldown`, `fetch_budget_exhausted`, `fetch_busy`, `ssrf_refused`, `fetch_failed`, `fetch_timeout`, `http_status`, `too_large`, `content_encoded`, `not_json`, `client_id_mismatch`, `document_invalid`, `redirect_uris_invalid`, `auth_method_unsupported`, `secret_present`, `grant_types_invalid`, `scope_invalid`, `redirect_uri_mismatch`, `metadata_changed` or `internal_id_submitted`. At `/token`, `internal_id_submitted` is recorded on `oauth_token_refused` (`invalid_client.internal_id_submitted`, or `invalid_grant.spent_code_internal_id_submitted` on a spent code), after the credential-first replay decision. At `/revoke` it is the concealed no-op reason on `oauth_revoke_noop` (HTTP 200, empty body).
+- CIMD refusals at `/authorize` emit the existing `oauth_authorize_refused` with `reason = client_metadata.<sub>`, where `<sub>` is one of `url_invalid`, `url_not_canonical`, `fetch_cooldown`, `fetch_budget_exhausted`, `fetch_busy`, `ssrf_refused`, `fetch_failed`, `fetch_timeout`, `http_status`, `too_large`, `content_encoded`, `not_json`, `client_id_mismatch`, `document_invalid`, `redirect_uris_invalid`, `auth_method_unsupported`, `secret_present`, `grant_types_invalid`, `scope_invalid`, `redirect_uri_mismatch`, `metadata_changed` or `internal_id_submitted`. At `/token`, `internal_id_submitted` is recorded on `oauth_token_refused` (`invalid_client.internal_id_submitted`, or `invalid_grant.spent_code_internal_id_submitted` on a spent code), after the credential-first replay decision. At `/revoke` it is the concealed no-op reason on `oauth_revoke_noop` (the existing constant 200 response (`{}`)).
 - `resource_class` and, for `unexpected`, `resource_host` are on every `/authorize` and `/token` record of D11. There is one new classification-only event, `oauth_resource_classified` (INFO: `resource_class`, `resource_host`, `route`), emitted only on the four terminal paths with no required outcome event. `rate_limit_exceeded` gains `resource_class` for `/token`. `oauth_authorize_refused` gains reason `client_vanished`.
 - New allow-listed fields: `registration_kind` (str 8), `cimd_host` (str 253), `cimd_ref` (str 16), `resource_class` (str 32) and `resource_host` (str 253). Provenance: `cimd_host`, `cimd_ref`, `resource_class` and `resource_host` are **server-derived** from a parsed value. They are neither a database read nor a raw `_submitted` value, so they are declared as their own class in the field-policy table. None is ever a suppression subject; the subject stays the address, or the user for a consent. SSRF error text, resolved addresses and document bytes are never logged.
-- **At `/authorize`, the response to every CIMD refusal is `{"error": "invalid_client"}` 400**, constant, with no description that says which check failed. That covers URL handling, fetch, admission, validation, a redirect mismatch (finding 4) and a submitted internal id. `/token` keeps its existing responses: a live credential with a `cimd_` id gets the constant `invalid_client` 401, a spent code the unknown-code response, and a reused refresh token the reuse `invalid_grant`. `/revoke` keeps RFC 7009's HTTP 200 with an empty body. A metadata publisher debugs against the log of an operator who can read it, not the response.
+- **At `/authorize`, the response to every CIMD refusal is `{"error": "invalid_client"}` 400**, constant, with no description that says which check failed. That covers URL handling, fetch, admission, validation, a redirect mismatch (finding 4) and a submitted internal id. `/token` keeps its existing responses: a live credential with a `cimd_` id gets the constant `invalid_client` 401, a spent code the unknown-code response, and a reused refresh token the reuse `invalid_grant`. `/revoke` keeps RFC 7009's the existing constant 200 response (`{}`). A metadata publisher debugs against the log of an operator who can read it, not the response.
 ### D13. Settings
 
 | Setting | Default | Range | Note |
@@ -250,7 +250,7 @@ The SSRF test is parameterised over the deny list (loopback v4/v6, RFC 1918, ULA
 | A secret in the client identifier reaching logs | D1 prohibits `?` and `#`; D12 logs only `cimd_host` and a 16-hex digest for every https client_id |
 | A local program claiming a loopback callback | Inherent to RFC 8252. Warned on consent (D10); PKCE binds the exchange to the initiating client |
 | Cross-user grant via a shared CIMD id | D6: per-(URL, user) rows; #68 rule untouched |
-| Cross-tenant probe with another user's synthetic id | D6: ids are HMAC'd under a `SECRET_KEY`-derived key (not computable); a `cimd_` client_id is never accepted (pre-lookup refusal at `/authorize`; after the credential and unchanged replay/reuse processing at `/token`; a concealed 200 no-op at `/revoke`); non-URL lookups exclude CIMD rows; prior approval resolves only from (URL, authenticated user) |
+| Cross-tenant probe with another user's synthetic id | D6: ids are HMAC'd under a `SECRET_KEY`-derived key (not computable); a `cimd_` client_id is never accepted (pre-lookup refusal at `/authorize`; after the credential and unchanged replay/reuse processing at `/token`; a concealed 200 (`{}`) no-op at `/revoke`); non-URL lookups exclude CIMD rows; prior approval resolves only from (URL, authenticated user) |
 | A harmless metadata edit blocking authorization | D4/D7: the pin covers only client_id, the sorted redirect set and scope |
 
 ## Risks / Trade-offs
@@ -281,7 +281,7 @@ The SSRF test is parameterised over the deny list (loopback v4/v6, RFC 1918, ULA
 12. At `/authorize`, every CIMD refusal, including a redirect mismatch, answers a constant `invalid_client` 400, and the reason goes only to the log. `/token` and `/revoke` keep their endpoint-specific responses (D6).
 16. CIMD client identifiers with a query or fragment are refused; CIMD records carry `cimd_host` and `cimd_ref`, never the URL (Codex round 1).
 17. No registration-path event; `registration_kind` rides `oauth_client_registered` and `oauth_consent_granted` (Codex round 1).
-18. Synthetic ids are HMAC-derived from `SECRET_KEY`. A submitted `cimd_` id is refused at `/authorize` before lookup, at `/token` after the credential-first replay decision, and at `/revoke` as a concealed 200 no-op (Codex round 3); CIMD rows are reachable only from (URL, authenticated user) (Codex round 2).
+18. Synthetic ids are HMAC-derived from `SECRET_KEY`. A submitted `cimd_` id is refused at `/authorize` before lookup, at `/token` after the credential-first replay decision, and at `/revoke` as a concealed 200 (`{}`) no-op (Codex round 3); CIMD rows are reachable only from (URL, authenticated user) (Codex round 2).
 19. The consent pin covers the authorization projection only (client_id, sorted redirect URIs, scope) (Codex round 2).
 20. `resource_class` is on every `/authorize` and `/token` record, plus one classification-only record where a terminal path emits nothing; the enforcement gate relies on exactly that evidence (Codex round 2). The `/token` 429 and framework 422s on POST paths are `unclassified_*` and excluded; a `GET /authorize` 422 is classified from the query (Codex round 3).
 13. CIMD sweep: no child rows + marker older than the #194 age, owner ignored, same kill switch.
@@ -383,7 +383,7 @@ Verdict FAIL: round-1 items VERIFIED, the pin hash VERIFIED, R2-1 REGRESSED and 
 What changed, per finding (decisions by the supervisor, 2026-10-31):
 
 1. **R3-1, prefix guard broke credential-first replay at `/token` (MAJOR).** At `/token` the credential is resolved and the #182/#325/#326 replay and reuse decisions run exactly as today. Only then, at the existing caller-`client_id` comparison and before any caller-directed client-row lookup, is a `cimd_` value refused (constant `invalid_client`, or the spent-code unknown-code response). `/authorize` keeps the pre-lookup guard. Codex's scenario is a requirement scenario and test 10.16: rotate R, replay revoked R with `client_id=cimd_nonexistent`, the family is revoked and the answer is `invalid_grant` (D6, spec, tasks 3.4, 10.15, 10.16).
-2. **R3-2, `/revoke` contract (MINOR).** The prefix refusal keeps RFC 7009's constant HTTP 200 with an empty body. `internal_id_submitted` is the concealed no-op reason on `oauth_revoke_noop`. The archived revocation requirement is unchanged (D6, D12, spec).
+2. **R3-2, `/revoke` contract (MINOR).** The prefix refusal keeps the existing constant 200 response (`{}`). `internal_id_submitted` is the concealed no-op reason on `oauth_revoke_noop`. The archived revocation requirement is unchanged (D6, D12, spec).
 3. **R3-3, event consistency (MINOR).** The `/token` 429 is the existing `rate_limit_exceeded` record with all its required fields plus `resource_class: unclassified_rate_limited`; there is no new record on that path. Client-vanished emits `oauth_authorize_refused` (`client_vanished`) with the class. `oauth_resource_classified` is only for the paths with no required outcome event: consent render, login redirect, unhandled exception and framework 422 (D11, D12, security-event spec, tasks 8.2, 9.2).
 4. **R3-4, framework 422s (MINOR).** A route-aware `RequestValidationError` handler covers them. A `GET /authorize` 422 is classified from the query string only. POST `/authorize` and `/token` 422s are `unclassified_malformed`, with no body read, and are excluded from the gate (L14). Malformed GET and POST cases were added to the terminal-path matrix (D11, specs, task 10.11).
 
@@ -437,3 +437,53 @@ were folded (supervisor decisions, 2026-10-31):
    client-vanished now says what the code does.
 9. MINOR: `oauth_revoke_refused` carries `cimd_host` / `cimd_ref` through the
    helper (catalogue updated).
+
+## Adversarial Codex — implementation round 1
+
+Verdict FAIL on a1a4bbb: 4 MAJOR, 2 MINOR. Verbatim:
+
+```json
+{"verdict":"FAIL","findings":[{"severity":"MAJOR","file":"alembic/versions/036_oauth_cimd.py","line":157,"claim":"The downgrade guard and DDL are search_path-relative, so downgrade can inspect and modify a different oauth_clients table instead of public.oauth_clients.","failing_input":"Run downgrade with search_path=tenant,public, where tenant.oauth_clients has the expected column/check but no CIMD rows while public.oauth_clients contains CIMD rows. The guard counts the tenant table, permits downgrade, drops its objects, and leaves Alembic at 035 without refusing for the production rows.","fix":"Before any downgrade query or DDL, SET LOCAL search_path TO public and assert that the unqualified table OID equals public.oauth_clients, then reset the settings as in migration 025."},{"severity":"MAJOR","file":"src/oauth/routes.py","line":1674,"claim":"Post-lookup token records discard the submitted CIMD URL, so required cimd_host and cimd_ref correlation fields are absent.","failing_input":"Exchange a live code with client_id=https://a.example/x when the code belongs to another client. oauth_token_refused contains the resolved client ID but neither cimd_host=a.example nor a 16-hex cimd_ref. The integration test checks only the HTTP response; successful token, refresh, replay, and revocation events have the same omission.","fix":"Preserve the submitted client_id for the request and derive all three logging fields through cimd.submitted_fields at every token/revoke emission, including mismatches, successes, and replay outcomes. Add event-field assertions for both grants and revoke."},{"severity":"MAJOR","file":"src/services/indexer.py","line":7824,"claim":"The CIMD sweep applies its 200-row limit before excluding referenced clients, allowing referenced rows to starve eligible rows forever.","failing_input":"Create 200 old CIMD rows with token references and lower IDs, followed by one old unreferenced CIMD row. Every maintenance pass selects the first 200, deletes none after rechecking, and never reaches the eligible row.","fix":"Put the no-code and no-token EXISTS predicates in the candidate query before ordering and LIMIT, while retaining the in-lock re-read for races."},{"severity":"MAJOR","file":"src/oauth/routes.py","line":2602,"claim":"The revocation endpoint returns JSON {} rather than the specified empty HTTP 200 body.","failing_input":"POST /revoke with a valid token and client_id=cimd_nonexistent returns body b\"{}\". The integration test at tests/integration/test_oauth_cimd_pg.py:248 incorrectly requires that broken body.","fix":"Return Response(status_code=200) on every successful or concealed-no-op revoke path and update the integration assertion to require b\"\"."},{"severity":"MINOR","file":"src/oauth/cimd.py","line":267,"claim":"Metadata validation accepts NUL and control characters that cannot be persisted as a PostgreSQL client row or are not valid redirect URIs.","failing_input":"Serve client_name=\"Claude\\u0000Code\" or redirect_uris=[\"http://localhost/cb\\u0000tail\"]. Validation succeeds, but approval reaches the upsert and fails instead of producing the constant invalid_client refusal.","fix":"Reject NUL in persisted strings and reject control characters in redirect URIs during validate_document; cover the resulting constant refusal and absence of a row."},{"severity":"MINOR","file":"tests/test_oauth_cimd.py","line":629,"claim":"The test named test_the_global_cap_is_eight also passes when the global cap is removed or raised to nine.","failing_input":"Allow all nine gated URLs to fetch concurrently. The test sees zero refusals and nine projections, satisfying len(refused) <= 1 and projections >= 8.","fix":"Assert exactly eight projections, exactly one fetch_busy refusal, and no ninth connection before the gate is released."}]}
+```
+
+What changed, per finding (supervisor decisions, 2026-10-31). Folded together
+with the verifier punch list above:
+
+1. **MAJOR: the 036 downgrade was `search_path`-relative.** Both upgrade and
+   downgrade now `SET LOCAL search_path TO public`, `lock_timeout` and
+   `statement_timeout`. Before any query or DDL they assert that the
+   unqualified `oauth_clients` OID equals `public.oauth_clients`'s, and they
+   `RESET` at the end (025's pattern). Test: a `tenant` schema holding a
+   CIMD-free decoy `oauth_clients` first on the database's `search_path`; the
+   CIMD row in `public` still refuses the downgrade, and the decoy is not
+   altered.
+2. **MAJOR: token records lacked `cimd_host` / `cimd_ref`** (the same as the
+   verifier's MAJOR 1). The submitted client_id is preserved for the request (a
+   `ContextVar`, set at `/token` and `/revoke`). The fields come from
+   `cimd.submitted_fields` on **every** token/revoke record: mismatches and all
+   refusals, `oauth_token_issued`, `oauth_token_refreshed`, the code-replay and
+   refresh-reuse pairs, `oauth_token_rotation_failed`, `oauth_grant_revoked`,
+   `oauth_revoke_noop` and `oauth_revoke_refused`. The catalogue is updated.
+   Event-field assertions cover both grants, both replay kinds and a revoke.
+3. **MAJOR: sweep starvation** (the same as the verifier's minor). The
+   no-code/no-token `NOT EXISTS` predicates are in the candidate query before
+   `ORDER BY` / `LIMIT`, and the in-lock re-read is kept. Test: 200 referenced
+   rows with lower ids ahead of one eligible row; one pass deletes exactly
+   that row.
+4. **MAJOR: the `/revoke` body is declined as a code change, and the wording
+   is amended.** This server's RFC 7009 constant has always been `{}`. Every
+   revoke path (success, concealed no-op, `cimd_`) keeps returning exactly
+   that existing constant. Changing a live endpoint's body under every
+   connected DCR client would be a contract change with no security value:
+   both bodies are constant and disclose nothing. The spec, design, tasks and
+   docs now say "the existing constant 200 response (`{}`)" instead of "empty
+   body". The integration assertion on `{}` stands.
+5. **MINOR: NUL and control characters.** `validate_document` refuses NUL in
+   `client_name` and `scope` (the persisted strings) and any control character
+   in a redirect URI. That gives the constant `invalid_client` and no row.
+   Tested both in validation and through the consent GET, which never reaches
+   a row lookup.
+6. **MINOR: the global-cap test now pins the cap.** It asserts exactly eight
+   projections, exactly one `fetch_busy` refusal and exactly eight connections
+   before the gate is released. The per-slot cap is lifted in that test so
+   that a slot collision cannot be what refuses.

@@ -279,6 +279,10 @@ class Projection:
         return all(is_loopback_uri(uri) for uri in self.redirect_uris)
 
 
+def _has_control(value: str) -> bool:
+    return any(ord(c) < 0x20 or ord(c) == 0x7F for c in value)
+
+
 def validate_document(url: str, document, host: str | None = None) -> Projection:
     if not isinstance(document, dict):
         raise CimdRefusal("not_json", host)
@@ -286,6 +290,10 @@ def validate_document(url: str, document, host: str | None = None) -> Projection
         raise CimdRefusal("client_id_mismatch", host)
     name = document.get("client_name")
     if not isinstance(name, str) or not name.strip() or len(name.strip()) > MAX_CLIENT_NAME_CHARS:
+        raise CimdRefusal("document_invalid", host)
+    # PostgreSQL text cannot hold NUL; a persisted string with one would fail
+    # at the upsert instead of answering the constant refusal (Codex impl R1).
+    if "\x00" in name:
         raise CimdRefusal("document_invalid", host)
     if "client_secret" in document or "client_secret_expires_at" in document:
         raise CimdRefusal("secret_present", host)
@@ -308,6 +316,7 @@ def validate_document(url: str, document, host: str | None = None) -> Projection
         not isinstance(uris, list)
         or not 1 <= len(uris) <= MAX_REDIRECT_URIS
         or any(not isinstance(u, str) or len(u) > MAX_REDIRECT_URI_CHARS for u in uris)
+        or any(_has_control(u) for u in uris)
         or len(set(uris)) != len(uris)
     ):
         raise CimdRefusal("redirect_uris_invalid", host)
@@ -324,7 +333,7 @@ def validate_document(url: str, document, host: str | None = None) -> Projection
         raise CimdRefusal("redirect_uris_invalid", host)
 
     raw_scope = document.get("scope", DEFAULT_CLIENT_SCOPE)
-    if not isinstance(raw_scope, str):
+    if not isinstance(raw_scope, str) or "\x00" in raw_scope:
         raise CimdRefusal("scope_invalid", host)
     tokens = set(raw_scope.split())
     if not tokens or tokens - VALID_SCOPES:
