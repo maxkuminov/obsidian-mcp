@@ -28,7 +28,7 @@ Wherever a submitted `client_id` begins with `https://`, at `/authorize`, at `/t
 - **THEN** the `oauth_revoke_noop` record SHALL carry `cimd_host` and `cimd_ref` and no `client_id_submitted`
 
 ### Requirement: A CIMD refusal SHALL be recorded once as an authorization refusal with a closed client_metadata reason
-Every refusal at `/authorize` arising from Client ID Metadata Document handling SHALL emit exactly one `oauth_authorize_refused` record whose `reason` is `client_metadata.` followed by one of `url_invalid`, `url_not_canonical`, `fetch_cooldown`, `fetch_budget_exhausted`, `fetch_busy`, `ssrf_refused`, `fetch_failed`, `fetch_timeout`, `http_status`, `too_large`, `content_encoded`, `not_json`, `client_id_mismatch`, `document_invalid`, `redirect_uris_invalid`, `auth_method_unsupported`, `secret_present`, `grant_types_invalid`, `scope_invalid`, `redirect_uri_mismatch` or `metadata_changed`. The record SHALL NOT carry a resolved address, SSRF error text, a response status line or any document content.
+Every refusal at `/authorize` arising from Client ID Metadata Document handling SHALL emit exactly one `oauth_authorize_refused` record whose `reason` is `client_metadata.` followed by one of `internal_id_submitted`, `url_invalid`, `url_not_canonical`, `fetch_cooldown`, `fetch_budget_exhausted`, `fetch_busy`, `ssrf_refused`, `fetch_failed`, `fetch_timeout`, `http_status`, `too_large`, `content_encoded`, `not_json`, `client_id_mismatch`, `document_invalid`, `redirect_uris_invalid`, `auth_method_unsupported`, `secret_present`, `grant_types_invalid`, `scope_invalid`, `redirect_uri_mismatch` or `metadata_changed`. The record SHALL NOT carry a resolved address, SSRF error text, a response status line or any document content.
 
 #### Scenario: An SSRF refusal does not leak the address
 - **WHEN** a CIMD URL resolving to `10.0.0.5` is refused
@@ -39,16 +39,24 @@ Every refusal at `/authorize` arising from Client ID Metadata Document handling 
 - **WHEN** CIMD refusals naming many distinct hosts arrive from one address
 - **THEN** they SHALL share one suppression subject, the trusted client address
 
-### Requirement: Every /authorize and /token outcome event SHALL carry the RFC 8707 resource classification
-`oauth_authorize_refused`, `oauth_consent_granted`, `oauth_consent_denied`, `oauth_token_issued`, `oauth_token_refreshed` and `oauth_token_refused` SHALL each carry `resource_class`, one of `absent`, `accepted_1`, `accepted_2`, `accepted_3`, `accepted_4` or `unexpected`, and SHALL carry `resource_host` only when the class is `unexpected`. `resource_host` SHALL be the value's host in ASCII form or the constant `<unparseable>`, and no record SHALL carry the value's scheme, path, query or fragment. No event SHALL be added for the classification and no request SHALL emit more records because of it.
+### Requirement: Every /authorize and /token terminal path SHALL carry the RFC 8707 resource classification
+Every security record emitted while handling a `GET` or `POST /authorize` or a `/token` request SHALL carry `resource_class`, one of `absent`, `accepted_1`, `accepted_2`, `accepted_3`, `accepted_4` or `unexpected`, and SHALL carry `resource_host` only when the class is `unexpected`. This SHALL include at least `oauth_authorize_refused`, `oauth_consent_granted`, `oauth_consent_denied`, `oauth_cross_user_client_refused`, `oauth_token_issued`, `oauth_token_refreshed`, `oauth_token_refused`, `oauth_code_replay_detected`, `oauth_code_replay_revocation_failed`, `oauth_refresh_reuse_detected`, `oauth_refresh_reuse_revocation_failed` and `oauth_token_rotation_failed`. A request whose terminal path emits none of them — a successful consent render, the multi-user login redirect, the client-vanished refusal, an unhandled exception, or the `/token` rate-limiter refusal — SHALL emit exactly one `oauth_resource_classified` record at INFO carrying only `resource_class`, `route` and, when `unexpected`, `resource_host`, with the trusted address as its subject. `resource_host` SHALL be the value's host in ASCII form or the constant `<unparseable>`, and no record SHALL carry the value's scheme, path, query or fragment. The later change that enforces `resource` MAY rely on exactly this evidence — no `unexpected` on any of these records for 14 consecutive days — and on nothing weaker.
 
 #### Scenario: Only the host is recorded
 - **WHEN** `resource=https://other.example/x?token=abc` is sent to `/token`
 - **THEN** the outcome record SHALL carry `resource_class` `unexpected` and `resource_host` `other.example` and SHALL NOT contain `token=abc`
 
+#### Scenario: A replay detection is classified
+- **WHEN** a replayed authorization code with `resource=https://other.example/` revokes its family
+- **THEN** the `oauth_code_replay_detected` record SHALL carry `resource_class` `unexpected`
+
+#### Scenario: A throttled token request is classified
+- **WHEN** `/token` refuses a request by its rate limiter
+- **THEN** exactly one `oauth_resource_classified` record SHALL be emitted for it
+
 #### Scenario: The follow-up gate is computable from the records
-- **WHEN** the emitted `/authorize` and `/token` outcome records of a period are counted by `resource_class`
-- **THEN** every record SHALL fall in exactly one of the six classes
+- **WHEN** the emitted `/authorize` and `/token` records of a period are counted by `resource_class`
+- **THEN** every request handled in the period SHALL be represented by at least one record, and every record SHALL fall in exactly one of the six classes
 
 ### Requirement: The new fields SHALL be allow-listed with declared types and bounds
 `ALLOWED_FIELDS` SHALL declare `registration_kind` as a string of at most 8 characters, `cimd_ref` of at most 16, `resource_class` of at most 16, and `cimd_host` and `resource_host` of at most 253. `cimd_host`, `cimd_ref`, `resource_class` and `resource_host` SHALL be documented as server-derived values computed from a parsed request value, distinct from both a database-read identifier and a `_submitted` value, and none SHALL ever be a suppression subject. The existing bound on `client_id` and `client_id_submitted` SHALL be unchanged.

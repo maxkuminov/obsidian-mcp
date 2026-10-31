@@ -148,11 +148,23 @@ A validated projection SHALL be cached in process, keyed by the exact URL, for t
 - **THEN** the token endpoint SHALL refuse it as a redirect mismatch
 
 ### Requirement: The consent approval SHALL bind the projection the consent page showed
-The consent page SHALL bind the SHA-256 of the validated projection it rendered into the signed consent state. The approval SHALL re-resolve the document under the cache and admission rules and SHALL refuse with `invalid_client`, minting and writing nothing, when the re-resolved projection's hash differs from the bound one; whatever an approval writes SHALL be exactly the projection that was shown. Detecting a change at the origin while the cached projection is still fresh is not required. The token endpoint and the refresh path MUST NOT fetch the document; the code row's client, exact redirect URI and clamped scope SHALL be all that the exchange depends on.
+The consent page SHALL bind into the signed consent state the SHA-256 of the canonical authorization projection it rendered, consisting only of the client identifier URL, the sorted list of normalised redirect URIs and the sorted scope tokens; `client_name` and every other self-described document field SHALL be outside the hash. The approval SHALL re-resolve the document under the cache and admission rules and SHALL refuse with `invalid_client`, minting and writing nothing, when the re-resolved authorization projection's hash differs from the bound one; the redirect URIs and scope an approval writes SHALL be exactly those that were shown. Detecting a change at the origin while the cached projection is still fresh is not required. The token endpoint and the refresh path MUST NOT fetch the document; the code row's client, exact redirect URI and clamped scope SHALL be all that the exchange depends on.
 
 #### Scenario: An expired re-resolution returning a different projection is refused
 - **WHEN** the consent page rendered a projection, its cache entry has expired or was never cached, and the approval's fetch returns a document whose `redirect_uris` differ
 - **THEN** the approval SHALL be refused with `invalid_client` and no code or client row SHALL be written
+
+#### Scenario: A name-only change does not block approval
+- **WHEN** an uncached re-resolution at approval returns the rendered document with only `client_name` changed
+- **THEN** the approval SHALL succeed
+
+#### Scenario: A redirect-order-only change does not block approval
+- **WHEN** an uncached re-resolution at approval returns the same `redirect_uris` in a different order with the same scope
+- **THEN** the approval SHALL succeed
+
+#### Scenario: A scope change is refused
+- **WHEN** an uncached re-resolution at approval returns a document whose `scope` differs from the rendered one
+- **THEN** the approval SHALL be refused with `invalid_client` and nothing SHALL be written
 
 #### Scenario: A fresh cached projection is approved as shown
 - **WHEN** the origin's document changes while the cached projection the page rendered is still fresh, and the user approves
@@ -163,7 +175,7 @@ The consent page SHALL bind the SHA-256 of the validated projection it rendered 
 - **THEN** no request SHALL be made to the document URL
 
 ### Requirement: A CIMD client SHALL be persisted as one synthetic client row per URL and user, written only on approval
-On an approval the server SHALL insert or refresh, in the transaction that inserts the authorization code, an `oauth_clients` row whose `client_id` is `cimd_` followed by the first 59 hex characters of SHA-256 over the URL, a newline and the owning user's id (or `-` when there is none), with `client_id_metadata_url` set to the URL, `user_id` set to the approving user, `token_endpoint_auth_method` `none`, no secret hash, and the projection's name, redirect URIs and scope, stamping `last_used_at` in the same statement. A consent page render and a denial SHALL NOT write a client row. The database SHALL enforce that a row carries a metadata URL exactly when its id begins `cimd_`, and that such a row has auth method `none` and no secret hash.
+On an approval the server SHALL insert or refresh, in the transaction that inserts the authorization code, an `oauth_clients` row whose `client_id` is `cimd_` followed by the first 59 hex characters of HMAC-SHA256, under a key derived from the deployment's `SECRET_KEY`, over the URL, a newline and the owning user's id (or `-` when there is none), with `client_id_metadata_url` set to the URL, `user_id` set to the approving user, `token_endpoint_auth_method` `none`, no secret hash, and the projection's name, redirect URIs and scope, stamping `last_used_at` in the same statement. A consent page render and a denial SHALL NOT write a client row. The database SHALL enforce that a row carries a metadata URL exactly when its id begins `cimd_`, and that such a row has auth method `none` and no secret hash.
 
 #### Scenario: Two users connecting the same client get separate rows
 - **WHEN** two users in multi-user mode each approve the same CIMD URL
@@ -181,8 +193,24 @@ On an approval the server SHALL insert or refresh, in the transaction that inser
 - **WHEN** a CIMD client's code is exchanged and its refresh token rotated or replayed
 - **THEN** grant families, code lineage, the absolute grant lifetime and refresh-reuse revocation SHALL behave exactly as for a registered client
 
+### Requirement: A synthetic CIMD client identifier MUST NOT be accepted as caller input
+A caller-submitted `client_id` beginning with `cimd_` SHALL be refused before any client lookup at `GET` and `POST /authorize`, at `/token` for both grant types and at `/revoke`, with that endpoint's constant `invalid_client` response, and SHALL be recorded with the reason `internal_id_submitted`. Every client lookup by a caller-submitted identifier that is not a CIMD URL SHALL exclude rows carrying a metadata URL. A CIMD row SHALL be resolved only from a submitted, validated CIMD URL together with the authenticated user, and the consent page's prior-approval display SHALL come only from that resolution.
+
+#### Scenario: Another user's synthetic id reveals nothing
+- **WHEN** user B submits user A's synthetic `cimd_…` id as `client_id` at `GET /authorize`
+- **THEN** the response SHALL be the constant `invalid_client` response, byte-identical to that for a nonexistent `cimd_` id
+- **AND** no consent page SHALL be rendered and no row data SHALL appear in the response
+
+#### Scenario: The synthetic id is refused at the token and revocation endpoints
+- **WHEN** a code exchange, a refresh or a revocation names a `cimd_…` client_id
+- **THEN** it SHALL be refused with that endpoint's `invalid_client` response before any lookup, and nothing SHALL be revoked
+
+#### Scenario: The synthetic id is not computable without the deployment secret
+- **WHEN** the same URL and user id are used under two different `SECRET_KEY` values
+- **THEN** the derived synthetic ids SHALL differ
+
 ### Requirement: The token and revocation endpoints SHALL accept a CIMD URL as the caller's client identifier
-Wherever `/token` or `/revoke` compares a caller-supplied `client_id` against a client row, a value byte-equal to that row's `client_id_metadata_url` SHALL match exactly as the row's own `client_id` does, through one shared definition. All other refusal rules, lookups and constant responses of those endpoints SHALL be unchanged.
+Wherever `/token` or `/revoke` compares a caller-supplied `client_id` against a client row, a value byte-equal to that row's `client_id_metadata_url` SHALL match, and for a CIMD row nothing else SHALL match, through one shared definition. All other refusal rules, lookups and constant responses of those endpoints SHALL be unchanged.
 
 #### Scenario: Claude Code exchanges with its URL
 - **WHEN** a code issued to a CIMD row is exchanged with `client_id` equal to the document URL
@@ -223,11 +251,15 @@ Every redirect issued by `POST /authorize`, approval and denial alike, SHALL car
 - **THEN** the redirect SHALL carry `error=access_denied` and `iss`
 
 ### Requirement: An RFC 8707 resource parameter SHALL be classified on every request and SHALL NOT cause a refusal
-At `GET` and `POST /authorize` and on both `/token` grant types, the server SHALL classify the request's `resource` parameter as exactly one of `absent`; `accepted_1` (`{base}/mcp`), `accepted_2` (`{base}/mcp/`), `accepted_3` (`{base}`) or `accepted_4` (`{base}/`) when every value present equals that one spelling; or `unexpected` otherwise. The classification SHALL be recorded as `resource_class` on the one outcome event the request emits, with `resource_host` (the first unexpected value's host, or `<unparseable>`) only when the class is `unexpected`. The request SHALL proceed exactly as if the parameter were absent; this change MUST NOT refuse a request because of its `resource` value.
+At `GET` and `POST /authorize` and on both `/token` grant types, the server SHALL classify the request's `resource` parameter as exactly one of `absent`; `accepted_1` (`{base}/mcp`), `accepted_2` (`{base}/mcp/`), `accepted_3` (`{base}`) or `accepted_4` (`{base}/`) when every value present equals that one spelling; or `unexpected` otherwise. The classification SHALL be recorded as `resource_class` on every security record the request's handling emits, and, when the request's terminal path emits no other record, on exactly one classification-only `oauth_resource_classified` record, with `resource_host` (the first unexpected value's host, or `<unparseable>`) only when the class is `unexpected`. The request SHALL proceed exactly as if the parameter were absent; this change MUST NOT refuse a request because of its `resource` value.
 
 #### Scenario: The advertised resource is classified accepted
 - **WHEN** `resource` equals the `resource` field of the protected-resource metadata, `{base}/mcp`, on a code exchange
 - **THEN** the exchange SHALL succeed and `oauth_token_issued` SHALL carry `resource_class` `accepted_1` and no `resource_host`
+
+#### Scenario: A successful consent render is classified
+- **WHEN** `GET /authorize` renders the consent page for a request carrying `resource=https://other.example/mcp`, and the user never submits
+- **THEN** exactly one `oauth_resource_classified` record SHALL be emitted with `resource_class` `unexpected` and `resource_host` `other.example`
 
 #### Scenario: Absence is classified
 - **WHEN** an approval carries no `resource`

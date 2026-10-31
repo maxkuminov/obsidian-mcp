@@ -18,7 +18,8 @@
 ## 3. URL detection and canonical form (`src/oauth/cimd.py`)
 
 - [ ] 3.1 `is_cimd_client_id(value)` (exact `https://` prefix) and `validate_client_id_url(value)`, implementing every D1 rule (including **no `?` and no `#` anywhere**), with `canonicalise(...).url == value` byte-equality, before any DNS.
-- [ ] 3.2 `cimd_row_id(url, user_id)`, which returns `"cimd_" + sha256(url + "\n" + owner)[:59]`, with `owner = str(user_id)` or `-`.
+- [ ] 3.2 `cimd_row_id(url, user_id)` returns `"cimd_" + HMAC-SHA256(K, url + "\n" + owner).hexdigest()[:59]`, where `owner = str(user_id)` or `-` and `K = HMAC-SHA256(SECRET_KEY, "oauth-cimd-client-id/v1")`.
+- [ ] 3.4 A prefix guard `refuse_internal_id(client_id)` runs before any lookup at `GET`/`POST /authorize`, `/token` (both grants) and `/revoke`, answering the endpoint's constant `invalid_client` and logging `internal_id_submitted`. Every `select(OAuthClient)` by a caller-submitted non-URL identifier adds `client_id_metadata_url IS NULL`. Grep shows none without it.
 - [ ] 3.3 `/authorize` GET and POST branch on detection after the session, response-type, PKCE and scope checks. A disabled CIMD feature means an unknown client.
 
 ## 4. Hardened fetch, budgets, validation, cache (`src/oauth/cimd.py`)
@@ -27,7 +28,7 @@
 - [ ] 4.2 Admission (D3), in order: cache hit → **join an in-progress flight of the same URL (charged nothing)** → cooldown (30 s; bounded 1,024-entry table, oldest replaced) → per-address budget on a **fixed 4,096-slot salted table, the same algorithm as `rate_limits._slot_index` / `record_auth_failure`** (reserved slot 0, per-process keyed BLAKE2b salt, fixed 60 s window, collisions merge, nothing evicted; share the helper, own table and salt) → ≤ 1 in flight per slot → ≤ 8 in flight globally. Refusals spend nothing. A `reset_state_for_tests()` hook that re-salts, and a test-only table-size override.
 - [ ] 4.3 `validate_document(url, obj)` returns the projection `{client_id, client_name, redirect_uris, scope}`, applying every D4 rule. https redirect URIs go through `_normalized_redirect_uri`, and loopback http follows D5's host set.
 - [ ] 4.4 Cache (D4/D13): bounded LRU of 256, keyed by exact URL, storing projection + hash + expiry. TTL = `max-age` clamped to the setting; 300 s when absent; 0 under `no-store`/`no-cache` or a ceiling of 0. An expired entry is never served after a failed refetch.
-- [ ] 4.5 `document_hash(projection)` (SHA-256 over sorted-key compact JSON).
+- [ ] 4.5 `authorization_hash(projection)`: SHA-256 over sorted-key compact JSON of `{client_id, redirect_uris: sorted normalised list, scope: sorted space-joined}` only. `client_name` and every other field are outside it.
 - [ ] 4.6 `src/services/transfer.py`: add `FetchResult.cache_control: CacheDirective | None` (`max_age: int | None`, `no_store: bool` for `no-store`/`no-cache`), parsed from `Cache-Control` only. The raw header and every other header are never exposed. Update every `FetchResult` construction site and test fixture (`import_from_url` ignores the field). Tests cover the parser cases (absent, `max-age=300`, `public, max-age=604800`, `no-store`, `no-cache`, malformed and negative `max-age`) and assert the result object carries no raw header string.
 
 ## 5. Redirect matching
@@ -39,7 +40,7 @@
 
 - [ ] 6.1 Approve path for CIMD: re-resolve the document (cache or admission), compare its hash with the signed state (D7, `metadata_changed`; the invariant is that the approval binds the projection shown), then in the code's transaction upsert the row (`INSERT … ON CONFLICT (client_id) DO UPDATE … last_used_at = now() RETURNING`), owner = session user, skipping the first-authorizer claim and the cross-user branch. Deny writes no row.
 - [ ] 6.2 `oauth_state` cookie payload `{"s": server_state, "m": hash}` for CIMD. Legacy string payloads are still accepted for DCR.
-- [ ] 6.3 `client_id_matches(row, submitted)` (D8), used by the code-exchange mismatch check, the refresh mismatch check and `/revoke`. Grep shows no other `client_id !=` comparison against a row.
+- [ ] 6.3 `client_id_matches(row, submitted)` (D8; for a CIMD row only its URL matches; the internal id never does), used by the code-exchange mismatch check, the refresh mismatch check and `/revoke`. Grep shows no other `client_id !=` comparison against a row.
 - [ ] 6.4 `cleanup_expired_tokens` (`src/services/indexer.py`): a CIMD branch per D9 with the same skip-locked batch, in-lock re-read and delete protocol. One INFO count line per pass covers both kinds. The `null` age disables it.
 - [ ] 6.5 `/token` and refresh make no outbound request for a CIMD client (asserted by a test that fails on any fetch).
 
@@ -53,15 +54,15 @@
 ## 8. `iss` and `resource`
 
 - [ ] 8.1 `_append_query(..., iss=<metadata issuer>)` on both `POST /authorize` redirects, for every client kind.
-- [ ] 8.2 `resource` classification (D11) at `GET`/`POST /authorize` and on both `/token` grants: `absent | accepted_1..accepted_4 | unexpected`, carried as `resource_class` (and `resource_host` for `unexpected`) on the one outcome event each request emits. No code path refuses on `resource`, and no extra emission.
+- [ ] 8.2 `resource` classification (D11): classify once at handler entry into `request.state`; every emission helper on an `/authorize` or `/token` path attaches `resource_class` (+ `resource_host` for `unexpected`) and sets a flag; each handler's `finally` emits `oauth_resource_classified` iff the flag is unset. This covers the successful GET render, the login redirect, client-vanished and unhandled exceptions. The `/token` slowapi 429 handler reads the form under the existing body limit and emits the classification-only record. No code path refuses on `resource`.
 
 ## 9. Security events
 
 - [ ] 9.1 `src/logging_setup.py`: `registration_kind` (str 8), `cimd_host` (str 253), `cimd_ref` (str 16), `resource_class` (str 16) and `resource_host` (str 253) in `ALLOWED_FIELDS`.
-- [ ] 9.2 `src/services/security_events.py`: add `registration_kind` to `oauth_client_registered`; `registration_kind`, `cimd_host`, `cimd_ref` and `outcome` to `oauth_consent_granted`; `cimd_host` and `cimd_ref` to `oauth_authorize_refused`, `oauth_consent_denied`, `oauth_token_refused` and `oauth_revoke_noop`; and `resource_class` / `resource_host` to the six `/authorize` and `/token` outcome events. **No new event.** Exactly one emission per DCR registration and per approval stays pinned by the existing tests.
+- [ ] 9.2 `src/services/security_events.py`: add `registration_kind` to `oauth_client_registered`; `registration_kind`, `cimd_host`, `cimd_ref` and `outcome` to `oauth_consent_granted`; `cimd_host` and `cimd_ref` to `oauth_authorize_refused`, `oauth_consent_denied`, `oauth_token_refused`, `oauth_revoke_noop` and `oauth_revoke_refused`; `resource_class` / `resource_host` to every `/authorize` and `/token` event listed in D11 (including the cross-user, replay, reuse, revocation-failure and rotation-failure events); and the one new classification-only event `oauth_resource_classified` (`resource_class`, `resource_host`, `route`). There is no registration-path event, and exactly one emission per DCR registration and per approval stays pinned.
 - [ ] 9.3 Every CIMD refusal (including a redirect mismatch) answers the constant `{"error":"invalid_client"}` 400 and emits one `oauth_authorize_refused` with `client_metadata.<sub>`. One helper, `cimd.submitted_fields(value)`, used by `_authorize_refused`, `_token_refused`, `_revoke_noop` and the consent-denied emission, replaces `client_id_submitted` with `cimd_host` + `cimd_ref` for every `https://` value. No address, error text, URL or document bytes in any record.
 - [ ] 9.4 After deploy: count the emitted `/authorize` and `/token` outcome records by `resource_class` daily, and record the `resource_host` values of any `unexpected`. This is the evidence for 9.5.
-- [ ] 9.5 File the follow-up issue "OAuth: refuse foreign RFC 8707 `resource` with `invalid_target`". Its gate is 14 consecutive days in which no emitted `/authorize` or `/token` outcome record carries `resource_class: unexpected`. It links L9 and this change.
+- [ ] 9.5 File the follow-up issue "OAuth: refuse foreign RFC 8707 `resource` with `invalid_target`". Its gate is 14 consecutive days in which **no record carrying `resource_class`** from `/authorize` or `/token` (every event of D11 plus `oauth_resource_classified`) shows `unexpected`. The issue states that the enforcement change may rely on exactly this evidence and nothing weaker. It links L9 and this change.
 
 ## 10. Tests
 
@@ -70,12 +71,13 @@
 - [ ] 10.3 Admission: per-address eleventh refusal; one address with four hostile slow fetches (1 admitted, 3 refused `fetch_busy`) while a Claude flow from another address fetches an uncached valid URL and renders consent; joining an in-progress flight with the slot and global caps full is admitted and charged nothing; the global cap of 8; the cooldown (50 callers → one origin request); a cache hit spends nothing; the table at `size + 1` distinct addresses (a forced collision shares the budget, the table stays fixed, and a spent slot is not refilled by churn); a request without an address is charged to slot 0.
 - [ ] 10.4 Cache: max-age clamp, no-store, no-cache, absent header, ceiling 0, failure after expiry.
 - [ ] 10.5 Redirect matching table: every D5 accept/refuse case. DCR membership is unchanged.
-- [ ] 10.6 Pinning: an uncached or expired re-resolution returning a different projection is refused; a fresh cached projection is approved as shown; `/token` and refresh never fetch.
+- [ ] 10.6 Pinning: an uncached or expired re-resolution with a different redirect set or scope is refused `metadata_changed`; a name-only change and a redirect-order-only change proceed; a fresh cached projection is approved as shown; `/token` and refresh never fetch.
 - [ ] 10.7 Row: per-(URL, user) ids in multi-user mode with two users and no cross-user refusal; a repeat approve refreshes the row; deny writes nothing; the CHECK rejects a malformed row (integration, real Postgres).
 - [ ] 10.8 Token/revoke matching with the URL as `client_id`; a different URL is a mismatch that revokes nothing. Grant family, #325 replay and #326 lifetime behave the same for a CIMD client (integration).
 - [ ] 10.9 Sweep: a CIMD row with a token of any state is kept; an unreferenced old row is deleted; the `null` age disables it; the race with a concurrent approve leaves a consistent row (integration).
 - [ ] 10.10 Consent rendering: host shown, hostile `client_name` absent, loopback warning, CIMD notice, CSP header exact, no inline style or handler (existing CSP template scanners pass).
-- [ ] 10.11 `iss` on approve and deny; `resource_class` on all six outcome events for `absent`, each of `accepted_1..4`, `unexpected` (host only, a query value never logged) and multiple values; requests still succeed.
+- [ ] 10.11 `iss` on approve and deny; `resource_class` on every terminal path: a successful GET render (one `oauth_resource_classified`), the login redirect, every GET and POST refusal, approve, deny, cross-user, client-vanished, an injected unhandled exception, every `/token` success and error, code and refresh replay detection, rotation failure and the slowapi 429. Each request yields at least one classified record; the classification-only record is emitted only when nothing else was, and it covers for `absent`, each of `accepted_1..4`, `unexpected` (host only, a query value never logged) and multiple values; requests still succeed.
+- [ ] 10.15 Internal-id probe: user B submitting user A's synthetic id at `GET /authorize` gets a response byte-identical to a nonexistent `cimd_` id and no rendered page. The same id at `POST /authorize`, `/token` (both grants) and `/revoke` is refused before any lookup and nothing is revoked. Two `SECRET_KEY` values derive different ids.
 - [ ] 10.14 URL-free logging: a `?`/`#` client_id is refused before any fetch; `/authorize`, `/token` (both grants) and `/revoke` records about an `https://` client_id carry `cimd_host` + `cimd_ref` and never `client_id_submitted` or the URL.
 - [ ] 10.12 Event catalogue parity test and the allow-list AST sweep cover the new fields, and no `oauth_client_registration_path` exists. The existing exactly-one-emission tests for `/register` and approval pass. The canary test confirms no secret in any new record.
 - [ ] 10.13 `pytest tests` plus `make test-integration` green, with the integration suite actually executed.
