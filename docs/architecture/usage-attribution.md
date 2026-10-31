@@ -771,8 +771,9 @@ this table.
   and on a `rerank=true` row `reranked` (bool, always), `rerank_reason`
   (string, one closed code such as `timeout` or `not_configured`, only when
   `reranked` is false), `rerank_ms` (int, the exchange time, only when a
-  request was sent) and `rerank_candidates` (int, the candidates scored or
-  considered). `result_paths` are the rendered rows in final, reranked order.
+  request was sent), `rerank_candidates` (int, the candidate notes scored or
+  considered) and `rerank_documents` (int, #402: the documents allocated to
+  them, at most `RERANK_MAX_DOCUMENTS`). `result_paths` are the rendered rows in final, reranked order.
   **`reranked: false` is not an error marker**: the call returned the honest,
   labelled unreranked page, so the row stays analysable and minable.
 - **Search confidence (#389) reserves three keys**, on every **page** of

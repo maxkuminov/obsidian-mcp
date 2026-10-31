@@ -88,7 +88,18 @@ async def test_rerank_false_adds_no_statement_and_keeps_the_page(monkeypatch):
     assert len(plain.rows) == 10 and len(flagged.rows) == 50
     assert [r.path for r in flagged.rows[:10]] == [r.path for r in plain.rows]
     assert not any(k == "excerpt" for k, _ in a.log)
-    assert [entry for entry in b.log if entry[0] != "excerpt"] == a.log
+    # #402: the same statements, except that the flagged overfetch projects
+    # exactly `embed_prefix` and `embedded_chunking_version` more.
+    extra = ", note_embeddings.embed_prefix, notes_metadata.embedded_chunking_version"
+    flagged_log = [entry for entry in b.log if entry[0] != "excerpt"]
+    assert len(flagged_log) == len(a.log)
+    for (ka, sa), (kb, sb) in zip(a.log, flagged_log):
+        assert ka == kb
+        if ka == "semantic":
+            assert extra in sb and "embed_prefix" not in sa
+            assert sb.replace(extra, "", 1) == sa
+        else:
+            assert sa == sb
     # The excerpt statement comes after the snippet statements, once.
     kinds = [k for k, _ in b.log]
     assert kinds.count("excerpt") == 1

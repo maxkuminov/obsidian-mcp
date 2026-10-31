@@ -326,7 +326,10 @@ the wire, so none is cut off by a client's description limit.
   it.
 - `rerank=true` on either of the last two asks an optional,
   operator-configured reranker (`RERANK_URL`) to reorder the candidates
-  the call already fetched (at most 50 notes). The response is either
+  the call already fetched (at most 50 notes). Each note is scored on the
+  best of up to four of its fetched chunks, sent as the same text they were
+  embedded from (title, heading path and tags, then the chunk); a reranked
+  row's preview and `§` locator show the chunk that scored. The response is either
   fully reranked (`reranked: true (candidates: N)`, a `rerank_score` per
   row) or the unreranked page marked `reranked: false (<reason>)`;
   without a reranker it answers `reranked: false (not_configured)`. Its
@@ -1423,9 +1426,10 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Override for Azure or proxies. Same transport rule as `OLLAMA_URL` when this provider is active. |
 | `EMBEDDING_ALLOW_PLAINTEXT` | `false` | Permit `http` to a non-loopback embedding host. Without it such a URL refuses to start. `.env.example` sets it `true` to match its `http://ollama:11434` default. |
 | `EMBEDDING_CA_FILE` | — | Trust anchor (PEM) for an `https` embedding endpoint behind an internal CA; replaces the default certifi bundle. Refused with an `http` URL. Embedding clients ignore `HTTP(S)_PROXY`, `SSL_CERT_*` and `.netrc`. |
-| `RERANK_URL` | — | Full URL of an optional reranker speaking the Jina-compatible `/v1/rerank` format (`llama-server --reranking`, vLLM, Infinity), e.g. `http://127.0.0.1:8081/v1/rerank`. Empty means no reranker: `rerank=true` answers `reranked: false (not_configured)`. **The endpoint receives the query and candidate note text.** Same transport rule as the embedding URL (`https`, loopback `http`, or `RERANK_ALLOW_PLAINTEXT`); a bad URL refuses to start, an unreachable reranker never does (it is probed at startup and re-probed in the background; `/health` reports `rerank`). Opt-in: no quality gain is claimed until you measure it with the harness on a GPU reranker, and a CPU reranker will time out at the default deadline. Under review: it scores one heading-less chunk per note ([#402](https://github.com/maxkuminov/obsidian-mcp/issues/402)). See [Reranker reference setup](#reranker-reference-setup) and `DEPLOYMENT.md`, "Reranker (optional)". |
+| `RERANK_URL` | — | Full URL of an optional reranker speaking the Jina-compatible `/v1/rerank` format (`llama-server --reranking`, vLLM, Infinity), e.g. `http://127.0.0.1:8081/v1/rerank`. Empty means no reranker: `rerank=true` answers `reranked: false (not_configured)`. **The endpoint receives the query and candidate note text.** Same transport rule as the embedding URL (`https`, loopback `http`, or `RERANK_ALLOW_PLAINTEXT`); a bad URL refuses to start, an unreachable reranker never does (it is probed at startup and re-probed in the background; `/health` reports `rerank`). Opt-in: no quality gain is claimed until you measure it with the harness on a GPU reranker, and a CPU reranker will time out at the default deadline. Since [#402](https://github.com/maxkuminov/obsidian-mcp/issues/402) it scores each note on up to four of its fetched chunks, sent with their heading path (`RERANK_MAX_DOCUMENTS`). See [Reranker reference setup](#reranker-reference-setup) and `DEPLOYMENT.md`, "Reranker (optional)". |
 | `RERANK_MODEL` | — | Sent as `model` in the rerank request (≤ 200 characters). `llama-server` serves one model and ignores it. |
-| `RERANK_TIMEOUT_MS` | `1500` | One deadline per rerank call (100–10000), covering connect, write and read; past it the page falls back unreranked with `reranked: false (timeout)`. Also the extra time a `rerank=true` call can hold its concurrency slot. The reference deployment (GPU `llama-server`, see [Reranker reference setup](#reranker-reference-setup)) runs `10000`. |
+| `RERANK_TIMEOUT_MS` | `1500` | One deadline per rerank call (100–30000), covering connect, write and read; past it the page falls back unreranked with `reranked: false (timeout)`. Also the extra time a `rerank=true` call can hold its `embedding` concurrency slot: under `MCP_CONCURRENCY_MODE` `queue` or `enforce`, keep it at or below `MCP_CONCURRENCY_WAIT_SECONDS` unless `make concurrency-report` passes with rerank traffic (a long hold delays, or under `enforce` refuses, concurrent vector searches). The reference deployment (GPU `llama-server`, see [Reranker reference setup](#reranker-reference-setup)) runs `10000`; size it together with `RERANK_MAX_DOCUMENTS`, which since #402 can double the documents per call (`DEPLOYMENT.md`). |
+| `RERANK_MAX_DOCUMENTS` | `100` | The most documents one rerank call sends (50–200). Every candidate note (at most 50) is sent its best chunk first, then up to three more of its already-fetched chunks in distance order; a note scores the best of its documents. Rerank latency multiplies with it and `RERANK_TIMEOUT_MS`; `50` restores the pre-#402 count. |
 | `RERANK_ALLOW_PLAINTEXT` | `false` | Permit `http` to a non-loopback reranker host. Separate from `EMBEDDING_ALLOW_PLAINTEXT`, which does not cover it. An `https` reranker is verified against `EMBEDDING_CA_FILE` when set, else certifi's bundle. |
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI model. Changing it post-deploy requires `make reset-embeddings`; the server refuses to start until the stored vectors match. See [Switching providers or models](#switching-providers-or-models). |
 | `CHUNK_SIZE` | `512` | Approx tokens per chunk (4-char heuristic) |
@@ -1515,10 +1519,12 @@ P4000 shared by Ollama and the reranker, ~4,200 notes re-embedded in about
 
 ### Reranker reference setup
 
-`rerank=true` is opt-in, and its behaviour is **currently under review**:
-the reranker scores one heading-less chunk per note, which demotes some
-notes both search arms ranked first ([#402](https://github.com/maxkuminov/obsidian-mcp/issues/402); a change is in
-proposal, not shipped). Measure it before telling agents to use it.
+`rerank=true` is opt-in. Before [#402](https://github.com/maxkuminov/obsidian-mcp/issues/402)
+the reranker scored one heading-less chunk per note, which demoted some
+notes both search arms ranked first; it now scores each note on the
+embedded text (title, heading path, tags, chunk) of up to four of its
+fetched chunks (`RERANK_MAX_DOCUMENTS`). Measure it before telling agents
+to use it.
 
 Ollama has no rerank endpoint
 ([ollama/ollama#3368](https://github.com/ollama/ollama/issues/3368)), so

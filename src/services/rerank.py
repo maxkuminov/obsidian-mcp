@@ -134,6 +134,11 @@ class RerankOutcome:
     #: The exchange time in ms, present when a request was sent.
     ms: int | None = None
     extra: dict = field(default_factory=dict)
+    #: #402: per candidate, the index of its winning document (the first
+    #: reaching its maximum), only when `reranked`.
+    best: list[int] | None = None
+    #: #402: how many documents were (or would have been) sent.
+    documents: int = 0
 
     @property
     def token(self) -> str:
@@ -368,30 +373,182 @@ def bounded_text(title: str | None, text: str | None) -> str | None:
     return text[: max(0, room)]
 
 
+# ── Per-chunk documents (#402, rerank-documents D1–D3) ─────────────────────
+
+#: At most this many documents per candidate note: its primary and at most
+#: three further fetched chunks (D2). A constant, not a setting.
+RERANK_MAX_DOCUMENTS_PER_NOTE = 4
+
+
+@dataclass(frozen=True)
+class Doc:
+    """One rerank document. `chunk` is the fetched chunk row it was built
+    from (a dict: `chunk_text`, `chunk_index`, `section`, `distance`,
+    `file_path`, `embed_prefix`), or `None` for a title or excerpt document."""
+
+    text: str
+    chunk: dict | None = None
+
+
+@dataclass
+class RerankCandidate:
+    """A candidate note's documents before allocation: its primary (always
+    sent) and its secondaries, each with the `(distance, file_path,
+    chunk_index)` key pass 2 orders by."""
+
+    primary: Doc
+    secondaries: list[tuple[tuple, Doc]] = field(default_factory=list)
+
+
+def embedding_document(prefix: str, chunk_text: str, stamp: int | None) -> str | None:
+    """The embedding input a stored row's vector was built from (D1):
+    `prefix + "\\n\\n" + fmt[stamp](chunk_text)`, cut to `RERANK_DOC_CHARS`.
+    `None` when the stamp is NULL or not a key of `EMBEDDED_TEXT_FORMATTERS`:
+    that input cannot be reconstructed, and the caller sends the title."""
+    from src.services.embeddings import EMBEDDED_TEXT_FORMATTERS
+
+    fmt = EMBEDDED_TEXT_FORMATTERS.get(stamp) if stamp is not None else None
+    if fmt is None:
+        return None
+    return f"{prefix}\n\n{fmt(chunk_text)}"[:RERANK_DOC_CHARS]
+
+
+def _chunk_key(chunk: dict) -> tuple:
+    return (chunk["distance"], chunk["file_path"], chunk["chunk_index"])
+
+
+def candidate_documents(
+    title: str | None,
+    *,
+    chunks: list[dict] | None,
+    stamp: int | None,
+    fallback_text: str | None,
+) -> RerankCandidate:
+    """One candidate's documents (D1, and the hybrid partition (a)/(b)/(c)).
+
+    `chunks` is the note's fetched rows, cosine-best first, given only for a
+    fresh semantic candidate. (a) With a known stamp (or pre-034 rows with a
+    NULL prefix) every row is a document, the cosine-best the primary.
+    (b) A non-NULL prefix with a NULL or unknown stamp: one title document,
+    never an excerpt. (c) No chunks (stale, keyword-only): one document,
+    `title + "\\n\\n" + fallback_text` (the excerpt; `None` sends the title).
+    """
+    if not chunks:
+        return RerankCandidate(Doc(build_document(title, fallback_text)))
+    if any(c.get("embed_prefix") is not None for c in chunks):
+        from src.services.embeddings import EMBEDDED_TEXT_FORMATTERS
+
+        if stamp is None or stamp not in EMBEDDED_TEXT_FORMATTERS:
+            return RerankCandidate(Doc(build_document(title, None)))
+    docs = []
+    for c in chunks:
+        prefix = c.get("embed_prefix")
+        if prefix is None:
+            text = build_document(title, c["chunk_text"])
+        else:
+            text = embedding_document(prefix, c["chunk_text"], stamp)
+        docs.append(Doc(text, c))
+    return RerankCandidate(docs[0], [(_chunk_key(d.chunk), d) for d in docs[1:]])
+
+
+def allocate_documents(candidates: list[RerankCandidate], budget: int) -> list[list[Doc]]:
+    """The D2 allocation, pure and deterministic. Pass 1: every candidate's
+    primary, in candidate order. Pass 2: every secondary, in `(distance,
+    file_path, chunk_index)` order, while fewer than `budget` documents are
+    allocated, at most `RERANK_MAX_DOCUMENTS_PER_NOTE` per note.
+
+    Bound: `documents ≤ max(len(candidates), min(budget, 4 · len(candidates)))`;
+    the services cap candidates at 50 and the budget is ≥ 50, so it is
+    `≤ min(budget, 4 · m)` and every candidate is scored."""
+    groups = [[c.primary] for c in candidates]
+    n = len(groups)
+    stream = sorted(
+        ((key, i, j, doc) for i, c in enumerate(candidates)
+         for j, (key, doc) in enumerate(c.secondaries)),
+        key=lambda t: (t[0], t[1], t[2]),
+    )
+    for _key, i, _j, doc in stream:
+        if n >= budget:
+            break
+        if len(groups[i]) >= RERANK_MAX_DOCUMENTS_PER_NOTE:
+            continue
+        groups[i].append(doc)
+        n += 1
+    return groups
+
+
+def semantic_document_groups(rows: list[dict]) -> list[list[Doc]]:
+    """`semantic_search(rerank=true)`'s allocated documents (D1/D2), shared by
+    the tool and the harness arm: one group per candidate row, in order."""
+    return allocate_documents(
+        [
+            candidate_documents(r["title"], chunks=r.get("rerank_chunks"),
+                                stamp=r.get("rerank_stamp"), fallback_text=None)
+            for r in rows
+        ],
+        settings.rerank_max_documents,
+    )
+
+
+def hybrid_document_groups(rows) -> list[list[Doc]]:
+    """`hybrid_search(rerank=true)`'s allocated documents (D1/D2/D7), shared by
+    the tool and the harness arm. The partition: (a) a fresh semantic-arm
+    candidate with a known stamp — its fetched chunks; (b) a fresh one with a
+    NULL or unknown stamp — its title; (c) a stale or keyword-only one — its
+    title and excerpt (`rerank_text`, from `_fill_excerpts`)."""
+    return allocate_documents(
+        [
+            candidate_documents(
+                r.title,
+                chunks=r.rerank_chunks if (r.semantic_rank is not None and not r.stale) else None,
+                stamp=r.rerank_stamp,
+                fallback_text=r.rerank_text,
+            )
+            for r in rows
+        ],
+        settings.rerank_max_documents,
+    )
+
+
 async def rerank_candidates(
     query: str, candidates: list[tuple[str | None, str | None]]
 ) -> RerankOutcome:
-    """Rerank `(title, text)` candidates, all or nothing.
+    """Rerank `(title, text)` candidates, one document each (`build_document`),
+    all or nothing — `rerank_groups` with one-document groups."""
+    return await rerank_groups(
+        query, [[build_document(t, x)] for t, x in candidates]
+    )
+
+
+async def rerank_groups(query: str, groups: list[list[str]]) -> RerankOutcome:
+    """Rerank candidate notes, each a non-empty list of documents (#402, D3),
+    all or nothing.
 
     The state precedence (`not_configured`, `probe_skipped`, `probe_failed`,
-    `no_candidates`) sends no request. Otherwise one exchange; on success the
-    order is `(-score, unreranked position)`, on any failure the identity
-    order with the code. Any exception other than cancellation falls back as
-    `malformed_response`.
+    `no_candidates`) sends no request. Otherwise the flattened documents go
+    in one exchange, validated against their count; a note's score is the
+    maximum over its documents, `best[i]` the first document reaching it (the
+    primary wins a tie). On success the order is `(-score, unreranked
+    position)`, on any failure the identity order with the code. Any
+    exception other than cancellation falls back as `malformed_response`.
     """
-    n = len(candidates)
+    n = len(groups)
     identity = list(range(n))
+    documents = sum(len(g) for g in groups)
+
+    def _fallback(reason: str, ms: int | None = None) -> RerankOutcome:
+        return RerankOutcome(False, identity, n, reason=reason, ms=ms, documents=documents)
+
     if not configured():
-        return RerankOutcome(False, identity, n, reason=NOT_CONFIGURED)
+        return _fallback(NOT_CONFIGURED)
     if _state != STATE_ENABLED:
-        code = _disabled_code if _state == STATE_DISABLED else PROBE_FAILED
-        return RerankOutcome(False, identity, n, reason=code)
+        return _fallback(_disabled_code if _state == STATE_DISABLED else PROBE_FAILED)
     if n == 0:
-        return RerankOutcome(False, identity, 0, reason=NO_CANDIDATES)
+        return _fallback(NO_CANDIDATES)
     started = time.monotonic()
     try:
-        documents = [build_document(t, x) for t, x in candidates]
-        result = await score(query, documents, deadline_s=settings.rerank_timeout_ms / 1000)
+        flat = [doc for g in groups for doc in g]
+        result = await score(query, flat, deadline_s=settings.rerank_timeout_ms / 1000)
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - the rerank step never fails a search
@@ -400,10 +557,19 @@ async def rerank_candidates(
     if isinstance(result, RerankFailure):
         _warn(result.code, result.exc_class)
         # `rerank_ms` only when a request was actually sent (D10).
-        return RerankOutcome(False, identity, n, reason=result.code,
-                             ms=ms if result.sent else None)
-    order = sorted(identity, key=lambda i: (-result[i], i))
-    return RerankOutcome(True, order, n, scores=result, ms=ms)
+        return _fallback(result.code, ms if result.sent else None)
+    scores: list[float] = []
+    best: list[int] = []
+    at = 0
+    for g in groups:
+        chunk_scores = result[at: at + len(g)]
+        at += len(g)
+        top = max(chunk_scores)
+        scores.append(top)
+        best.append(chunk_scores.index(top))
+    order = sorted(identity, key=lambda i: (-scores[i], i))
+    return RerankOutcome(True, order, n, scores=scores, ms=ms, best=best,
+                         documents=documents)
 
 
 # ── The probe (D8) ─────────────────────────────────────────────────────────
