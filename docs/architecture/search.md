@@ -460,7 +460,7 @@ nothing under `src/` sets it. The #403 A/B is therefore one generation:
 `make_arm` against `make_arm_alt` with `hybrid_alt_k=60
 hybrid_alt_any_offset=0` as `BASELINE`, judged by the `gate` step below.
 
-Accepted limitations (the change's design, L1–L13): equal votes can demote a
+Accepted limitations (the change's design, L1–L13): equal votes (since #403: fill ranks offset by 50) can demote a
 strong single-arm hit (the paraphrase regression is expected on
 `class:prose`; the single-arm tools are the remedy); RRF discards score
 magnitude; RRF is over each arm's top 50 (L3 above); 50 chunks can be
@@ -1502,7 +1502,12 @@ any cell fails, 64 on a usage error.
 baseline the staging generation's report (`--baseline-report`, then
 required), must each have verdict `OK`, `attachable: true` and
 `provenance.users == 1`. Otherwise the step exits 64 with no cell and no
-PASS/FAIL printed, and F is neither created nor replaced.
+PASS/FAIL printed, and F is neither created nor replaced. A
+`runfile:<label>@<generation>` baseline's report must also be **that**
+generation's report: the same `generation`, the same qrels, snapshot and
+selection hashes as the candidate report, and an arm `<label>`. Otherwise
+an unrelated safe report could vouch for a multi-user runfile (Codex,
+#403 implementation round 1).
 
 #403's bar is eight cells: `--metrics
 recall@10,recall@20,recall@50,ndcg@10 --slices overall,class:identifier

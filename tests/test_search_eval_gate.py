@@ -193,15 +193,55 @@ def test_a_report_that_is_not_evidence_is_refused(tmp_path, capsys, verdict):
     _refused(tmp_path, capsys, _write(tmp_path, "r.json", _report(verdict=verdict)))
 
 
+RF_GEN = "20261031T000000Z"
+RF_LABEL = "scripts.search_eval_arms.hybrid:make_arm"
+RF = f"runfile:{RF_LABEL}@{RF_GEN}"
+HASHES = {"qrels_sha256": "q" * 64, "snapshot_sha256": "s" * 64, "selected_qids_hash": "h" * 64}
+
+
+def _rf_candidate(tmp_path):
+    return _write(tmp_path, "r.json", {**_report(baseline=RF, arms=(CAND, RF)),
+                                       "generation": "20261101T000000Z", **HASHES})
+
+
+def _rf_source(tmp_path, name="src.json", **over):
+    src = {**_report(arms=(RF_LABEL, BASE)), "generation": RF_GEN, **HASHES}
+    src.update(over)
+    return _write(tmp_path, name, src)
+
+
 def test_a_runfile_baseline_needs_its_own_attachable_report(tmp_path, capsys):
-    rf = "runfile:scripts.search_eval_arms.hybrid:make_arm@20261031T000000Z"
-    report = _write(tmp_path, "r.json", _report(baseline=rf, arms=(CAND, rf)))
+    report = _rf_candidate(tmp_path)
     _refused(tmp_path, capsys, report)                              # missing
-    bad = _write(tmp_path, "b.json", _report(attachable=False, users="multi"))
+    bad = _rf_source(tmp_path, "b.json", attachable=False, provenance={"users": "multi"})
     _refused(tmp_path, capsys, report, "--baseline-report", str(bad))
-    good = _write(tmp_path, "g.json", _report())
-    code, out = _gate(tmp_path, report, "--baseline-report", str(good))
+    code, out = _gate(tmp_path, report, "--baseline-report", str(_rf_source(tmp_path)))
     assert code == EXIT_OK and out.exists()
+
+
+@pytest.mark.parametrize("over", [
+    {"generation": "20261031T999999Z"},                 # an unrelated safe report
+    {"qrels_sha256": "x" * 64},
+    {"snapshot_sha256": "x" * 64},
+    {"selected_qids_hash": "x" * 64},
+    {"qrels_sha256": None},
+    {"arms": [{"arm": BASE}]},                          # the source arm is absent
+])
+def test_a_baseline_report_that_is_not_the_runfiles_source_is_refused(tmp_path, capsys, over):
+    """Codex implementation round 1: an attachable single-user report that
+    is not the runfile's source generation cannot vouch for it."""
+    report = _rf_candidate(tmp_path)
+    err = _refused(tmp_path, capsys, report, "--baseline-report",
+                   str(_rf_source(tmp_path, **over)))
+    assert "--baseline-report" in err
+    _refused(tmp_path, capsys, report, "--baseline-report",
+             str(_rf_source(tmp_path, "s2.json", **over)), existing="old table\n")
+
+
+def test_a_runfile_label_without_a_generation_is_refused(tmp_path, capsys):
+    rf = "runfile:no-generation"
+    report = _write(tmp_path, "r.json", {**_report(baseline=rf, arms=(CAND, rf)), **HASHES})
+    _refused(tmp_path, capsys, report, "--baseline-report", str(_rf_source(tmp_path)))
 
 
 @pytest.mark.parametrize("mutate", [

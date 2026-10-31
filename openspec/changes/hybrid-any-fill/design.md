@@ -411,4 +411,30 @@ No change: every item VERIFIED.
   989 unchanged, both arms `rerank=false` cut 1,000, `rerank=true` omitted
   1,008 → `explain omitted` 988; with the transition line `rerank=true` cut
   1,027 (was 1,026). The description measures 3,976 characters (pinned).
+- **Codex implementation round 1 (BLOCKER, fixed): `--baseline-report` is
+  bound to the runfile's source.** For a `runfile:<label>@<generation>`
+  baseline, the gate now requires `--baseline-report` to be that
+  generation's report:
+  - its `generation` equals the label's generation;
+  - its `qrels_sha256`, `snapshot_sha256` and `selected_qids_hash` are
+    present and equal the candidate report's (`resolve_arm` already binds a
+    runfile to those three);
+  - the source arm `<label>` is among its arms.
 
+  Any mismatch is exit 64, with nothing printed and `--out` neither created
+  nor replaced. Before the fix, an unrelated attachable report could vouch
+  for a multi-user runfile. Tests cover each mismatch (generation, each
+  hash, a missing hash, the missing arm, a label without a generation), and
+  the permissive test is replaced by a matching-source success case.
+
+## Adversarial Codex — implementation round 1
+
+Verdict, verbatim:
+
+FAIL. The ranking, offset, rendering, and ContextVar paths matched the specification in review, and 362 targeted offline tests passed. However, the release gate’s baseline provenance check is bypassable; the existing test even accepts the broken behavior.
+
+```json
+{"verdict":"FAIL","findings":[{"severity":"BLOCKER","file":"scripts/search_eval/gate.py","line":117,"claim":"For a runfile baseline, the gate verifies only that the supplied --baseline-report is attachable single-user evidence; it never verifies that this report belongs to the generation that produced the baseline. An unrelated safe report can therefore authorize deltas derived from a non-attachable multi-user baseline, leaking cross-tenant aggregate evidence into the PR-ready output.","failing_input":"Use an attachable candidate report whose baseline is `runfile:hybrid-old@GEN_MULTI` and whose deltas were computed from that multi-user runfile, then pass an unrelated report with `generation: GEN_UNRELATED`, `verdict: OK`, `attachable: true`, and `provenance.users: 1` as `--baseline-report`. Reproduced result: exit 0, `gate: PASS`, and the Markdown output is created. `tests/test_search_eval_gate.py:202-204` currently asserts that any such unrelated “good” report is accepted.","fix":"Bind --baseline-report to the runfile source before accepting it: verify its generation matches the runfile label/source metadata and that its qrels, snapshot, and selected-query hashes match the candidate report; also require the source arm to be present. On any mismatch, exit 64 without stdout or replacing --out. Replace the current permissive test with mismatched-report refusal and matching-report success cases."}]}
+```
+
+Fixed as above (implementation notes).

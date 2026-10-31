@@ -76,6 +76,32 @@ def _require_evidence(report: dict, what: str) -> None:
             "USER_ID= and re-score")
 
 
+#: The hashes a runfile arm is bound to: `resolve_arm` refuses a runfile
+#: whose qrels, snapshot or selection differ from the scoring run's, so the
+#: staging generation's report must carry the same three.
+_BOUND_HASHES = ("qrels_sha256", "snapshot_sha256", "selected_qids_hash")
+
+
+def _require_source_of(source: dict, baseline: str, report: dict) -> None:
+    """`--baseline-report` must be the report of the generation that staged
+    the `runfile:<label>@<generation>` baseline: the same generation, the
+    same qrels / snapshot / selection hashes as the candidate's report, and
+    the source arm present in it."""
+    body = baseline[len(RUNFILE_PREFIX):]
+    label, sep, generation = body.rpartition("@")
+    if not sep or not label or not generation:
+        raise UsageError(f"the runfile baseline {baseline!r} names no source generation")
+    if source.get("generation") != generation:
+        raise UsageError(f"--baseline-report is generation {source.get('generation')!r}, "
+                         f"not the runfile's source generation {generation!r}")
+    for key in _BOUND_HASHES:
+        if not source.get(key) or source.get(key) != report.get(key):
+            raise UsageError(f"--baseline-report's {key} does not match the report's")
+    source_arms = [a.get("arm") for a in source.get("arms") or [] if isinstance(a, dict)]
+    if label not in source_arms:
+        raise UsageError(f"--baseline-report has no arm {label!r}")
+
+
 def _split(value: str, allowed: tuple[str, ...], what: str) -> list[str]:
     items = [v.strip() for v in value.split(",") if v.strip()]
     if not items:
@@ -110,11 +136,15 @@ def run_gate(*, report_path: Path, arm: str, metrics: str, slices: str,
         raise UsageError(f"arm {arm!r} is the report's baseline")
     if baseline.startswith(RUNFILE_PREFIX):
         # The baseline's evidence came from another generation: its own report
-        # must clear the same boundary.
+        # must clear the same boundary, and must BE that generation's report
+        # (Codex implementation round 1: an unrelated safe report must not
+        # vouch for a multi-user runfile).
         if baseline_report_path is None:
             raise UsageError(f"the baseline {baseline!r} is a runfile arm; pass "
                              "--baseline-report with the report of the generation that staged it")
-        _require_evidence(_load(baseline_report_path, "baseline report"), "the baseline report")
+        source = _load(baseline_report_path, "baseline report")
+        _require_evidence(source, "the baseline report")
+        _require_source_of(source, baseline, report)
     elif baseline_report_path is not None:
         _require_evidence(_load(baseline_report_path, "baseline report"), "the baseline report")
     by_slice = (report.get("deltas") or {}).get(arm)

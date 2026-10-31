@@ -56,6 +56,10 @@ where the fill leads.
   order, fill-only notes are the first to leave that window.
   **Confidence (#389)** is unchanged: `keyword_all` already counts
   conjunctive rows only.
+- **The issue's query as a judgment.** The named judgment for that query
+  lives in the operator's tenant-data `.search-eval/manual.jsonl`, which
+  is never committed. The synthetic fixture has no hybrid arm, and the
+  note's path is vault data.
 - **Harness.** `make_arm_alt` gains the optional arm option
   `hybrid_alt_any_offset` (`0` or `50`, default `50`). With `0` it
   replays the incumbent fusion through a `ContextVar` override that only
@@ -118,9 +122,11 @@ delta. The `reranker` spec's "first 50 fused rows" wording still holds.
   `scripts/search_eval_arms/hybrid.py`; `scripts/search_eval/gate.py`,
   `scripts/search_eval/__main__.py` (`gate`), `scripts/search_eval/runner.py`
   (`check_options` hook).
-- Tests: `tests/test_hybrid_search_offline.py`, `tests/test_hybrid_rerank.py`,
-  `tests/test_hybrid_search_eval.py`, `tests/integration/test_hybrid_search_pg.py`,
-  `tests/test_issue_343_tool_metadata.py` (description cap).
+- Tests: new `tests/test_hybrid_any_fill.py` and `tests/test_search_eval_gate.py`;
+  amended `tests/test_hybrid_search_offline.py` (description and bounds),
+  `tests/test_hybrid_rerank.py` and `tests/test_search_confidence.py` (the
+  re-measured bounds), `tests/integration/test_hybrid_search_pg.py` (the
+  oracle on PostgreSQL).
 - No migration, no setting, no new dependency, no write path touched.
   Search-path change: the CLAUDE.md eval-gate row applies, and an
   adversarial Codex pass is mandatory (ranking an agent acts on unseen).
