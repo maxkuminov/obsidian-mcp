@@ -487,3 +487,19 @@ with the verifier punch list above:
    projections, exactly one `fetch_busy` refusal and exactly eight connections
    before the gate is released. The per-slot cap is lifted in that test so
    that a slot collision cannot be what refuses.
+
+## Adversarial Codex — implementation round 2
+
+Verdict PASS on 1cd5a96: every round-1 item VERIFIED (the `/revoke` body SUPERSEDED_BY_OWNER_DECISION), one NIT. Verbatim:
+
+PASS. No BLOCKER or MAJOR remains. Migration pinning covers both directions, `/token` remains credential-first, the sweep predicate precedes `LIMIT`, CIMD fields derive through `submitted_fields`, and terminal-path tests assert concrete resource classes. DCR/CIMD live paths remain intact. I could not independently rerun pytest because the read-only environment provides no writable temporary directory.
+
+round1:[{"claim":"Migration 036 search-path-relative downgrade","status":"VERIFIED"},{"claim":"Token and revoke records lose submitted CIMD correlation fields","status":"VERIFIED"},{"claim":"Referenced rows starve the CIMD sweep","status":"VERIFIED"},{"claim":"Revocation must return an empty body","status":"SUPERSEDED_BY_OWNER_DECISION"},{"claim":"NUL and control characters pass metadata validation","status":"VERIFIED"},{"claim":"Global-cap test permits nine fetches","status":"VERIFIED"}]
+
+One non-blocking stale comment remains.
+
+```json
+{"verdict":"PASS","findings":[{"severity":"NIT","file":"src/oauth/routes.py","line":268,"claim":"The revocation helper docstring still says the endpoint returns an empty body, contradicting the accepted constant `{}` response.","failing_input":"Any concealed `/revoke` no-op returns body `b\"{}\"`, while `_revoke_noop` documents an empty body.","fix":"Change the docstring to say the existing constant 200 `{}` response."}]}
+```
+
+What changed: the `_revoke_noop` docstring now says the endpoint answers "the existing constant 200 `{}` response" (docstring only; the full gates on 1cd5a96 stand).

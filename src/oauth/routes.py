@@ -265,7 +265,7 @@ def _registration_refused(request, reason: str) -> None:
 def _revoke_noop(request, reason: str, submitted_client_id=None) -> None:
     """One `oauth_revoke_noop`. RFC 7009 §2.2 forbids the *response* saying it.
 
-    The endpoint answers 200 with an empty body whether the token was unknown,
+    The endpoint answers the existing constant 200 `{}` response whether the token was unknown,
     foreign or already dead, so the log is the only place the distinction
     exists.
     """
