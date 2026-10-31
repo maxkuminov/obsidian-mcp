@@ -569,3 +569,10 @@ Measurements (gate container, PostgreSQL 16, local):
   twenty, `english,simple`: 128 ms best of three (161, 147, 128), under 300.
 - **Hybrid bounds**: worst abbreviated structure 337 at `rerank=false`
   (pinned 345) and 365 at `rerank=true` (pinned 367).
+
+Gates run by the implementer (2026-10-30): `openspec validate --all
+--strict` 41/41; offline suite 7,595 passed, 6 skipped; `make search-eval`
+(synthetic fixture) ran; `make test-schema` 343 passed; `make
+test-integration` 1,167 passed; `make audit` clean. Not run here: the
+verifier, the adversarial Codex rounds, the search-eval gate on a restored
+copy (operator, runfile workflow) and the live end-to-end pass.

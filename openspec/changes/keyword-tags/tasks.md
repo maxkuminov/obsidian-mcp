@@ -17,7 +17,7 @@
 - [x] 2.2 `downgrade()`: generation lock, `ts_filter(content_tsvector, '{a,d}')` on every row carrying a `B` lexeme, count logged
 - [x] 2.3 Offline literal test (as `tests/test_migration_031_literals.py`): 035's lock-key and fingerprint-key/version literals equal `index_state`'s
 - [x] 2.4 `tests/integration/test_schema_check.py`: `HEAD_REVISION = "035"`; cases per the schema-integrity delta — tagged / untagged / stop-word-tagged rows over a 034 database (tagged gains `B`, others byte-equal), a D-only tagged row re-headed byte-exactly, stamp-back byte-idempotence, fingerprint present / absent / unreadable, a seeded near-limit tagged row makes the preflight abort before any UPDATE (count and id named, `alembic_version` `034`, every vector byte-equal, `alembic check` clean afterwards), an ordinary database passes the preflight, the `DEPLOYMENT.md` operator statement (verbatim from design D5) run against a seeded D-only tagged row that passes `S(v) + S(B)` but exceeds `S(D) + S(A + B)` reports its id, and 035 then aborts naming the same id, a unit test of `S` against PostgreSQL's reported size; with the preflight bypassed, a 54000 row fails the whole migration naming its id with `alembic_version` still `034` and every vector unchanged, any other row error likewise, downgrade leaves no `B` lexeme and keeps every `A`/`D` lexeme (a tag-and-body lexeme keeps its `D` positions), `alembic check` clean after upgrade, downgrade and re-upgrade
-- [ ] 2.5 `make test-schema` green (own container/port; never concurrently with `make test-integration`); `test_nonsuperuser_migrations_pg.py` still green (035 needs no privilege beyond ownership)
+- [x] 2.5 `make test-schema` green (own container/port; never concurrently with `make test-integration`); `test_nonsuperuser_migrations_pg.py` still green (035 needs no privilege beyond ownership)
 
 ## 3. Writers — D6
 
@@ -47,7 +47,7 @@
 - [x] 5.5d Response bounds: `HYBRID_ROW_STRUCTURE_MAX = 345`, `HYBRID_RERANK_ROW_STRUCTURE_MAX = 367`; the fixed-bound tests (`tests/test_hybrid_rerank.py` arithmetic and the hybrid structure test) recomputed with `matched_in: title+tags+body`; minimum-cap tests for `rerank=false` (cut form, 40–45) and `rerank=true` (≤ 1,000, omitted form when the cut form does not fit); `docs/architecture/search.md`'s pinned numbers updated
 - [x] 5.6 A tag edit alone: `alpha` → `beta`, one incremental pass, `beta` found and `alpha` not
 - [x] 5.7 The worst-case snippet latency test gains tag-only rows and stays under 300 ms; record the measurement in `design.md`
-- [ ] 5.8 `make test-integration` green; full offline `pytest tests` green
+- [x] 5.8 `make test-integration` green; full offline `pytest tests` green
 
 ## 6. Docs (last commits of the feature branch)
 
