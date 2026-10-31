@@ -57,38 +57,49 @@ Every other case keeps today's `build_document(title, text)`:
 
 *Alternatives.* Rebuilding the prefix from the row's current `title`/`tags` with `build_embed_prefix` would need no new projection, but it is not the text the embedder scored, and owner decision 7 rules it out. Re-reading the vault at query time would put a filesystem read on the hot path (#200 refused that).
 
-### D2. Per-chunk documents under a 50-document budget: the allocation and its proof
+### D2. Per-chunk documents under a 3-per-note cap and a 50-document budget: the allocation and its proof
 
 `semantic_arm_rows(with_rerank_text=True)` no longer discards a deduped note's other rows. Each deduped row carries `rerank_chunks`: the note's fetched rows in the re-sort order `(distance, file_path, chunk_index)`, the cosine-best first. A stale note carries none. The dedup itself, the row order, the `rows` list, `chunk_rows` and every legacy field are unchanged. The **candidate notes** `c_1 … c_m` stay what they are today: semantic, the first ≤ 50 deduped notes in vector order; hybrid, `fused[:50]` in fused order. Each `c_i` has:
 
 - a **primary** document `p_i`: the cosine-best chunk under D1 for a fresh semantic row, otherwise today's document (the D1 table);
-- **secondary** documents `s_i,1 … s_i,k`: the D1 documents of its other fetched rows, in re-sort order (none for a stale or keyword-only note).
+- **secondary** documents: the D1 documents of its other fetched rows (none for a stale or keyword-only note).
 
-`rerank.allocate_documents(candidates, limit)` is pure. With `B = RERANK_MAX_DOCUMENTS = 50` and `L = min(limit, m)`:
+`rerank.allocate_documents(candidates, limit)` is pure and deterministic. It uses `B = RERANK_MAX_DOCUMENTS = 50`, `K = RERANK_MAX_DOCUMENTS_PER_NOTE = 3` and `L = min(limit, m)`:
 
 ```
-n = 0
-pass 1: for i in 1..L:  give c_i its primary;  n += 1
-pass 2: for i in 1..m:
-            if n == B: stop
-            if i > L:  give c_i its primary;  n += 1
-            for each secondary of c_i, in order:
-                if n == B: stop
-                give it to c_i;  n += 1
-admitted = the notes that hold at least one document
+n = 0; count[i] = 0 for every note
+pass 1 (the page):   for i in 1..L:  give c_i its primary;  n += 1; count[i] = 1
+pass 2 (distance):   S = every fetched chunk row of a fresh candidate note that has no
+                         document yet (the primaries of semantic notes c_{L+1}..c_m and
+                         every secondary), sorted by (distance, file_path, chunk_index)
+                     for r in S:
+                         if n == B: stop
+                         i = r's note
+                         if count[i] == K: skip
+                         if count[i] == 0 and r is not c_i's primary: skip   # first doc = primary
+                         give r to c_i;  n += 1; count[i] += 1
+pass 3 (the rest):   for i in L+1..m in unreranked order with count[i] == 0
+                         (keyword-only or stale notes; their document is a title or excerpt):
+                         if n == B: stop
+                         give c_i its primary;  n += 1; count[i] = 1
+admitted = the notes with count >= 1
 ```
 
-**Bound (proof).** Both tools clamp `limit` to `[1, 50]`, so pass 1 adds `L ≤ limit ≤ 50 = B` documents. Every addition in pass 2 is preceded by the check `n < B`. So after the call `n ≤ B = 50`. ∎
+The skip in pass 2 never fires in practice: a note's rows reach the stream in its own distance order, so its first row in the stream is its cosine-best row, which is its primary. It is stated so that "the first document of a note is its primary" holds by construction, not by an ordering argument.
 
-**No extra retrieval (proof).** Every chunk document is a distinct row already returned by the call's one overfetch statement: the primary is the dedup's representative, and the secondaries are the same note's other rows in that result. Every excerpt document is read by the existing `_fill_excerpts` statement for a row it already serves. So, for `semantic_search`, documents ≤ min(50, `chunk_rows`): a stale note contributes 1 document against ≥ 1 rows, and a fresh note contributes at most its rows. For `hybrid_search`, documents ≤ min(50, semantic `chunk_rows` (≤ 50) + the keyword-only or stale candidates). The document count therefore cannot exceed the overfetch's row count plus the excerpt rows the call already reads, and it never exceeds 50.
+**Determinism.** `S` is totally ordered by `(distance, file_path, chunk_index)`, the same key as the arm's re-sort (#280 D6). Pass 1 and pass 3 walk a fixed order. So the allocation is a function of the fetched rows and `limit`. Equidistant rows break ties by path, then by chunk index.
 
-**Corollaries.** (a) Every note of the unreranked page (`c_1 … c_L`) is admitted, which keeps #367's "the unreranked page is contained in the candidates". (b) The admitted notes are a **prefix** `c_1 … c_j` of the unreranked order, with `j ≥ L`: a note is dropped only if every note above it was admitted. (c) For `semantic_search` with `limit ≤ 10` the overfetch is exactly 50 rows. So documents ≤ rows ≤ 50, the budget never binds, and **every fetched non-stale row is a document**, which is the owner's model exactly. For `10 < limit ≤ 50` (overfetch 55–250 rows), and for `hybrid_search`, the budget binds and breadth gives way to depth (R1).
+**Bounds (proof).** Both tools clamp `limit` to `[1, 50]`, so pass 1 adds `L ≤ 50 = B` documents, one per note. Every addition in pass 2 and pass 3 is preceded by the checks `n < B` and `count[i] < K` (pass 3 adds only at `count[i] = 0`). So after the call `n ≤ 50` and `count[i] ≤ 3` for every note. The per-note maximum is therefore taken over at most 3 documents. ∎
 
-*Alternatives.* (i) Keep 50 notes with one document each: that is today's behaviour, so no depth. (ii) Send every fetched chunk of all 50 candidates: up to 250 documents, which breaks the latency bound. (iii) Fill pass 2 in global distance order instead of note order: this is equivalent when `limit ≤ 10`, but it has no meaning for keyword-only hybrid rows. (iv) A per-note cap of k = 3 (issue follow-up 1): left as a question, because owner decision 2 says "every chunk".
+**No extra retrieval (proof).** Every chunk document is a distinct row already returned by the call's one overfetch statement: the primary is the dedup's representative, and the secondaries are the same note's other rows in that result. Every excerpt document is read by the existing `_fill_excerpts` statement for a row it already serves. So for `semantic_search`, documents ≤ min(50, 3·m, `chunk_rows`); for `hybrid_search`, documents ≤ min(50, semantic `chunk_rows` (≤ 50) + the keyword-only or stale candidates). The count cannot exceed the overfetch's rows plus the excerpt rows the call already reads, and it never exceeds 50.
+
+**Corollaries.** (a) Every note of the unreranked page (`c_1 … c_L`) is admitted, which keeps #367's "the unreranked page is contained in the candidates". (b) Beyond the page, notes are admitted by their best fetched chunk's distance, not by their rank. A deeper note whose best chunk is near the query beats a shallower note's second or third chunk. (c) For `semantic_search` with `limit ≤ 10` the overfetch is exactly 50 rows, and every fetched fresh row is a document, except a note's rows past its third. (d) In hybrid, a keyword-only note beyond the page is admitted only from budget that pass 2 left over. The keyword arm's deep rows therefore yield to semantic depth (R1b).
+
+*Alternatives.* (i) Keep 50 notes with one document each: that is today's behaviour, so no depth. (ii) Send every fetched chunk of all 50 candidates: up to 250 documents, which breaks the latency bound. (iii) Pass 2 in unreranked note order (the first draft): this spends the budget on the top notes' secondaries before deeper notes' best chunks, and the owner preferred distance order. (iv) No per-note cap (the first draft): rejected for R1/R2 by owner decision, 2026-10-31.
 
 ### D3. The per-note maximum and the order
 
-`rerank_candidates(query, groups)` takes one non-empty document list per admitted note and sends the flattened list (note order, then document order) in **one** exchange. It validates over the flattened count with the D7 order unchanged, so `count_mismatch` and `bad_index` are judged against documents. It maps scores back by index. `score_i = max(group_i)`, and `best_i` is the **first** document in allocation order that reaches the max (the primary wins a tie, so a tie never moves the preview). The order is `(−score_i, i)`, and the page is its first `limit` rows. `RerankOutcome` gains `best: list[int]` and `documents: int`. `candidates` stays the admitted note count, which is the `N` of `reranked: true (candidates: N)`.
+`rerank_candidates(query, groups)` takes one non-empty document list (at most 3) per admitted note and sends the flattened list (note order, then document order) in **one** exchange. It validates over the flattened count with the D7 order unchanged, so `count_mismatch` and `bad_index` are judged against documents. It maps scores back by index. `score_i = max(group_i)` over at most 3 scores, and `best_i` is the **first** document in allocation order that reaches the max (the primary wins a tie, so a tie never moves the preview). The order is `(−score_i, i)`, and the page is its first `limit` rows. `RerankOutcome` gains `best: list[int]` and `documents: int`. `candidates` stays the admitted note count, which is the `N` of `reranked: true (candidates: N)`.
 
 On the issue's numbers, the note is scored +0.33 instead of −8.87. The free-will card, whose version-1 matched chunk was a two-wikilink "Related to:" section, is scored on its best fetched prose chunk instead.
 
@@ -127,12 +138,15 @@ Issue follow-up 3 (`rerank: skipped (weak scores)` when every score is below a f
 
 `--arm-opt` is one run-global dict, so a builder option would switch every arm. `hybrid.make_arm_alt` is the unreranked hybrid arm keyed by `hybrid_alt_k` and cannot hold a builder. The incumbent therefore gets two factories in `scripts/search_eval_arms/rerank.py`: `make_semantic_arm_incumbent` (membership `semantic`) and `make_hybrid_arm_incumbent` (`keyword_or_semantic`). Both call the same candidate services, then send **one document per candidate note** (all of today's ≤ 50), built by a frozen copy of the pre-change `build_document`/`bounded_text` that lives in the arm module. The text is the cosine-best `chunk`, uncut, for a fresh semantic row, otherwise the excerpt or nothing, exactly as today. They go through the same `rerank_candidates`, with one document per group, and follow the same probe, `empty_candidates` and `UnrerankedAnswer` rules. The gate then runs twice, each in its own report because a report has one `BASELINE`: `ARMS="…:make_semantic_arm_incumbent …:make_semantic_arm" BASELINE=…:make_semantic_arm_incumbent`, and likewise for hybrid. Each run applies the eight-cell gate (`recall@10/@20/@50`, `ndcg@10` × `overall`, `class:identifier`, CI95 lower bound ≥ −0.01). A `runfile:` baseline staged from the pre-change tree is the fallback if a frozen copy proves impractical.
 
-The issue's two queries go into `.search-eval/manual.jsonl` (tenant data, git-ignored; paths never in the repo) as named judgments. For victimhood, relevant = *Virtue by Circumstance*, top 3 with rerank. For free will, relevant = the RRF #1 note, top 3. Their ranks under all four arms are reported for information in the PR.
+The issue's two queries go into `.search-eval/manual.jsonl` (tenant data, git-ignored; paths never in the repo) as named judgments. For victimhood, relevant = *Virtue by Circumstance*, top 3 with rerank. For free will, relevant = the RRF #1 note, top 3. Their ranks under all four arms are reported **for information only, not as a release bar** (owner decision, as in #403).
+
+**Sequencing.** This change merges **after `hybrid-any-fill`** (#403). It uses that change's `gate` step and follows its incumbent-arm pattern, and the two frozen incumbent factories above are the baseline arms.
 
 ## Risks / Trade-offs
 
-- **R1 Crowding.** A note with many fetched chunks near the top of the order spends the budget on its secondaries, and the admitted prefix shrinks, so fewer deep notes can be promoted. → The page notes are always admitted (D2a). `rerank_candidates` and `rerank_documents` are on every usage row, so the shrinkage is measurable. The gate decides. A per-note cap is the ready remedy (open question 2).
-- **R2 Max bias.** The maximum over k noisy scores rises with k, which favours notes with many fetched chunks. → The budget bounds k. The gate measures whether the bias costs recall. Normalisation is a follow-up only if the gate shows it.
+- **R1 Crowding.** Secondaries spend budget that deeper notes could have used, so fewer of them can be promoted. → The cap bounds any note to 3 documents. Pass 2's distance order spends the budget on the chunks nearest the query, whichever note they belong to. The page notes are always admitted (D2a). `rerank_candidates` and `rerank_documents` are on every usage row, and the gate decides.
+- **R1b Keyword depth in hybrid.** Keyword-only notes beyond the page are admitted only from what pass 2 leaves over (D2d). → The page's keyword-only notes are always admitted. The gate's `class:identifier` slice is the measurement.
+- **R2 Max bias.** The maximum over k noisy scores rises with k. → k ≤ 3 by construction. The gate measures what bias remains.
 - **R3 Longer documents, more latency.** → D8: the worst case is unchanged, the latency is measured, and the deployment timeout is raised in infra. A timeout falls back honestly, as today.
 - **R4 Stored-prefix staleness.** → L3. The window is one pass, and only for rows the index still calls fresh.
 - **R5 Similarity and preview from different chunks.** → L5. It is documented. `similarity` is a note-level retrieval score in the encoding.
@@ -154,18 +168,23 @@ No migration and no reindex: every column already exists. Deploy is merge → im
 ## Accepted limitations
 
 - **L1** Depth comes only from rows the overfetch returned. A note's best-for-reranker chunk outside the window is never scored. There is no extra retrieval, by decision.
-- **L2** The max rule is biased toward notes with many fetched chunks (R2).
+- **L2** The max rule favours a note with 3 documents over a note with 1 (R2). This is bounded by the cap and not normalised.
 - **L3** The stored prefix is what the vector was built from. A title or tag edit makes the row stale at the next pass, which then sends no stored text. Until that pass, the stale prefix is sent. This is the same "what the index knows" bound as #200's chunk text.
 - **L4** The 2,048 cut can drop up to 302 characters of a full-window chunk (`W = CHUNK_SIZE × 4` = 2,048 by default). A title longer than 80 characters reaches the reranker cut, as a prefix component.
 - **L5** `similarity` keeps the cosine-best chunk's value while the preview and locator may show the max chunk.
 - **L6** A hybrid row that renders a keyword snippet keeps the snippet. Only its locator follows the scored chunk.
-- **L7** `candidates: N` can be smaller than today's for `semantic_search` with `limit > 10` and for `hybrid_search` (the admitted prefix, R1).
+- **L7** `candidates: N` can be smaller than today's (secondaries take budget, R1). A note's fourth and later fetched chunks are never scored.
 - **L8** The 1,500 ms default times out most 50-document calls on P4000-class hardware. Operators size it from DEPLOYMENT.md.
 - **L9** This retires #367 L2 ("a note is judged on its best-distance chunk only"). #367 L4 (a stale candidate is scored on its title or excerpt) stands.
 
+## Owner decisions (2026-10-31, on the open questions)
+
+1. `RERANK_TIMEOUT_MS` range 100–30000; default unchanged at 1,500.
+2. A per-note document cap of 3 (the primary plus at most two more), so the max is taken over ≤ 3 documents.
+3. Pass 2 walks the remaining fetched chunks in **distance order** for both tools (best remaining chunks globally first), deterministic with ties broken by `(file_path, chunk_index)`, under the per-note cap and the 50-document budget.
+4. The two named judgments are information only, as in #403.
+5. This change merges after `hybrid-any-fill`; the two frozen incumbent factories are the baseline arms.
+
 ## Open Questions
 
-1. The timeout ceiling: 30,000 (proposed, headroom over the 20 s infra value) or exactly 20,000?
-2. A per-note document cap (issue follow-up 1, k = 3) against R1 and R2, or "every fetched chunk" as decided, with the gate as arbiter?
-3. Pass 2 in note order (proposed: one rule for both tools, and the prefix property) or in global distance order for `semantic_search`?
-4. Are the two named judgments information only (as briefed), or a release bar ("both top 3 or no merge")?
+None.
