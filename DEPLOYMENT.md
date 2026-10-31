@@ -13,7 +13,9 @@ together:
 3. Vault sync. Getting your Obsidian vault onto the VPS and keeping it
    in sync with your local edits. Nextcloud is the recommended path.
 4. Embeddings. OpenAI API for VPS deployments without GPUs (Ollama on
-   a CPU-only VPS is too slow to be usable).
+   a CPU-only VPS is too slow to be usable). With a GPU, Ollama runs
+   `bge-m3` (the default) or `qwen3-embedding:0.6b` (the reference
+   deployment's model); see the README's "Embedding model choice".
 5. TLS and reverse proxy. Caddy for the simplest path, Traefik if you
    already run it, or your own external proxy (Nginx Proxy Manager,
    nginx, …) if you already terminate TLS elsewhere.
@@ -1076,7 +1078,8 @@ similarity of the call's candidates is strictly below
 `SEARCH_LOW_CONFIDENCE_SIMILARITY`. The setting ships at **0, which is off**
 (every page reads `ok`). A false `low` on a good page pushes an agent away
 from the right notes, so the value is chosen from your own usage, not
-guessed. bge-m3's candidate is 0.50; another model needs its own number.
+guessed. bge-m3's candidate is 0.50; another model (`qwen3-embedding:0.6b`
+included) needs its own number.
 
 1. **Accrue evidence at 0.** Run the release with the threshold at 0 for at
    least **14 days and** until **each** tool has at least **200**
@@ -1128,7 +1131,11 @@ you set `RERANK_URL`, and the default setup does not. **It is not a recommended 
 scoring 10 documents takes several seconds, so 50 candidates time out at the
 1.5 s default on every call. Treat it as a GPU-only option, and measure it
 with the harness (above) on your own judgments before telling agents to use
-it. The reranker receives the query and candidate note text, so give it the
+it. Before [#402](https://github.com/maxkuminov/obsidian-mcp/issues/402) it
+scored one heading-less chunk per note, which demoted some notes both search
+arms ranked first; #402 sends the embedded text of up to four fetched chunks
+per note instead, and its real-data quality gate is still to be run before
+you rely on it. The reranker receives the query and candidate note text, so give it the
 same trust as your embedding endpoint.
 
 One wire format is supported: the Jina-compatible `/v1/rerank` that
@@ -1148,8 +1155,27 @@ RERANK_URL=http://127.0.0.1:8081/v1/rerank
 ```
 
 A reranker on another host needs `https`, or `RERANK_ALLOW_PLAINTEXT=true`
-for plaintext (the embedding override does not cover it). Restart, then
-check:
+for plaintext (the embedding override does not cover it).
+
+**Reference setup.** Ollama has no rerank endpoint
+([ollama/ollama#3368](https://github.com/ollama/ollama/issues/3368)), so the
+reference deployment runs llama.cpp's `llama-server` from the
+`ghcr.io/ggml-org/llama.cpp:server-cuda12-*` image (pin a build) serving
+`bge-reranker-v2-m3` as a Q8_0 GGUF with `--reranking`, behind TLS, on an
+8 GiB Quadro P4000 it shares with Ollama:
+
+```sh
+RERANK_URL=https://<host>:<port>/v1/rerank
+RERANK_TIMEOUT_MS=10000
+```
+
+Measured on that card with nothing else running: 50 documents of ~410
+characters in 1.6 s, 50 documents of 2,000 characters in 7.3 s. Candidates
+are cut to 2,048 characters, so the 1,500 ms default is too short there;
+10,000 ms is the setting's maximum. An internal CA goes in
+`EMBEDDING_CA_FILE`, which is the reranker's trust anchor too.
+
+Restart, then check:
 
 - the log has one `Rerank transport:` line and `Reranker probe passed`;
 - `/health` reports `"rerank": "enabled"` (`disabled` means the probe
@@ -1174,9 +1200,11 @@ characters × per-character cost`, doubled when the GPU is shared with the
 embedding model (the indexer's batches slow it down). The 1,500 ms default is
 deliberately conservative and falls back on most calls on hardware like this;
 `RERANK_MAX_DOCUMENTS=50` restores the pre-#402 document count. The
-reference deployment sets `RERANK_TIMEOUT_MS=20000` (in its own
-infrastructure config, not here), which is valid **only while
-`MCP_CONCURRENCY_MODE` is `shadow` or `off`**.
+reference deployment runs `RERANK_TIMEOUT_MS=10000` (see the README's
+"Reranker reference setup"); at the 100-document default it moves to `20000`
+in its own infrastructure config, not here. Either value above
+`MCP_CONCURRENCY_WAIT_SECONDS` is valid **only while `MCP_CONCURRENCY_MODE`
+is `shadow` or `off`**.
 
 **The concurrency-mode rule.** A `rerank=true` call holds its `embedding`
 concurrency slot through the rerank exchange, up to `RERANK_TIMEOUT_MS`.

@@ -480,6 +480,15 @@ update it in the same change.** What stays here is the short list:
   wire (the raw docstring is what ships); the four long ones lead with their
   contract and the reasoning moved to the vault-tools note. See
   [vault tools](docs/architecture/vault-tools.md), "Tool metadata".
+  **`tools/list` is scoped by the presented credential** (#358): an OAuth
+  grant without `readwrite` lists 19 — the full list minus
+  `tool_permissions.WRITE_REQUIRED_TOOLS`, the one literal that also drives
+  `_tracked`'s body-boundary write gate (after quota, so spend is unchanged);
+  API keys of either permission, `readwrite` grants, sandbox and in-process
+  callers list 28, byte-identical to `tests/fixtures/tools_list_full_v1.json`
+  (the 1.0 freeze fixture — regenerate only deliberately). The seam is the
+  public `list_tools()` override (survives SDK 2.x); no setting, no
+  `list_changed`, instructions unfiltered.
 - **`hybrid_search` is a third search peer, not a primary** (#354). All three
   search descriptions carry one routing sentence (identifiers →
   `keyword_search`, paraphrase → `semantic_search`, unsure →
@@ -585,6 +594,14 @@ Every registration carries `title=` and `annotations=` (one of four shared
 `ToolAnnotations` shapes); `tests/test_issue_343_tool_metadata.py` fails on a
 registration without them, on a description over 4,000 characters, and on a
 destructive set that drifts from the write bucket.
+
+A read-only OAuth grant **sees 19 of the 28** (#358): `tools/list` omits the
+nine names in `src/mcp_server/tool_permissions.py`'s `WRITE_REQUIRED_TOOLS`
+(the write bucket plus `request_upload`). That same literal drives the write
+gate `_tracked` runs at the body boundary, so the list and enforcement cannot
+drift; a hidden tool called by name is refused `permission_denied` as before.
+API keys and `readwrite` grants see all 28. See
+[vault tools](docs/architecture/vault-tools.md), "Who sees which tools (#358)".
 
 **Search and read** — `keyword_search`, `semantic_search`, `hybrid_search`
 (RRF of the two, for a query that is neither clearly an identifier nor a

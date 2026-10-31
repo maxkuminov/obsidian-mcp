@@ -37,7 +37,8 @@ In claude.ai, Claude Desktop or ChatGPT, add a custom connector at
 consent page. [Connect a client](#4-connect-a-client) has the rest.
 
 Stack: Python 3.12, FastAPI, PostgreSQL with pgvector. Pluggable
-embeddings (Ollama bge-m3, or OpenAI `text-embedding-3-{small,large}`).
+embeddings (Ollama — `bge-m3` by default, `qwen3-embedding:0.6b` in the
+reference deployment — or OpenAI `text-embedding-3-{small,large}`).
 
 ![Dashboard](https://raw.githubusercontent.com/maxkuminov/obsidian-mcp/main/screenshots/dashboard.png)
 
@@ -499,7 +500,10 @@ origin the mint tools refuse rather than emit a localhost link.
 - OAuth 2.0 PKCE (S256) flow for public and confidential clients,
   including ChatGPT, Claude Desktop, and claude.ai. Dynamic registration
   defaults to both vault permission levels; the user chooses the actual
-  grant on the consent screen.
+  grant on the consent screen. A read-only grant lists 19 tools — the
+  nine write tools are left out of `tools/list` (and still refused if
+  called by name); choose read + write at consent for all 28, and
+  reconnect the client after changing a grant's scope.
 - Control panel (Jinja2, hand-written CSS, vendored Chart.js, nonce-based
   CSP) for keys, usage logs,
   indexer status, embedding-provider info, and a danger-zone reset.
@@ -820,9 +824,11 @@ The bundled Caddy configuration fails closed on `/admin`, `/api`, and
 - Docker and Docker Compose
 - A PostgreSQL 16 instance reachable from the container, with
   `pgvector` **0.8.0 or newer** installed
-- Either an Ollama instance running `bge-m3`, or an OpenAI API key.
-  Anything that speaks the OpenAI embeddings protocol works (Azure
-  OpenAI, OpenRouter, Together, etc.).
+- Either an Ollama instance running an embedding model (`bge-m3`, the
+  default, or `qwen3-embedding:0.6b`, which the reference deployment
+  runs; see [Embedding model choice](#embedding-model-choice)), or an
+  OpenAI API key. Anything that speaks the OpenAI embeddings protocol
+  works (Azure OpenAI, OpenRouter, Together, etc.).
 - Linux, kernel 5.6 or newer (see below)
 
 ### System requirements
@@ -912,7 +918,11 @@ EMBEDDING_DIMENSIONS=1024
 ```
 
 This is the default. Omitting `EMBEDDING_PROVIDER` falls back to
-Ollama.
+Ollama. On a new install, consider `qwen3-embedding:0.6b` (also 1024
+dimensions) with a query instruction, which is what the reference
+deployment runs; read [Embedding model choice](#embedding-model-choice)
+before the first index pass, because changing the model later means a
+full re-embed.
 
 The embedding URL must be `https`, or `http` to a loopback host
 (`localhost`, `127.x`, `::1`). Plaintext `http` to any other host —
@@ -1019,7 +1029,8 @@ Across the reranker release (#367):
   output unchanged), and four optional settings (`RERANK_URL`,
   `RERANK_MODEL`, `RERANK_TIMEOUT_MS`, `RERANK_ALLOW_PLAINTEXT`). Nothing
   changes until you set `RERANK_URL`. The concurrency class mapping is
-  unchanged, so readiness evidence carries over.
+  unchanged, so readiness evidence carries over. A reference setup is in
+  [Reranker reference setup](#reranker-reference-setup).
 - **Rollback** is a redeploy of the previous image. A client that keeps
   sending `rerank` is then refused by the unknown-argument rule, which is
   the normal cost of rolling back a new argument.
@@ -1359,7 +1370,7 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `RANK_WEIGHTS` | `{0.02, 0.2, 0.4, 1.0}` | `keyword_search`'s `ts_rank_cd` weight array `{D, C, B, A}`: the title and aliases are indexed at `A`, the tags at `B`, the body at `D` (`C` is unused). At the default one two-word title match outweighs fifty body repetitions, and one tag match ranks below a title match and equals twenty body matches; PostgreSQL's own `D=0.1` lets ten body repetitions tie the title. Four finite numbers, each in [1e-6, 1]; body-only order never moves. |
 | `KEYWORD_EXCERPT_CHARS` | `20000` | Leading characters of each note's indexed text stored for `keyword_search` snippets (1000–100000). Applies to notes indexed afterwards; `make rebuild-tsvectors` rewrites the rest. The snippet cost grows roughly linearly with this; the 300 ms budget was measured at the defaults. |
 | `KEYWORD_SNIPPET_ROWS` | `20` | Rows per `keyword_search` page that get a snippet, whatever `limit` is (0–100; 0 turns snippets off). Bounds the per-call `ts_headline` cost, which grows roughly linearly with this; the 300 ms budget was measured at the defaults. |
-| `SEARCH_LOW_CONFIDENCE_SIMILARITY` | `0` | Where `semantic_search` and `hybrid_search` start reading `confidence: low` (#389): no keyword note matched all terms and the best similarity of the call's candidates is strictly below this value. **0 is off** (the shipped default: the token is still on every page and always reads `ok`, which means "not judged"). Range 0–1; out of range or non-finite refuses to start. Model-dependent: bge-m3's candidate value is 0.50 (live probes: gibberish 0.36–0.49, paraphrases 0.61–0.67), OpenAI `text-embedding-3-*` cosines run lower, so re-choose it when the embedding model changes. Ranks nothing and is not part of the retrieval fingerprint. Set it only after both tools pass the calibration recipe in `DEPLOYMENT.md`, "Calibrating search confidence". |
+| `SEARCH_LOW_CONFIDENCE_SIMILARITY` | `0` | Where `semantic_search` and `hybrid_search` start reading `confidence: low` (#389): no keyword note matched all terms and the best similarity of the call's candidates is strictly below this value. **0 is off** (the shipped default: the token is still on every page and always reads `ok`, which means "not judged"). Range 0–1; out of range or non-finite refuses to start. Model-dependent: bge-m3's candidate value is 0.50 (live probes: gibberish 0.36–0.49, paraphrases 0.61–0.67; not calibrated for `qwen3-embedding:0.6b`), OpenAI `text-embedding-3-*` cosines run lower, so re-choose it when the embedding model changes. Ranks nothing and is not part of the retrieval fingerprint. Set it only after both tools pass the calibration recipe in `DEPLOYMENT.md`, "Calibrating search confidence". |
 | `HYBRID_RRF_K` | `60` | `hybrid_search`'s reciprocal-rank-fusion constant (1–1000; out of range refuses to start): a note scores the sum over the two arms of `1/(k + rank)`. Smaller lets each arm's top ranks dominate; larger flattens toward counting votes. Measure a change with the harness arms `scripts.search_eval_arms.hybrid:make_arm` / `make_arm_alt` (`ARM_OPTS="hybrid_k=60 hybrid_alt_k=20"`, see `DEPLOYMENT.md`, "Measuring search quality"); there is no per-call argument. |
 | `TRANSFER_TOKEN_TTL_SECONDS` | `600` | Default life of a transfer link. Per-call `expires_in` is clamped to 60–3600. |
 | `TRANSFER_MAX_UPLOAD_SECONDS` | `600` | How long one claimed upload may stream before the token is spent |
@@ -1370,16 +1381,16 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `EMBEDDING_PROVIDER` | `ollama` | `ollama` or `openai` |
 | `EMBEDDING_DIMENSIONS` | `1024` | pgvector column width |
 | `OLLAMA_URL` | `http://ollama:11434` | Used when provider is Ollama. Must be `https`, loopback `http`, or covered by `EMBEDDING_ALLOW_PLAINTEXT`. |
-| `EMBEDDING_MODEL` | `bge-m3` | Ollama model name. Changing it post-deploy requires `make reset-embeddings`; the server refuses to start until the stored vectors match. See [Switching providers or models](#switching-providers-or-models). |
-| `EMBEDDING_QUERY_INSTRUCTION` | empty | Prepended verbatim, with no separator, to every **search query** sent to the embedding provider, and never to a note. For instruction-tuned embedders such as Qwen3-Embedding, e.g. `"Instruct: Given a question, retrieve the notes that answer it\nQuery: "` (double quotes, so `.env` turns `\n` into a newline). Up to 1,000 characters; NUL and control characters other than newline and tab are refused. It is **not** in the stored embedding fingerprint, so changing it needs no reset and re-embeds nothing; changing the model still does. The default model is unchanged (bge-m3, which wants no instruction). |
+| `EMBEDDING_MODEL` | `bge-m3` | Ollama model name. `bge-m3` stays the default and fully supported; the reference deployment runs `qwen3-embedding:0.6b` (also 1024-d) with the query instruction below, see [Embedding model choice](#embedding-model-choice). Changing it post-deploy requires `make reset-embeddings`; the server refuses to start until the stored vectors match. See [Switching providers or models](#switching-providers-or-models). |
+| `EMBEDDING_QUERY_INSTRUCTION` | empty | Prepended verbatim, with no separator, to every **search query** sent to the embedding provider, and never to a note. For instruction-tuned embedders such as Qwen3-Embedding, e.g. `"Instruct: Given a question, retrieve the notes that answer it\nQuery: "` (double quotes, so `.env` turns `\n` into a newline). Up to 1,000 characters; NUL and control characters other than newline and tab are refused. It is **not** in the stored embedding fingerprint, so changing it needs no reset and re-embeds nothing; changing the model still does. The default model is unchanged (bge-m3, which wants no instruction); the template above is the one the reference deployment runs with `qwen3-embedding:0.6b`. |
 | `OLLAMA_KEEP_ALIVE` | `-1` | How long Ollama keeps the model resident. `-1` pins it; a Go duration (`30m`) frees VRAM when idle. Ollama only. |
 | `OPENAI_API_KEY` | — | Required when provider is OpenAI |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Override for Azure or proxies. Same transport rule as `OLLAMA_URL` when this provider is active. |
 | `EMBEDDING_ALLOW_PLAINTEXT` | `false` | Permit `http` to a non-loopback embedding host. Without it such a URL refuses to start. `.env.example` sets it `true` to match its `http://ollama:11434` default. |
 | `EMBEDDING_CA_FILE` | — | Trust anchor (PEM) for an `https` embedding endpoint behind an internal CA; replaces the default certifi bundle. Refused with an `http` URL. Embedding clients ignore `HTTP(S)_PROXY`, `SSL_CERT_*` and `.netrc`. |
-| `RERANK_URL` | — | Full URL of an optional reranker speaking the Jina-compatible `/v1/rerank` format (`llama-server --reranking`, vLLM, Infinity), e.g. `http://127.0.0.1:8081/v1/rerank`. Empty means no reranker: `rerank=true` answers `reranked: false (not_configured)`. **The endpoint receives the query and candidate note text.** Same transport rule as the embedding URL (`https`, loopback `http`, or `RERANK_ALLOW_PLAINTEXT`); a bad URL refuses to start, an unreachable reranker never does (it is probed at startup and re-probed in the background; `/health` reports `rerank`). Opt-in: no quality gain is claimed until you measure it with the harness on a GPU reranker, and a CPU reranker will time out at the default deadline. See `DEPLOYMENT.md`, "Reranker (optional)". |
+| `RERANK_URL` | — | Full URL of an optional reranker speaking the Jina-compatible `/v1/rerank` format (`llama-server --reranking`, vLLM, Infinity), e.g. `http://127.0.0.1:8081/v1/rerank`. Empty means no reranker: `rerank=true` answers `reranked: false (not_configured)`. **The endpoint receives the query and candidate note text.** Same transport rule as the embedding URL (`https`, loopback `http`, or `RERANK_ALLOW_PLAINTEXT`); a bad URL refuses to start, an unreachable reranker never does (it is probed at startup and re-probed in the background; `/health` reports `rerank`). Opt-in: no quality gain is claimed until you measure it with the harness on a GPU reranker, and a CPU reranker will time out at the default deadline. Since [#402](https://github.com/maxkuminov/obsidian-mcp/issues/402) it scores each note on up to four of its fetched chunks, sent with their heading path (`RERANK_MAX_DOCUMENTS`). See [Reranker reference setup](#reranker-reference-setup) and `DEPLOYMENT.md`, "Reranker (optional)". |
 | `RERANK_MODEL` | — | Sent as `model` in the rerank request (≤ 200 characters). `llama-server` serves one model and ignores it. |
-| `RERANK_TIMEOUT_MS` | `1500` | One deadline per rerank call (100–30000), covering connect, write and read; past it the page falls back unreranked with `reranked: false (timeout)`. Also the extra time a `rerank=true` call can hold its `embedding` concurrency slot: under `MCP_CONCURRENCY_MODE` `queue` or `enforce`, keep it at or below `MCP_CONCURRENCY_WAIT_SECONDS` unless `make concurrency-report` passes with rerank traffic (a long hold delays, or under `enforce` refuses, concurrent vector searches). Size it together with `RERANK_MAX_DOCUMENTS` (`DEPLOYMENT.md`). |
+| `RERANK_TIMEOUT_MS` | `1500` | One deadline per rerank call (100–30000), covering connect, write and read; past it the page falls back unreranked with `reranked: false (timeout)`. Also the extra time a `rerank=true` call can hold its `embedding` concurrency slot: under `MCP_CONCURRENCY_MODE` `queue` or `enforce`, keep it at or below `MCP_CONCURRENCY_WAIT_SECONDS` unless `make concurrency-report` passes with rerank traffic (a long hold delays, or under `enforce` refuses, concurrent vector searches). The reference deployment (GPU `llama-server`, see [Reranker reference setup](#reranker-reference-setup)) runs `10000`; size it together with `RERANK_MAX_DOCUMENTS`, which since #402 can double the documents per call (`DEPLOYMENT.md`). |
 | `RERANK_MAX_DOCUMENTS` | `100` | The most documents one rerank call sends (50–200). Every candidate note (at most 50) is sent its best chunk first, then up to three more of its already-fetched chunks in distance order; a note scores the best of its documents. Rerank latency multiplies with it and `RERANK_TIMEOUT_MS`; `50` restores the pre-#402 count. |
 | `RERANK_ALLOW_PLAINTEXT` | `false` | Permit `http` to a non-loopback reranker host. Separate from `EMBEDDING_ALLOW_PLAINTEXT`, which does not cover it. An `https` reranker is verified against `EMBEDDING_CA_FILE` when set, else certifi's bundle. |
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI model. Changing it post-deploy requires `make reset-embeddings`; the server refuses to start until the stored vectors match. See [Switching providers or models](#switching-providers-or-models). |
@@ -1431,6 +1442,68 @@ waits up to 15 s if it does not fit, and otherwise gets HTTP 429 with
 container too small to admit one maximum-size body (about 1.1 GiB with the
 defaults). The `MCP_BODY_*` settings in `.env.example` only allow the safe
 direction.
+
+### Embedding model choice
+
+Two local models are documented here. Both are multilingual and produce
+1024-dimensional vectors, so `EMBEDDING_DIMENSIONS=1024` fits either.
+
+- **`bge-m3`** is the code default (`EMBEDDING_MODEL=bge-m3`) and stays a
+  fully supported choice. It needs no query instruction
+  (`EMBEDDING_QUERY_INSTRUCTION` empty). The default is not changing: the
+  stored-fingerprint guard refuses to start a deployment whose model
+  changed, so a new default would stop every existing install that relies
+  on it.
+- **`qwen3-embedding:0.6b`** is what the reference deployment has run since
+  2026-10-31, with a query instruction. The instruction is applied to
+  queries only (notes are embedded without one) and is outside the stored
+  fingerprint:
+
+  ```env
+  EMBEDDING_PROVIDER=ollama
+  EMBEDDING_MODEL=qwen3-embedding:0.6b
+  EMBEDDING_DIMENSIONS=1024
+  EMBEDDING_QUERY_INSTRUCTION="Instruct: Given a question, retrieve the notes that answer it\nQuery: "
+  ```
+
+What was observed after the switch, on one user's vault (not a
+benchmark): cross-language recall between English and Russian queries and
+notes was strong, and `hybrid_search` became the day-to-day default. **No
+harness A/B was run for the switch**, so no quality gain is claimed. To
+measure it on your own vault, use the search-evaluation recipe in
+[`DEPLOYMENT.md`](./DEPLOYMENT.md#measuring-search-quality).
+
+Switching an existing install is a full re-embed (the procedure is
+[below](#switching-providers-or-models)). For scale: on an 8 GiB Quadro
+P4000 shared by Ollama and the reranker, ~4,200 notes re-embedded in about
+84 minutes. `SEARCH_LOW_CONFIDENCE_SIMILARITY` is model-dependent: its
+0.50 candidate was measured on `bge-m3`, so re-calibrate after a switch.
+
+### Reranker reference setup
+
+`rerank=true` is opt-in. Before [#402](https://github.com/maxkuminov/obsidian-mcp/issues/402)
+the reranker scored one heading-less chunk per note, which demoted some
+notes both search arms ranked first; it now scores each note on the
+embedded text (title, heading path, tags, chunk) of up to four of its
+fetched chunks (`RERANK_MAX_DOCUMENTS`). Measure it before telling agents
+to use it.
+
+Ollama has no rerank endpoint
+([ollama/ollama#3368](https://github.com/ollama/ollama/issues/3368)), so
+the reference deployment runs llama.cpp's `llama-server` (image
+`ghcr.io/ggml-org/llama.cpp:server-cuda12-*`, pinned to a build) serving
+`bge-reranker-v2-m3` as a Q8_0 GGUF with `--reranking`, behind TLS:
+
+```env
+RERANK_URL=https://<host>:<port>/v1/rerank
+RERANK_TIMEOUT_MS=10000
+```
+
+Measured on the same P4000 with nothing else running: 50 documents of ~410
+characters in 1.6 s, 50 documents of 2,000 characters in 7.3 s. Candidates
+are cut to 2,048 characters, so the 1,500 ms default deadline is too short
+for this card; the reference runs 10,000 ms, the maximum. Details and the
+startup checks are in [`DEPLOYMENT.md`](./DEPLOYMENT.md#reranker-optional).
 
 ### Switching providers or models
 
@@ -1507,8 +1580,8 @@ record — while the server is running (pauses the indexer, runs the SQL,
 resumes).
 
 > **The fingerprint records the configuration, not the model artifact.**
-> `bge-m3` is a mutable Ollama tag, so `ollama pull` can replace the
-> weights behind it, and `OLLAMA_URL` / `OPENAI_BASE_URL` are
+> `bge-m3` is a mutable Ollama tag (so is `qwen3-embedding:0.6b`), so
+> `ollama pull` can replace the weights behind it, and `OLLAMA_URL` / `OPENAI_BASE_URL` are
 > deliberately excluded from the fingerprint — repointing at another host
 > or proxy is usually an infrastructure move that serves the identical
 > artifact, and including it would demand a full re-embed for one.

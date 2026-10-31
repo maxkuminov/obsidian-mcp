@@ -5,8 +5,11 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from pydantic import ConfigDict
 
+from src.auth.session import current_principal
 from src.config import settings
+from src.mcp_server.auth import current_permission
 from src.mcp_server.read_result import ReadNoteResult
+from src.mcp_server.tool_permissions import visible
 from src.mcp_server.tools import (
     check_upload_impl,
     create_note_impl,
@@ -165,7 +168,38 @@ SERVER_INSTRUCTIONS = (
 )
 
 
-mcp = FastMCP(
+class _ScopedFastMCP(FastMCP):
+    """`FastMCP` whose `tools/list` follows the authorization presented (#358).
+
+    The override seam is the **public** `list_tools()`: SDK 1.30 registers it
+    as the `tools/list` handler in `FastMCP._setup_handlers`, and SDK 2.x's
+    `MCPServer._handle_list_tools` awaits `self.list_tools()` — so the 2.x
+    migration (#365) changes only the base class. That migration must keep the
+    2026-07-28 `cacheScope` of `tools/list` `"private"` (the list varies by
+    credential; 2.x's default) and, if it ever paginates, page the filtered
+    list.
+
+    The rule (`tool_permissions.visible`) reads only this request's
+    `current_principal` and `current_permission` — the value `_require_write`
+    reads — so the result depends on the presented credential and nothing
+    else: no earlier request, no cache. Called in-process with no principal
+    (tests, stdio, `MCP_SANDBOX_MODE`) it returns the full list. The return
+    type is unchanged (`list[MCPTool]`); the SDK's cursor handling is untouched
+    (the complete list, no `nextCursor`). This hides tools, it does not guard
+    them: a hidden tool called by name is refused by `_tracked`'s write gate
+    exactly as before. Never touch `self._mcp_server._tool_cache` from here.
+    """
+
+    async def list_tools(self):
+        tools = await super().list_tools()
+        return visible(
+            tools,
+            principal=current_principal.get(),
+            permission=current_permission.get(),
+        )
+
+
+mcp = _ScopedFastMCP(
     "obsidian-vault",
     instructions=SERVER_INSTRUCTIONS,
     stateless_http=True,

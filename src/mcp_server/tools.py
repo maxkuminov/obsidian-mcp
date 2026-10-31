@@ -57,6 +57,7 @@ from src.mcp_server.auth import (
     current_permission,
     current_transport_queue_ms,
 )
+from src.mcp_server import tool_permissions
 from src.mcp_server.read_result import (
     ReadNoteResult,
     apply_metadata_budget,
@@ -1927,7 +1928,22 @@ def _tracked(
                     # shutdown must not be recorded as a tool failure or write a
                     # row.
                     try:
-                        result = await fn(*args, **kwargs)
+                        # The body-boundary write gate (#358, design D2): for a
+                        # tool in the one write-required registry — the same
+                        # object `tools/list` filters on — the read-only check
+                        # runs here, after every admission gate and exactly
+                        # where the body would start, so tokens and the quota
+                        # slot are spent as before and the refusal is the
+                        # body's own (same marker, event and outcome). Looked
+                        # up per call, so the registry is the live source. The
+                        # in-body `_require_write()` calls stay as defence in
+                        # depth.
+                        gate = (
+                            _require_write()
+                            if tool_name in tool_permissions.WRITE_REQUIRED_TOOLS
+                            else None
+                        )
+                        result = gate if gate is not None else await fn(*args, **kwargs)
                     except Exception as exc:
                         # Guarded: a `transforms` entry that raises on a value
                         # the body already choked on must not become the
