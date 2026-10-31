@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scripts.search_eval import UsageError
-from scripts.search_eval._io import atomic_write, pretty_json, read_jsonl
+from scripts.search_eval._io import atomic_write, pretty_json, read_jsonl, sha256_bytes
 from scripts.search_eval.classify import CLASSES
 from scripts.search_eval.metrics import _percentile
 
@@ -106,8 +106,10 @@ def _block(rows: list[dict], threshold: float) -> dict:
     }
 
 
-def verdict(block: dict) -> str:
-    if block["span_days"] < MIN_SPAN_DAYS or block["clicked"] < MIN_CLICKED:
+def verdict(block: dict, span_days: float) -> str:
+    """`span_days` is the **unrounded** span (Codex impl r1 m1): 13.9996
+    days is short of 14, whatever the rounded display says."""
+    if span_days < MIN_SPAN_DAYS or block["clicked"] < MIN_CLICKED:
         return INSUFFICIENT
     return PASS if block["false_low_rate"] < MAX_FALSE_LOW else FAIL
 
@@ -121,7 +123,7 @@ def tabulate(rows: list[dict], threshold: float, mine_report: dict) -> dict:
         post = [r for r in mine if r.get("confidence") in ("ok", "low")]
         block = _block(post, threshold)
         block["excluded_pre_change"] = len(mine) - len(post)
-        block["verdict"] = verdict(block)
+        block["verdict"] = verdict(block, _span_days(post))
         block["per_class"] = {c: _block([r for r in post if r.get("class") == c], threshold)
                               for c in CLASSES}
         tools[tool] = block
@@ -190,8 +192,17 @@ def run_confidence(data_dir: Path, threshold: float, *, write: bool = True) -> C
     for path in (rows_path, report_path):
         if not path.is_file():
             raise UsageError(f"{path} is missing; run `mine` first")
-    rows = read_jsonl(rows_path)
     mine_report = json.loads(report_path.read_text(encoding="utf-8"))
+    raw = rows_path.read_bytes()
+    want = mine_report.get("confidence_rows_sha256")
+    # The rows must be the ones this report's `mine` run wrote (Codex impl
+    # r1 B1): otherwise its provenance says nothing about them.
+    if not isinstance(want, str) or sha256_bytes(raw) != want:
+        raise UsageError(f"{rows_path} does not match {report_path} (missing or different "
+                         "confidence_rows_sha256); re-run `mine`")
+    rows = read_jsonl(rows_path)
+    if mine_report.get("confidence_rows") != len(rows):
+        raise UsageError(f"{rows_path} row count does not match {report_path}; re-run `mine`")
     report = tabulate(rows, threshold, mine_report)
     serialized = pretty_json(report)
     texts: set[str] = set()

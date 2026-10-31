@@ -22,20 +22,14 @@ from typing import Literal
 
 Confidence = Literal["ok", "low"]
 
-#: The upper bound on either hint line (D4). The design drafted 140, but
-#: the hybrid-search spec fixes the owner's hybrid text verbatim and that text
-#: is 147 characters; the semantic line is 132 and keeps the search-quality
-#: spec's "at most 140". The hint never enters a response bound (it is
-#: withdrawn before it could cost a row), so this number is a promise about
-#: the line, not a term in any arithmetic. See the design's implementation
-#: notes.
-CONFIDENCE_HINT_MAX = 150
-SEMANTIC_HINT_MAX = 140
+#: The upper bound on either hint line (D4): the hybrid line is exactly 140,
+#: the semantic line 132.
+CONFIDENCE_HINT_MAX = 140
 
 #: `hybrid_search`'s hint, after the header and any `index_transition:` line.
 HYBRID_LOW_CONFIDENCE_HINT = (
-    "low confidence: no keyword match on all terms and weak similarity; try "
-    "`keyword_search` with an identifier, or `get_neighborhood` from a known note"
+    "low confidence: no all-terms keyword match, weak similarity; try "
+    "`keyword_search` with an identifier or `get_neighborhood` from a known note"
 )
 
 #: `semantic_search`'s sibling hint (it has no keyword arm).
@@ -45,7 +39,7 @@ SEMANTIC_LOW_CONFIDENCE_HINT = (
 )
 
 assert len(HYBRID_LOW_CONFIDENCE_HINT) <= CONFIDENCE_HINT_MAX
-assert len(SEMANTIC_LOW_CONFIDENCE_HINT) <= SEMANTIC_HINT_MAX
+assert len(SEMANTIC_LOW_CONFIDENCE_HINT) <= CONFIDENCE_HINT_MAX
 
 
 def confidence(keyword_all: int, top_similarity: float | None,

@@ -91,12 +91,16 @@ def test_the_boundary_is_strict_and_zero_is_hard_off():
 
 
 def test_the_hints():
-    assert len(SEMANTIC_HINT) <= search_confidence.SEMANTIC_HINT_MAX == 140
-    assert len(HYBRID_HINT) <= search_confidence.CONFIDENCE_HINT_MAX
+    assert search_confidence.CONFIDENCE_HINT_MAX == 140
+    assert len(SEMANTIC_HINT) == 132 and len(SEMANTIC_HINT) <= 140
+    assert len(HYBRID_HINT) == 140 and len(HYBRID_HINT) <= 140
+    assert HYBRID_HINT == ("low confidence: no all-terms keyword match, weak similarity; try "
+                           "`keyword_search` with an identifier or `get_neighborhood` from a "
+                           "known note")
     for hint in (HYBRID_HINT, SEMANTIC_HINT):
         assert hint.startswith("low confidence: ") and not hint.startswith("- ")
         assert "\n" not in hint and "try `keyword_search`" in hint
-    assert "no keyword match on all terms" in HYBRID_HINT
+    assert "no all-terms keyword match" in HYBRID_HINT
 
 
 # ── 1.3 HybridResult.top_similarity ─────────────────────────────────────────
@@ -708,3 +712,49 @@ def test_a_semantic_note_cannot_forge_the_token_or_the_hint(monkeypatch, thresho
         assert lines[0].count("confidence: ") == 1 and "confidence: low" in lines[0]
         assert sum(1 for line in lines if line.startswith("low confidence:")) == 1
         assert next(line for line in lines if line.startswith("low confidence:")) == SEMANTIC_HINT
+
+
+# ── V3: hybrid rerank=false golden, pinned against d56444b ─────────────────
+
+from tests.test_hybrid_search_offline import snip  # noqa: E402
+
+#: Rendered by `hybrid_search_impl` from d56444b's `src/` (the tree before
+#: #389) with the rows of `_golden_session`, query "deploy runbook": the
+#: all-terms case and the semantic-only case. Verified there, not here.
+_HYBRID_PRE_389_OK = (
+    'Found 3 hybrid results for "deploy runbook" — arms: both — rrf_k: 60 — arm_depth: keyword 2/50, semantic 2/50 chunks — semantic: 2 notes, keyword: 2 notes (all 2, any 0), in both: 1 — stale: 1, truncated: 0 — without excerpt: 0 — shown: 3:\n'
+    '- {"title":"Ops/Runbook","path":"Ops/Runbook.md","tags":["ops"],"preview_kind":"chunk","preview":"Deploy the\\\\nrunbook"} — score: 0.03279 — semantic_rank: 1 (similarity 0.800) — keyword_rank: 1 (match: all, matched_in: title,body) — explain: 1/(60+1) + 1/(60+1)\n'
+    '- {"title":"Notes/Other","path":"Notes/Other.md","tags":[],"preview_kind":"stale_notice","preview":"(preview withheld — this note changed after it was embedded, so the stored excerpt is superseded text. Call `read_note` for the current content.)"} — score: 0.01613 — semantic_rank: 2 (similarity 0.600) — keyword_rank: - — explain: 1/(60+2), semantic only — stale: true\n'
+    '- {"title":"Ops/Backups","path":"Ops/Backups.md","tags":[],"preview_kind":"none","preview":""} — score: 0.01613 — semantic_rank: - — keyword_rank: 2 (match: all, matched_in: body) — explain: 1/(60+2), keyword only'
+)
+_HYBRID_PRE_389_LOW = (
+    'Found 2 hybrid results for "deploy runbook" — arms: both — rrf_k: 60 — arm_depth: keyword 0/50, semantic 2/50 chunks — semantic: 2 notes, keyword: 0 notes (all 0, any 0), in both: 0 — stale: 1, truncated: 0 — without excerpt: 0 — shown: 2:\n'
+    '- {"title":"Ops/Runbook","path":"Ops/Runbook.md","tags":["ops"],"preview_kind":"chunk","preview":"Deploy the\\\\nrunbook"} — score: 0.01639 — semantic_rank: 1 (similarity 0.800) — keyword_rank: - — explain: 1/(60+1), semantic only\n'
+    '- {"title":"Notes/Other","path":"Notes/Other.md","tags":[],"preview_kind":"stale_notice","preview":"(preview withheld — this note changed after it was embedded, so the stored excerpt is superseded text. Call `read_note` for the current content.)"} — score: 0.01613 — semantic_rank: 2 (similarity 0.600) — keyword_rank: - — explain: 1/(60+2), semantic only — stale: true'
+)
+
+
+def _golden_session(keyword_too=True):
+    keyword = [kw_row(1, "Ops/Runbook.md", tags=["ops"]), kw_row(2, "Ops/Backups.md")]
+    semantic = [sem_row(1, "Ops/Runbook.md", distance=0.2, chunk="Deploy the\\nrunbook", tags=["ops"]),
+                sem_row(3, "Notes/Other.md", distance=0.4, chunk="other text", stale=True)]
+    if not keyword_too:
+        return _Session(ranked=[[]], semantic=[semantic])
+    return _Session(ranked=[keyword], semantic=[semantic],
+                    snippet=[[snip(1, hl="deploy «runbook»", title=True), snip(2)]])
+
+
+@pytest.mark.parametrize("case", ["ok", "low"])
+def test_hybrid_rerank_false_golden_differs_by_the_token_alone(monkeypatch, threshold, case):
+    monkeypatch.setattr(settings, "keyword_snippet_rows", 20, raising=False)
+    threshold(0.0 if case == "ok" else 0.95)
+    session = _golden_session(case == "ok")
+    monkeypatch.setattr(tools, "async_session", lambda: session)
+    out = str(_run(tools.hybrid_search_impl, query="deploy runbook", limit=10))
+    before = _HYBRID_PRE_389_OK if case == "ok" else _HYBRID_PRE_389_LOW
+    token = f" — confidence: {case}"
+    expected = before.replace(" — arms: both", " — arms: both" + token, 1)
+    if case == "low":
+        head, rest = expected.split("\n", 1)
+        expected = head + "\n" + HYBRID_HINT + "\n" + rest
+    assert out == expected

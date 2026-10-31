@@ -16,7 +16,7 @@ import pytest
 
 from scripts.search_eval import EXIT_OK, EXIT_USAGE, UsageError
 from scripts.search_eval.__main__ import build_parser, main as cli_main
-from scripts.search_eval._io import pretty_json, read_jsonl, sha256_file
+from scripts.search_eval._io import pretty_json, read_jsonl, sha256_bytes, sha256_file
 from scripts.search_eval.classify import classify
 from scripts.search_eval.commands import write_mine
 from scripts.search_eval.confidence import (
@@ -292,8 +292,11 @@ def test_the_tabulation_does_not_leak(tmp_path):
     d = tmp_path / "d"
     d.mkdir()
     rows = [_row("hybrid_search", 0, clicked=True, top=0.3, kall=0)]
-    (d / "confidence-rows.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
-    (d / "mine-report.json").write_text(json.dumps(SINGLE))
+    body = "".join(json.dumps(r) + "\n" for r in rows)
+    (d / "confidence-rows.jsonl").write_text(body)
+    (d / "mine-report.json").write_text(json.dumps(
+        {**SINGLE, "confidence_rows": 1,
+         "confidence_rows_sha256": sha256_bytes(body.encode())}))
     (d / "queries.jsonl").write_text(json.dumps(
         {"qid": "q", "text": "PASS", "pool": ["Secret.md"]}) + "\n")
     res = run_confidence(d, 0.5)
@@ -323,3 +326,89 @@ def test_no_query_text_on_the_rows(tmp_path):
     out = mine(rows).confidence_rows
     blob = json.dumps(out)
     assert "secret" not in blob and "Hidden" not in blob
+
+
+# ── Codex implementation review, round 1 ────────────────────────────────────
+
+
+def test_rows_from_another_mine_run_are_refused(tmp_path):
+    """B1: multi-user rows left beside a single-user report (an interrupted
+    or interleaved `mine`) never tabulate as attachable."""
+    multi = _fixture_mine(tmp_path / "multi")
+    single = _fixture_mine(tmp_path / "single", user_id=1)
+    report = json.loads((single / "mine-report.json").read_text())
+    assert report["confidence_rows_sha256"] == sha256_file(single / "confidence-rows.jsonl")
+    assert report["confidence_rows"] == len(read_jsonl(single / "confidence-rows.jsonl"))
+    # Plant the multi-user rows under the single-user report.
+    forged = [*read_jsonl(multi / "confidence-rows.jsonl"),
+              _row("hybrid_search", 0, clicked=True, top=0.9, kall=1)]
+    (single / "confidence-rows.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in forged))
+    with pytest.raises(UsageError, match="does not match"):
+        run_confidence(single, 0.5)
+    assert cli_main(["confidence", "--data", str(single), "--threshold", "0.5"]) == EXIT_USAGE
+    assert not (single / "confidence-report.json").exists()
+    # A report without the digest (an older mine) is refused too.
+    del report["confidence_rows_sha256"]
+    (single / "mine-report.json").write_text(json.dumps(report))
+    with pytest.raises(UsageError):
+        run_confidence(single, 0.5)
+
+
+def test_the_rows_are_published_before_the_report(tmp_path, monkeypatch):
+    from scripts.search_eval import commands
+
+    order = []
+    real = commands.atomic_write
+
+    def spy(path, data):
+        order.append(Path(path).name)
+        return real(path, data)
+
+    monkeypatch.setattr(commands, "atomic_write", spy)
+    _fixture_mine(tmp_path / "m")
+    assert order[-2:] == ["confidence-rows.jsonl", "mine-report.json"]
+
+
+def test_truncated_queries_stay_confidence_evidence():
+    """M1: 200 short clicked pages at 0.7 plus 100 clicked pages whose
+    logged query hit the 200-character cap, at 0.3, over 20 days → 100/300
+    FAIL at 0.5, never 0/200 PASS."""
+    long_q = "x" * 200 + "…"
+    rows = []
+    for i in range(300):
+        t = 20 * DAY * i / 299
+        q, top = (f"short {i}", 0.7) if i < 200 else (long_q, 0.3)
+        rows.append(_se(t, q, [f"N{i}.md"], confidence="ok", top_similarity=top))
+        rows.append(rd(t + 5, f"N{i}.md"))
+    out = mine(rows).confidence_rows
+    assert len(out) == 300 and all(r["clicked"] for r in out)
+    se = tabulate(out, 0.5, SINGLE)["tools"]["semantic_search"]
+    assert (se["false_low"], se["clicked"], se["verdict"]) == (100, 300, "FAIL")
+    # Refusals and unresolved principals are still not evidence.
+    refused = mine([_se(0, "q", ["A.md"], confidence="ok", error="rate_limited"),
+                    _se(1, "q", ["A.md"], who="UN", confidence="ok")]).confidence_rows
+    assert refused == []
+
+
+def test_the_judgments_ignore_the_truncated_query():
+    long_q = "x" * 200 + "…"
+    result = mine([_se(0, long_q, ["A.md"], confidence="ok", top_similarity=0.3),
+                   rd(5, "A.md")])
+    assert result.queries == [] and result.confidence_rows[0]["clicked"] is True
+
+
+def test_the_fourteen_day_boundary_is_not_rounded():
+    span = 13.9996
+    rows = [_row("hybrid_search", span * i / 199, clicked=True, top=0.9, kall=1)
+            for i in range(200)]
+    hy = tabulate(rows, 0.5, SINGLE)["tools"]["hybrid_search"]
+    assert hy["span_days"] == 14.0, "the display rounds"
+    assert hy["verdict"] == "INSUFFICIENT_DATA"
+    rows.append(_row("hybrid_search", 14.0001, clicked=True, top=0.9, kall=1))
+    assert tabulate(rows, 0.5, SINGLE)["tools"]["hybrid_search"]["verdict"] == "PASS"
+
+
+def test_a_null_keyword_all_counts_as_zero():
+    assert would_be_low({"tool": "hybrid_search", "top_similarity": 0.3, "keyword_all": None},
+                        0.5)

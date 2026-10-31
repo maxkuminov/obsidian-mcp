@@ -523,8 +523,8 @@ line are byte-identical; otherwise it is withdrawn before the abbreviation
 ladder or a row drop could change anything. So the hint never costs a row
 (L7: on a tightly capped page it is often withdrawn; the token stays). The
 legacy `semantic_search(rerank=false)` page has no character budget, so its
-hint is unconditional. The semantic hint is 132 characters; the hybrid hint,
-the owner's text verbatim, is 147.
+hint is unconditional. Both hints are at most 140 characters (semantic 132,
+hybrid 140).
 
 **The token is a header token like `arm_depth` (L14).** It is part of every
 page's base budget with no compaction: on a capped page whose last row fitted
@@ -1312,7 +1312,10 @@ was regenerated once by #389 (the new metric keys, `staged_depth`, depth 50,
 
 **The confidence tabulation (#389).** `python -m scripts.search_eval
 confidence --data DIR --threshold T` reads `confidence-rows.jsonl` (one line
-per usable `semantic_search` / `hybrid_search` row: `tool`, `class`,
+per non-refusal `semantic_search` / `hybrid_search` row with a resolved
+principal — a query the 200-character telemetry cap cut is kept, unlike for
+replay, and clicks are attributed over these rows plus the replay-usable
+searches: `tool`, `class`,
 `confidence` when the usage row recorded one, `created_at` in UTC epoch
 microseconds, `top_similarity`, `keyword_all`, `clicked` — no text, no path)
 and `mine-report.json`, connects to no database, and prints one
@@ -1324,7 +1327,11 @@ as excluded and contribute to no rate and no span. A keyword-only page (null
 `top_similarity`) is included, so a clicked-through keyword-only `low` is a
 false low. A tool's line is `INSUFFICIENT_DATA` under 14 days of post-change
 rows (by `created_at`) or under 200 clicked-through pages (zero included),
-otherwise PASS exactly when the rate is below 1/50; there is no aggregate.
+otherwise PASS exactly when the rate is below 1/50 (the span is judged
+unrounded); there is no aggregate. `mine` publishes the rows first and the
+report last with the rows' SHA-256 and count, and the tabulation refuses
+(exit 64) a pair that does not match, so one run's rows never tabulate under
+another run's provenance.
 `confidence-report.json` (counts and rates, checked by `assert_no_leak`)
 carries the mine run's `provenance` and `attachable`, and a non-attachable
 table begins with the `NOT ATTACHABLE` line; only attachable output leaves

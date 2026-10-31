@@ -336,6 +336,50 @@ def _number_or_none(v: Any) -> float | None:
     return float(v)
 
 
+def confidence_evidence_search(row: dict) -> bool:
+    """A `semantic_search` / `hybrid_search` row that is calibration
+    evidence (#389, Codex impl r1 M1): not a refusal, a resolved principal
+    and a well-typed `result_paths`. Unlike `usable_search`, a query or
+    folder the telemetry cap truncated does **not** exclude it — that rule
+    exists because a cut query cannot be replayed, and the tabulation
+    replays nothing. Dropping such pages could let the false-low gate PASS
+    on incomplete evidence."""
+    if row.get("tool") not in CONFIDENCE_TOOLS:
+        return False
+    params = row.get("params") or {}
+    if _refusal_reason(params) is not None or principal_of(row) is None:
+        return False
+    paths = params.get("result_paths")
+    return isinstance(paths, list) and all(isinstance(x, str) for x in paths)
+
+
+def _confidence_evidence(rows: list[dict], searches: list[dict], reads: list[dict],
+                         window_us: int) -> list[dict]:
+    """One confidence row per evidence search, with its own click
+    attribution: a usable read credits the latest search by the same
+    principal within the window whose `result_paths` holds the path, over
+    the union of the replay-usable searches and the evidence searches (so a
+    read still credits at most one search). The judgments are unaffected."""
+    evidence = [r for r in rows if confidence_evidence_search(r)]
+    pool = {r["id"]: r for r in (*searches, *evidence)}
+    index: dict[tuple, list[tuple[int, int]]] = defaultdict(list)
+    for r in pool.values():
+        principal = (r.get("user_id"), *principal_of(r))
+        for path in set(r["params"]["result_paths"]):
+            index[(principal, path)].append((r["created_at"], r["id"]))
+    for entries in index.values():
+        entries.sort()
+    clicked: set[int] = set()
+    for r in reads:
+        entries = index.get(((r.get("user_id"), *principal_of(r)), r["params"]["path"]))
+        if not entries:
+            continue
+        i = bisect.bisect_left(entries, (r["created_at"], -1)) - 1
+        if i >= 0 and entries[i][0] > r["created_at"] - window_us:
+            clicked.add(entries[i][1])
+    return [confidence_row(r, r["id"] in clicked) for r in evidence]
+
+
 def confidence_row(s: dict, clicked: bool) -> dict:
     """The calibration evidence of one search row (#389, D7): `tool`, the
     miner's query `class`, `created_at` (the export's UTC epoch
@@ -345,7 +389,10 @@ def confidence_row(s: dict, clicked: bool) -> dict:
     p = s["params"]
     row = {
         "tool": s["tool"],
-        "class": classify(normalize_text(p["query"])),
+        # A query the 200-character telemetry cap cut is still classed by
+        # what was logged (#389, Codex impl r1 M1): the row stays evidence.
+        "class": classify(normalize_text(p["query"])) if isinstance(p.get("query"), str)
+        and normalize_text(p["query"]) else "prose",
         "created_at": s["created_at"],
         "top_similarity": _number_or_none(p.get("top_similarity")),
         "keyword_all": p.get("keyword_all") if _is_int(p.get("keyword_all")) else None,
@@ -444,7 +491,6 @@ def mine(rows: list[dict], *, window_seconds: float = DEFAULT_WINDOW_SECONDS,
         entries.sort()
 
     credited_pairs: set[tuple[str, str]] = set()
-    clicked_positions: set[int] = set()
     credits = 0
     unattributed = 0
     for r in reads:
@@ -462,7 +508,6 @@ def mine(rows: list[dict], *, window_seconds: float = DEFAULT_WINDOW_SECONDS,
             continue
         credits += 1
         pos = hit[2]
-        clicked_positions.add(pos)
         qid = search_qid[pos]
         credited_pairs.add((qid, path))
         queries[qid].relevant.add(path)
@@ -537,8 +582,7 @@ def mine(rows: list[dict], *, window_seconds: float = DEFAULT_WINDOW_SECONDS,
         "manual_excluded_other_owner": n_manual_other_owner,
         "provenance": provenance,
     }
-    confidence_rows = [confidence_row(s, pos in clicked_positions)
-                       for pos, s in enumerate(searches) if s["tool"] in CONFIDENCE_TOOLS]
+    confidence_rows = _confidence_evidence(rows, searches, reads, window_us)
     report["confidence_rows"] = len(confidence_rows)
     return MineResult(queries=out_queries, qrels=qrels, report=report,
                       confidence_rows=confidence_rows)
