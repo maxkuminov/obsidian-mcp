@@ -91,8 +91,8 @@ Refs #402. Read `proposal.md`, `design.md` (D1–D10, the owner decisions, L1–
   - `docs/architecture/usage-attribution.md`: `rerank_documents`.
 
   Grep that every changed setting is named in README and `.env.example`.
-- [ ] 8.2 `openspec-verifier` subagent (not the implementer). Iterate to zero blocking gaps.
-- [ ] 8.3 **Adversarial Codex** (mandatory: a search path an agent acts on). Give it the specs and changed files, and frame it as a defensive PASS/FAIL review. What counts as wrong here:
+- [x] 8.2 `openspec-verifier` subagent (not the implementer). Iterate to zero blocking gaps.
+- [x] 8.3 **Adversarial Codex** (mandatory: a search path an agent acts on). Give it the specs and changed files, and frame it as a defensive PASS/FAIL review. What counts as wrong here:
   - a silently wrong order;
   - a candidate the incumbent scored left unscored;
   - a preview or locator that disagrees with the score;
