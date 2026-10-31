@@ -1,3 +1,4 @@
+import contextvars
 import hashlib
 import logging
 import os
@@ -41,6 +42,13 @@ from src.oauth.trust import (
     redirect_display_host,
 )
 from src.services import panel_csp, security_events
+
+# The caller's submitted client_id for the /token request in progress
+# (#357). `_token_refused` falls back to it when a call site passes none,
+# so no /token record can drop `cimd_host` / `cimd_ref`.
+_SUBMITTED_CLIENT_ID: contextvars.ContextVar = contextvars.ContextVar(
+    "oauth_submitted_client_id", default=None
+)
 
 # No module logger, deliberately. Everything this module records is an
 # authentication outcome a caller can drive on demand, so it goes through
@@ -139,14 +147,17 @@ def _token_refused(
     resolved neither — a missing field means the path did not have it, which is
     the honest answer.
     """
+    if submitted_client_id is None:
+        submitted_client_id = _SUBMITTED_CLIENT_ID.get()
+    submitted = cimd.submitted_fields(submitted_client_id, resolved=bool(client_id))
     security_events.emit(
         "oauth_token_refused",
         subject=security_events.subject_for(request=request),
         reason=reason,
         client_id=client_id,
-        client_id_submitted=None if client_id else cimd.submitted_for_log(submitted_client_id),
-        cimd_host=cimd.host_for_log(submitted_client_id),
-        cimd_ref=cimd.ref_for_log(submitted_client_id) if cimd.is_cimd_client_id(submitted_client_id) else None,
+        client_id_submitted=submitted.client_id_submitted,
+        cimd_host=submitted.cimd_host,
+        cimd_ref=submitted.cimd_ref,
         user_id=user_id,
         grant_id=grant_id,
         client_ip=security_events.client_ip(request),
@@ -169,15 +180,15 @@ def _authorize_refused(
     An `https://` client_id is never logged (#357): `cimd_host` and the 16-hex
     `cimd_ref` stand in for it.
     """
-    is_cimd = cimd.is_cimd_client_id(submitted_client_id)
+    submitted = cimd.submitted_fields(submitted_client_id, resolved=bool(client_id))
     security_events.emit(
         "oauth_authorize_refused",
         subject=security_events.subject_for(request=request),
         reason=reason,
         client_id=client_id,
-        client_id_submitted=None if client_id else cimd.submitted_for_log(submitted_client_id),
-        cimd_host=cimd_host or cimd.host_for_log(submitted_client_id),
-        cimd_ref=cimd.ref_for_log(submitted_client_id) if is_cimd else None,
+        client_id_submitted=submitted.client_id_submitted,
+        cimd_host=cimd_host or submitted.cimd_host,
+        cimd_ref=submitted.cimd_ref,
         user_id=user_id,
         client_ip=security_events.client_ip(request),
         resource_class=oauth_resource.resource_class(request),
@@ -253,15 +264,15 @@ def _revoke_noop(request, reason: str, submitted_client_id=None) -> None:
     foreign or already dead, so the log is the only place the distinction
     exists.
     """
-    is_cimd = cimd.is_cimd_client_id(submitted_client_id)
+    submitted = cimd.submitted_fields(submitted_client_id)
     security_events.emit(
         "oauth_revoke_noop",
         level=logging.INFO,
         subject=security_events.subject_for(request=request),
         reason=reason,
-        client_id_submitted=cimd.submitted_for_log(submitted_client_id),
-        cimd_host=cimd.host_for_log(submitted_client_id),
-        cimd_ref=cimd.ref_for_log(submitted_client_id) if is_cimd else None,
+        client_id_submitted=submitted.client_id_submitted,
+        cimd_host=submitted.cimd_host,
+        cimd_ref=submitted.cimd_ref,
         client_ip=security_events.client_ip(request),
     )
 
@@ -828,7 +839,7 @@ async def _authorize_get(
         _authorize_refused(request, "unknown_client", submitted_client_id=client_id)
         return JSONResponse({"error": "invalid_client"}, status_code=400)
 
-    if redirect_uri not in client.redirect_uris:
+    if not cimd.redirect_uri_allowed(client.redirect_uris, redirect_uri, cimd=False):
         _authorize_refused(
             request, "invalid_redirect_uri", client_id=client.client_id
         )
@@ -1144,7 +1155,7 @@ async def _authorize_post(
             )
             return JSONResponse({"error": "invalid_client"}, status_code=400)
 
-        if redirect_uri not in client_row.redirect_uris:
+        if not cimd.redirect_uri_allowed(client_row.redirect_uris, redirect_uri, cimd=False):
             _authorize_refused(
                 request,
                 "invalid_redirect_uri",
@@ -1311,9 +1322,9 @@ async def _authorize_post(
         # takes the row lock the sweep's `FOR UPDATE` contends for, so if the
         # sweep has already deleted this registration we learn it here, with
         # nothing written, instead of from a foreign-key violation on the
-        # INSERT. `_authorize_refused` is not emitted — the refusal is the
-        # sweep's ordinary work, not a rejected authorization attempt, and the
-        # sweep logs its own count.
+        # INSERT. Since #357 it is recorded as `oauth_authorize_refused`
+        # (`client_vanished`), so every /authorize refusal carries a record and
+        # its `resource_class`; the sweep still logs its own count.
         if not await _stamp_client_use(session, client_id):
             _authorize_refused(
                 request, "client_vanished", submitted_client_id=client_id,
@@ -1388,8 +1399,8 @@ async def _authorize_post_cimd(
             )
         session_user_id = current_user.id
 
-    client_host = cimd.host_for_log(client_id)
-    client_ref = cimd.ref_for_log(client_id)
+    submitted = cimd.submitted_fields(client_id)
+    client_host, client_ref = submitted.cimd_host, submitted.cimd_ref
     try:
         projection = await cimd.resolve(client_id, security_events.client_ip(request))
     except cimd.CimdRefusal as refusal:
@@ -1525,9 +1536,16 @@ async def _authorize_post_cimd(
 @router.post("/token")
 @limiter.limit("10/minute")
 async def token_endpoint(request: Request):
-    form = await request.form()
+    # A body that does not parse is classified without a re-read (#357).
+    oauth_resource.set_fixed(request, oauth_resource.UNCLASSIFIED_MALFORMED)
+    try:
+        form = await request.form()
+    except Exception:
+        oauth_resource.finish(request)
+        raise
     grant_type = form.get("grant_type")
     oauth_resource.begin(request, _getlist(form, "resource"))
+    token = _SUBMITTED_CLIENT_ID.set(form.get("client_id"))
     try:
         if grant_type == "authorization_code":
             return await _handle_auth_code(form, request)
@@ -1541,6 +1559,7 @@ async def token_endpoint(request: Request):
             )
             return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
     finally:
+        _SUBMITTED_CLIENT_ID.reset(token)
         oauth_resource.finish(request)
 
 
@@ -1563,6 +1582,7 @@ async def _handle_auth_code(form, request=None):
     # The caller's `client_id` until a row resolves. Every refusal below that
     # has not yet read `oauth_clients` reports it as `client_id_submitted`.
     submitted_client_id = client_id
+    _SUBMITTED_CLIENT_ID.set(client_id)
 
     if not all([code, code_verifier]):
         _token_refused(
@@ -2051,6 +2071,7 @@ async def _handle_refresh(form, request=None):
     # in the rotation-failure handler below, where `client_id` may still hold
     # the caller's form value.
     submitted_client_id = client_id
+    _SUBMITTED_CLIENT_ID.set(client_id)
     resolved_client_id: str | None = None
     resolved_grant_id: str | None = None
     resolved_user_id: int | None = None
@@ -2661,11 +2682,14 @@ async def revoke_token(request: Request):
                 if not _client_authenticated(client, client_secret):
                     # The one case that is a real error rather than a no-op:
                     # the right client was named and failed to authenticate.
+                    submitted = cimd.submitted_fields(client_id, resolved=True)
                     security_events.emit(
                         "oauth_revoke_refused",
                         subject=security_events.subject_for(request=request),
                         reason="client_auth_failed",
                         client_id=oauth_token.client_id,
+                        cimd_host=submitted.cimd_host,
+                        cimd_ref=submitted.cimd_ref,
                         client_ip=security_events.client_ip(request),
                     )
                     return JSONResponse({"error": "invalid_client"}, status_code=401)

@@ -284,3 +284,141 @@ async def test_a_referenced_cimd_row_is_never_swept(db):
         await session.commit()
     assert await indexer._expire_unreferenced_cimd_clients() == 0
     assert len(await rows(db)) == 1
+
+
+# ── verifier round (a1a4bbb): /token records, replay alarms, terminal paths ─
+
+
+@pytest.fixture
+def emitted(monkeypatch):
+    from src.services import security_events
+
+    records: list[tuple[str, dict]] = []
+    real = security_events.emit
+
+    def capture(event, **kwargs):
+        records.append((event, kwargs))
+        return real(event, **kwargs)
+
+    monkeypatch.setattr(security_events, "emit", capture)
+    return records
+
+
+def classified_request(resource=None) -> Request:
+    from src.oauth import resource as oauth_resource
+
+    req = request()
+    oauth_resource.begin(req, [resource] if resource else [])
+    return req
+
+
+def named(emitted, event):
+    return [kw for name, kw in emitted if name == event]
+
+
+async def test_a_spent_code_under_a_synthetic_id_revokes_nothing(db, emitted):
+    code = code_of(await approve())
+    assert (await exchange(code)).status_code == 200
+    replay = await exchange(code, client_id="cimd_" + "f" * 59)
+    assert replay.status_code == 400 and body(replay) == {"error": "invalid_grant"}
+    async with db() as session:
+        tokens = (await session.execute(select(OAuthToken))).scalars().all()
+    assert tokens and not any(t.revoked for t in tokens)
+    reasons = [kw["reason"] for kw in named(emitted, "oauth_token_refused")]
+    assert reasons[-1] == "invalid_grant.spent_code_internal_id_submitted"
+
+
+async def test_the_synthetic_id_replay_emits_the_reuse_alarm(db, emitted):
+    tokens = body(await exchange(code_of(await approve())))
+    assert (await refresh(tokens["refresh_token"])).status_code == 200
+    await refresh(tokens["refresh_token"], client_id="cimd_nonexistent")
+    (alarm,) = named(emitted, "oauth_refresh_reuse_detected")
+    assert alarm["revoked_tokens"] >= 1
+
+
+async def test_https_mismatch_at_token_and_revoke_logs_host_and_ref_only(db, emitted):
+    other = "https://a.example/x"
+    code = code_of(await approve())
+    assert (await exchange(code, client_id=other)).status_code == 400
+    tokens = body(await exchange(code))
+    assert (await refresh(tokens["refresh_token"], client_id=other)).status_code == 400
+    assert (await _revoke(tokens["access_token"], other)).status_code == 200
+    records = named(emitted, "oauth_token_refused")[-2:] + named(emitted, "oauth_revoke_noop")[-1:]
+    assert len(records) == 3
+    for kw in records:
+        assert kw["cimd_host"] == "a.example"
+        assert len(kw["cimd_ref"]) == 16
+        assert kw.get("client_id_submitted") is None
+    assert other not in json.dumps(emitted, default=str)
+
+
+async def test_the_token_endpoint_and_refresh_never_fetch(db, monkeypatch):
+    """Task 6.5: no document fetch on /token or refresh, whatever the cache holds."""
+    code = code_of(await approve())
+    cimd.reset_state_for_tests()  # nothing cached: a fetch would be needed
+
+    async def no_fetch(*_a, **_kw):
+        raise AssertionError("a document fetch on the token path")
+
+    monkeypatch.setattr(cimd, "resolve", no_fetch)
+    monkeypatch.setattr(cimd, "_fetch", no_fetch)
+    tokens = body(await exchange(code))
+    assert (await refresh(tokens["refresh_token"])).status_code == 200
+
+
+async def test_token_terminal_paths_carry_the_resource_class(db, emitted, monkeypatch):
+    base = oauth.settings.base_url.rstrip("/")
+    # issued
+    req = classified_request(f"{base}/mcp")
+    code = code_of(await approve())
+    issued = await oauth._handle_auth_code(
+        {"code": code, "code_verifier": VERIFIER, "redirect_uri": REDIRECT, "client_id": URL}, req
+    )
+    assert issued.status_code == 200
+    assert named(emitted, "oauth_token_issued")[-1]["resource_class"] == "accepted_1"
+    tokens = body(issued)
+
+    # code replay detected
+    req = classified_request("https://other.example/")
+    await oauth._handle_auth_code(
+        {"code": code, "code_verifier": VERIFIER, "redirect_uri": REDIRECT, "client_id": URL}, req
+    )
+    (replay,) = named(emitted, "oauth_code_replay_detected")
+    assert replay["resource_class"] == "unexpected" and replay["resource_host"] == "other.example"
+
+    # refresh reuse detected
+    tokens = body(await exchange(code_of(await approve())))
+    assert (await refresh(tokens["refresh_token"])).status_code == 200
+    req = classified_request()
+    await oauth._handle_refresh({"refresh_token": tokens["refresh_token"], "client_id": URL}, req)
+    assert named(emitted, "oauth_refresh_reuse_detected")[-1]["resource_class"] == "absent"
+
+    # rotation failed
+    fresh = body(await exchange(code_of(await approve())))
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("injected")
+
+    real_clamp = oauth.clamp_token_expiry
+    monkeypatch.setattr(oauth, "clamp_token_expiry", boom)
+    req = classified_request()
+    failed = await oauth._handle_refresh({"refresh_token": fresh["refresh_token"]}, req)
+    assert failed.status_code == 500
+    assert named(emitted, "oauth_token_rotation_failed")[-1]["resource_class"] == "absent"
+    monkeypatch.setattr(oauth, "clamp_token_expiry", real_clamp)
+
+    # client vanished at the code exchange
+    code = code_of(await approve())
+
+    async def gone(*_a, **_kw):
+        return False
+
+    monkeypatch.setattr(oauth, "_stamp_client_use", gone)
+    req = classified_request()
+    vanished = await oauth._handle_auth_code(
+        {"code": code, "code_verifier": VERIFIER, "redirect_uri": REDIRECT}, req
+    )
+    assert vanished.status_code == 400
+    last = named(emitted, "oauth_token_refused")[-1]
+    assert last["reason"] == "invalid_client.client_vanished"
+    assert last["resource_class"] == "absent"

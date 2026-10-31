@@ -302,7 +302,7 @@ None open. Max answered all three on 2026-10-31: no CIMD host allow-list (decisi
 - **L6** The cache, cooldown and budgets are per process and reset on restart.
 - **L7** Timing distinguishes a cache hit from a fetch, and one refusal sub-reason from another. The response body does not.
 - **L8** A local program can claim a loopback callback. This is inherent to RFC 8252. The page warns, and PKCE binds the exchange.
-- **L9** The RFC 8707 `resource` parameter is checked but not enforced. A token requested for a foreign resource is still issued for this server, and the mismatch is only logged (`resource_class: unexpected` on the outcome event). Every token is for the one resource this server has, so the residual is a client misconfiguration going unrefused, not a token usable elsewhere. The `invalid_target` refusal is a follow-up issue (task 9.5), gated on 14 consecutive days of emitted `/authorize` and `/token` outcome records with no `resource_class: unexpected`. The outcome events pass the ordinary suppressor, so a burst from one address may be partly suppressed. Its first record per window is still emitted, which is all the gate needs to see that the class occurred.
+- **L9** The RFC 8707 `resource` parameter is checked but not enforced. A token requested for a foreign resource is still issued for this server, and the mismatch is only logged (`resource_class: unexpected` on the outcome event). Every token is for the one resource this server has, so the residual is a client misconfiguration going unrefused, not a token usable elsewhere. The `invalid_target` refusal is follow-up issue #404 (task 9.5), gated on 14 consecutive days of emitted `/authorize` and `/token` outcome records with no `resource_class: unexpected`. The outcome events pass the ordinary suppressor, so a burst from one address may be partly suppressed. Its first record per window is still emitted, which is all the gate needs to see that the class occurred.
 - **L14** A client whose every `/authorize` POST or `/token` request fails framework validation is recorded only as `unclassified_malformed` and never contributes evidence to the 14-day gate. It also never reaches the authorization server: no code or token is issued to it.
 - **L13** Rotating `SECRET_KEY` changes the derived synthetic ids. The next approval of each (URL, user) creates a new row, and the old row keeps its grants until they expire, after which D9 sweeps it. (Rotating `SECRET_KEY` already invalidates sessions and consent state.)
 - **L10** Per-address budget collisions: two addresses sharing a salted slot (about 1 in 4,095 per pair, not choosable) share one budget and one in-flight allowance for that window.
@@ -399,3 +399,41 @@ What changed (supervisor decision, 2026-10-31; no further Codex spec round):
 
 1. **Universal pre-lookup wording (MAJOR, prose).** proposal.md, D8 and the threat-model row now state the endpoint-specific order. `/authorize` refuses before any lookup. `/token` resolves the credential and runs the unchanged replay/reuse processing first, including full #325 revalidation for spent codes. `/revoke` is a concealed RFC 7009 200 no-op decided before the token lookup.
 2. **Universal `invalid_client` 400 wording (MINOR, prose).** D12, decision 12, task 9.3 and the proposal now scope the constant `invalid_client` 400 to `/authorize`. `/token` and `/revoke` keep their endpoint-specific responses.
+
+## Verifier — implementation (a1a4bbb)
+
+The independent `openspec-verifier` found 0 blocking, 2 MAJOR and 7 MINOR. All
+were folded (supervisor decisions, 2026-10-31):
+
+1. **MAJOR: `/token` mismatch records dropped `cimd_host` / `cimd_ref`.**
+   The code-exchange mismatch, the refresh mismatch and `_refuse_spent` passed
+   no `submitted_client_id`. Fixed at the root. `cimd.submitted_fields(value,
+   *, resolved)` is the single shared helper, used by `_token_refused`,
+   `_authorize_refused`, `_revoke_noop`, `oauth_revoke_refused` and the CIMD
+   consent records (the four hand copies are gone). `/token` also sets a
+   per-request `ContextVar` with the caller's `client_id`, which
+   `_token_refused` falls back to, so no `/token` call site can drop the fields.
+   Positive test: an `https://a.example/x` mismatch at the code exchange, the
+   refresh and `/revoke` logs `cimd_host` and `cimd_ref` and never the URL.
+2. **MAJOR: tasks ticked without tests.** Added the following tests:
+   - a spent code under a `cimd_` id gets the unknown-code response, nothing is revoked, and the log reason is `invalid_grant.spent_code_internal_id_submitted`;
+   - the `cimd_nonexistent` replay emits `oauth_refresh_reuse_detected`;
+   - the `/token` terminal-path matrix: `resource_class` on `oauth_token_issued`, `oauth_code_replay_detected`, `oauth_refresh_reuse_detected`, `oauth_token_rotation_failed`, `invalid_client.client_vanished`, and an injected unhandled exception at `/token` and at `/authorize`;
+   - task 6.5 rewritten to the true statement, that `/token` and refresh never fetch, pinned by a test that makes the fetch raise.
+3. MINOR: #404 is cited in L9, task 9.5, DEPLOYMENT.md's gate recipe and the
+   OAuth note.
+4. MINOR: DCR GET/POST now go through `cimd.redirect_uri_allowed(..., cimd=False)`,
+   so one function serves both, as task 5.1 says.
+5. MINOR: the sweep's starvation is fixed. The CIMD **candidate** query carries
+   the no-code/no-token predicate, so a referenced row is never selected or
+   row-locked (the in-lock re-read keeps it as well).
+6. MINOR: 036 now follows 025's pattern: `statement_timeout`, a pinned and
+   asserted `search_path` (the qualified oid equals the unqualified one) and
+   `RESET` at the end, in both upgrade and downgrade.
+7. MINOR: a `/token` form-parse failure is classified. The request starts as
+   `unclassified_malformed` before `request.form()`, and on an exception the
+   classification-only record is emitted with no re-read.
+8. MINOR: the stale comment about `_authorize_refused` not being emitted for
+   client-vanished now says what the code does.
+9. MINOR: `oauth_revoke_refused` carries `cimd_host` / `cimd_ref` through the
+   helper (catalogue updated).

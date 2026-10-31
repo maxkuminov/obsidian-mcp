@@ -1201,7 +1201,7 @@ kubectl logs deploy/obsidian-mcp | grep '"msg": "oauth_consent_granted"' \
 A DCR registration shows `oauth_client_registered` with
 `registration_kind: dcr`. On a compose host use `docker logs obsidian-mcp`.
 
-**The 14-day `resource` gate.** RFC 8707 `resource` is classified on every
+**The 14-day `resource` gate (follow-up #404).** RFC 8707 `resource` is classified on every
 `/authorize` and `/token` request and never refused in this release. A later
 change may refuse a foreign value with `invalid_target`, but only after **14
 consecutive days with no `resource_class: unexpected`** on any record. The
@@ -1214,8 +1214,8 @@ kubectl logs deploy/obsidian-mcp --since=24h \
   | sort | uniq -c
 ```
 
-Any `unexpected` line names only the host the client sent. Record it in the
-follow-up issue before anything is enforced.
+Any `unexpected` line names only the host the client sent. Record it in
+#404 before anything is enforced.
 
 ## Upgrading across migration 035 (tags in keyword search, #391)
 

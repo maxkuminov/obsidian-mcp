@@ -911,6 +911,46 @@ def test_a_malformed_post_is_unclassified_without_a_body_read(monkeypatch, emitt
     assert "other.example" not in json.dumps(emitted, default=str)
 
 
+def test_an_unhandled_exception_at_token_is_classified(monkeypatch, emitted):
+    async def explode(*_a, **_kw):
+        raise RuntimeError("injected")
+
+    monkeypatch.setattr(routes, "_handle_auth_code", explode)
+    limiter.reset()
+    response = TestClient(_app_with_handlers(), raise_server_exceptions=False).post(
+        "/token",
+        data={"grant_type": "authorization_code", "resource": "https://other.example/mcp"},
+    )
+    assert response.status_code == 500
+    classified = [kw for event, kw in emitted if event == "oauth_resource_classified"]
+    assert [(c["resource_class"], c["resource_host"]) for c in classified] == [
+        ("unexpected", "other.example")
+    ]
+
+
+def test_an_unhandled_exception_at_authorize_is_classified(client, origin, monkeypatch, emitted):
+    async def explode(*_a, **_kw):
+        raise RuntimeError("injected")
+
+    monkeypatch.setattr(routes, "_authorize_get", explode)
+    response = TestClient(client.app, raise_server_exceptions=False).get(
+        "/authorize", params={
+            "response_type": "code", "client_id": CLAUDE_CODE_URL,
+            "redirect_uri": "http://localhost:1/callback", "code_challenge": PKCE,
+        },
+    )
+    assert response.status_code == 500
+    assert [kw["resource_class"] for e, kw in emitted if e == "oauth_resource_classified"] == ["absent"]
+
+
+def test_the_shared_submitted_fields_helper():
+    assert cimd.submitted_fields("https://a.example/x?y") == cimd.SubmittedFields(
+        None, "a.example", hashlib.sha256(b"https://a.example/x?y").hexdigest()[:16]
+    )
+    assert cimd.submitted_fields("a3f1") == cimd.SubmittedFields("a3f1", None, None)
+    assert cimd.submitted_fields("a3f1", resolved=True) == cimd.SubmittedFields(None, None, None)
+
+
 def test_the_token_429_rides_rate_limit_exceeded_without_reading_the_body(emitted):
     from types import SimpleNamespace
 

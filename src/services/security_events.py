@@ -278,7 +278,9 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
     "oauth_resource_classified": frozenset(
         {"resource_class", "resource_host", "route"}
     ),
-    "oauth_revoke_refused": frozenset({"reason", "client_id", "client_ip"}),
+    "oauth_revoke_refused": frozenset(
+        {"reason", "client_id", "client_ip", "cimd_host", "cimd_ref"}
+    ),
     # ── The request boundary (Slice A) ──
     "rate_limit_exceeded": frozenset(
         {"route", "method", "client_ip", "limit_count", "window_seconds",

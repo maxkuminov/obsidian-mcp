@@ -30,6 +30,7 @@ import secrets
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
+from typing import NamedTuple
 from urllib.parse import unquote, urlsplit
 
 from src.config import settings
@@ -112,6 +113,26 @@ def ref_for_log(value) -> str | None:
 def submitted_for_log(value):
     """What may go in `client_id_submitted`: never an https client_id (D12)."""
     return None if is_cimd_client_id(value) else value
+
+
+class SubmittedFields(NamedTuple):
+    client_id_submitted: object
+    cimd_host: str | None
+    cimd_ref: str | None
+
+
+def submitted_fields(value, *, resolved: bool = False) -> SubmittedFields:
+    """The one definition of how a submitted client_id is logged (D12).
+
+    An `https://` value is never logged: `cimd_host` and the 16-hex `cimd_ref`
+    stand in for it. A DCR value goes in `client_id_submitted` unless a row
+    already `resolved` (then only the row's `client_id` may appear, D15).
+    Every OAuth emission site that records a submitted client identifier
+    takes its three fields from here.
+    """
+    if is_cimd_client_id(value):
+        return SubmittedFields(None, host_for_log(value), ref_for_log(value))
+    return SubmittedFields(None if resolved else value, None, None)
 
 
 def validate_client_id_url(value: str) -> str:

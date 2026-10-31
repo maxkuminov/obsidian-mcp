@@ -7827,6 +7827,15 @@ async def _expire_unreferenced_cimd_clients() -> int:
                 .where(
                     OAuthClient.client_id_metadata_url.is_not(None),
                     OAuthClient.last_used_at < cutoff,
+                    # In the candidate query too, not only the re-read: a
+                    # referenced row must never be selected or row-locked, or
+                    # a full batch of referenced rows would starve the sweep.
+                    ~select(OAuthCode.id)
+                    .where(OAuthCode.client_id == OAuthClient.client_id)
+                    .exists(),
+                    ~select(OAuthToken.id)
+                    .where(OAuthToken.client_id == OAuthClient.client_id)
+                    .exists(),
                 )
                 .order_by(OAuthClient.id)
                 .limit(OAUTH_CLIENT_EXPIRY_BATCH)

@@ -743,7 +743,7 @@ logs its own INFO count.
 
   The class is set once at handler entry and rides every record the request emits. A terminal path with no required outcome event emits one `oauth_resource_classified`: a consent render, the login redirect, an unhandled exception, or a framework 422 (route-aware handler in `src/main.py`, query only on `GET /authorize`, no body read elsewhere). The `/token` 429 carries the class on its existing `rate_limit_exceeded` record and reads no body.
 
-  The follow-up that would refuse with `invalid_target` may rely on exactly this evidence: 14 consecutive days with no `unexpected` on any of these records, the two `unclassified_*` classes excluded. The query is in `DEPLOYMENT.md`.
+  The follow-up that would refuse with `invalid_target` (#404) may rely on exactly this evidence: 14 consecutive days with no `unexpected` on any of these records, the two `unclassified_*` classes excluded. The query is in `DEPLOYMENT.md`.
 
 **Accepted limitations (#357)**, recorded so they are not re-fixed when
 re-reported:
@@ -755,7 +755,7 @@ re-reported:
 - L6 The cache, cooldown and budgets are per process.
 - L7 Timing distinguishes a cache hit from a fetch.
 - L8 A local program can claim a loopback callback; the page warns, and PKCE binds the exchange.
-- L9 `resource` is not enforced.
+- L9 `resource` is not enforced (follow-up #404).
 - L10 Colliding addresses share a budget slot.
 - L11 Eight distinct addresses holding 10 s fetches can fill the global cap for 10 s.
 - L12 An origin edit inside the freshness window is not seen at the POST.

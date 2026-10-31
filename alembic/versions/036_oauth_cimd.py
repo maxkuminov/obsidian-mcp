@@ -99,10 +99,42 @@ def _constraint_def(bind):
     ).scalar()
 
 
-def upgrade() -> None:
-    bind = op.get_bind()
+def _pin_and_assert(bind) -> None:
+    """025's device: pin `search_path` and prove the unqualified name is ours.
+
+    `op.add_column` / `COMMENT ON` / the constraint DDL are unqualified and
+    resolve through `search_path`; a column added to an `oauth_clients` in a
+    decoy schema would leave the routes writing a table the sweep never reads.
+    """
     op.execute("SET LOCAL search_path TO public")
     op.execute("SET LOCAL lock_timeout = '10s'")
+    op.execute("SET LOCAL statement_timeout = '60s'")
+    qualified = bind.execute(
+        sa.text("SELECT CAST(to_regclass('public.oauth_clients') AS oid)")
+    ).scalar()
+    unqualified = bind.execute(
+        sa.text("SELECT CAST(to_regclass('oauth_clients') AS oid)")
+    ).scalar()
+    if qualified is None or qualified != unqualified:
+        raise RuntimeError(
+            "036's oauth_clients is not the table public.oauth_clients resolves "
+            f"to (search_path-relative oid {unqualified!r}, qualified oid "
+            f"{qualified!r}). Set the migration role's search_path so `public` "
+            "comes first, then re-run. Nothing has been changed."
+        )
+
+
+def _reset() -> None:
+    # alembic runs every pending revision in one transaction, so a SET LOCAL
+    # would otherwise leak into a later revision (013 through 025 do the same).
+    op.execute("RESET lock_timeout")
+    op.execute("RESET statement_timeout")
+    op.execute("RESET search_path")
+
+
+def upgrade() -> None:
+    bind = op.get_bind()
+    _pin_and_assert(bind)
 
     state = _column_state(bind)
     if state is None:
@@ -150,12 +182,12 @@ def upgrade() -> None:
                 "036 will not adopt it. Drop it and re-run. Nothing has been changed."
             )
 
-    op.execute("RESET lock_timeout")
-    op.execute("RESET search_path")
+    _reset()
 
 
 def downgrade() -> None:
     bind = op.get_bind()
+    _pin_and_assert(bind)
     count = bind.execute(
         sa.text(f"SELECT count(*) FROM {TABLE} WHERE {COLUMN} IS NOT NULL")
     ).scalar_one()
@@ -167,3 +199,4 @@ def downgrade() -> None:
         )
     op.drop_constraint(CHECK, TABLE, type_="check")
     op.drop_column(TABLE, COLUMN)
+    _reset()
