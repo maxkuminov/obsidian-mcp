@@ -62,13 +62,13 @@
 
 - [x] 6.1 `pytest tests` green offline. Also green: `make test-integration`, `make search-eval` (fixture) and `openspec validate search-confidence --strict`
 - [x] 6.2 `openspec-verifier` (non-author), iterated to zero blocking gaps — 0 blocking in code, 2 spec-text MAJOR, 4 minor, all folded
-- [ ] 6.3 Adversarial Codex (mandatory: search-path change), `-m gpt-daybreak-blue-latest`, read-only, on the committed tree. Framing:
+- [x] 6.3 Adversarial Codex (mandatory: search-path change), `-m gpt-daybreak-blue-latest`, read-only, on the committed tree. Framing:
   - a false `low` on a good page pushes an agent away from the right notes;
   - a missing `low` on noise is the bug being fixed;
   - the hint must never cost a row;
   - the 1,000-character bound must hold on every page.
 
-  Two rounds, triaged per the workflow
+  Two rounds, triaged per the workflow — round 1 FAIL (4 findings, all fixed); round 2 PASS: 4 VERIFIED, no findings
 - [ ] 6.4 Search eval gate: `make search-eval-snapshot`, then `make search-eval` on a restored copy against the incumbent `BASELINE` (re-staged at depth 50). Attach the report only if `attachable: true`
 
 ## 7. Archive

@@ -243,3 +243,7 @@ Verdict FAIL: 1 BLOCKER, 2 MAJOR, 1 MINOR, all fixed.
 - **m1, rounded 14-day boundary.** Judged unrounded (N17).
 
 The verifier's pass: 0 blocking in code, 2 spec-text MAJOR (V1 the unreachable scenario clause, V2 the 140 texts), 4 minor (V3 hybrid golden, V4–V6 readings stated in the search-evaluation delta and N10/N11/N12), all folded.
+
+## Codex implementation review, round 2 (2026-10-31)
+
+Verdict PASS on 51937f2: all four round-1 fixes (B1, M1, M2, m1) VERIFIED, no findings.
