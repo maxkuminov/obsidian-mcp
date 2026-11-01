@@ -1152,8 +1152,12 @@ with the harness (above) on your own judgments before telling agents to use
 it. Before [#402](https://github.com/maxkuminov/obsidian-mcp/issues/402) it
 scored one heading-less chunk per note, which demoted some notes both search
 arms ranked first; #402 sends the embedded text of up to four fetched chunks
-per note instead, and its real-data quality gate is still to be run before
-you rely on it. The reranker receives the query and candidate note text, so give it the
+per note instead; its real-data quality gate ran on 2026-10-31 against the previous
+reranker documents and passed 4 of 6 reports (the owner waived one
+near-miss cell; see the archived `rerank-documents` design). Measured
+against `rerank=false` on the reference vault (see "Does `rerank=true`
+help?" below), it improves `semantic_search` and makes `hybrid_search`
+worse. The reranker receives the query and candidate note text, so give it the
 same trust as your embedding endpoint.
 
 One wire format is supported: the Jina-compatible `/v1/rerank` that
@@ -1184,13 +1188,14 @@ reference deployment runs llama.cpp's `llama-server` from the
 
 ```sh
 RERANK_URL=https://<host>:<port>/v1/rerank
-RERANK_TIMEOUT_MS=10000
+RERANK_TIMEOUT_MS=20000
 ```
 
 Measured on that card with nothing else running: 50 documents of ~410
 characters in 1.6 s, 50 documents of 2,000 characters in 7.3 s. Candidates
 are cut to 2,048 characters, so the 1,500 ms default is too short there;
-10,000 ms is the setting's maximum. An internal CA goes in
+the setting accepts 100–30000 ms, and the sizing table below explains the
+reference value of 20,000 ms. An internal CA goes in
 `EMBEDDING_CA_FILE`, which is the reranker's trust anchor too.
 
 Restart, then check:
@@ -1212,17 +1217,61 @@ characters sent. Measured on an NVIDIA Quadro P4000 running
 | 50 × ~2,000 characters | 7.3 s (measured) |
 | 100 × ~410 characters | ≈ 3.2 s (scaled) |
 | 100 × ~2,000 characters | ≈ 15 s (scaled) |
+| 24 × 2,000 characters | 3.2 s (measured 2026-11-01) |
+| 50 × 2,000 characters | 6.7 s (measured 2026-11-01) |
+| 68 × 2,000 characters | 9.1 s (measured 2026-11-01) |
+
+The 2026-11-01 rows were measured on the same P4000, uncontended, over a
+loopback port-forward, with 2,000-character documents and
+`bge-reranker-v2-m3` Q8_0 under llama.cpp: about 133 ms per document,
+consistent with the 75 µs per character above. A hybrid `rerank=true`
+call sends 67–68 documents on the reference vault, so it takes about
+9–10 s there uncontended. That is why the reference deployment runs
+`RERANK_TIMEOUT_MS=20000`, and why the 10,000 ms it ran before timed out
+on every hybrid rerank call.
+
+**Does `rerank=true` help? Measured 2026-11-01** on a snapshot of the
+reference vault, scoped to one user: 196 mined queries (66 identifier, 130
+prose), 390 judged paths, depth 50, the plain tool as `BASELINE`, paired
+bootstrap CI95, `RERANK_TIMEOUT_MS=20000`, `RERANK_MAX_DOCUMENTS=100`, no
+unreranked answer in either run, about 6.4–6.9 s per reranked query on the
+P4000. Overall, plain → reranked (Δ [CI95]):
+
+| metric | `semantic_search` | `hybrid_search` |
+| --- | --- | --- |
+| recall@10 | 0.505 → 0.582 (+0.077 [+0.037, +0.116]) | 0.654 → 0.628 (−0.026 [−0.085, +0.028]) |
+| recall@20 | 0.571 → 0.627 (+0.056 [+0.015, +0.095]) | 0.791 → 0.731 (−0.060 [−0.110, −0.013]) |
+| MRR | 0.383 → 0.433 (+0.050 [+0.005, +0.093]) | 0.533 → 0.465 (−0.068 [−0.120, −0.020]) |
+| nDCG@10 | 0.389 → 0.442 (+0.053 [+0.016, +0.090]) | 0.519 → 0.474 (−0.045 [−0.086, −0.005]) |
+
+On `semantic_search` the gains are of similar size in both classes
+(identifier MRR +0.084 [+0.007, +0.158], prose recall@10 +0.082 [+0.033,
++0.134]); recall@50 is unchanged by construction, because the same 50
+candidates are reordered. On `hybrid_search` reranking loses (prose
+recall@20 −0.069 [−0.130, −0.013]): plain hybrid is already the strongest
+ranking on this vault (nDCG@10 0.519, against reranked semantic's 0.442).
+The judgments are mined from what agents read after the existing tools'
+results, which favours the ordering they saw, so hybrid's loss may be
+somewhat overstated; it does not turn into a gain.
+
+So keep `rerank=false` as the default. `rerank=true` is worth its cost
+with `semantic_search` when the top few rows matter; do not use it with
+`hybrid_search`, which should stay a plain call. After a model or
+reranker change, re-run the same two reports: the arms
+`scripts.search_eval_arms.rerank:make_semantic_arm` and
+`scripts.search_eval_arms.rerank:make_hybrid_arm`, each against its plain
+tool as `BASELINE`, then the `gate` step with `--slices
+overall,class:identifier,class:prose`.
 
 Rule of thumb: `RERANK_TIMEOUT_MS ≥ RERANK_MAX_DOCUMENTS × average
 characters × per-character cost`, doubled when the GPU is shared with the
 embedding model (the indexer's batches slow it down). The 1,500 ms default is
 deliberately conservative and falls back on most calls on hardware like this;
 `RERANK_MAX_DOCUMENTS=50` restores the pre-#402 document count. The
-reference deployment runs `RERANK_TIMEOUT_MS=10000` (see the README's
-"Reranker reference setup"); at the 100-document default it moves to `20000`
-in its own infrastructure config, not here. Either value above
-`MCP_CONCURRENCY_WAIT_SECONDS` is valid **only while `MCP_CONCURRENCY_MODE`
-is `shadow` or `off`**.
+reference deployment runs `RERANK_TIMEOUT_MS=20000` since 2026-11-01, at
+the 100-document default (see the README's "Reranker reference setup").
+A value above `MCP_CONCURRENCY_WAIT_SECONDS` is valid **only while
+`MCP_CONCURRENCY_MODE` is `shadow` or `off`**.
 
 **The concurrency-mode rule.** A `rerank=true` call holds its `embedding`
 concurrency slot through the rerank exchange, up to `RERANK_TIMEOUT_MS`.

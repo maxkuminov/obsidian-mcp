@@ -54,6 +54,7 @@ reference deployment — or OpenAI `text-embedding-3-{small,large}`).
 - [Who this is for](#who-this-is-for)
 - [Control panel](#control-panel)
 - [Quick start](#quick-start)
+- [Versioning and compatibility](#versioning-and-compatibility)
 - [Upgrading](#upgrading)
 - [Cost expectations](#cost-expectations)
 - [The self-describing vault](#the-self-describing-vault)
@@ -1001,10 +1002,77 @@ The first thing any agent should do in a new session is call
 `get_vault_guide()`. That's how it learns your folder structure,
 naming conventions, and YAML schema before it writes anything.
 
+## Versioning and compatibility
+
+From 1.0 the version number is a promise about the MCP tool contract:
+the 28 tools' names, their argument schemas, the shape of their result
+lines, and the `MCP-REFUSAL` codes. An agent written against 1.0 keeps
+working against every 1.x.
+
+- **The wire form is pinned.** `tests/fixtures/tools_list_full_v1.json`
+  is the complete `tools/list` result an API key or a `readwrite` OAuth
+  grant sees (every field of all 28 tools), and
+  `tests/fixtures/tools_list_readonly_oauth.json` pins the 19 names a
+  read-only OAuth grant lists. CI fails on any drift; a deliberate change
+  regenerates the fixture and says so in its spec. Result line shapes
+  are specified in `openspec/specs/` and pinned by each tool's tests,
+  not by one fixture.
+- **Refusal codes are a closed set.** Every code an `MCP-REFUSAL` line can
+  carry is declared in `src/services/refusals.py` (`CODES`), and a refusal
+  with any other code cannot be constructed. That module is the catalogue;
+  there is no separate list. The transport 429s (failed authentication,
+  transfer redemption, `body_memory`) are outside that line by design.
+- **Within 1.x, additions only:** new tools, new optional arguments whose
+  default leaves the old result byte-identical, new header tokens or
+  trailing fields, new refusal codes. Never a rename, a removal, a changed
+  default that alters an existing result, or a changed meaning of an
+  existing field or code. A change of that kind is 2.0, announced one
+  minor release earlier in the release notes. Unknown arguments are
+  refused, so a client that sends a newer argument to an older server gets
+  a refusal, not a silently ignored filter.
+- **Settings.** A new setting ships with a default that keeps the previous
+  behaviour. Every setting change is in the release's upgrade notes, in
+  the [Configuration](#configuration) table and in `.env.example`.
+- **Schema.** Every release names its migrations and says whether they
+  refuse startup or need a rebuild or re-embed, and
+  [`DEPLOYMENT.md`](./DEPLOYMENT.md) documents each one's downgrade (it
+  does so for every migration from 033 on).
+
+Not part of the contract: the control panel and its `/api/*` endpoints,
+log fields, the search-evaluation harness (`scripts/search_eval/`), the
+internal MCP SDK version, and ranking quality. Which notes come back, and
+in what order, moves with the index, the embedding model and the
+reranker; the harness measures it
+([docs/architecture/search.md](./docs/architecture/search.md#search-evaluation-harness-356)).
+`MCP_SANDBOX_MODE`, the registry-evaluation switch, is outside the promise
+too.
+
 ## Upgrading
 
 Pull, then `make deploy` (or rebuild your compose stack); migrations
 run on start.
+
+Across the reranker-documents release (#402):
+
+- **No migration, nothing re-derived or re-embedded.** `rerank=true` now
+  sends each candidate note's embedding input (title, heading path, tags,
+  then the chunk) for its cosine-best chunk and up to three more of its
+  already-fetched chunks, at most `RERANK_MAX_DOCUMENTS` per call (new,
+  default 100, 50–200; `50` restores the previous count); a note scores
+  the best of its documents. `rerank=false` is byte-identical. The usage
+  row gains `rerank_documents`.
+- **`RERANK_TIMEOUT_MS` accepts 100–30000**; the default stays 1,500.
+  Size it with the document budget: `RERANK_TIMEOUT_MS ≥
+  RERANK_MAX_DOCUMENTS × average characters × per-character cost`,
+  doubled when the GPU is shared with the embedding model. The
+  reference deployment runs `20000`
+  ([DEPLOYMENT.md, "Reranker (optional)"](./DEPLOYMENT.md#reranker-optional)).
+  Under `MCP_CONCURRENCY_MODE` `queue` or `enforce`, keep it at or below
+  `MCP_CONCURRENCY_WAIT_SECONDS × 1000` unless `make concurrency-report`
+  passes with `rerank=true` traffic.
+- **Rollback** is a redeploy of the previous image. Set
+  `RERANK_TIMEOUT_MS` to 10000 or less first: the previous image's range
+  ends there and refuses to start above it.
 
 Across the Client ID Metadata Documents release (migration 036, #357):
 
@@ -1024,6 +1092,23 @@ Across the Client ID Metadata Documents release (migration 036, #357):
 - **The consent page's CSP** gains `form-action http://localhost:* http://127.0.0.1:*`
   for native loopback callbacks.
 
+Across the scoped tools/list release (#358):
+
+- **No migration and no setting.** An OAuth grant without `readwrite`
+  now lists 19 tools: the nine write-required tools (`create_note`,
+  `edit_note`, `move_note`, `delete_note`, `set_frontmatter`,
+  `write_file`, `delete_file`, `import_from_url`, `request_upload`) are
+  left out. API keys of either permission and `readwrite` grants still
+  list all 28, byte-identical to before. A read-only client that cached
+  the 28 and calls a hidden tool gets `permission_denied`, as before.
+- **No `list_changed` is sent.** After a grant's scope is changed in the
+  panel, the connector sees the new list when it reconnects.
+- **One refusal changes for read-only callers.** The refusals
+  `write_file` / `delete_file` made before their permission check (a
+  malformed `expected_hash`, `no_incumbent` for
+  `write_file(overwrite=false)`) are now `permission_denied`; a
+  `readwrite` caller's refusals are unchanged.
+
 Across the keyword-tags release (migration 035, #391):
 
 - **Tags become searchable at once.** Migration 035 adds each note's tags
@@ -1040,6 +1125,24 @@ Across the keyword-tags release (migration 035, #391):
   the remedy.
 - **Rollback**: `alembic downgrade 034` with the new image strips the
   tags part, then deploy the previous image.
+
+Across the chunk-minimum release (`CHUNKING_VERSION` 2, #390):
+
+- **No migration and no new setting, but a second gradual re-embed.**
+  Chunks shorter than 200 characters are no longer stored (a short
+  section is grouped with its neighbours), windows are cut at a line or
+  word start, and long whitespace runs are sent collapsed. Startup does
+  not refuse; every note is selected again in the background under the
+  per-tenant embed budgets.
+- **Until your notes drain**, the `index_transition: N notes not yet
+  re-chunked; …` line returns on `semantic_search`, `find_related` and
+  `hybrid_search`, and `/health` reads `indexer.rechunk: "in_progress"`,
+  then `"complete"`. A section that did not change keeps its vector;
+  each pass logs `Embedding complete: N notes, X chunks (S submitted, R
+  reused)`.
+- **Rollback** is a redeploy of the previous image, which re-embeds
+  every note stamped 2 in full
+  ([DEPLOYMENT.md](./DEPLOYMENT.md#upgrading-to-chunking-version-2-390-minimum-chunk-length)).
 
 Across the search-confidence release (#389):
 
@@ -1426,9 +1529,9 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Override for Azure or proxies. Same transport rule as `OLLAMA_URL` when this provider is active. |
 | `EMBEDDING_ALLOW_PLAINTEXT` | `false` | Permit `http` to a non-loopback embedding host. Without it such a URL refuses to start. `.env.example` sets it `true` to match its `http://ollama:11434` default. |
 | `EMBEDDING_CA_FILE` | — | Trust anchor (PEM) for an `https` embedding endpoint behind an internal CA; replaces the default certifi bundle. Refused with an `http` URL. Embedding clients ignore `HTTP(S)_PROXY`, `SSL_CERT_*` and `.netrc`. |
-| `RERANK_URL` | — | Full URL of an optional reranker speaking the Jina-compatible `/v1/rerank` format (`llama-server --reranking`, vLLM, Infinity), e.g. `http://127.0.0.1:8081/v1/rerank`. Empty means no reranker: `rerank=true` answers `reranked: false (not_configured)`. **The endpoint receives the query and candidate note text.** Same transport rule as the embedding URL (`https`, loopback `http`, or `RERANK_ALLOW_PLAINTEXT`); a bad URL refuses to start, an unreachable reranker never does (it is probed at startup and re-probed in the background; `/health` reports `rerank`). Opt-in: no quality gain is claimed until you measure it with the harness on a GPU reranker, and a CPU reranker will time out at the default deadline. Since [#402](https://github.com/maxkuminov/obsidian-mcp/issues/402) it scores each note on up to four of its fetched chunks, sent with their heading path (`RERANK_MAX_DOCUMENTS`). See [Reranker reference setup](#reranker-reference-setup) and `DEPLOYMENT.md`, "Reranker (optional)". |
+| `RERANK_URL` | — | Full URL of an optional reranker speaking the Jina-compatible `/v1/rerank` format (`llama-server --reranking`, vLLM, Infinity), e.g. `http://127.0.0.1:8081/v1/rerank`. Empty means no reranker: `rerank=true` answers `reranked: false (not_configured)`. **The endpoint receives the query and candidate note text.** Same transport rule as the embedding URL (`https`, loopback `http`, or `RERANK_ALLOW_PLAINTEXT`); a bad URL refuses to start, an unreachable reranker never does (it is probed at startup and re-probed in the background; `/health` reports `rerank`). Opt-in: on the reference vault it improves `semantic_search` and makes `hybrid_search` worse (see [Reranker reference setup](#reranker-reference-setup)); measure it with the harness on your own judgments, and a CPU reranker will time out at the default deadline. Since [#402](https://github.com/maxkuminov/obsidian-mcp/issues/402) it scores each note on up to four of its fetched chunks, sent with their heading path (`RERANK_MAX_DOCUMENTS`). See [Reranker reference setup](#reranker-reference-setup) and `DEPLOYMENT.md`, "Reranker (optional)". |
 | `RERANK_MODEL` | — | Sent as `model` in the rerank request (≤ 200 characters). `llama-server` serves one model and ignores it. |
-| `RERANK_TIMEOUT_MS` | `1500` | One deadline per rerank call (100–30000), covering connect, write and read; past it the page falls back unreranked with `reranked: false (timeout)`. Also the extra time a `rerank=true` call can hold its `embedding` concurrency slot: under `MCP_CONCURRENCY_MODE` `queue` or `enforce`, keep it at or below `MCP_CONCURRENCY_WAIT_SECONDS` unless `make concurrency-report` passes with rerank traffic (a long hold delays, or under `enforce` refuses, concurrent vector searches). The reference deployment (GPU `llama-server`, see [Reranker reference setup](#reranker-reference-setup)) runs `10000`; size it together with `RERANK_MAX_DOCUMENTS`, which since #402 can double the documents per call (`DEPLOYMENT.md`). |
+| `RERANK_TIMEOUT_MS` | `1500` | One deadline per rerank call (100–30000), covering connect, write and read; past it the page falls back unreranked with `reranked: false (timeout)`. Also the extra time a `rerank=true` call can hold its `embedding` concurrency slot: under `MCP_CONCURRENCY_MODE` `queue` or `enforce`, keep it at or below `MCP_CONCURRENCY_WAIT_SECONDS` unless `make concurrency-report` passes with rerank traffic (a long hold delays, or under `enforce` refuses, concurrent vector searches). The reference deployment (GPU `llama-server`, see [Reranker reference setup](#reranker-reference-setup)) runs `20000`, because a hybrid `rerank=true` call there sends 67–68 documents and takes about 9–10 s; size it together with `RERANK_MAX_DOCUMENTS`, which since #402 can double the documents per call (`DEPLOYMENT.md`). |
 | `RERANK_MAX_DOCUMENTS` | `100` | The most documents one rerank call sends (50–200). Every candidate note (at most 50) is sent its best chunk first, then up to three more of its already-fetched chunks in distance order; a note scores the best of its documents. Rerank latency multiplies with it and `RERANK_TIMEOUT_MS`; `50` restores the pre-#402 count. |
 | `RERANK_ALLOW_PLAINTEXT` | `false` | Permit `http` to a non-loopback reranker host. Separate from `EMBEDDING_ALLOW_PLAINTEXT`, which does not cover it. An `https` reranker is verified against `EMBEDDING_CA_FILE` when set, else certifi's bundle. |
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI model. Changing it post-deploy requires `make reset-embeddings`; the server refuses to start until the stored vectors match. See [Switching providers or models](#switching-providers-or-models). |
@@ -1523,8 +1626,18 @@ P4000 shared by Ollama and the reranker, ~4,200 notes re-embedded in about
 the reranker scored one heading-less chunk per note, which demoted some
 notes both search arms ranked first; it now scores each note on the
 embedded text (title, heading path, tags, chunk) of up to four of its
-fetched chunks (`RERANK_MAX_DOCUMENTS`). Measure it before telling agents
-to use it.
+fetched chunks (`RERANK_MAX_DOCUMENTS`). The #402 real-data gate ran on
+2026-10-31 against the previous reranker documents and passed 4 of 6
+reports (the owner waived one near-miss cell). Measured against
+`rerank=false` on the reference vault (2026-11-01, 196 queries), it
+improves `semantic_search` (overall recall@10 0.505 → 0.582, nDCG@10
+0.389 → 0.442) and makes `hybrid_search` worse (MRR 0.533 → 0.465,
+nDCG@10 0.519 → 0.474), because plain hybrid is already the strongest
+ranking there. Keep `rerank=false` as the default, use `rerank=true`
+with `semantic_search` when the top few rows matter, and call
+`hybrid_search` without it. The intervals and the method are in
+[`DEPLOYMENT.md`](./DEPLOYMENT.md#reranker-optional); measure on your
+own judgments after a model or reranker change.
 
 Ollama has no rerank endpoint
 ([ollama/ollama#3368](https://github.com/ollama/ollama/issues/3368)), so
@@ -1534,14 +1647,17 @@ the reference deployment runs llama.cpp's `llama-server` (image
 
 ```env
 RERANK_URL=https://<host>:<port>/v1/rerank
-RERANK_TIMEOUT_MS=10000
+RERANK_TIMEOUT_MS=20000
 ```
 
 Measured on the same P4000 with nothing else running: 50 documents of ~410
 characters in 1.6 s, 50 documents of 2,000 characters in 7.3 s. Candidates
 are cut to 2,048 characters, so the 1,500 ms default deadline is too short
-for this card; the reference runs 10,000 ms, the maximum. Details and the
-startup checks are in [`DEPLOYMENT.md`](./DEPLOYMENT.md#reranker-optional).
+for this card. A hybrid `rerank=true` call sends 67–68 documents on the
+reference vault and takes about 9–10 s uncontended (68 documents of 2,000
+characters measured 9.1 s), so the reference runs 20,000 ms since
+2026-11-01; the setting accepts 100–30000. Details, the sizing table and
+the startup checks are in [`DEPLOYMENT.md`](./DEPLOYMENT.md#reranker-optional).
 
 ### Switching providers or models
 
