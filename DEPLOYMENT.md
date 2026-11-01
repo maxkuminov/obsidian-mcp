@@ -1152,8 +1152,11 @@ with the harness (above) on your own judgments before telling agents to use
 it. Before [#402](https://github.com/maxkuminov/obsidian-mcp/issues/402) it
 scored one heading-less chunk per note, which demoted some notes both search
 arms ranked first; #402 sends the embedded text of up to four fetched chunks
-per note instead, and its real-data quality gate is still to be run before
-you rely on it. The reranker receives the query and candidate note text, so give it the
+per note instead; its real-data quality gate ran on 2026-10-31 against the previous
+reranker documents and passed 4 of 6 reports (the owner waived one
+near-miss cell; see the archived `rerank-documents` design). Whether
+`rerank=true` beats `rerank=false` is a separate measurement, still in
+progress. The reranker receives the query and candidate note text, so give it the
 same trust as your embedding endpoint.
 
 One wire format is supported: the Jina-compatible `/v1/rerank` that
@@ -1184,13 +1187,14 @@ reference deployment runs llama.cpp's `llama-server` from the
 
 ```sh
 RERANK_URL=https://<host>:<port>/v1/rerank
-RERANK_TIMEOUT_MS=10000
+RERANK_TIMEOUT_MS=20000
 ```
 
 Measured on that card with nothing else running: 50 documents of ~410
 characters in 1.6 s, 50 documents of 2,000 characters in 7.3 s. Candidates
 are cut to 2,048 characters, so the 1,500 ms default is too short there;
-10,000 ms is the setting's maximum. An internal CA goes in
+the setting accepts 100–30000 ms, and the sizing table below explains the
+reference value of 20,000 ms. An internal CA goes in
 `EMBEDDING_CA_FILE`, which is the reranker's trust anchor too.
 
 Restart, then check:
@@ -1212,17 +1216,28 @@ characters sent. Measured on an NVIDIA Quadro P4000 running
 | 50 × ~2,000 characters | 7.3 s (measured) |
 | 100 × ~410 characters | ≈ 3.2 s (scaled) |
 | 100 × ~2,000 characters | ≈ 15 s (scaled) |
+| 24 × 2,000 characters | 3.2 s (measured 2026-11-01) |
+| 50 × 2,000 characters | 6.7 s (measured 2026-11-01) |
+| 68 × 2,000 characters | 9.1 s (measured 2026-11-01) |
+
+The 2026-11-01 rows were measured on the same P4000, uncontended, over a
+loopback port-forward, with 2,000-character documents and
+`bge-reranker-v2-m3` Q8_0 under llama.cpp: about 133 ms per document,
+consistent with the 75 µs per character above. A hybrid `rerank=true`
+call sends 67–68 documents on the reference vault, so it takes about
+9–10 s there uncontended. That is why the reference deployment runs
+`RERANK_TIMEOUT_MS=20000`, and why the 10,000 ms it ran before timed out
+on every hybrid rerank call.
 
 Rule of thumb: `RERANK_TIMEOUT_MS ≥ RERANK_MAX_DOCUMENTS × average
 characters × per-character cost`, doubled when the GPU is shared with the
 embedding model (the indexer's batches slow it down). The 1,500 ms default is
 deliberately conservative and falls back on most calls on hardware like this;
 `RERANK_MAX_DOCUMENTS=50` restores the pre-#402 document count. The
-reference deployment runs `RERANK_TIMEOUT_MS=10000` (see the README's
-"Reranker reference setup"); at the 100-document default it moves to `20000`
-in its own infrastructure config, not here. Either value above
-`MCP_CONCURRENCY_WAIT_SECONDS` is valid **only while `MCP_CONCURRENCY_MODE`
-is `shadow` or `off`**.
+reference deployment runs `RERANK_TIMEOUT_MS=20000` since 2026-11-01, at
+the 100-document default (see the README's "Reranker reference setup").
+A value above `MCP_CONCURRENCY_WAIT_SECONDS` is valid **only while
+`MCP_CONCURRENCY_MODE` is `shadow` or `off`**.
 
 **The concurrency-mode rule.** A `rerank=true` call holds its `embedding`
 concurrency slot through the rerank exchange, up to `RERANK_TIMEOUT_MS`.
