@@ -54,6 +54,7 @@ reference deployment — or OpenAI `text-embedding-3-{small,large}`).
 - [Who this is for](#who-this-is-for)
 - [Control panel](#control-panel)
 - [Quick start](#quick-start)
+- [Versioning and compatibility](#versioning-and-compatibility)
 - [Upgrading](#upgrading)
 - [Cost expectations](#cost-expectations)
 - [The self-describing vault](#the-self-describing-vault)
@@ -1000,6 +1001,51 @@ claude mcp add obsidian --transport http \
 The first thing any agent should do in a new session is call
 `get_vault_guide()`. That's how it learns your folder structure,
 naming conventions, and YAML schema before it writes anything.
+
+## Versioning and compatibility
+
+From 1.0 the version number is a promise about the MCP tool contract:
+the 28 tools' names, their argument schemas, the shape of their result
+lines, and the `MCP-REFUSAL` codes. An agent written against 1.0 keeps
+working against every 1.x.
+
+- **The wire form is pinned.** `tests/fixtures/tools_list_full_v1.json`
+  is the complete `tools/list` result an API key or a `readwrite` OAuth
+  grant sees (every field of all 28 tools), and
+  `tests/fixtures/tools_list_readonly_oauth.json` pins the 19 names a
+  read-only OAuth grant lists. CI fails on any drift; a deliberate change
+  regenerates the fixture and says so in its spec. Result line shapes
+  are specified in `openspec/specs/` and pinned by each tool's tests,
+  not by one fixture.
+- **Refusal codes are a closed set.** Every code an `MCP-REFUSAL` line can
+  carry is declared in `src/services/refusals.py` (`CODES`), and a refusal
+  with any other code cannot be constructed. That module is the catalogue;
+  there is no separate list. The transport 429s (failed authentication,
+  transfer redemption, `body_memory`) are outside that line by design.
+- **Within 1.x, additions only:** new tools, new optional arguments whose
+  default leaves the old result byte-identical, new header tokens or
+  trailing fields, new refusal codes. Never a rename, a removal, a changed
+  default that alters an existing result, or a changed meaning of an
+  existing field or code. A change of that kind is 2.0, announced one
+  minor release earlier in the release notes. Unknown arguments are
+  refused, so a client that sends a newer argument to an older server gets
+  a refusal, not a silently ignored filter.
+- **Settings.** A new setting ships with a default that keeps the previous
+  behaviour. Every setting change is in the release's upgrade notes, in
+  the [Configuration](#configuration) table and in `.env.example`.
+- **Schema.** Every release names its migrations and says whether they
+  refuse startup or need a rebuild or re-embed, and
+  [`DEPLOYMENT.md`](./DEPLOYMENT.md) documents each one's downgrade (it
+  does so for every migration from 033 on).
+
+Not part of the contract: the control panel and its `/api/*` endpoints,
+log fields, the search-evaluation harness (`scripts/search_eval/`), the
+internal MCP SDK version, and ranking quality. Which notes come back, and
+in what order, moves with the index, the embedding model and the
+reranker; the harness measures it
+([docs/architecture/search.md](./docs/architecture/search.md#search-evaluation-harness-356)).
+`MCP_SANDBOX_MODE`, the registry-evaluation switch, is outside the promise
+too.
 
 ## Upgrading
 
