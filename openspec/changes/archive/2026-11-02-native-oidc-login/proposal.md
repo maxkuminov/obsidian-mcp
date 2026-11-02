@@ -1,4 +1,9 @@
 # Native OIDC browser login (#414)
+
+## Why
+Existing accounts need centralized browser authentication while retaining their vaults and MCP credentials.
+
+## What Changes
 Add optional native OIDC for existing accounts without altering local MCP authorization. Disabled by default; no automatic linking, provisioning, vault assignment or role changes.
 
 ## Design
