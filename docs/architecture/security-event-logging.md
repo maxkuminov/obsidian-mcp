@@ -471,3 +471,12 @@ point of logging them at that level.
   up to three per transfer publication, until `mcp-rate-limits`' write bucket
   refuses. They are durability notes on operations that succeeded, and keeping
   them off the destructive publication path is the reason.
+
+## Native OIDC events (#414)
+
+| Event | Level | Fields | Meaning |
+| --- | --- | --- | --- |
+| `panel_oidc_started` | INFO | `client_ip`, `route` | Authlib produced the provider authorization redirect |
+| `panel_oidc_refused` | WARNING | `reason`, `client_ip`, `route` | Closed reasons: `capacity`, `state`, `provider`, `token`, `entitlement`, `mapping`, `account`, `session_mint` |
+
+OIDC successes reuse `panel_login_succeeded` after the existing session mint commits. Refusals use the normal bounded suppressor. No provider subject, group, code, token, state, nonce, verifier or upstream exception text enters these events. Uvicorn's callback access-log query is filtered in `configure_logging`; proxy logs need the corresponding deployment setting before activation. Other Uvicorn logs keep their existing formatting.

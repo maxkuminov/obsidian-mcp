@@ -91,6 +91,8 @@ class SecurityEventFieldError(AssertionError):
 
 EVENT_FIELDS: dict[str, frozenset[str]] = {
     # ── Panel authentication (Slice B) ──
+    "panel_oidc_started": frozenset({"client_ip", "route"}),
+    "panel_oidc_refused": frozenset({"reason", "client_ip", "route"}),
     "panel_login_succeeded": frozenset({"user_id", "username", "client_ip", "route"}),
     "panel_login_failed": frozenset(
         {"reason", "username_submitted", "user_id", "client_ip", "route"}

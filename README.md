@@ -2282,3 +2282,7 @@ as plain markdown you can open in Obsidian.
 ## License
 
 MIT. See `LICENSE`.
+
+### Optional native browser SSO
+
+[Native OIDC login](docs/native-oidc.md) supports a Keycloak issuer with explicit mappings to existing users and application-group admission. It ships disabled, preserves vault ownership and the local MCP OAuth issuer/credentials, and can replace an external Google login gate after validation. See the guide for configuration, recovery and offboarding limitations.
