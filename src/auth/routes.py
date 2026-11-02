@@ -4,13 +4,11 @@ The router is mounted at the FastAPI app level in `src/main.py` ONLY when
 `settings.multi_user_mode` is true. In single-user mode the router is not
 mounted at all, so these paths 404.
 
-`/admin/auth/*` and `/admin/register` live under the `/admin` prefix so that
-Traefik's `chain-oauth@file` middleware (which gates `/admin/*` on the
-production deploy) still fronts them. That gating is what makes the bootstrap
-race-free in practice — only an already-SSO'd admin can reach
-`/admin/register`. The application also enforces a strict empty-users-table
-guard with a PostgreSQL transaction-scoped advisory lock for defense in
-depth.
+`/admin/auth/*` and `/admin/register` retain the legacy `/admin` prefix.
+Legacy deployments protect bootstrap with an external login gate; the app also
+serializes the empty-users-table check with a PostgreSQL advisory lock.
+Native OIDC closes bootstrap entirely, so its operator can retire that gate
+after verifying native authentication without exposing first-admin creation.
 """
 import logging
 import os

@@ -1013,7 +1013,7 @@ The lifecycle, in one table — one implementation per phase:
 
 | Phase | Trigger | What happens | Where |
 | --- | --- | --- | --- |
-| **Mint** | login; bootstrap registration; the re-issue after a password change | **under the account guard**: re-read the user `FOR UPDATE` with `populate_existing=True`, require it to exist and be active, insert a row keyed on `sha256(sid)` with `expires_at = now + session_max_age` and `user_agent_hash`, **commit**, and only then write `sid` into the signed cookie | `start_session()`, three callers |
+| **Mint** | password/OIDC login; bootstrap registration; the re-issue after a password change | **under the account guard**: re-read the user `FOR UPDATE` with `populate_existing=True`, require it to exist and be active, insert a row keyed on `sha256(sid)` with `expires_at = now + session_max_age` and `user_agent_hash`, **commit**, and only then write `sid` into the signed cookie | `start_session()`, four callers |
 | **Validate** | every request that resolves a browser identity | the cookie must carry **both** `user_id` and `sid`; refused when the row is absent, revoked, expired, or `row.user_id` disagrees with the cookie's; then the existing user-exists / `is_active` / `session_version` checks. Every refusal clears the cookie **and records `panel_session_replay_refused`** with one of eight reasons | `get_active_session_user()`, reached from `require_user_panel`, `login_form`, `authorize_get`, `authorize_post` — the only four entry points |
 | **Touch** | a `GET`/`HEAD` whose row is more than `SESSION_TOUCH_INTERVAL_SECONDS` stale | `last_seen_at = now()` on the **request's own** session, committed in the dependency before the handler runs; skipped on every other method and on any failure | `touch_session()` |
 | **Revoke — one** | logout | `revoked_at` for that row, commit, cookie cleared | `logout` in `src/auth/routes.py` |
@@ -1027,7 +1027,7 @@ The lifecycle, in one table — one implementation per phase:
   handed to the browser beside it would authenticate nothing, which is a hard
   logout loop on the very next request. Making `start_session` own its
   transaction makes "the row exists before the cookie leaves" a property of one
-  function rather than of three call sites' discipline.
+  function rather than of four call sites' discipline.
   `revoke_session` / `revoke_user_sessions` are the opposite by the same
   reasoning: every one of their callers holds the account guard, and the
   documented rule for that critical section is that nothing may commit between
@@ -1063,9 +1063,10 @@ The lifecycle, in one table — one implementation per phase:
   that only asked that question would insert a live row *after* the reset's
   sweep and copy the new version into the cookie — handing the **superseded**
   password a fully valid session and defeating both invalidators at once. The
-  three call sites each pass the generation they hold: `login_submit` the
+  call sites each pass the generation they hold: `login_submit` the
   version `verify_password` ran against, `register_submit` the row it just
-  created, `change_password` the bumped version it just committed. The same
+  created, `change_password` the bumped version it just committed, and the OIDC callback
+  the local account version resolved after provider verification. The same
   window is why the post-change re-issue, which runs in a *second* transaction,
   needs it too.
 
