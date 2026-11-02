@@ -685,3 +685,9 @@ summaries.
 
 Formal requirements live in `openspec/specs/`; the change history and its
 reasoning in `openspec/changes/archive/`.
+
+Native browser OIDC is optional and disabled by default (#414). Read
+[docs/native-oidc.md](docs/native-oidc.md) before changing `src/auth/oidc.py` or
+its rollout. Preserve existing user IDs, vault assignments, local MCP OAuth
+issuer/credentials, and the guarded `start_session` mint. No email linking or
+provisioning; explicit immutable subjects and exact signed app-group admission.

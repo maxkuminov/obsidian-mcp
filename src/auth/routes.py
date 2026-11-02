@@ -17,12 +17,13 @@ import os
 import re
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Form, Request, status
+from fastapi import APIRouter, Depends, Form, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.auth import oidc
 from src.auth.passwords import (
     MIN_PASSWORD_LENGTH,
     hash_password,
@@ -163,7 +164,8 @@ def _render_login(
     return templates.TemplateResponse(
         request,
         "login.html",
-        {"error": error, "next": next_url, "username": username, "csrf_token": generate_csrf_token(request)},
+        {"error": error, "next": next_url, "username": username, "csrf_token": generate_csrf_token(request),
+         "oidc_enabled": settings.oidc_enabled, "local_login_enabled": settings.local_login_enabled},
         status_code=status_code,
     )
 
@@ -222,6 +224,8 @@ async def login_submit(
     next: str = Form("/admin/"),
     session: AsyncSession = Depends(get_session),
 ):
+    if not settings.local_login_enabled:
+        raise HTTPException(403, "Password sign-in is disabled")
     target = _safe_next(next)
     normalized = (username or "").strip().lower()
 
@@ -384,6 +388,80 @@ async def login_submit(
     return RedirectResponse(target, status_code=status.HTTP_302_FOUND)
 
 
+def _oidc_refused(request: Request, reason: str):
+    security_events.emit(
+        "panel_oidc_refused", subject=security_events.subject_for(request=request),
+        reason=reason, client_ip=security_events.client_ip(request), route=request.url.path,
+    )
+    response = _render_login(request, error="Single sign-on could not be completed. Please try again.",
+                             status_code=503 if reason == "capacity" else 401)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    if reason == "capacity":
+        response.headers["Retry-After"] = "60"
+    return response
+
+
+@router.get("/admin/auth/oidc/start")
+@limiter.limit("5/minute")
+async def oidc_start(request: Request, next: str = "/admin/"):
+    if not settings.oidc_enabled:
+        raise HTTPException(404)
+    state = None
+    try:
+        target = _safe_next(next) if len(next) <= 4096 else "/admin/"
+        state, tx = oidc.begin(request.session, target)
+        url = await oidc.authorization_url(state, tx)
+    except Exception as exc:
+        if state is not None:
+            oidc._transactions.pop(state, None)
+            request.session.pop(oidc.STATE_KEY, None)
+        reason = exc.reason if isinstance(exc, oidc.LoginRefused) else "provider"
+        return _oidc_refused(request, reason)
+    security_events.emit(
+        "panel_oidc_started", level=logging.INFO,
+        subject=security_events.subject_for(request=request),
+        client_ip=security_events.client_ip(request), route=request.url.path,
+    )
+    return RedirectResponse(url, status_code=302,
+                            headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+
+
+@router.get(oidc.CALLBACK_PATH)
+@limiter.limit("10/minute")
+async def oidc_callback(request: Request, session: AsyncSession = Depends(get_session)):
+    if not settings.oidc_enabled:
+        raise HTTPException(404)
+    try:
+        params = request.query_params
+        if any(len(params.getlist(k)) > 1 for k in ("state", "code", "error", "iss")):
+            raise oidc.LoginRefused("state")
+        tx = oidc.consume(request.session, params.get("state", ""))
+        if "error" in params or ("iss" in params and params["iss"] != settings.oidc_issuer):
+            raise oidc.LoginRefused("provider")
+        # get_session has not checked out a connection: all network I/O precedes DB access.
+        user_id = await oidc.exchange(params.get("code", ""), tx)
+    except Exception as exc:
+        reason = exc.reason if isinstance(exc, oidc.LoginRefused) else "provider"
+        return _oidc_refused(request, reason)
+    user = (await session.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    if user is None or not user.is_active:
+        return _oidc_refused(request, "account")
+    version, username = user.session_version, user.username
+    await warm_user_vault_cache(session, user_id)
+    # Reuse the one guarded mint. No provider identity or role enters the cookie.
+    if await start_session(request, session, user_id, expected_session_version=version) is None:
+        return _oidc_refused(request, "session_mint")
+    security_events.emit(
+        "panel_login_succeeded", level=logging.INFO,
+        subject=security_events.subject_for(user_id=user_id, request=request),
+        user_id=user_id, username=username, client_ip=security_events.client_ip(request),
+        route=request.url.path,
+    )
+    return RedirectResponse(_safe_next(tx.next_url), status_code=302,
+                            headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+
+
 @router.post("/admin/auth/logout")
 async def logout(request: Request, session: AsyncSession = Depends(get_session)):
     """Revoke this session server-side, then clear the cookie. Always redirects.
@@ -483,6 +561,8 @@ async def register_form(
     request: Request,
     session: AsyncSession = Depends(get_session),
 ):
+    if settings.oidc_enabled:
+        raise HTTPException(404)
     # Bootstrap is closed once any user exists.
     if not await _users_table_empty(session):
         return RedirectResponse("/admin/auth/login", status_code=status.HTTP_302_FOUND)
@@ -498,6 +578,8 @@ async def register_submit(
     vault_path: str = Form(...),
     session: AsyncSession = Depends(get_session),
 ):
+    if settings.oidc_enabled:
+        raise HTTPException(404)
     # Early UX-friendly validation (no DB roundtrip).
     normalized = (username or "").strip().lower()
     if not _USERNAME_RE.match(normalized):

@@ -1278,3 +1278,11 @@ The lifecycle, in one table — one implementation per phase:
   absence of any numeric `minlength` on these forms **and** that each handler
   actually passes the key — a template reading it off a context that has none
   renders `minlength=""`, which is silently no minimum at all.
+
+## Optional native OIDC (#414)
+
+`src/auth/oidc.py` implements a deliberately narrow Keycloak profile for browser login; see [configuration and recovery](../native-oidc.md). It never alters local MCP OAuth protocols. A signed ID token must pass Authlib/JOSE verification, exact issuer and singleton audience, RS256, nonce, expiry, optional authorized-party and group-array checks. Only an explicit issuer-scoped immutable-subject mapping resolves a local user ID. Existing local active/admin/vault state remains authoritative.
+
+The new callback calls the same `start_session` with the version of the local user it resolved; the existing guard re-reads and commits before emitting success. Provider credentials never enter the app session registry. Random state is bound to a signed browser cookie and consumed from a bounded server-side store before exchange; replaying an old signed cookie cannot revive it. One worker remains required. Lost/restarted/expired transactions fail closed.
+
+OIDC activation requires multi-user mode and forbids sandbox mode. Bootstrap is disabled and the panel never redirects to it under OIDC, even with an empty database. An explicit local-login switch hides the password form and denies POST; at least one login method must remain enabled in multi-user mode. Existing application sessions and MCP credentials survive upstream offboarding until local revocation/expiry. This limitation and independent operator recovery are rollout requirements, not implicit account synchronization.

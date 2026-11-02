@@ -295,7 +295,7 @@ async def require_user_panel(
         target = request.url.path
         if request.url.query:
             target = f"{target}?{request.url.query}"
-        if settings.multi_user_mode:
+        if settings.multi_user_mode and not settings.oidc_enabled:
             user_count = (
                 await session.execute(select(func.count(User.id)))
             ).scalar() or 0

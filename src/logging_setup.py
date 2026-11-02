@@ -367,6 +367,16 @@ def installed_stream_handler() -> logging.Handler | None:
     return None
 
 
+class OIDCCallbackAccessFilter(logging.Filter):
+    """Uvicorn's access logger must never persist provider callback credentials."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple) and len(record.args) == 5:
+            client, method, target, version, status = record.args
+            if isinstance(target, str) and target.split("?", 1)[0].rstrip("/") == "/admin/auth/oidc/callback":
+                record.args = (client, method, target.split("?", 1)[0], version, status)
+        return True
+
+
 def configure_logging(
     level: int | str | None = None, fmt: str | None = None
 ) -> logging.Handler | None:
@@ -387,6 +397,11 @@ def configure_logging(
         resolved_level = level if level is not None else settings.log_level
         resolved_fmt = fmt if fmt is not None else settings.log_format
 
+        access = logging.getLogger("uvicorn.access")
+        if not any(isinstance(f, OIDCCallbackAccessFilter) for f in access.filters):
+            access.addFilter(OIDCCallbackAccessFilter())
+        logging.getLogger("httpx2").setLevel(logging.WARNING)
+        logging.getLogger("httpcore2").setLevel(logging.WARNING)
         root = logging.getLogger()
         exempt = error_log.installed_handler()
         for handler in list(root.handlers):

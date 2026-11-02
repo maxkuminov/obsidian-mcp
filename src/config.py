@@ -1018,6 +1018,24 @@ class Settings(BaseSettings):
         return self
 
     multi_user_mode: bool = False
+    oidc_enabled: bool = False
+    oidc_issuer: str = ""
+    oidc_client_id: str = ""
+    oidc_client_secret: str = Field("", repr=False)
+    oidc_required_group: str = ""
+    oidc_subject_user_ids: dict[str, int] = Field(default_factory=dict)
+    local_login_enabled: bool = True
+
+    @field_validator("oidc_subject_user_ids", mode="before")
+    @classmethod
+    def _oidc_mapping(cls, value):
+        if not isinstance(value, dict) or len(value) > 256 or any(
+            not isinstance(k, str) or not k or len(k) > 255
+            or type(v) is not int or v < 1 for k, v in value.items()
+        ):
+            raise ValueError("OIDC_SUBJECT_USER_IDS must map subjects to positive integer user IDs")
+        return value
+
     session_max_age: int = 60 * 60 * 24 * 7
     session_cookie_name: str = "omcp_session"
 
@@ -1951,6 +1969,29 @@ class Settings(BaseSettings):
                     repr(h) for h in public_hosts
                 ),
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_oidc(self) -> "Settings":
+        if self.multi_user_mode and not (self.local_login_enabled or self.oidc_enabled):
+            raise ValueError("Multi-user mode requires at least one login method")
+        if not self.oidc_enabled:
+            return self
+        if not self.multi_user_mode or self.mcp_sandbox_mode:
+            raise ValueError("OIDC requires multi-user mode and forbids sandbox mode")
+        for value, origin_only in ((self.oidc_issuer, False), (self.base_url or "", True)):
+            parsed = urlsplit(value)
+            if (parsed.scheme != "https" or not parsed.hostname or parsed.username
+                    or parsed.password or parsed.query or parsed.fragment
+                    or any(ord(c) <= 32 or c == "\\" for c in value)
+                    or (origin_only and parsed.path not in ("", "/"))):
+                raise ValueError("OIDC requires an HTTPS issuer and HTTPS BASE_URL origin")
+            _ = parsed.port  # invalid port fails at startup
+        if not all((self.oidc_client_id.strip(), self.oidc_client_secret.strip(),
+                    self.oidc_required_group.strip(), self.oidc_subject_user_ids)):
+            raise ValueError("OIDC requires client credentials, required group and subject mappings")
+        if len(self.oidc_required_group) > 512:
+            raise ValueError("OIDC_REQUIRED_GROUP must be at most 512 characters")
         return self
 
 

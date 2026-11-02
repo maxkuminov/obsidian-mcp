@@ -1740,3 +1740,7 @@ release works with either shape of cluster:
   vaults on the same container, see the **Multi-user mode** section in
   the [README](./README.md#multi-user-mode): bootstrap flow, inviting
   users, the admin role, and rollback are covered there.
+
+## Optional native browser SSO
+
+Follow [Native OIDC login](docs/native-oidc.md) for client configuration, existing-account mappings, network/logging prerequisites, recovery, and the mandatory browser/consent checks before retiring an external login gate. Shipping this code does not enable SSO: `OIDC_ENABLED` defaults to false. Do not remove a proxy gate by changing multi-user mode to false.

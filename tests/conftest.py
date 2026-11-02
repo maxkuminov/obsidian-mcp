@@ -21,6 +21,8 @@ if str(ROOT) not in sys.path:
 # asserts it still matches `Settings.model_fields`, so adding a setting without
 # adding it here is a test failure rather than a silent hole.
 SETTINGS_ENV_KEYS = (
+    "OIDC_ENABLED", "OIDC_ISSUER", "OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET",
+    "OIDC_REQUIRED_GROUP", "OIDC_SUBJECT_USER_IDS", "LOCAL_LOGIN_ENABLED",
     "DATABASE_URL",
     # Superuser opt-out (#324).
     "DATABASE_ALLOW_SUPERUSER",
