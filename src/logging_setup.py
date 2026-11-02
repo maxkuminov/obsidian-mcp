@@ -72,6 +72,7 @@ import logging
 import sys
 import traceback
 from dataclasses import dataclass
+from urllib.parse import unquote
 
 # ── Bounds ──────────────────────────────────────────────────────────────────
 
@@ -372,7 +373,7 @@ class OIDCCallbackAccessFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         if isinstance(record.args, tuple) and len(record.args) == 5:
             client, method, target, version, status = record.args
-            if isinstance(target, str) and target.split("?", 1)[0].rstrip("/") == "/admin/auth/oidc/callback":
+            if isinstance(target, str) and unquote(target.split("?", 1)[0]).rstrip("/") == "/admin/auth/oidc/callback":
                 record.args = (client, method, target.split("?", 1)[0], version, status)
         return True
 

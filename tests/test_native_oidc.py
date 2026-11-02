@@ -205,9 +205,10 @@ async def test_inactive_and_session_race_refuse(monkeypatch, active, minted):
     assert mint.await_count == int(active)
 
 
-def test_callback_access_log_redacted():
+@pytest.mark.parametrize("path", [oidc.CALLBACK_PATH, "/admin/auth/oidc/%63allback", "/admin/auth%2Foidc/callback"])
+def test_callback_access_log_redacted(path):
     record = logging.LogRecord("uvicorn.access", 20, "", 0, "%s %s %s %s %s",
-                               ("ip", "GET", oidc.CALLBACK_PATH + "?code=secret&state=secret", "1.1", 302), None)
+                               ("ip", "GET", path + "?code=secret&state=secret", "1.1", 302), None)
     assert OIDCCallbackAccessFilter().filter(record)
     assert "secret" not in record.getMessage()
 
@@ -301,3 +302,22 @@ async def test_provider_body_limits(encoded, oversized):
     async with httpx2.AsyncClient(transport=transport) as http:
         with pytest.raises(oidc.LoginRefused):
             await http.get(ISSUER)
+
+
+@pytest.mark.asyncio
+async def test_encoded_callback_still_routes_and_refuses_invalid_state():
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+    from starlette.middleware.sessions import SessionMiddleware
+    from src.database import get_session
+    app = FastAPI()
+    app.add_middleware(SessionMiddleware, secret_key="test-browser-secret")
+    app.include_router(routes.router)
+
+    async def db():
+        yield AsyncMock()
+    app.dependency_overrides[get_session] = db
+    async with AsyncClient(transport=ASGITransport(app), base_url="https://notes.example.test") as http:
+        response = await http.get("/admin/auth/oidc/%63allback?state=invalid&code=test")
+        assert response.status_code == 401
+        assert "Single sign-on could not be completed" in response.text
