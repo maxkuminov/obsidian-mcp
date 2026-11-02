@@ -10,3 +10,6 @@ Local login retains default behavior; when explicitly disabled deny its POST and
 
 ## Accepted limitations and rollout
 Login transactions are in memory and lost on restart; one worker is existing app contract. Existing app sessions/MCP credentials survive provider group removal or disablement until app expiry/revocation; operator must revoke locally. Native OIDC is not active until client/group/subject mappings configured, account linkage and MCP consent tested, and proxy Google gate removed. Keep rollback config and strong local recovery password. Max manual browser/CSP pass remains required before production activation.
+
+## Spec review resolutions
+Independent review a69f882: accepted activation invariant, strict audience/azp/algorithm/claim types, group array typing, transient credential handling, usable login-method invariant, bounded transaction admission and audit requirements. Intended issuer is Keycloak; Google is retired, not a direct provider. Unknown mapped IDs fail callback closed rather than making a typo prevent all app startup. Exact group is in signed ID token; configuration never infers roles or creates accounts. Additional protocol and rollout details are in design.md. Callback query logging is suppressed inside the app and must also be disabled at its external proxy before activation.
