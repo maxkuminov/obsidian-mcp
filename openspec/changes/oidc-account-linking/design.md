@@ -71,18 +71,58 @@ Downgrade drops the columns and constraints. That loses the links, which is
 stated in the migration docstring. No data migration is needed: #415 kept
 mappings in the environment.
 
-037 follows the conventions in `docs/architecture/schema-and-migrations.md`:
-`search_path` pinned and asserted, `lock_timeout` / `statement_timeout` set and
-`RESET`, a COMMENT marker on each constraint so `downgrade()` drops only marked
-objects, a same-named column or constraint of another shape refused by name
-(never silently accepted), and nothing that needs superuser
-(`test_nonsuperuser_migrations_pg.py` runs it as the owning role).
+**Provenance: marker-owned, reconcile or refuse**, in the shape of 029 and
+030 in `docs/architecture/schema-and-migrations.md`:
+
+- **Column markers.** Each of the six columns carries 037's column COMMENT
+  marker, `OIDC account link (037_oidc_account_links)`. It is mirrored
+  byte-identically in `src/models/db.py` as a module constant
+  `_OIDC_LINK_COLUMN_MARKER`, passed as `comment=` on each `mapped_column`, so
+  `alembic check` compares it. A drift shows up as a pending
+  `alter_column(comment=…)`. The migration's `COLUMN_MARKER` and the model
+  constant must stay byte-identical.
+- **Constraint markers.** Each of the five constraints carries 037's
+  constraint-comment marker, `OIDC account link constraint
+  (037_oidc_account_links)`. Autogenerate does not compare constraint
+  comments, so the gate checks them through the catalogue.
+- **Adopt only an exact match, else refuse. All six columns and all five
+  constraints are checked before anything is touched.** Re-running over a
+  same-named column adopts it only if it has the exact type
+  (`character varying(2048)` / `(255)` / `(254)` / `timestamp with time
+  zone`), is nullable, has no default and carries the column marker. A
+  same-named constraint is adopted only if its `pg_get_constraintdef` is the
+  canonical definition, `convalidated` is true and it carries the constraint
+  marker. Anything else is refused by name with the disagreement, and nothing
+  changes. That includes an object with the right shape but no marker, an
+  `oidc_subject varchar(1024)`, a NOT NULL or defaulted column, or a `NOT
+  VALID` CHECK. An unmarked object of the right shape has unknown provenance:
+  adopting it would let `downgrade()` drop something 037 did not create.
+- **`downgrade()` decides each object on its own marker.** It drops a
+  constraint only if it carries the constraint marker, and a column only if it
+  carries the column marker. Each unmarked object is skipped with a printed
+  line. Constraints go before columns.
+- `search_path` is pinned to `public` and asserted, then `RESET`.
+  `lock_timeout` / `statement_timeout` are set, then `RESET`. Nothing needs
+  superuser (`test_nonsuperuser_migrations_pg.py` runs it as the owning role).
+
 `HEAD_REVISION` in `tests/integration/test_schema_check.py` moves `036 -> 037`
-as part of the migration, not beside it. The gate's 037 cases are: a fresh
-upgrade; the chain from 036 with existing users untouched; catalogue column
-types and nullability; each CHECK and UNIQUE read back through
-`pg_get_constraintdef` and `convalidated`; every invalid row shape rejected;
-the impostor refusals; and downgrade to 036 followed by a clean re-upgrade.
+as part of the migration, not beside it. The gate's 037 cases:
+
+- a fresh upgrade;
+- the chain from 036 with existing users untouched;
+- for each column, the catalogue type, nullability, absent default and
+  `col_description` equal to the marker;
+- for each CHECK and UNIQUE, `pg_get_constraintdef`, `convalidated` and an
+  `obj_description` equal to the constraint marker;
+- every invalid row shape rejected;
+- re-run stamp-back over the exact marked shape changing nothing;
+- impostor refusals, atomic across all eleven objects: a wrong type, a
+  NOT NULL column, a defaulted column, a wrong constraint definition, a `NOT
+  VALID` CHECK, and **the correct shape with no marker** (once for a column,
+  once for a constraint);
+- downgrade of marked objects, downgrade skipping unmarked ones, and
+  downgrade to 036 followed by a clean re-upgrade with `alembic check`
+  clean.
 
 ### D2. The matching rule: verified email, single use, 7-day window
 
@@ -575,11 +615,36 @@ it. Item 5 must differ only by the OIDC blocks.
 
 ## Migration plan
 
-1. Deploy with OIDC still off: migration 037 runs, and the panel is unchanged.
-2. Enable OIDC (or remove `OIDC_SUBJECT_USER_IDS` if set), set each user's
-   expected email (or bind subjects), and have each user sign in once.
-3. Optionally set `LOCAL_LOGIN_ENABLED=false` after the boot line confirms a
-   bound admin exists.
+Two paths. Which one applies depends on whether `OIDC_SUBJECT_USER_IDS` is
+set anywhere in the deployment's configuration.
+
+**(a) Fresh activation.** OIDC was never configured, or
+`OIDC_SUBJECT_USER_IDS` was never set.
+
+1. Deploy with OIDC off. Migration 037 runs, and every page is unchanged
+   (D16).
+2. Confirm a local admin password works. Keep `LOCAL_LOGIN_ENABLED=true`.
+3. Configure the provider client, set the `OIDC_*` settings, enable OIDC and
+   restart.
+4. For each user, set an expected email, or bind a known subject, on their
+   edit page. Each user signs in once with SSO.
+5. Verify an SSO sign-in per user and one `/authorize` consent round trip.
+6. Optionally set `LOCAL_LOGIN_ENABLED=false`, only after the boot log shows
+   no lockout CRITICAL (D13). D15 guards it from then on.
+
+**(b) Upgrade from `OIDC_SUBJECT_USER_IDS`.** This is D3, in order:
+
+1. **On the old release**, confirm a local admin password works. Reset one if
+   needed.
+2. Set `LOCAL_LOGIN_ENABLED=true`.
+3. Record the map's subject-to-user pairs, then remove
+   `OIDC_SUBJECT_USER_IDS`.
+4. Deploy. Migration 037 runs. Startup refuses while the map is still set.
+5. Sign in with the password and bind each former subject on its user's edit
+   page (Bind subject).
+6. Verify an SSO sign-in per user and one `/authorize` consent round trip.
+7. Optionally set `LOCAL_LOGIN_ENABLED=false` again, under the same boot-log
+   condition as (a) step 6.
 
 Rollback: unset `OIDC_ENABLED`. The columns are inert. The migration downgrade
 drops the links.

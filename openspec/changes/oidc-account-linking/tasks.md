@@ -36,15 +36,22 @@ Files: `src/models/db.py` (User columns + constraints only),
 and the slice-A test files above. Do NOT touch `src/auth/`, `src/config.py`,
 `src/control_panel/` or templates.
 
-- [ ] 1.1 Add the six nullable columns and the five named constraints (design D1) to `User`, with a comment block in the file's style
-- [ ] 1.2 Migration 037, `down_revision` = 036's revision id, following D1's conventions: pinned `search_path`, timeouts set and reset, COMMENT markers, impostor refusals by name, no backfill, downgrade drops only marked objects (the docstring states that the links are lost), no superuser requirement
+- [ ] 1.1 Add the six nullable columns and the five named constraints (design D1) to `User`, each column with `comment=_OIDC_LINK_COLUMN_MARKER`. The module constant must be byte-identical to the migration's `COLUMN_MARKER`, with a comment block in the file's style (see `_INDEXED_PROVENANCE_MARKER`)
+- [ ] 1.2 Migration 037, `down_revision` = 036's revision id, following D1's provenance rules:
+  - a column marker on each of the six columns and a constraint marker on each of the five constraints;
+  - all eleven objects checked before anything is touched; adopt only an exact type / nullability / no-default / marker (or canonical definition / `convalidated` / marker) match, else refuse by name and change nothing;
+  - `downgrade()` decides each object on its own marker (constraints first) and prints a skip for an unmarked one; the docstring states that the links are lost;
+  - pinned `search_path`, timeouts set and reset, no backfill, no superuser requirement.
 - [ ] 1.3 `tests/integration/test_schema_check.py`: `HEAD_REVISION = "037"`, keeping every earlier wave's cases. Add 037 cases:
   - a fresh upgrade;
   - the chain from 036 with existing user rows unchanged and all six columns NULL;
   - catalogue column types and nullability;
-  - each CHECK and UNIQUE via `pg_get_constraintdef` + `convalidated`, plus its marker;
+  - **per column:** type, nullability, absent default, and `col_description` equal to the column marker;
+  - **per constraint:** `pg_get_constraintdef`, `convalidated`, and `obj_description` equal to the constraint marker;
+  - stamp-back: re-running over the exact marked shape changes nothing;
   - every invalid row shape rejected (half-bound, half-pending, bound-and-pending, a duplicate `(issuer, subject)`, a duplicate `(expected_issuer, expected_email)`);
-  - the impostor column and constraint refusals;
+  - impostor refusals, atomic across all eleven objects: a wrong type, NOT NULL, a default, a wrong constraint definition, a `NOT VALID` CHECK, and **the correct shape but unmarked**, once for a column and once for a constraint;
+  - downgrade drops the marked objects and skips the unmarked ones;
   - downgrade to 036, then a clean re-upgrade and `alembic check`.
 - [ ] 1.4 Confirm `tests/integration/test_nonsuperuser_migrations_pg.py` runs 037 to head as the owning role (edit it only if it pins a head)
 - [ ] 1.5 `oidc_links.normalize_email(str) -> str | None` per D2; a pure function that never raises

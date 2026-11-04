@@ -63,7 +63,7 @@ The server SHALL request the scopes `openid email profile` plus any configured `
 ## ADDED Requirements
 
 ### Requirement: OIDC links SHALL be stored on the user row with uniqueness enforced by the database
-Migration 037 SHALL add to `users` the nullable columns `oidc_issuer`, `oidc_subject`, `oidc_linked_at`, `oidc_expected_issuer`, `oidc_expected_email` and `oidc_expected_set_at`, a UNIQUE constraint on `(oidc_issuer, oidc_subject)`, a UNIQUE constraint on `(oidc_expected_issuer, oidc_expected_email)`, and CHECK constraints making each triple all-NULL or all-non-NULL and forbidding a row that is both bound and pending. The ORM model SHALL declare the same constraints so that `alembic check` reports no operations, and the migration SHALL follow the schema gate's conventions (pinned `search_path`, bounded lock and statement timeouts, marked constraints dropped only by marker on downgrade, same-named impostors refused, no superuser requirement).
+Migration 037 SHALL add to `users` the nullable columns `oidc_issuer`, `oidc_subject`, `oidc_linked_at`, `oidc_expected_issuer`, `oidc_expected_email` and `oidc_expected_set_at`, a UNIQUE constraint on `(oidc_issuer, oidc_subject)`, a UNIQUE constraint on `(oidc_expected_issuer, oidc_expected_email)`, and CHECK constraints making each triple all-NULL or all-non-NULL and forbidding a row that is both bound and pending. The ORM model SHALL declare the same constraints so that `alembic check` reports no operations, and the migration SHALL follow the schema gate's conventions: each of the six columns SHALL carry 037's column comment marker, mirrored on the model; each constraint SHALL carry 037's constraint comment marker; a same-named existing column SHALL be adopted only with the exact type, nullability, absent default and marker, and a same-named constraint only with the canonical definition, validated and marked, otherwise the migration SHALL refuse by name having changed nothing; `downgrade()` SHALL drop each object only if it carries its marker; the `search_path` SHALL be pinned; lock and statement timeouts SHALL be bounded; and no superuser SHALL be required.
 
 #### Scenario: One identity, one user
 - **WHEN** a write would bind an `(issuer, subject)` pair already bound to another user
@@ -80,7 +80,11 @@ Migration 037 SHALL add to `users` the nullable columns `oidc_issuer`, `oidc_sub
 
 #### Scenario: Catalogue shape
 - **WHEN** the catalogue is read after a fresh upgrade and after an upgrade from 036 with existing users
-- **THEN** the six columns SHALL have the specified types and be nullable, each CHECK and UNIQUE SHALL be validated and match its canonical `pg_get_constraintdef`, and existing user rows SHALL be unchanged with all six columns NULL
+- **THEN** the six columns SHALL have the specified types, be nullable, have no default and carry the column marker, each CHECK and UNIQUE SHALL be validated, match its canonical `pg_get_constraintdef` and carry the constraint marker, and existing user rows SHALL be unchanged with all six columns NULL
+
+#### Scenario: Correct shape without a marker is refused
+- **WHEN** 037 runs over a database whose `users.oidc_subject` already exists as `character varying(255)` NULL with no comment, or whose `uq_users_oidc_identity` exists with the canonical definition but no marker
+- **THEN** the migration SHALL refuse, naming the object, and SHALL change nothing
 
 #### Scenario: Downgrade and re-upgrade
 - **WHEN** the database is downgraded to 036 and upgraded again
