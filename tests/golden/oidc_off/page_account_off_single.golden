@@ -1,0 +1,9 @@
+HTTP 404
+content-type: application/json
+vary: Cookie, Origin
+strict-transport-security: max-age=31536000; includeSubDomains
+x-content-type-options: nosniff
+x-frame-options: DENY
+referrer-policy: no-referrer
+
+{"detail":"Not found"}

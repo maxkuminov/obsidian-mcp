@@ -1,0 +1,8 @@
+HTTP 302
+location: https://client.example/callback?code=<CODE>&state=client-state-golden&iss=https%3A%2F%2Flocalhost
+vary: Origin
+strict-transport-security: max-age=31536000; includeSubDomains
+x-content-type-options: nosniff
+x-frame-options: DENY
+referrer-policy: no-referrer
+

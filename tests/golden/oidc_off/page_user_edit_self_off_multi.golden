@@ -1,0 +1,1889 @@
+HTTP 200
+content-type: text/html; charset=utf-8
+vary: Accept-Encoding, Cookie, Origin
+content-encoding: gzip
+set-cookie: omcp_session=<COOKIE>; path=/; Max-Age=604800; httponly; samesite=lax; secure
+strict-transport-security: max-age=31536000; includeSubDomains
+x-content-type-options: nosniff
+x-frame-options: DENY
+referrer-policy: no-referrer
+content-security-policy: default-src 'self'; script-src 'nonce-<NONCE>'; style-src 'nonce-<NONCE>' https://fonts.googleapis.com; style-src-elem 'nonce-<NONCE>' https://fonts.googleapis.com; style-src-attr 'none'; img-src 'self' data:; font-src https://fonts.gstatic.com; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#070910" data-theme-color-token="--bg">
+    <title>Edit admin — Obsidian MCP</title>
+    
+    <script src="/admin/static/vendor/chart-4.4.7.umd.min.js" nonce="<NONCE>"></script>
+    <script src="/admin/static/panel.js" nonce="<NONCE>" defer></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;1,400&family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500;9..40,600;9..40,700&family=JetBrains+Mono:wght@300;400;500&display=swap" rel="stylesheet">
+    
+    <style nonce="<NONCE>">
+    :root {
+        color-scheme: dark;
+
+        /* ── Core surfaces and text ── */
+        --bg: #070910;
+        --bg-2: #1c1c20;
+        --surface: #0c1018;
+        --surface-2: #141b2c;
+        --surface-3: #1b2440;
+        --border: #222c44;
+        --border-2: #2d3a5a;
+        --control-border: #222c44;
+        --control-border-strong: #2d3a5a;
+        --scrollbar-thumb: #2d3a5a;
+        --disabled-opacity: 0.6;
+        --primary: #9b82e8;
+        --primary-dim: #6d57c2;
+        --primary-text: #c4b4f5;
+        --text: #eef1f8;
+        --text-2: #a8b4cc;
+        --text-3: #7d8ba6;
+        --success: #5fd9a0;
+        --error: #f58888;
+        --warning: #f0b555;
+        --info: #7abde6;
+
+        /* ── Accent washes, borders, glows ──
+           Given explicit per-theme values rather than derived from --primary:
+           an rgba glow that reads as a halo on a near-black ground reads as
+           dirt on a white one. */
+        --primary-glow: rgba(155, 130, 232, 0.12);
+        --primary-glow-strong: rgba(155, 130, 232, 0.28);
+        --primary-glow-xs: rgba(155,130,232,0.05);
+        --primary-glow-md: rgba(155,130,232,0.08);
+        --primary-glow-amb: rgba(155,130,232,0.07);
+        --sidebar-glow: rgba(155,130,232,0.16);
+        --primary-border: rgba(155,130,232,0.25);
+        --primary-border-soft: rgba(155,130,232,0.15);
+        --primary-border-strong: rgba(155,130,232,0.3);
+        --primary-shadow: rgba(155,130,232,0.25);
+        --primary-shadow-hover: rgba(155,130,232,0.45);
+        --primary-halo: rgba(155,130,232,0.55);
+        --primary-halo-strong: rgba(155,130,232,0.95);
+        --gem-facet: rgba(155,130,232,0.22);
+        --gem-facet-2: rgba(155,130,232,0.06);
+        --auth-card-glow: rgba(155,130,232,0.06);
+
+        /* ── Status tints, borders, text ── */
+        --success-surface: rgba(95,217,160,0.12);
+        --success-surface-soft: rgba(95,217,160,0.1);
+        --success-surface-faint: rgba(95,217,160,0.08);
+        --success-border: rgba(95,217,160,0.25);
+        --success-text: #8deabf;
+        --error-surface: rgba(245,136,136,0.12);
+        --error-surface-soft: rgba(245,136,136,0.1);
+        --error-surface-faint: rgba(245,136,136,0.08);
+        --error-surface-strong: rgba(245,136,136,0.2);
+        --error-border: rgba(245,136,136,0.25);
+        --error-border-strong: rgba(245,136,136,0.28);
+        --error-text: #f5abab;
+        --error-text-hover: #f7a5a5;
+        --warning-surface: rgba(240,181,85,0.12);
+        --warning-border: rgba(240,181,85,0.25);
+        --info-surface: rgba(122,189,230,0.12);
+        --info-surface-faint: rgba(122,189,230,0.08);
+        --info-border: rgba(122,189,230,0.25);
+        --info-text: #a6d2ea;
+        --neutral-surface: rgba(125,139,166,0.12);
+        --danger-border: rgba(240,110,110,0.25);
+        --danger-border-soft: rgba(240,110,110,0.2);
+        --key-text: #a0f0cc;
+
+        /* ── Text drawn on a filled accent ── */
+        --on-primary: #efe9ff;
+        --on-primary-strong: white;
+
+        /* ── Overlays, scrims, elevation ── */
+        --topbar-bg: rgba(12, 16, 24, 0.92);
+        --backdrop: rgba(7, 9, 16, 0.6);
+        --modal-scrim: rgba(7, 9, 16, 0.75);
+        --modal-scrim-2: rgba(0,0,0,0.55);
+        --shadow-card: rgba(0,0,0,0.35);
+        --shadow-sidebar: rgba(0,0,0,0.6);
+        --shadow-modal: rgba(0,0,0,0.7);
+        --shadow-auth: rgba(0,0,0,0.65);
+        --code-bg: rgba(0,0,0,0.3);
+        --code-bg-soft: rgba(0,0,0,0.28);
+        --inset-highlight: rgba(255,255,255,0.12);
+        --inset-highlight-strong: rgba(255,255,255,0.2);
+
+        /* Select chevron. A data-URI image cannot read a custom property, so
+           the whole url() is the token and each theme ships its own. */
+        --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%237d8ba6' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+
+        /* ── Chart.js (usage.html) ── */
+        --chart-bar-bg: rgba(139,111,223,0.35);
+        --chart-bar-border: rgba(139,111,223,0.8);
+        --chart-tooltip-bg: #12192a;
+        --chart-tooltip-border: #223050;
+        --chart-tooltip-title: #d8dce8;
+        --chart-tooltip-body: #6e7e9c;
+        --chart-tick: #7d8ba6;
+        --chart-grid: #222c44;
+
+        /* ── OAuth consent page ──
+           A palette that drifted away from the panel's years ago. Dark keeps
+           it byte-for-byte (zero-visual-diff gate); light folds it back onto
+           the panel's own light values, which is where the two surfaces
+           finally converge. */
+        --consent-text: #d8dce8;
+        --consent-text-2: #9fa8b8;
+        --consent-text-3: #6e7e9c;
+        --consent-label: #364155;
+        --consent-border: #1a2336;
+        --consent-border-hover: #223050;
+        --consent-control-border: #1a2336;
+        --consent-control-border-hover: #223050;
+        --consent-primary: #8b6fdf;
+        --consent-primary-dim: #5a45a8;
+        --consent-primary-text: #e0d9f8;
+        --consent-warn: #c9a227;
+        --consent-glow-amb: rgba(139,111,223,0.07);
+        --consent-halo: rgba(139,111,223,0.55);
+        --consent-halo-strong: rgba(139,111,223,0.9);
+        --consent-surface: rgba(139,111,223,0.07);
+        --consent-surface-border: rgba(139,111,223,0.18);
+        --consent-option-hover: rgba(139,111,223,0.04);
+        --consent-option-active: rgba(139,111,223,0.10);
+        --consent-gem-facet: rgba(139,111,223,0.18);
+        --consent-gem-facet-2: rgba(139,111,223,0.05);
+        --consent-primary-glow: rgba(139,111,223,0.3);
+        --consent-neutral-surface: rgba(110,126,156,0.1);
+        --consent-neutral-surface-hover: rgba(110,126,156,0.18);
+    }
+
+    /* ── Light palette ──
+       Selected by `data-theme="light"` on <html>, which the pre-paint
+       bootstrap below stamps from localStorage. Every token defined for dark
+       has a light value here; none falls through. */
+    :root[data-theme="light"] {
+        color-scheme: light;
+
+        /* ── Core surfaces and text ── */
+        --bg: #f5f6fa;
+        --bg-2: #ffffff;
+        --surface: #ffffff;
+        --surface-2: #eef0f6;
+        --surface-3: #e3e6ef;
+        --border: #dfe3ec;
+        --border-2: #c3c9d8;
+        --control-border: #767e91;
+        --control-border-strong: #5e677b;
+        --scrollbar-thumb: #767e91;
+        --disabled-opacity: 0.75;
+        --primary: #6440c8;
+        --primary-dim: #573ab0;
+        --primary-text: #4b2fa6;
+        --text: #14171f;
+        --text-2: #454c5e;
+        --text-3: #5d6577;
+        --success: #0a6b41;
+        --error: #b32218;
+        --warning: #7a4d00;
+        --info: #10557f;
+
+        /* ── Accent washes, borders, glows ── */
+        --primary-glow: rgba(100, 64, 200, 0.10);
+        --primary-glow-strong: rgba(100, 64, 200, 0.22);
+        --primary-glow-xs: rgba(100,64,200,0.05);
+        --primary-glow-md: rgba(100,64,200,0.10);
+        --primary-glow-amb: rgba(100,64,200,0.06);
+        --sidebar-glow: rgba(100,64,200,0.10);
+        --primary-border: rgba(100,64,200,0.32);
+        --primary-border-soft: rgba(100,64,200,0.20);
+        --primary-border-strong: rgba(100,64,200,0.40);
+        --primary-shadow: rgba(100,64,200,0.28);
+        --primary-shadow-hover: rgba(100,64,200,0.40);
+        --primary-halo: rgba(100,64,200,0.30);
+        --primary-halo-strong: rgba(100,64,200,0.50);
+        --gem-facet: rgba(100,64,200,0.30);
+        --gem-facet-2: rgba(100,64,200,0.12);
+        --auth-card-glow: rgba(100,64,200,0.08);
+
+        /* ── Status tints, borders, text ── */
+        --success-surface: rgba(10,107,65,0.10);
+        --success-surface-soft: rgba(10,107,65,0.08);
+        --success-surface-faint: rgba(10,107,65,0.07);
+        --success-border: rgba(10,107,65,0.38);
+        --success-text: #075232;
+        --error-surface: rgba(179,34,24,0.09);
+        --error-surface-soft: rgba(179,34,24,0.07);
+        --error-surface-faint: rgba(179,34,24,0.06);
+        --error-surface-strong: rgba(179,34,24,0.15);
+        --error-border: rgba(179,34,24,0.36);
+        --error-border-strong: rgba(179,34,24,0.8);
+        --error-text: #8f1b13;
+        --error-text-hover: #6f150f;
+        --warning-surface: rgba(122,77,0,0.10);
+        --warning-border: rgba(122,77,0,0.36);
+        --info-surface: rgba(16,85,127,0.10);
+        --info-surface-faint: rgba(16,85,127,0.07);
+        --info-border: rgba(16,85,127,0.36);
+        --info-text: #0c4363;
+        --neutral-surface: rgba(93,101,119,0.12);
+        --danger-border: rgba(179,34,24,0.36);
+        --danger-border-soft: rgba(179,34,24,0.26);
+        --key-text: #075232;
+
+        /* ── Text drawn on a filled accent ── */
+        --on-primary: #ffffff;
+        --on-primary-strong: #ffffff;
+
+        /* ── Overlays, scrims, elevation ──
+           Inverted deliberately: on a white ground a scrim has to darken and a
+           shadow has to be a soft neutral, not the near-opaque black that
+           reads as depth against #070910. */
+        --topbar-bg: rgba(255, 255, 255, 0.92);
+        --backdrop: rgba(20, 23, 31, 0.38);
+        --modal-scrim: rgba(20, 23, 31, 0.46);
+        --modal-scrim-2: rgba(20,23,31,0.42);
+        --shadow-card: rgba(20,23,31,0.10);
+        --shadow-sidebar: rgba(20,23,31,0.12);
+        --shadow-modal: rgba(20,23,31,0.20);
+        --shadow-auth: rgba(20,23,31,0.14);
+        --code-bg: rgba(20,23,31,0.05);
+        --code-bg-soft: rgba(20,23,31,0.04);
+        --inset-highlight: rgba(255,255,255,0.30);
+        --inset-highlight-strong: rgba(255,255,255,0.45);
+
+        --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%235d6577' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+
+        /* ── Chart.js (usage.html) ── */
+        --chart-bar-bg: rgba(100,64,200,0.42);
+        --chart-bar-border: rgba(100,64,200,0.95);
+        --chart-tooltip-bg: #ffffff;
+        --chart-tooltip-border: #c3c9d8;
+        --chart-tooltip-title: #14171f;
+        --chart-tooltip-body: #454c5e;
+        --chart-tick: #5d6577;
+        --chart-grid: #c3c9d8;
+
+        /* ── OAuth consent page ──
+           In light the consent surface stops being its own thing and folds
+           onto the panel's values. */
+        --consent-text: #14171f;
+        --consent-text-2: #454c5e;
+        --consent-text-3: #5d6577;
+        --consent-label: #5d6577;
+        --consent-border: #dfe3ec;
+        --consent-border-hover: #c3c9d8;
+        --consent-control-border: #767e91;
+        --consent-control-border-hover: #5e677b;
+        --consent-primary: #6440c8;
+        --consent-primary-dim: #573ab0;
+        --consent-primary-text: #ffffff;
+        --consent-warn: #7a4d00;
+        --consent-glow-amb: rgba(100,64,200,0.06);
+        --consent-halo: rgba(100,64,200,0.30);
+        --consent-halo-strong: rgba(100,64,200,0.50);
+        --consent-surface: rgba(100,64,200,0.07);
+        --consent-surface-border: rgba(100,64,200,0.22);
+        --consent-option-hover: rgba(100,64,200,0.05);
+        --consent-option-active: rgba(100,64,200,0.11);
+        --consent-gem-facet: rgba(100,64,200,0.28);
+        --consent-gem-facet-2: rgba(100,64,200,0.10);
+        --consent-primary-glow: rgba(100,64,200,0.30);
+        --consent-neutral-surface: rgba(93,101,119,0.10);
+        --consent-neutral-surface-hover: rgba(93,101,119,0.18);
+    }
+
+    /* OS default, for a visitor who has never chosen. Guarded on
+       `:not([data-theme="dark"])` so an explicit dark choice still wins on a
+       light machine — and so the OS default works with JavaScript off. */
+    @media (prefers-color-scheme: light) {
+        :root:not([data-theme="dark"]) {
+            color-scheme: light;
+
+/* ── Core surfaces and text ── */
+            --bg: #f5f6fa;
+            --bg-2: #ffffff;
+            --surface: #ffffff;
+            --surface-2: #eef0f6;
+            --surface-3: #e3e6ef;
+            --border: #dfe3ec;
+            --border-2: #c3c9d8;
+            --control-border: #767e91;
+            --control-border-strong: #5e677b;
+            --scrollbar-thumb: #767e91;
+            --disabled-opacity: 0.75;
+            --primary: #6440c8;
+            --primary-dim: #573ab0;
+            --primary-text: #4b2fa6;
+            --text: #14171f;
+            --text-2: #454c5e;
+            --text-3: #5d6577;
+            --success: #0a6b41;
+            --error: #b32218;
+            --warning: #7a4d00;
+            --info: #10557f;
+
+/* ── Accent washes, borders, glows ── */
+            --primary-glow: rgba(100, 64, 200, 0.10);
+            --primary-glow-strong: rgba(100, 64, 200, 0.22);
+            --primary-glow-xs: rgba(100,64,200,0.05);
+            --primary-glow-md: rgba(100,64,200,0.10);
+            --primary-glow-amb: rgba(100,64,200,0.06);
+            --sidebar-glow: rgba(100,64,200,0.10);
+            --primary-border: rgba(100,64,200,0.32);
+            --primary-border-soft: rgba(100,64,200,0.20);
+            --primary-border-strong: rgba(100,64,200,0.40);
+            --primary-shadow: rgba(100,64,200,0.28);
+            --primary-shadow-hover: rgba(100,64,200,0.40);
+            --primary-halo: rgba(100,64,200,0.30);
+            --primary-halo-strong: rgba(100,64,200,0.50);
+            --gem-facet: rgba(100,64,200,0.30);
+            --gem-facet-2: rgba(100,64,200,0.12);
+            --auth-card-glow: rgba(100,64,200,0.08);
+
+/* ── Status tints, borders, text ── */
+            --success-surface: rgba(10,107,65,0.10);
+            --success-surface-soft: rgba(10,107,65,0.08);
+            --success-surface-faint: rgba(10,107,65,0.07);
+            --success-border: rgba(10,107,65,0.38);
+            --success-text: #075232;
+            --error-surface: rgba(179,34,24,0.09);
+            --error-surface-soft: rgba(179,34,24,0.07);
+            --error-surface-faint: rgba(179,34,24,0.06);
+            --error-surface-strong: rgba(179,34,24,0.15);
+            --error-border: rgba(179,34,24,0.36);
+            --error-border-strong: rgba(179,34,24,0.8);
+            --error-text: #8f1b13;
+            --error-text-hover: #6f150f;
+            --warning-surface: rgba(122,77,0,0.10);
+            --warning-border: rgba(122,77,0,0.36);
+            --info-surface: rgba(16,85,127,0.10);
+            --info-surface-faint: rgba(16,85,127,0.07);
+            --info-border: rgba(16,85,127,0.36);
+            --info-text: #0c4363;
+            --neutral-surface: rgba(93,101,119,0.12);
+            --danger-border: rgba(179,34,24,0.36);
+            --danger-border-soft: rgba(179,34,24,0.26);
+            --key-text: #075232;
+
+/* ── Text drawn on a filled accent ── */
+            --on-primary: #ffffff;
+            --on-primary-strong: #ffffff;
+
+/* ── Overlays, scrims, elevation ──
+               Inverted deliberately: on a white ground a scrim has to darken and a
+               shadow has to be a soft neutral, not the near-opaque black that
+               reads as depth against #070910. */
+            --topbar-bg: rgba(255, 255, 255, 0.92);
+            --backdrop: rgba(20, 23, 31, 0.38);
+            --modal-scrim: rgba(20, 23, 31, 0.46);
+            --modal-scrim-2: rgba(20,23,31,0.42);
+            --shadow-card: rgba(20,23,31,0.10);
+            --shadow-sidebar: rgba(20,23,31,0.12);
+            --shadow-modal: rgba(20,23,31,0.20);
+            --shadow-auth: rgba(20,23,31,0.14);
+            --code-bg: rgba(20,23,31,0.05);
+            --code-bg-soft: rgba(20,23,31,0.04);
+            --inset-highlight: rgba(255,255,255,0.30);
+            --inset-highlight-strong: rgba(255,255,255,0.45);
+
+--select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%235d6577' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+
+/* ── Chart.js (usage.html) ── */
+            --chart-bar-bg: rgba(100,64,200,0.42);
+            --chart-bar-border: rgba(100,64,200,0.95);
+            --chart-tooltip-bg: #ffffff;
+            --chart-tooltip-border: #c3c9d8;
+            --chart-tooltip-title: #14171f;
+            --chart-tooltip-body: #454c5e;
+            --chart-tick: #5d6577;
+            --chart-grid: #c3c9d8;
+
+/* ── OAuth consent page ──
+               In light the consent surface stops being its own thing and folds
+               onto the panel's values. */
+            --consent-text: #14171f;
+            --consent-text-2: #454c5e;
+            --consent-text-3: #5d6577;
+            --consent-label: #5d6577;
+            --consent-border: #dfe3ec;
+            --consent-border-hover: #c3c9d8;
+            --consent-control-border: #767e91;
+            --consent-control-border-hover: #5e677b;
+            --consent-primary: #6440c8;
+            --consent-primary-dim: #573ab0;
+            --consent-primary-text: #ffffff;
+            --consent-warn: #7a4d00;
+            --consent-glow-amb: rgba(100,64,200,0.06);
+            --consent-halo: rgba(100,64,200,0.30);
+            --consent-halo-strong: rgba(100,64,200,0.50);
+            --consent-surface: rgba(100,64,200,0.07);
+            --consent-surface-border: rgba(100,64,200,0.22);
+            --consent-option-hover: rgba(100,64,200,0.05);
+            --consent-option-active: rgba(100,64,200,0.11);
+            --consent-gem-facet: rgba(100,64,200,0.28);
+            --consent-gem-facet-2: rgba(100,64,200,0.10);
+            --consent-primary-glow: rgba(100,64,200,0.30);
+            --consent-neutral-surface: rgba(93,101,119,0.10);
+            --consent-neutral-surface-hover: rgba(93,101,119,0.18);
+        }
+    }
+
+    /* ── Theme toggle ──
+       Markup lives in `_theme_toggle.html`; the icon swap is pure CSS on the
+       same selectors as the palette, so the right glyph is showing before any
+       script runs. */
+    .theme-toggle {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 34px;
+        height: 34px;
+        flex-shrink: 0;
+        padding: 0;
+        border-radius: 7px;
+        border: 1px solid var(--control-border);
+        background: var(--surface-2);
+        color: var(--text-2);
+        cursor: pointer;
+        transition: background 0.15s, border-color 0.15s, color 0.15s;
+    }
+    .theme-toggle:hover {
+        background: var(--surface-3);
+        border-color: var(--control-border-strong);
+        color: var(--text);
+    }
+    .theme-toggle:focus-visible {
+        outline: 2px solid var(--primary);
+        outline-offset: 2px;
+    }
+    .theme-toggle svg { width: 16px; height: 16px; display: block; }
+    .theme-toggle .icon-moon { display: none; }
+    :root[data-theme="light"] .theme-toggle .icon-sun { display: none; }
+    :root[data-theme="light"] .theme-toggle .icon-moon { display: block; }
+    @media (prefers-color-scheme: light) {
+        :root:not([data-theme="dark"]) .theme-toggle .icon-sun { display: none; }
+        :root:not([data-theme="dark"]) .theme-toggle .icon-moon { display: block; }
+    }
+</style>
+<script nonce="<NONCE>">
+/* Pre-paint theme bootstrap. It runs in <head>, before the body is parsed, so
+   a stored choice is on <html> before the first paint and there is no flash of
+   the other theme.
+
+   It stays inline, carrying the response's CSP nonce (see
+   docs/architecture/control-panel.md): a script file would be fetched after
+   first paint and bring the flash back. The panel policy refuses inline event
+   handlers, so the toggle's click listener is registered here too, delegated
+   from `document` — this partial is included by all three roots, including
+   the login and consent pages that do not load panel.js, and a listener on
+   `document` works before the body exists. The script body is kept free of
+   Jinja delimiters so `{` and `}` never have to be escaped.
+
+   The attribute is stamped ONLY when an explicit choice is stored. With no
+   choice the attribute stays absent and the `prefers-color-scheme` block above
+   decides, which is what keeps the OS default working with JavaScript off. */
+(function () {
+    var KEY = 'omcp-theme';
+    var root = document.documentElement;
+
+    function stored() {
+        try { return localStorage.getItem(KEY); } catch (e) { return null; }
+    }
+    function osLight() {
+        return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches);
+    }
+    function effective() {
+        var set = root.getAttribute('data-theme');
+        if (set === 'light' || set === 'dark') { return set; }
+        return osLight() ? 'light' : 'dark';
+    }
+
+    var choice = stored();
+    if (choice === 'light' || choice === 'dark') {
+        root.setAttribute('data-theme', choice);
+    }
+
+    /* A <meta> cannot read a custom property, so the color is copied across by
+       script; the token name rides on the tag itself. */
+    function syncMeta() {
+        var m = document.querySelector('meta[name="theme-color"][data-theme-color-token]');
+        if (!m) { return; }
+        var v = getComputedStyle(root).getPropertyValue(m.getAttribute('data-theme-color-token')).trim();
+        if (v) { m.setAttribute('content', v); }
+    }
+
+    function label(theme) {
+        return theme === 'light' ? 'Switch to dark theme' : 'Switch to light theme';
+    }
+    function syncButtons() {
+        var text = label(effective());
+        var all = document.querySelectorAll('[data-theme-toggle]');
+        for (var i = 0; i < all.length; i += 1) {
+            all[i].setAttribute('aria-label', text);
+            all[i].setAttribute('title', text);
+        }
+    }
+
+    window.__themeToggle = function () {
+        var next = effective() === 'light' ? 'dark' : 'light';
+        root.setAttribute('data-theme', next);
+        /* Storage may throw (private mode, blocked site data). The document
+           has already switched by this point, so the toggle still works; only
+           the persistence is lost and the next load follows the OS. */
+        try { localStorage.setItem(KEY, next); } catch (e) { /* not fatal */ }
+        syncMeta();
+        syncButtons();
+        window.dispatchEvent(new CustomEvent('themechange', { detail: { theme: next } }));
+    };
+
+    /* With no explicit choice the palette follows the OS, and the OS can flip
+       under a page that is already open. CSS re-evaluates itself; the Chart.js
+       canvas does not, so the same event has to fire for it. An explicit
+       choice wins, so this stays quiet once the user has picked. */
+    if (window.matchMedia) {
+        var mq = window.matchMedia('(prefers-color-scheme: dark)');
+        var onSystemChange = function () {
+            var s = stored();
+            if (s === 'light' || s === 'dark') { return; }
+            syncMeta();
+            syncButtons();
+            window.dispatchEvent(new CustomEvent('themechange', { detail: { theme: effective() } }));
+        };
+        if (mq.addEventListener) { mq.addEventListener('change', onSystemChange); }
+        else if (mq.addListener) { mq.addListener(onSystemChange); }
+    }
+
+    /* The toggle button carries `data-theme-toggle` and no handler of its own. */
+    document.addEventListener('click', function (event) {
+        var t = event.target;
+        if (t && t.nodeType !== 1) { t = t.parentElement; }
+        if (t && t.closest && t.closest('[data-theme-toggle]')) {
+            window.__themeToggle();
+        }
+    });
+
+    syncMeta();
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', syncButtons);
+    } else {
+        syncButtons();
+    }
+})();
+</script>
+    <style nonce="<NONCE>">
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        html { -webkit-text-size-adjust: 100%; }
+
+        body {
+            background-color: var(--bg);
+            color: var(--text);
+            font-family: 'DM Sans', sans-serif;
+            font-size: 15px;
+            line-height: 1.55;
+            min-height: 100vh;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        /* Subtle noise texture */
+        body::after {
+            content: '';
+            position: fixed;
+            inset: 0;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='300' height='300'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='300' height='300' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
+            pointer-events: none;
+            z-index: 9999;
+        }
+
+        /* Layout */
+        .layout {
+            display: flex;
+            min-height: 100vh;
+        }
+
+        /* ── Mobile top bar (hidden on desktop) ── */
+        .topbar {
+            display: none;
+            position: sticky;
+            top: 0;
+            z-index: 40;
+            background: var(--topbar-bg);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            border-bottom: 1px solid var(--border);
+            padding: 10px 14px;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .topbar-brand {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-family: 'Cormorant Garamond', serif;
+            font-size: 19px;
+            font-weight: 600;
+            color: var(--text);
+        }
+
+        .topbar-brand svg { width: 22px; height: 22px; }
+
+        .topbar-toggle {
+            background: var(--surface-2);
+            border: 1px solid var(--control-border);
+            width: 40px; height: 40px;
+            border-radius: 7px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--text);
+            cursor: pointer;
+            transition: background 0.15s, border-color 0.15s;
+        }
+        .topbar-toggle:hover { background: var(--surface-3); border-color: var(--control-border-strong); }
+        .topbar-toggle svg { width: 18px; height: 18px; }
+
+        .sidebar-backdrop {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: var(--backdrop);
+            backdrop-filter: blur(3px);
+            -webkit-backdrop-filter: blur(3px);
+            z-index: 45;
+            opacity: 0;
+            transition: opacity 0.22s ease;
+        }
+        .sidebar-backdrop.open { display: block; opacity: 1; }
+
+        /* ── Sidebar ── */
+        .sidebar {
+            width: 224px;
+            flex-shrink: 0;
+            background: var(--surface);
+            border-right: 1px solid var(--border);
+            position: fixed;
+            top: 0; left: 0; bottom: 0;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            z-index: 50;
+        }
+
+        /* Atmospheric glow at sidebar bottom */
+        .sidebar::after {
+            content: '';
+            position: absolute;
+            bottom: -20px; left: -20px; right: -20px;
+            height: 180px;
+            background: radial-gradient(ellipse at 50% 100%, var(--sidebar-glow) 0%, transparent 70%);
+            pointer-events: none;
+        }
+
+        .sidebar-brand {
+            padding: 26px 22px 22px;
+            border-bottom: 1px solid var(--border);
+            flex-shrink: 0;
+        }
+
+        .brand-icon {
+            width: 30px;
+            height: 30px;
+            margin-bottom: 14px;
+            animation: gem-glow 4s ease-in-out infinite;
+        }
+
+        @keyframes gem-glow {
+            0%, 100% { filter: drop-shadow(0 0 4px var(--primary-halo)); }
+            50%       { filter: drop-shadow(0 0 10px var(--primary-halo-strong)); }
+        }
+
+        .brand-name {
+            font-family: 'Cormorant Garamond', serif;
+            font-size: 21px;
+            font-weight: 600;
+            color: var(--text);
+            letter-spacing: 0.025em;
+            line-height: 1;
+            display: block;
+        }
+
+        .brand-tagline {
+            font-size: 10px;
+            font-weight: 600;
+            letter-spacing: 0.18em;
+            text-transform: uppercase;
+            color: var(--text-3);
+            margin-top: 6px;
+            display: block;
+        }
+
+        /* Theme toggle sits in the sidebar foot on desktop and in the
+           mobile top bar, so every panel page exposes it however it is
+           being viewed. */
+        .sidebar-foot {
+            flex-shrink: 0;
+            padding: 12px 14px;
+            border-top: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            position: relative;
+            z-index: 1;
+        }
+
+        /* Nav */
+        .sidebar-nav {
+            padding: 14px 10px;
+            flex: 1;
+            overflow-y: auto;
+        }
+
+        .nav-section {
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.2em;
+            text-transform: uppercase;
+            color: var(--text-3);
+            padding: 0 12px;
+            margin: 18px 0 6px;
+        }
+
+        .nav-section:first-child { margin-top: 4px; }
+
+        .nav-item {
+            display: flex;
+            align-items: center;
+            gap: 11px;
+            padding: 10px 14px;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 400;
+            color: var(--text-2);
+            text-decoration: none;
+            transition: background 0.18s, color 0.18s;
+            position: relative;
+            margin-bottom: 2px;
+        }
+
+        .nav-item:hover {
+            background: var(--surface-2);
+            color: var(--text);
+        }
+
+        .nav-item.active {
+            background: var(--primary-glow);
+            color: var(--primary-text);
+            font-weight: 500;
+        }
+
+        .nav-item.active::before {
+            content: '';
+            position: absolute;
+            left: 0; top: 5px; bottom: 5px;
+            width: 2px;
+            background: var(--primary);
+            border-radius: 0 2px 2px 0;
+        }
+
+        .nav-icon {
+            width: 16px;
+            height: 16px;
+            flex-shrink: 0;
+            opacity: 0.7;
+            transition: opacity 0.18s;
+        }
+
+        .nav-item:hover .nav-icon,
+        .nav-item.active .nav-icon { opacity: 1; }
+
+        /* ── User badge in header ── */
+        .user-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            padding: 6px 12px;
+            background: var(--surface-2);
+            border: 1px solid var(--border);
+            border-radius: 99px;
+            font-size: 12px;
+            color: var(--text-2);
+        }
+        .user-badge-name {
+            font-weight: 500;
+            color: var(--text);
+            letter-spacing: 0.01em;
+        }
+        .user-badge-role {
+            font-size: 9px;
+            font-weight: 700;
+            letter-spacing: 0.16em;
+            text-transform: uppercase;
+            color: var(--primary-text);
+            padding: 2px 6px;
+            border-radius: 3px;
+            background: var(--primary-glow);
+            border: 1px solid var(--primary-border-strong);
+        }
+        .logout-btn {
+            background: none;
+            border: none;
+            color: var(--text-3);
+            font-size: 12px;
+            cursor: pointer;
+            padding: 4px 8px;
+            border-radius: 4px;
+            transition: color 0.15s, background 0.15s;
+            font-family: 'DM Sans', sans-serif;
+        }
+        .logout-btn:hover { color: var(--error); background: var(--error-surface-faint); }
+
+        /* ── Main content ── */
+        .main {
+            margin-left: 224px;
+            flex: 1;
+            min-height: 100vh;
+            min-width: 0;
+        }
+
+        .page-top {
+            padding: 40px 48px 24px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: flex-end;
+            justify-content: space-between;
+            gap: 20px;
+            flex-wrap: wrap;
+        }
+
+        .page-title {
+            font-family: 'Cormorant Garamond', serif;
+            font-size: 34px;
+            font-weight: 600;
+            color: var(--text);
+            letter-spacing: 0.01em;
+            line-height: 1;
+        }
+
+        .page-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+
+        .page-body {
+            padding: 36px 48px 56px;
+        }
+
+        /* ── Responsive grid utilities ── */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 16px;
+            margin-bottom: 32px;
+        }
+
+        .split-2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+
+        /* Horizontal-scroll wrapper for wide tables on small screens */
+        .table-scroll {
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+        }
+
+        /* ── Cards ── */
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 7px;
+            overflow: hidden;
+        }
+
+        .card-header {
+            padding: 18px 26px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 14px;
+            flex-wrap: wrap;
+        }
+
+        .card-title {
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+            color: var(--text-2);
+        }
+
+        .card-body { padding: 24px 26px; }
+
+        /* ── Stat cards ── */
+        .stat-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 9px;
+            padding: 24px 26px;
+            position: relative;
+            overflow: hidden;
+            transition: border-color 0.25s, box-shadow 0.25s, transform 0.2s;
+            cursor: default;
+        }
+
+        .stat-card:hover {
+            border-color: var(--border-2);
+            box-shadow: 0 8px 32px var(--shadow-card), 0 0 20px var(--primary-glow-md);
+            transform: translateY(-2px);
+        }
+
+        /* Thin accent top line */
+        .stat-card::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0;
+            height: 1px;
+            background: linear-gradient(90deg, transparent 0%, var(--primary-dim) 50%, transparent 100%);
+            opacity: 0.7;
+            transition: opacity 0.25s;
+        }
+
+        .stat-card:hover::before { opacity: 1; }
+
+        .stat-label {
+            font-size: 11px;
+            font-weight: 600;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            color: var(--text-2);
+            margin-bottom: 14px;
+        }
+
+        /* Numbers: DM Sans, bold, clean */
+        .stat-num {
+            font-family: 'DM Sans', sans-serif;
+            font-size: 38px;
+            font-weight: 700;
+            line-height: 1;
+            color: var(--text);
+            font-variant-numeric: tabular-nums;
+            letter-spacing: -0.02em;
+        }
+
+        .stat-num.accent { color: var(--primary-text); }
+
+        .stat-sub {
+            font-size: 13px;
+            color: var(--text-3);
+            margin-top: 10px;
+        }
+
+        /* ── Tables ── */
+        .data-table { width: 100%; border-collapse: collapse; }
+
+        .data-table th {
+            text-align: left;
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+            color: var(--text-2);
+            padding: 13px 20px;
+            border-bottom: 1px solid var(--border);
+            white-space: nowrap;
+            background: var(--surface);
+        }
+
+        .data-table td {
+            padding: 14px 20px;
+            font-size: 14px;
+            color: var(--text-2);
+            border-bottom: 1px solid var(--border);
+            transition: background 0.12s, color 0.12s;
+        }
+
+        .data-table tbody tr:last-child td { border-bottom: none; }
+
+        .data-table tbody tr:hover td {
+            background: var(--surface-2);
+            color: var(--text);
+        }
+
+        .mono {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+        }
+
+        /* ── Badges ── */
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 3px 8px;
+            border-radius: 3px;
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+        }
+
+        .badge-green  { background: var(--success-surface); color: var(--success); border: 1px solid var(--success-border); }
+        .badge-red    { background: var(--error-surface);   color: var(--error);   border: 1px solid var(--error-border); }
+        .badge-yellow { background: var(--warning-surface); color: var(--warning); border: 1px solid var(--warning-border); }
+        .badge-purple { background: var(--primary-glow); color: var(--primary-text); border: 1px solid var(--primary-border-strong); }
+        .badge-blue   { background: var(--info-surface);    color: var(--info);    border: 1px solid var(--info-border); }
+        .badge-gray   { background: var(--neutral-surface); color: var(--text-2);  border: 1px solid var(--border-2); }
+
+        /* ── Buttons ── */
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            padding: 8px 16px;
+            border-radius: 5px;
+            font-size: 13px;
+            font-weight: 500;
+            letter-spacing: 0.02em;
+            cursor: pointer;
+            transition: all 0.15s;
+            border: none;
+            text-decoration: none;
+            font-family: 'DM Sans', sans-serif;
+            white-space: nowrap;
+            min-height: 36px;
+        }
+
+        .btn:disabled { opacity: var(--disabled-opacity); cursor: not-allowed; }
+
+        .btn-lg {
+            padding: 11px 22px;
+            font-size: 14px;
+            font-weight: 600;
+            min-height: 44px;
+            border-radius: 7px;
+        }
+
+        .btn-primary {
+            background: var(--primary-dim);
+            color: var(--on-primary);
+        }
+        .btn-primary:hover:not(:disabled) {
+            background: var(--primary);
+            box-shadow: 0 0 20px var(--primary-glow-strong);
+            color: var(--on-primary-strong);
+        }
+
+        .btn-primary.btn-lg {
+            background: linear-gradient(180deg, var(--primary) 0%, var(--primary-dim) 100%);
+            box-shadow: 0 2px 12px var(--primary-shadow), inset 0 1px 0 var(--inset-highlight);
+            color: var(--on-primary-strong);
+        }
+        .btn-primary.btn-lg:hover:not(:disabled) {
+            box-shadow: 0 4px 22px var(--primary-shadow-hover), inset 0 1px 0 var(--inset-highlight-strong);
+            transform: translateY(-1px);
+        }
+        .btn-primary.btn-lg:active:not(:disabled) { transform: translateY(0); }
+
+        .btn-ghost {
+            background: var(--surface-2);
+            color: var(--text-2);
+            border: 1px solid var(--control-border);
+        }
+        .btn-ghost:hover:not(:disabled) {
+            color: var(--text);
+            border-color: var(--control-border-strong);
+            background: var(--surface-3);
+        }
+
+        .btn-danger {
+            background: var(--error-surface-soft);
+            color: var(--error);
+            border: 1px solid var(--error-border-strong);
+        }
+        .btn-danger:hover:not(:disabled) {
+            background: var(--error-surface-strong);
+        }
+
+        .btn-link {
+            background: none;
+            color: var(--error);
+            font-size: 12px;
+            padding: 4px 8px;
+            min-height: 0;
+        }
+        .btn-link:hover { color: var(--error-text-hover); }
+
+        /* Reindex CTA icon spin on click */
+        .btn .spin { animation: spin 0.9s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* Inline status pill (e.g. "Reindex started ✓") */
+        .inline-status {
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            padding: 6px 12px;
+            border-radius: 99px;
+            font-size: 12px;
+            font-weight: 500;
+            border: 1px solid transparent;
+            opacity: 0;
+            transition: opacity 0.25s;
+        }
+        .inline-status.show { opacity: 1; }
+        .inline-status.ok  { background: var(--success-surface-soft); color: var(--success); border-color: var(--success-border); }
+        .inline-status.err { background: var(--error-surface-soft);   color: var(--error);   border-color: var(--error-border); }
+
+        /* ── Forms ── */
+        .field { margin-bottom: 18px; }
+
+        .field-label {
+            display: block;
+            font-size: 11px;
+            font-weight: 600;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            color: var(--text-2);
+            margin-bottom: 8px;
+        }
+
+        .field-input, .field-select {
+            width: 100%;
+            padding: 10px 13px;
+            background: var(--bg);
+            border: 1px solid var(--control-border);
+            border-radius: 5px;
+            color: var(--text);
+            font-family: 'DM Sans', sans-serif;
+            font-size: 14px;
+            outline: none;
+            transition: border-color 0.15s, box-shadow 0.15s;
+            appearance: none;
+        }
+
+        .field-input:focus, .field-select:focus {
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px var(--primary-glow);
+        }
+
+        .field-select {
+            background-image: var(--select-arrow);
+            background-repeat: no-repeat;
+            background-position: right 12px center;
+            padding-right: 34px;
+        }
+
+        /* ── Modal ── */
+        .modal {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: var(--modal-scrim);
+            backdrop-filter: blur(5px);
+            -webkit-backdrop-filter: blur(5px);
+            z-index: 60;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .modal.open { display: flex; }
+
+        .modal-panel {
+            background: var(--surface);
+            border: 1px solid var(--border-2);
+            border-radius: 10px;
+            padding: 28px;
+            width: 100%;
+            max-width: 420px;
+            box-shadow: 0 32px 80px var(--shadow-modal), 0 0 50px var(--primary-glow);
+            animation: modal-in 0.2s ease;
+        }
+
+        @keyframes modal-in {
+            from { opacity: 0; transform: scale(0.97) translateY(6px); }
+            to   { opacity: 1; transform: scale(1) translateY(0); }
+        }
+
+        .modal-title {
+            font-family: 'Cormorant Garamond', serif;
+            font-size: 22px;
+            font-weight: 600;
+            color: var(--text);
+            margin-bottom: 22px;
+        }
+
+        .modal-footer {
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+            margin-top: 24px;
+            flex-wrap: wrap;
+        }
+
+        /* ── Alerts ── */
+        .alert {
+            padding: 14px 18px;
+            border-radius: 6px;
+            font-size: 14px;
+            margin-bottom: 24px;
+        }
+
+        .alert-success {
+            background: var(--success-surface-faint);
+            border: 1px solid var(--success-border);
+            color: var(--success-text);
+        }
+
+        .alert-warning {
+            background: var(--error-surface-faint);
+            border: 1px solid var(--error-border);
+            color: var(--error-text);
+        }
+
+        /* ── Key-value rows ── */
+        .kv { display: flex; align-items: center; justify-content: space-between; padding: 13px 0; border-bottom: 1px solid var(--border); gap: 16px; }
+        .kv:last-child { border-bottom: none; }
+        .kv-k { font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-2); }
+        .kv-v { font-size: 14px; color: var(--text); text-align: right; word-break: break-word; }
+
+        /* ── Scrollbar ── */
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--text-3); }
+
+        /* ── Page entrance animation ── */
+        @keyframes fade-up {
+            from { opacity: 0; transform: translateY(7px); }
+            to   { opacity: 1; transform: translateY(0); }
+        }
+
+        .page-top    { animation: fade-up 0.28s ease both; }
+        .anim-1 { animation: fade-up 0.3s ease both; animation-delay: 0.04s; }
+        .anim-2 { animation: fade-up 0.3s ease both; animation-delay: 0.08s; }
+        .anim-3 { animation: fade-up 0.3s ease both; animation-delay: 0.13s; }
+        .anim-4 { animation: fade-up 0.3s ease both; animation-delay: 0.18s; }
+
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+        }
+
+        /* ── Mobile / tablet ── */
+        @media (max-width: 900px) {
+            .topbar { display: flex; }
+
+            .sidebar {
+                transform: translateX(-100%);
+                transition: transform 0.25s ease;
+                width: 260px;
+                box-shadow: 24px 0 60px var(--shadow-sidebar);
+            }
+            .sidebar.open { transform: translateX(0); }
+
+            .main { margin-left: 0; }
+
+            .page-top {
+                padding: 22px 18px 18px;
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 14px;
+            }
+            .page-title { font-size: 28px; }
+            .page-actions { width: 100%; }
+
+            .page-body { padding: 22px 16px 44px; }
+
+            .stats-grid { grid-template-columns: repeat(2, 1fr); gap: 12px; margin-bottom: 22px; }
+            .split-2 { grid-template-columns: 1fr; gap: 14px; }
+
+            .card-header { padding: 14px 18px; }
+            .card-body { padding: 18px 18px; }
+
+            .stat-card { padding: 18px 18px; }
+            .stat-num { font-size: 30px; }
+
+            .data-table th, .data-table td { padding: 11px 14px; font-size: 13px; }
+            .data-table th { font-size: 10px; }
+        }
+
+        @media (max-width: 480px) {
+            .stats-grid { grid-template-columns: 1fr; }
+            .page-title { font-size: 26px; }
+            .btn-lg { width: 100%; justify-content: center; }
+            .page-actions > form { width: 100%; }
+            .page-actions > form .btn-lg { width: 100%; }
+        }
+
+        /* Gem marks (sidebar and mobile header). Stylesheet rules, not
+           fill=/stroke= presentation attributes: var() in a presentation
+           attribute does not substitute dependably and falls back to black
+           (#289, design D2). */
+        .gem-edge { stroke: var(--primary); }
+        .gem-facet { fill: var(--gem-facet); stroke: none; }
+        .gem-facet-2 { fill: var(--gem-facet-2); stroke: none; }
+
+        /* Signed-in user row above the page content (multi-user mode). */
+        .base-user-bar {
+            display: flex;
+            justify-content: flex-end;
+            align-items: center;
+            gap: 10px;
+            padding: 14px 48px 0;
+        }
+    </style>
+    
+    <style nonce="<NONCE>">
+.u-accent-color-primary { accent-color: var(--primary); }
+.u-align-items-baseline { align-items: baseline; }
+.u-align-items-center { align-items: center; }
+.u-align-items-flex-start { align-items: flex-start; }
+.u-border-bottom-color-danger-border-soft { border-bottom-color: var(--danger-border-soft); }
+.u-border-color-danger-border { border-color: var(--danger-border); }
+.u-border-color-error-border { border-color: var(--error-border); }
+.u-border-left-3px-solid-error { border-left: 3px solid var(--error); }
+.u-border-top-1px-solid-border { border-top: 1px solid var(--border); }
+.u-color-error { color: var(--error); }
+.u-color-primary-text { color: var(--primary-text); }
+.u-color-success { color: var(--success); }
+.u-color-text { color: var(--text); }
+.u-color-text-2 { color: var(--text-2); }
+.u-color-text-3 { color: var(--text-3); }
+.u-color-warning { color: var(--warning); }
+.u-cursor-pointer { cursor: pointer; }
+.u-display-block { display: block; }
+.u-display-flex { display: flex; }
+.u-display-inline { display: inline; }
+.u-flex-1 { flex: 1; }
+.u-flex-direction-column { flex-direction: column; }
+.u-flex-shrink-0 { flex-shrink: 0; }
+.u-flex-wrap-wrap { flex-wrap: wrap; }
+.u-font-size-10px { font-size: 10px; }
+.u-font-size-11px { font-size: 11px; }
+.u-font-size-12px { font-size: 12px; }
+.u-font-size-13px { font-size: 13px; }
+.u-font-size-14px { font-size: 14px; }
+.u-font-size-15px { font-size: 15px; }
+.u-font-size-16px { font-size: 16px; }
+.u-font-size-17px { font-size: 17px; }
+.u-font-weight-500 { font-weight: 500; }
+.u-font-weight-600 { font-weight: 600; }
+.u-gap-10px { gap: 10px; }
+.u-gap-14px { gap: 14px; }
+.u-gap-16px { gap: 16px; }
+.u-gap-8px { gap: 8px; }
+.u-height-18px { height: 18px; }
+.u-justify-content-flex-end { justify-content: flex-end; }
+.u-justify-content-space-between { justify-content: space-between; }
+.u-line-height-1_3 { line-height: 1.3; }
+.u-line-height-1_6 { line-height: 1.6; }
+.u-margin-0 { margin: 0; }
+.u-margin-0-0-8px { margin: 0 0 8px; }
+.u-margin-0-auto-14px { margin: 0 auto 14px; }
+.u-margin-bottom-0 { margin-bottom: 0; }
+.u-margin-bottom-14px { margin-bottom: 14px; }
+.u-margin-bottom-16px { margin-bottom: 16px; }
+.u-margin-bottom-18px { margin-bottom: 18px; }
+.u-margin-bottom-20px { margin-bottom: 20px; }
+.u-margin-bottom-6px { margin-bottom: 6px; }
+.u-margin-bottom-8px { margin-bottom: 8px; }
+.u-margin-left-4px { margin-left: 4px; }
+.u-margin-left-6px { margin-left: 6px; }
+.u-margin-left-auto { margin-left: auto; }
+.u-margin-right-6px { margin-right: 6px; }
+.u-margin-right-8px { margin-right: 8px; }
+.u-margin-top-10px { margin-top: 10px; }
+.u-margin-top-12px { margin-top: 12px; }
+.u-margin-top-14px { margin-top: 14px; }
+.u-margin-top-16px { margin-top: 16px; }
+.u-margin-top-18px { margin-top: 18px; }
+.u-margin-top-20px { margin-top: 20px; }
+.u-margin-top-24px { margin-top: 24px; }
+.u-margin-top-2px { margin-top: 2px; }
+.u-margin-top-3px { margin-top: 3px; }
+.u-margin-top-4px { margin-top: 4px; }
+.u-margin-top-6px { margin-top: 6px; }
+.u-margin-top-8px { margin-top: 8px; }
+.u-max-width-480px { max-width: 480px; }
+.u-min-height-0 { min-height: 0; }
+.u-min-width-0 { min-width: 0; }
+.u-min-width-150px { min-width: 150px; }
+.u-min-width-170px { min-width: 170px; }
+.u-min-width-180px { min-width: 180px; }
+.u-min-width-240px { min-width: 240px; }
+.u-opacity-0_25 { opacity: 0.25; }
+.u-opacity-0_5 { opacity: 0.5; }
+.u-opacity-0_75 { opacity: 0.75; }
+.u-overflow-hidden { overflow: hidden; }
+.u-overflow-y-auto { overflow-y: auto; }
+.u-padding-10px-0 { padding: 10px 0; }
+.u-padding-12px-0 { padding: 12px 0; }
+.u-padding-12px-16px { padding: 12px 16px; }
+.u-padding-14px-16px { padding: 14px 16px; }
+.u-padding-14px-16px-10px { padding: 14px 16px 10px; }
+.u-padding-14px-22px { padding: 14px 22px; }
+.u-padding-18px-22px { padding: 18px 22px; }
+.u-padding-20px-22px { padding: 20px 22px; }
+.u-padding-24px { padding: 24px; }
+.u-padding-32px { padding: 32px; }
+.u-padding-3px-28px-3px-8px { padding: 3px 28px 3px 8px; }
+.u-padding-48px-24px { padding: 48px 24px; }
+.u-padding-4px-12px { padding: 4px 12px; }
+.u-padding-6px-0 { padding: 6px 0; }
+.u-padding-6px-12px { padding: 6px 12px; }
+.u-padding-6px-14px { padding: 6px 14px; }
+.u-padding-6px-2px-0 { padding: 6px 2px 0; }
+.u-padding-8px-16px { padding: 8px 16px; }
+.u-padding-9px-18px { padding: 9px 18px; }
+.u-padding-bottom-12px { padding-bottom: 12px; }
+.u-padding-bottom-14px { padding-bottom: 14px; }
+.u-padding-bottom-18px { padding-bottom: 18px; }
+.u-padding-left-18px { padding-left: 18px; }
+.u-padding-top-12px { padding-top: 12px; }
+.u-padding-top-14px { padding-top: 14px; }
+.u-padding-top-18px { padding-top: 18px; }
+.u-text-align-center { text-align: center; }
+.u-text-align-left { text-align: left; }
+.u-text-align-right { text-align: right; }
+.u-text-decoration-none { text-decoration: none; }
+.u-text-overflow-ellipsis { text-overflow: ellipsis; }
+.u-white-space-nowrap { white-space: nowrap; }
+.u-width-18px { width: 18px; }
+.u-width-auto { width: auto; }
+.u-word-break-break-word { word-break: break-word; }
+</style>
+    
+<style nonce="<NONCE>">
+    /* #289: converted from inline style attributes. */
+    /* Initial state only (design D3): the toggle script below writes
+       `style.display` through CSSOM, which beats this non-important rule. */
+    .ue-vault-custom { margin-top: 8px; display: none; }
+    .ue-check-hint { color: var(--text-3); font-size: 12px; display: block; margin-top: 2px; }
+</style>
+
+</head>
+<body>
+
+<!-- ── Mobile top bar ── -->
+<header class="topbar">
+    <div class="topbar-brand">
+        <svg viewBox="0 0 30 30" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <polygon points="15,2 27,10 24,25 6,25 3,10" fill="none" stroke-width="1.4" class="gem-edge"/>
+            <polygon points="15,2 27,10 15,8" class="gem-facet"/>
+            <polygon points="15,8 27,10 24,25 6,25 3,10" class="gem-facet-2"/>
+            <line x1="15" y1="2" x2="15" y2="8" stroke-width="0.8" opacity="0.7" class="gem-edge"/>
+            <line x1="15" y1="8" x2="3" y2="10" stroke-width="0.5" opacity="0.4" class="gem-edge"/>
+            <line x1="15" y1="8" x2="27" y2="10" stroke-width="0.5" opacity="0.4" class="gem-edge"/>
+        </svg>
+        Obsidian MCP
+    </div>
+    <div class="u-display-flex u-align-items-center u-gap-8px">
+        <button type="button" class="theme-toggle" data-theme-toggle
+        aria-label="Switch to light theme" title="Switch to light theme">
+    <svg class="icon-sun" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+         stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+        <circle cx="8" cy="8" r="3.1"/>
+        <path d="M8 1v1.8M8 13.2V15M1 8h1.8M13.2 8H15M3.05 3.05l1.27 1.27M11.68 11.68l1.27 1.27M3.05 12.95l1.27-1.27M11.68 4.32l1.27-1.27"/>
+    </svg>
+    <svg class="icon-moon" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+         stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M13.5 9.6A5.9 5.9 0 0 1 6.4 2.5a5.9 5.9 0 1 0 7.1 7.1Z"/>
+    </svg>
+</button>
+        <button type="button" class="topbar-toggle" aria-label="Open menu" data-sidebar-open>
+            <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+                <line x1="2" y1="5" x2="16" y2="5"/>
+                <line x1="2" y1="9" x2="16" y2="9"/>
+                <line x1="2" y1="13" x2="16" y2="13"/>
+            </svg>
+        </button>
+    </div>
+</header>
+
+<div class="sidebar-backdrop" data-sidebar-close></div>
+
+<div class="layout">
+
+    <!-- ── Sidebar ── -->
+    <aside class="sidebar">
+        <div class="sidebar-brand">
+            <!-- Obsidian gem icon -->
+            <svg class="brand-icon" viewBox="0 0 30 30" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <polygon points="15,2 27,10 24,25 6,25 3,10" fill="none" stroke-width="1.4" class="gem-edge"/>
+                <polygon points="15,2 27,10 15,8"          class="gem-facet"/>
+                <polygon points="15,8 27,10 24,25 6,25 3,10" class="gem-facet-2"/>
+                <line x1="15" y1="2"  x2="15" y2="8"  stroke-width="0.8" opacity="0.7" class="gem-edge"/>
+                <line x1="15" y1="8"  x2="3"  y2="10" stroke-width="0.5" opacity="0.4" class="gem-edge"/>
+                <line x1="15" y1="8"  x2="27" y2="10" stroke-width="0.5" opacity="0.4" class="gem-edge"/>
+                <line x1="15" y1="8"  x2="6"  y2="25" stroke-width="0.4" opacity="0.3" class="gem-edge"/>
+                <line x1="15" y1="8"  x2="24" y2="25" stroke-width="0.4" opacity="0.3" class="gem-edge"/>
+            </svg>
+            <span class="brand-name">Obsidian</span>
+            <span class="brand-tagline">MCP Control</span>
+        </div>
+
+        <nav class="sidebar-nav">
+            <div class="nav-section">System</div>
+            <a href="/admin/" class="nav-item ">
+                <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+                    <rect x="1.5" y="1.5" width="5" height="5" rx="1.2"/><rect x="9.5" y="1.5" width="5" height="5" rx="1.2"/>
+                    <rect x="1.5" y="9.5" width="5" height="5" rx="1.2"/><rect x="9.5" y="9.5" width="5" height="5" rx="1.2"/>
+                </svg>
+                Dashboard
+            </a>
+            <a href="/admin/usage" class="nav-item ">
+                <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <polyline points="1.5,12 5,7.5 8,10 11,5 14.5,8"/>
+                    <line x1="1.5" y1="14.5" x2="14.5" y2="14.5"/>
+                </svg>
+                Usage
+            </a>
+            <a href="/admin/performance" class="nav-item ">
+                <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M1.8 11.5a6.5 6.5 0 1 1 12.4 0"/>
+                    <line x1="8" y1="11.5" x2="11.2" y2="6.4"/>
+                </svg>
+                Performance
+            </a>
+            <a href="/admin/search-analytics" class="nav-item ">
+                <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="7" cy="7" r="4.5"/>
+                    <line x1="10.4" y1="10.4" x2="14.5" y2="14.5"/>
+                </svg>
+                Search
+            </a>
+            <a href="/admin/health" class="nav-item ">
+                <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <polyline points="1.5,8.5 4.5,8.5 6,5 8.5,11.5 10.5,8.5 14.5,8.5"/>
+                </svg>
+                Health
+            </a>
+
+            <div class="nav-section">Access</div>
+            <a href="/admin/keys" class="nav-item ">
+                <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+                    <circle cx="6" cy="7.5" r="3.2"/>
+                    <line x1="8.5" y1="9.5" x2="15" y2="9.5"/>
+                    <line x1="12" y1="9.5" x2="12" y2="12"/>
+                    <line x1="14.5" y1="9.5" x2="14.5" y2="11.5"/>
+                </svg>
+                API Keys
+            </a>
+            <a href="/admin/oauth" class="nav-item ">
+                <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+                    <circle cx="8" cy="8" r="6.2"/>
+                    <ellipse cx="8" cy="8" rx="2.8" ry="6.2"/>
+                    <line x1="1.8" y1="6" x2="14.2" y2="6"/>
+                    <line x1="1.8" y1="10" x2="14.2" y2="10"/>
+                </svg>
+                OAuth
+            </a>
+            
+            
+            <a href="/admin/account" class="nav-item ">
+                <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="8" cy="5.5" r="2.8"/>
+                    <path d="M2.5 14c0-2.8 2.4-4.8 5.5-4.8s5.5 2 5.5 4.8"/>
+                </svg>
+                Account
+            </a>
+            
+
+            <div class="nav-section">Content</div>
+            <a href="/admin/vault" class="nav-item ">
+                <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M1.5 4 Q1.5 2 3.5 2 L6.5 2 L8 3.5 L13.5 3.5 Q14.5 3.5 14.5 4.5 L14.5 13 Q14.5 14 13.5 14 L2.5 14 Q1.5 14 1.5 13Z"/>
+                </svg>
+                Vault
+            </a>
+            
+            <a href="/admin/settings" class="nav-item ">
+                <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+                    <circle cx="8" cy="8" r="2.2"/>
+                    <path d="M8 1.5v1.8M8 12.7v1.8M1.5 8h1.8M12.7 8h1.8M3.6 3.6l1.3 1.3M11.1 11.1l1.3 1.3M3.6 12.4l1.3-1.3M11.1 4.9l1.3-1.3"/>
+                </svg>
+                Settings
+            </a>
+            
+
+            
+            
+            <div class="nav-section">Admin</div>
+            <a href="/admin/users/" class="nav-item active">
+                <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="6" cy="6" r="2.6"/>
+                    <path d="M1.5 14c0-2.6 2-4.5 4.5-4.5s4.5 1.9 4.5 4.5"/>
+                    <circle cx="11.5" cy="5" r="2"/>
+                    <path d="M14.5 12.5c0-2-1.3-3.4-3-3.4"/>
+                </svg>
+                Users
+            </a>
+            
+        </nav>
+
+        <div class="sidebar-foot">
+            <button type="button" class="theme-toggle" data-theme-toggle
+        aria-label="Switch to light theme" title="Switch to light theme">
+    <svg class="icon-sun" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+         stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+        <circle cx="8" cy="8" r="3.1"/>
+        <path d="M8 1v1.8M8 13.2V15M1 8h1.8M13.2 8H15M3.05 3.05l1.27 1.27M11.68 11.68l1.27 1.27M3.05 12.95l1.27-1.27M11.68 4.32l1.27-1.27"/>
+    </svg>
+    <svg class="icon-moon" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+         stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M13.5 9.6A5.9 5.9 0 0 1 6.4 2.5a5.9 5.9 0 1 0 7.1 7.1Z"/>
+    </svg>
+</button>
+        </div>
+    </aside>
+
+    <!-- ── Main ── -->
+    <div class="main">
+        
+        <div class="base-user-bar">
+            <span class="user-badge">
+                <span class="user-badge-name">admin</span>
+                <span class="user-badge-role">Admin</span>
+            </span>
+            <form method="POST" action="/admin/auth/logout" class="u-margin-0">
+                <input type="hidden" name="csrf_token" value="<CSRF>">
+                <button type="submit" class="logout-btn" title="Sign out">Logout</button>
+            </form>
+        </div>
+        
+        
+
+<div class="page-top">
+    <h1 class="page-title">Edit user: <span class="u-color-primary-text">admin</span></h1>
+    <div class="page-actions">
+        <a href="/admin/users/" class="btn btn-ghost">← Back to users</a>
+    </div>
+</div>
+
+<div class="page-body">
+
+    
+    
+
+    <div class="split-2">
+
+        <!-- Profile / role / vault -->
+        <div class="card anim-1">
+            <div class="card-header">
+                <span class="card-title">Profile</span>
+            </div>
+            <div class="card-body">
+                <form method="POST" action="/admin/users/<UID:admin>/edit">
+                    <input type="hidden" name="csrf_token" value="<CSRF>">
+                    <div class="field">
+                        <label class="field-label">Vault Path</label>
+                        <select name="vault_path" class="field-select" id="vault-select">
+                            <option value="">(unassigned — every MCP tool refuses; index kept for reassignment)</option>
+                            
+                            <option value="<VAULT>" selected><VAULT></option>
+                            
+                            <option value="__custom__" >Custom path…</option>
+                        </select>
+                        <input type="text" name="vault_path_custom" id="vault-custom"
+                               class="field-input ue-vault-custom"
+                               placeholder="/vaults/<name>"
+                               value="">
+                        <div class="u-font-size-11px u-color-text-3 u-margin-top-6px">
+                            Must be a subpath of <code class="mono">/vaults/</code> or the legacy mount.
+                            Directory must exist in the container.
+                        </div>
+                    </div>
+                    <div class="field u-display-flex u-align-items-center u-gap-10px">
+                        <input type="checkbox" name="is_admin" id="is_admin" checked
+                               disabled
+                               class="u-width-18px u-height-18px u-accent-color-primary">
+                        <label for="is_admin" class="u-font-size-14px u-color-text u-cursor-pointer">
+                            Admin
+                            <span class="ue-check-hint">
+                                Sees all users' control-plane data; can manage users + settings.
+                            </span>
+                        </label>
+                    </div>
+                    <div class="field u-display-flex u-align-items-center u-gap-10px">
+                        <input type="checkbox" name="is_active" id="is_active" checked
+                               disabled
+                               class="u-width-18px u-height-18px u-accent-color-primary">
+                        <label for="is_active" class="u-font-size-14px u-color-text u-cursor-pointer">
+                            Active
+                            <span class="ue-check-hint">
+                                Inactive users cannot log in and are skipped by the indexer.
+                            </span>
+                        </label>
+                    </div>
+                    
+                    <div class="alert alert-warning u-margin-top-8px u-font-size-12px">
+                        This is your own account — you can't remove your own admin role or
+                        deactivate yourself here. Both toggles are locked, and the server
+                        refuses the change even if the form is bypassed. Another admin can
+                        do it from this page.
+                    </div>
+                    
+                    <div class="u-display-flex u-gap-10px u-margin-top-18px">
+                        <button type="submit" class="btn btn-primary">Save</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- Reset password -->
+        <div class="card anim-2">
+            <div class="card-header">
+                <span class="card-title">Reset password</span>
+            </div>
+            <div class="card-body">
+                <form method="POST" action="/admin/users/<UID:admin>/reset-password">
+                    <input type="hidden" name="csrf_token" value="<CSRF>">
+                    <div class="field">
+                        <label class="field-label">New password</label>
+                        
+                        <input type="password" name="new_password" required minlength="12"
+                               class="field-input" placeholder="≥ 12 characters" autocomplete="new-password">
+                        <div class="u-font-size-11px u-color-text-3 u-margin-top-6px">
+                            Replaces the user's current password. Communicate the new one
+                            to them out-of-band.
+                        </div>
+                    </div>
+                    <button type="submit" class="btn btn-primary">Reset password</button>
+                </form>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Danger zone -->
+    <div class="card anim-3 u-margin-top-20px u-border-color-error-border">
+        <div class="card-header">
+            <span class="card-title u-color-error">Danger zone</span>
+        </div>
+        <div class="card-body">
+            
+            <div class="alert alert-warning u-margin-bottom-14px u-font-size-12px">
+                This is your own account — you can't deactivate or permanently
+                delete it here. Both controls are locked, and the server refuses
+                the request even if the form is bypassed. The permanent form is
+                the worse of the two: the cascade on <code class="mono">users.id</code>
+                would take your own api_keys / oauth_clients / oauth_tokens /
+                notes_metadata with it, leaving nothing to sign back in with and
+                undo it. Another admin can do it from this page.
+            </div>
+            
+            <div class="kv">
+                <div>
+                    <div class="kv-k">Deactivate user</div>
+                    <div class="u-color-text-3 u-font-size-12px u-margin-top-4px">
+                        Soft-delete: sets <code class="mono">is_active=false</code>. Data preserved;
+                        the user can no longer log in. Reversible by re-saving the form above.
+                    </div>
+                </div>
+                
+                <form method="POST" action="/admin/users/<UID:admin>/delete">
+                    <input type="hidden" name="csrf_token" value="<CSRF>">
+                    <button type="button" class="btn btn-danger"
+                            disabled
+                            data-confirm="Deactivate this user? They will no longer be able to log in.">
+                        Deactivate
+                    </button>
+                </form>
+            </div>
+            <div class="kv">
+                <div>
+                    <div class="kv-k u-color-error">Permanent delete</div>
+                    <div class="u-color-text-3 u-font-size-12px u-margin-top-4px">
+                        Cascades: removes the user row plus all their api_keys / oauth_clients /
+                        oauth_tokens / notes_metadata via FK. Usage logs persist with
+                        <code class="mono">user_id=NULL</code>. <strong>Irreversible.</strong>
+                    </div>
+                </div>
+                <form method="POST" action="/admin/users/<UID:admin>/delete?permanent=true">
+                    <input type="hidden" name="csrf_token" value="<CSRF>">
+                    <button type="button" class="btn btn-danger"
+                            disabled
+                            data-confirm="PERMANENTLY DELETE this user and all their data? This cannot be undone.">
+                        Permanently delete
+                    </button>
+                </form>
+            </div>
+            <div class="kv">
+                <div>
+                    <div class="kv-k">Confirm vault is empty</div>
+                    <div class="u-color-text-3 u-font-size-12px u-margin-top-4px">
+                        The indexer will not delete this user's index when
+                        their vault root contains no markdown files — usually
+                        a mount that did not mount. If the vault really was
+                        emptied, confirm it: the next pass for this user only
+                        may then delete every indexed note. The next page
+                        shows how many and asks again (#309).
+                    </div>
+                </div>
+                <a href="/admin/users/<UID:admin>/confirm-empty-vault" class="btn btn-danger">
+                    Confirm vault is empty
+                </a>
+            </div>
+        </div>
+    </div>
+
+</div>
+
+<script nonce="<NONCE>">
+// Toggle custom-path input visibility based on dropdown selection.
+(function() {
+    const sel = document.getElementById('vault-select');
+    const custom = document.getElementById('vault-custom');
+    function update() {
+        if (sel.value === '__custom__') {
+            custom.style.display = 'block';
+            custom.required = true;
+            custom.name = 'vault_path';
+            sel.removeAttribute('name');
+        } else {
+            custom.style.display = 'none';
+            custom.required = false;
+            custom.removeAttribute('name');
+            sel.name = 'vault_path';
+        }
+    }
+    sel.addEventListener('change', update);
+    update();
+})();
+</script>
+
+
+    </div>
+
+</div>
+
+<script nonce="<NONCE>">
+// Close sidebar when a nav link is tapped on mobile
+document.querySelectorAll('.sidebar .nav-item').forEach(function(a) {
+    a.addEventListener('click', function() {
+        document.querySelector('.sidebar').classList.remove('open');
+        document.querySelector('.sidebar-backdrop').classList.remove('open');
+    });
+});
+
+// Localize ISO-8601 UTC timestamps to the viewer's locale.
+(function() {
+    const fmtDateTime = new Intl.DateTimeFormat(undefined, {
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', hour12: false,
+    });
+    const fmtDate = new Intl.DateTimeFormat(undefined, {
+        year: 'numeric', month: '2-digit', day: '2-digit',
+    });
+    document.querySelectorAll('time[data-localize]').forEach(function(el) {
+        const iso = el.getAttribute('datetime');
+        if (!iso) return;
+        const d = new Date(iso);
+        if (isNaN(d)) return;
+        el.textContent = el.dataset.localize === 'date' ? fmtDate.format(d) : fmtDateTime.format(d);
+    });
+})();
+</script>
+
+</body>
+</html>
