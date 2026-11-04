@@ -42,6 +42,34 @@ _INDEXED_PROVENANCE_MARKER = (
     "(016_indexed_vault_provenance)"
 )
 
+# Migration 037's ownership marker for the six OIDC link columns on `users`
+# (#416), mirrored here so `alembic check` compares it like any other column
+# attribute. Must stay byte identical to `COLUMN_MARKER` in
+# `alembic/versions/037_oidc_account_links.py`; a mismatch shows up as a
+# pending `alter_column(comment=...)` rather than as a `downgrade()` that has
+# quietly stopped recognising its own columns. The five constraints carry a
+# separate marker (`CONSTRAINT_MARKER` there) that autogenerate does not
+# compare, so it lives in the migration only and the schema gate reads it from
+# the catalogue.
+_OIDC_LINK_COLUMN_MARKER = "OIDC account link (037_oidc_account_links)"
+
+# The three CHECK predicates migration 037 creates, byte identical to the
+# migration's literals. Autogenerate does not compare CHECK predicates; they
+# are declared here so a fresh `create_all` and the migration agree, and the
+# schema gate asserts them through `pg_constraint` by definition.
+_OIDC_BOUND_COMPLETE_PREDICATE = (
+    "(oidc_issuer IS NULL AND oidc_subject IS NULL AND oidc_linked_at IS NULL) OR "
+    "(oidc_issuer IS NOT NULL AND oidc_subject IS NOT NULL "
+    "AND oidc_linked_at IS NOT NULL)"
+)
+_OIDC_EXPECTED_COMPLETE_PREDICATE = (
+    "(oidc_expected_issuer IS NULL AND oidc_expected_email IS NULL "
+    "AND oidc_expected_set_at IS NULL) OR "
+    "(oidc_expected_issuer IS NOT NULL AND oidc_expected_email IS NOT NULL "
+    "AND oidc_expected_set_at IS NOT NULL)"
+)
+_OIDC_NOT_BOTH_PREDICATE = "oidc_subject IS NULL OR oidc_expected_email IS NULL"
+
 
 class User(Base):
     __tablename__ = "users"
@@ -57,6 +85,47 @@ class User(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     last_login_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # ── OIDC account link (issue #416, migration 037) ──────────────────────
+    #
+    # Two triples, each all-NULL or all-set (the two `_complete` CHECKs), and
+    # never both set on one row (`ck_users_oidc_not_both`).
+    #
+    # *Bound*: `(oidc_issuer, oidc_subject)` is the provider identity this
+    # user signs in as, compared by exact equality with a validated ID
+    # token's `(iss, sub)`. Once set, nothing else about the token (email,
+    # username) is ever consulted for this user. UNIQUE, so one identity maps
+    # to at most one user; NULLs are distinct, so unlinked rows never collide.
+    #
+    # *Pending*: an administrator's expectation that the first verified login
+    # whose normalized email equals `oidc_expected_email` under
+    # `oidc_expected_issuer`, within `oidc_links.PENDING_DAYS` of
+    # `oidc_expected_set_at`, binds this user. Stored already normalized
+    # (`oidc_links.normalize_email`), so a plain UNIQUE suffices and no
+    # functional index is needed.
+    #
+    # Columns rather than a table on purpose: a table needs a foreign key to
+    # `users`, and an FK to `users` reopened the permanent-deletion deadlock
+    # for the feed tables. Deleting the row deletes its link. All writes go
+    # through `src/services/oidc_links.py` under the account guard.
+    oidc_issuer: Mapped[str | None] = mapped_column(
+        String(2048), nullable=True, comment=_OIDC_LINK_COLUMN_MARKER
+    )
+    oidc_subject: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, comment=_OIDC_LINK_COLUMN_MARKER
+    )
+    oidc_linked_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, comment=_OIDC_LINK_COLUMN_MARKER
+    )
+    oidc_expected_issuer: Mapped[str | None] = mapped_column(
+        String(2048), nullable=True, comment=_OIDC_LINK_COLUMN_MARKER
+    )
+    oidc_expected_email: Mapped[str | None] = mapped_column(
+        String(254), nullable=True, comment=_OIDC_LINK_COLUMN_MARKER
+    )
+    oidc_expected_set_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, comment=_OIDC_LINK_COLUMN_MARKER
+    )
 
     # ── Index provenance (issue #91, migration 016) ────────────────────────
     #
@@ -207,6 +276,21 @@ class User(Base):
     # reason.
     sessions: Mapped[list["UserSession"]] = relationship(
         back_populates="user", cascade="all, delete", passive_deletes=True
+    )
+
+    # Migration 037's five constraints (#416), named as the migration names
+    # them so `alembic check` compares the two UNIQUEs. The CHECK predicates
+    # are not compared by autogenerate; the schema gate asserts them.
+    __table_args__ = (
+        UniqueConstraint("oidc_issuer", "oidc_subject", name="uq_users_oidc_identity"),
+        UniqueConstraint(
+            "oidc_expected_issuer", "oidc_expected_email", name="uq_users_oidc_expected"
+        ),
+        CheckConstraint(_OIDC_BOUND_COMPLETE_PREDICATE, name="ck_users_oidc_bound_complete"),
+        CheckConstraint(
+            _OIDC_EXPECTED_COMPLETE_PREDICATE, name="ck_users_oidc_expected_complete"
+        ),
+        CheckConstraint(_OIDC_NOT_BOTH_PREDICATE, name="ck_users_oidc_not_both"),
     )
 
 

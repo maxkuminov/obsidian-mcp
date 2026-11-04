@@ -36,13 +36,13 @@ Files: `src/models/db.py` (User columns + constraints only),
 and the slice-A test files above. Do NOT touch `src/auth/`, `src/config.py`,
 `src/control_panel/` or templates.
 
-- [ ] 1.1 Add the six nullable columns and the five named constraints (design D1) to `User`, each column with `comment=_OIDC_LINK_COLUMN_MARKER`. The module constant must be byte-identical to the migration's `COLUMN_MARKER`, with a comment block in the file's style (see `_INDEXED_PROVENANCE_MARKER`)
-- [ ] 1.2 Migration 037, `down_revision` = 036's revision id, following D1's provenance rules:
+- [x] 1.1 Add the six nullable columns and the five named constraints (design D1) to `User`, each column with `comment=_OIDC_LINK_COLUMN_MARKER`. The module constant must be byte-identical to the migration's `COLUMN_MARKER`, with a comment block in the file's style (see `_INDEXED_PROVENANCE_MARKER`)
+- [x] 1.2 Migration 037, `down_revision` = 036's revision id, following D1's provenance rules:
   - a column marker on each of the six columns and a constraint marker on each of the five constraints;
   - all eleven objects checked before anything is touched; adopt only an exact type / nullability / no-default / marker (or canonical definition / `convalidated` / marker) match, else refuse by name and change nothing;
   - `downgrade()` decides each object on its own marker (constraints first) and prints a skip for an unmarked one; the docstring states that the links are lost;
   - pinned `search_path`, timeouts set and reset, no backfill, no superuser requirement.
-- [ ] 1.3 `tests/integration/test_schema_check.py`: `HEAD_REVISION = "037"`, keeping every earlier wave's cases. Add 037 cases:
+- [x] 1.3 `tests/integration/test_schema_check.py`: `HEAD_REVISION = "037"`, keeping every earlier wave's cases. Add 037 cases:
   - a fresh upgrade;
   - the chain from 036 with existing user rows unchanged and all six columns NULL;
   - catalogue column types and nullability;
@@ -53,15 +53,15 @@ and the slice-A test files above. Do NOT touch `src/auth/`, `src/config.py`,
   - impostor refusals, atomic across all eleven objects: a wrong type, NOT NULL, a default, a wrong constraint definition, a `NOT VALID` CHECK, and **the correct shape but unmarked**, once for a column and once for a constraint;
   - downgrade drops the marked objects and skips the unmarked ones;
   - downgrade to 036, then a clean re-upgrade and `alembic check`.
-- [ ] 1.4 Confirm `tests/integration/test_nonsuperuser_migrations_pg.py` runs 037 to head as the owning role (edit it only if it pins a head)
-- [ ] 1.5 `oidc_links.normalize_email(str) -> str | None` per D2; a pure function that never raises
-- [ ] 1.6 `oidc_links.resolve(session, iss, sub, email: str | None, email_verified: bool) -> Resolution`: unlocked SELECTs; **`(iss, sub)` first, email never examined when it matches**; otherwise `None` or an unnormalizable email → `none`; a matching live expectation → `pending` or `unverified`; `PENDING_DAYS = 7`
-- [ ] 1.7 `oidc_links.prepare_login(session, resolution) -> PrepareResult`: `lock_account_guard`, `FOR UPDATE` re-read with `populate_existing=True`, re-check every D4 step-3 condition, write the bind (pending only) and stamp `last_login_at`, flush, **no commit**; a unique violation or failed re-check → rollback + a closed reason; returns the re-read `session_version`
-- [ ] 1.8 `oidc_links.reachable_admins_after(session, issuer, *, target_id, target_after)` per D15
-- [ ] 1.9 Admin operations with no commit: `set_expectation`, `bind_subject`, `unlink` (clears the six columns, returns the `revoke_user_sessions` count); closed results `ok` / `bound_already` / `conflict` / `invalid`
-- [ ] 1.10 Unit tests: the normalization table (case, whitespace, non-ASCII kept, two `@`, control characters, length bounds, non-string input)
-- [ ] 1.11 Integration tests: bind happy path; expired; wrong issuer; a concurrent double bind of one `(iss, sub)` → exactly one wins; `resolve` on a bound user with `email=None`; `reachable_admins_after` for each `target_after`; advisory-lock re-entry by `start_session` in the same transaction does not block; unlink revokes sessions; a permanent user delete leaves no link residue
-- [ ] 1.12 `make test-schema`, `make db-check`, `make test-integration` (slice-A modules) clean
+- [x] 1.4 Confirm `tests/integration/test_nonsuperuser_migrations_pg.py` runs 037 to head as the owning role (edit it only if it pins a head)
+- [x] 1.5 `oidc_links.normalize_email(str) -> str | None` per D2; a pure function that never raises
+- [x] 1.6 `oidc_links.resolve(session, iss, sub, email: str | None, email_verified: bool) -> Resolution`: unlocked SELECTs; **`(iss, sub)` first, email never examined when it matches**; otherwise `None` or an unnormalizable email → `none`; a matching live expectation → `pending` or `unverified`; `PENDING_DAYS = 7`
+- [x] 1.7 `oidc_links.prepare_login(session, resolution) -> PrepareResult`: `lock_account_guard`, `FOR UPDATE` re-read with `populate_existing=True`, re-check every D4 step-3 condition, write the bind (pending only) and stamp `last_login_at`, flush, **no commit**; a unique violation or failed re-check → rollback + a closed reason; returns the re-read `session_version`
+- [x] 1.8 `oidc_links.reachable_admins_after(session, issuer, *, target_id, target_after)` per D15
+- [x] 1.9 Admin operations with no commit: `set_expectation`, `bind_subject`, `unlink` (clears the six columns, returns the `revoke_user_sessions` count); closed results `ok` / `bound_already` / `conflict` / `invalid`
+- [x] 1.10 Unit tests: the normalization table (case, whitespace, non-ASCII kept, two `@`, control characters, length bounds, non-string input)
+- [x] 1.11 Integration tests: bind happy path; expired; wrong issuer; a concurrent double bind of one `(iss, sub)` → exactly one wins; `resolve` on a bound user with `email=None`; `reachable_admins_after` for each `target_after`; advisory-lock re-entry by `start_session` in the same transaction does not block; unlink revokes sessions; a permanent user delete leaves no link residue
+- [x] 1.12 `make test-schema`, `make db-check`, `make test-integration` (slice-A modules) clean
 
 ## 2. Slice B: protocol profile and settings
 
