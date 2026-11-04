@@ -19,7 +19,7 @@ edits it.
 ## 0. Spec gate and regression baseline
 
 - [x] 0.1 Codex reviews this proposal (read-only, `gpt-daybreak-blue-latest`); round 1 FAIL folded (reachable-admin invariant, actor re-check, email sentinel, upgrade sequence, schema gate, OIDC-off goldens, docs matrix)
-- [ ] 0.2 `openspec validate oidc-account-linking --strict` clean after each fold; Codex round 2 (verification of the round-1 folds)
+- [x] 0.2 `openspec validate oidc-account-linking --strict` clean after each fold; Codex round 2 FAIL on two remediation gaps (stale migration plan, column markers), folded in fdfb5c0 and checked by the supervisor; no round 3 (no new class)
 - [ ] 0.3 **Goldens on the base commit, before any slice.** On bd9b386, capture and commit the D16 goldens with their tests, normalizing the CSRF token, nonce, cookies, dates, ids and codes:
   - the unauthenticated `/authorize` redirect (DCR and CIMD clients);
   - authenticated consent render (DCR and CIMD);
