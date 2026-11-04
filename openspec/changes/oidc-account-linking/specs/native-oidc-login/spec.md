@@ -24,7 +24,7 @@ The server SHALL reject startup with OIDC enabled unless multi-user mode is enab
 
 #### Scenario: Retired mapping setting
 - **WHEN** `OIDC_SUBJECT_USER_IDS` is set to a non-empty object, with OIDC enabled or not
-- **THEN** startup fails with a message that names binding the subject on the user's edit page
+- **THEN** startup fails with a message that lists the upgrade sequence (confirm a local admin password, set `LOCAL_LOGIN_ENABLED=true`, remove the setting, start, bind each former subject on its user's edit page, verify SSO and `/authorize`, optionally disable password login) and names the `docs/native-oidc.md` section that describes it
 
 #### Scenario: Cross-origin endpoint
 - **WHEN** discovery advertises a token or JWKS endpoint on a host other than the issuer's
@@ -63,7 +63,7 @@ The server SHALL request the scopes `openid email profile` plus any configured `
 ## ADDED Requirements
 
 ### Requirement: OIDC links SHALL be stored on the user row with uniqueness enforced by the database
-Migration 037 SHALL add to `users` the nullable columns `oidc_issuer`, `oidc_subject`, `oidc_linked_at`, `oidc_expected_issuer`, `oidc_expected_email` and `oidc_expected_set_at`, a UNIQUE constraint on `(oidc_issuer, oidc_subject)`, a UNIQUE constraint on `(oidc_expected_issuer, oidc_expected_email)`, and CHECK constraints making each triple all-NULL or all-non-NULL and forbidding a row that is both bound and pending. The ORM model SHALL declare the same constraints so that `alembic check` reports no operations.
+Migration 037 SHALL add to `users` the nullable columns `oidc_issuer`, `oidc_subject`, `oidc_linked_at`, `oidc_expected_issuer`, `oidc_expected_email` and `oidc_expected_set_at`, a UNIQUE constraint on `(oidc_issuer, oidc_subject)`, a UNIQUE constraint on `(oidc_expected_issuer, oidc_expected_email)`, and CHECK constraints making each triple all-NULL or all-non-NULL and forbidding a row that is both bound and pending. The ORM model SHALL declare the same constraints so that `alembic check` reports no operations, and the migration SHALL follow the schema gate's conventions (pinned `search_path`, bounded lock and statement timeouts, marked constraints dropped only by marker on downgrade, same-named impostors refused, no superuser requirement).
 
 #### Scenario: One identity, one user
 - **WHEN** a write would bind an `(issuer, subject)` pair already bound to another user
@@ -76,13 +76,30 @@ Migration 037 SHALL add to `users` the nullable columns `oidc_issuer`, `oidc_sub
 #### Scenario: Schema gate
 - **WHEN** migrations are applied to head
 - **THEN** `alembic check` SHALL report "No new upgrade operations detected"
+- **AND** the gate's asserted head revision SHALL be `037`
+
+#### Scenario: Catalogue shape
+- **WHEN** the catalogue is read after a fresh upgrade and after an upgrade from 036 with existing users
+- **THEN** the six columns SHALL have the specified types and be nullable, each CHECK and UNIQUE SHALL be validated and match its canonical `pg_get_constraintdef`, and existing user rows SHALL be unchanged with all six columns NULL
+
+#### Scenario: Downgrade and re-upgrade
+- **WHEN** the database is downgraded to 036 and upgraded again
+- **THEN** the columns and constraints SHALL be removed and then recreated identically, and `alembic check` SHALL be clean
+
+#### Scenario: Non-superuser migration
+- **WHEN** 037 runs as the database-owning, non-superuser role
+- **THEN** it SHALL complete
 
 ### Requirement: A pending expectation SHALL bind only on a verified, exactly matching email within seven days, once
-When no user is bound to a validated token's `(iss, sub)`, the server SHALL bind it to the user whose pending expectation has `oidc_expected_issuer` equal to `iss`, `oidc_expected_email` equal to the token's `email` after the same normalization (surrounding ASCII whitespace stripped, ASCII letters lower-cased, nothing else folded), `oidc_expected_set_at` no more than seven days ago, and only if the token's `email_verified` claim is the JSON boolean `true`. A bind SHALL write the issuer, subject and link time, clear the three expected columns and stamp `last_login_at` under the account guard, after re-checking every condition on a `FOR UPDATE` re-read, in the same transaction that `start_session` commits, so that a refused mint leaves no binding.
+When no user is bound to a validated token's `(iss, sub)`, and only then, the server SHALL examine the token's `email` and `email_verified`, and SHALL bind it to the user whose pending expectation has `oidc_expected_issuer` equal to `iss`, `oidc_expected_email` equal to the token's `email` after the same normalization (surrounding ASCII whitespace stripped, ASCII letters lower-cased, nothing else folded), `oidc_expected_set_at` no more than seven days ago, and only if the token's `email_verified` claim is the JSON boolean `true`. A bind SHALL write the issuer, subject and link time, clear the three expected columns and stamp `last_login_at` under the account guard, after re-checking every condition on a `FOR UPDATE` re-read, in the same transaction that `start_session` commits, so that a refused mint leaves no binding.
 
 #### Scenario: First sign-in binds
 - **WHEN** an active user is pending for `max@example.com` under the configured issuer, set yesterday, and a valid token carries `email` `Max@Example.com` with `email_verified: true`
 - **THEN** the user SHALL become bound to the token's `(iss, sub)`, the expectation SHALL be cleared, and a session SHALL be minted for that user
+
+#### Scenario: Absent or malformed email on the pending branch
+- **WHEN** no user is bound to the token's `(iss, sub)` and its `email` claim is absent, not a string, longer than 254 characters or fails normalization
+- **THEN** nothing SHALL be written and login SHALL be refused with reason `unlinked`
 
 #### Scenario: Unverified email does not bind
 - **WHEN** the token's email matches but `email_verified` is false, absent or the string `"true"`
@@ -105,7 +122,15 @@ When no user is bound to a validated token's `(iss, sub)`, the server SHALL bind
 - **THEN** the second bind SHALL roll back and login SHALL be refused with reason `link_conflict`
 
 ### Requirement: A bound user SHALL be resolved by issuer and subject alone
-Once a user is bound, the callback SHALL resolve that user only by equality of `(oidc_issuer, oidc_subject)` with the validated token's `(iss, sub)`, and SHALL NOT consult the token's `email`, `preferred_username` or any other claim to resolve, re-bind or refuse that user, except the group check when a group is required.
+Once a user is bound, the callback SHALL resolve that user only by equality of `(oidc_issuer, oidc_subject)` with the validated token's `(iss, sub)`, before any examination of the email claim, and SHALL NOT refuse it for an absent or malformed email nor consult the token's `email`, `preferred_username` or any other claim to resolve, re-bind or refuse that user, except the group check when a group is required.
+
+#### Scenario: Bound login with no email claim
+- **WHEN** a bound user's valid token carries no `email` claim
+- **THEN** that user SHALL sign in
+
+#### Scenario: Bound login with a malformed email claim
+- **WHEN** a bound user's valid token carries an `email` that is a number, a list, a 300-character string or a string with two `@`, and `email_verified` is the string `"true"`
+- **THEN** that user SHALL sign in
 
 #### Scenario: Provider account renamed
 - **WHEN** a bound user's provider account changes its username and email
@@ -178,11 +203,23 @@ At lifespan start, with OIDC enabled and `LOCAL_LOGIN_ENABLED=false`, the server
 - **THEN** one CRITICAL line is logged and startup continues
 
 ### Requirement: Deployments without OIDC SHALL be byte-for-byte unchanged
-With `OIDC_ENABLED=false`, in single-user or multi-user mode, every panel, login, account, user list, user edit and consent page SHALL render identically to the release before this change, and no route added by this change SHALL be reachable.
+With `OIDC_ENABLED=false`, in single-user or multi-user mode, every panel, login, account, user list, user edit and consent page SHALL render identically to the release before this change, and no route added by this change SHALL be reachable. This SHALL be enforced by golden tests captured on the pre-change commit, covering the unauthenticated `/authorize` redirect, authenticated consent rendering for a DCR and a CIMD client, consent approval preserving the user and grant lineage, and `/admin/register` GET and POST. The `/authorize` goldens SHALL also hold with OIDC enabled.
 
 #### Scenario: Panel snapshot with OIDC off
 - **WHEN** the login, users list, user edit and account pages are rendered with OIDC disabled
 - **THEN** each equals the pre-change rendering apart from the CSRF token and the nonce
+
+#### Scenario: Unauthenticated authorize redirect
+- **WHEN** an unauthenticated browser requests `/authorize` for a DCR client or a CIMD client, with OIDC disabled or enabled
+- **THEN** the redirect SHALL equal the golden captured before this change
+
+#### Scenario: Consent render and approval
+- **WHEN** a signed-in user opens and approves consent for a DCR client and for a CIMD client, with OIDC disabled or enabled
+- **THEN** the consent page SHALL equal its golden apart from the CSRF token and the nonce, and the issued code SHALL belong to the same user and grant lineage as before this change
+
+#### Scenario: Bootstrap matrix
+- **WHEN** `/admin/register` is requested by GET and POST on an empty and on a populated users table
+- **THEN** with OIDC disabled the responses SHALL equal the pre-change goldens, and with OIDC enabled both SHALL be 404
 
 #### Scenario: Link routes absent
 - **WHEN** OIDC is disabled and an admin POSTs to `/admin/users/{id}/oidc/expect`

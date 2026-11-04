@@ -23,6 +23,36 @@ While OIDC is enabled, the user edit page SHALL show the user's link status (not
 - **WHEN** the card is rendered
 - **THEN** it SHALL contain no inline event handler, no `style=` attribute and no `javascript:` URL, and the unlink control SHALL be a `type="button"` with a `data-confirm` attribute handled by `panel.js`
 
+### Requirement: OIDC link handlers SHALL re-check the acting administrator inside the guard
+Each of `/admin/users/{id}/oidc/expect`, `/oidc/bind` and `/oidc/unlink` SHALL take the admin guard and then re-run the actor-privilege re-check before reading the target row; when the actor is no longer an active administrator the handler SHALL roll back, log the established actor-revoked event and answer with the established actor-revoked refusal, writing nothing.
+
+#### Scenario: Actor demoted while waiting for the guard
+- **WHEN** admin A's unlink request is held at the guard while admin B's demotion of A commits, and A's request then proceeds
+- **THEN** A's request SHALL be refused with the actor-revoked message and the target's link SHALL be unchanged
+
+### Requirement: With password login disabled, no panel mutation SHALL leave zero reachable administrators
+While `LOCAL_LOGIN_ENABLED` is false, the OIDC unlink, the user edit that clears `is_admin` or `is_active`, the soft delete and the permanent delete SHALL each, under the admin guard and after the actor re-check, refuse with nothing written any change whose resulting state has no row that is an active administrator bound under the configured issuer. No other panel handler SHALL be able to reduce that set. While password login is enabled this requirement SHALL NOT apply and the existing last-active-administrator rule SHALL be unchanged.
+
+#### Scenario: Unlinking the only reachable admin
+- **WHEN** password login is disabled and admin A unlinks admin B, the only other admin, while A is not bound
+- **THEN** the unlink SHALL be refused and B's link SHALL be unchanged
+
+#### Scenario: Demoting or deactivating the only reachable admin
+- **WHEN** password login is disabled and the edit would demote or deactivate the only bound active admin
+- **THEN** the edit SHALL be refused and the row SHALL be unchanged, even though an unbound active admin exists
+
+#### Scenario: Deleting the only reachable admin
+- **WHEN** password login is disabled and a soft or permanent delete targets the only bound active admin
+- **THEN** the delete SHALL be refused and the row SHALL be unchanged
+
+#### Scenario: Concurrent mutations keep one reachable admin
+- **WHEN** password login is disabled, admins A and B are both bound, and "A unlinks B" and "B deactivates A" are issued with the first deterministically holding the guard
+- **THEN** exactly one SHALL succeed, the other SHALL be refused by the actor re-check or the reachable-admin rule, and one reachable admin SHALL remain
+
+#### Scenario: Password login enabled
+- **WHEN** password login is enabled and an admin unlinks the only bound admin
+- **THEN** the unlink SHALL proceed
+
 ### Requirement: Unlinking an OIDC identity SHALL end the user's live sessions
 The unlink action SHALL clear all six OIDC columns and revoke the user's live browser sessions in the same transaction, under the admin guard, without committing between the lock and the writes. An administrator SHALL NOT unlink their own account while `LOCAL_LOGIN_ENABLED` is false.
 

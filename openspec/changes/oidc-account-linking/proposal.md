@@ -77,6 +77,10 @@ single-mint discipline and the rate limits all stay as they are.
   message naming the panel action that replaces it (an upgrade note goes in the
   README).
 - **`last_login_at`** is stamped on OIDC login. #415 does not stamp it.
+- **The last reachable admin:** while `LOCAL_LOGIN_ENABLED=false`, unlink,
+  demotion, deactivation, soft delete and permanent delete refuse any result
+  that leaves no active admin bound under the configured issuer. The check runs
+  under the shared admin guard, after the actor re-check (design D15).
 - **Boot warning, never a refusal:** with `LOCAL_LOGIN_ENABLED=false` and no
   active admin bound under the configured issuer, one CRITICAL line says the
   panel can only be recovered by re-enabling password login.
@@ -113,8 +117,11 @@ enabled; the "at least one login method" invariant; every MCP-facing path.
   are already pinned by #415. `make audit` is unaffected.
 - **Schema:** migration 037, nullable columns plus constraints, no backfill.
   `make test-schema` and `make db-check` gate it.
-- **Upgrade:** a deployment that set `OIDC_SUBJECT_USER_IDS` must remove it and
-  bind each subject in the panel. Startup refuses until then.
+- **Upgrade:** a deployment that set `OIDC_SUBJECT_USER_IDS` follows the
+  sequence in design D3: confirm a local admin password, enable password login,
+  remove the map, start, bind the subjects, verify, and optionally disable
+  password login again. The startup refusal repeats that sequence. The owner
+  confirmed that no production deployment has #415's OIDC enabled.
 - **Docs:** README (feature section, settings, upgrade note), `.env.example`,
   DEPLOYMENT.md, `docs/native-oidc.md` (generic provider + Keycloak
   walkthrough), `docs/architecture/control-panel.md`,

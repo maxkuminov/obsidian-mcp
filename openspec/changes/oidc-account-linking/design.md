@@ -71,6 +71,19 @@ Downgrade drops the columns and constraints. That loses the links, which is
 stated in the migration docstring. No data migration is needed: #415 kept
 mappings in the environment.
 
+037 follows the conventions in `docs/architecture/schema-and-migrations.md`:
+`search_path` pinned and asserted, `lock_timeout` / `statement_timeout` set and
+`RESET`, a COMMENT marker on each constraint so `downgrade()` drops only marked
+objects, a same-named column or constraint of another shape refused by name
+(never silently accepted), and nothing that needs superuser
+(`test_nonsuperuser_migrations_pg.py` runs it as the owning role).
+`HEAD_REVISION` in `tests/integration/test_schema_check.py` moves `036 -> 037`
+as part of the migration, not beside it. The gate's 037 cases are: a fresh
+upgrade; the chain from 036 with existing users untouched; catalogue column
+types and nullability; each CHECK and UNIQUE read back through
+`pg_get_constraintdef` and `convalidated`; every invalid row shape rejected;
+the impostor refusals; and downgrade to 036 followed by a clean re-upgrade.
+
 ### D2. The matching rule: verified email, single use, 7-day window
 
 Owner decision 2 lets the expected identity be `preferred_username` or email.
@@ -98,9 +111,17 @@ Owner decision 2 lets the expected identity be `preferred_username` or email.
   non-ASCII stays as entered. Store that form. The claim is compared under the
   same normalization. This is an exact match. No IDN or Unicode folding, which
   would add a homograph surface.
-- The `email` claim must be a string ≤ 254 characters. `email_verified` must be
-  the JSON boolean `true`. The string `"true"` (seen from some misconfigured
-  mappers) is refused. A missing claim is refused.
+- **Email is never a reason to refuse a bound user.** `exchange()` validates
+  the token (signature, `iss`, `aud`, `azp`, `exp`/`iat`, `nonce`, `sub`,
+  group) but does **not** judge `email`. It carries the claim as
+  `email: str | None`, where anything that is not a string of ≤ 254 characters
+  (absent, a number, a list, oversized) becomes `None`. `None` is a
+  non-matching sentinel: it equals no stored expectation. `email_verified` is
+  carried as `True` only for the JSON boolean `true`, else `False`. The
+  string `"true"`, seen from some misconfigured mappers, becomes `False`.
+  Normalization, and the `email_verified` check, run **only on the pending
+  branch** of resolution, after `(iss, sub)` has failed to match. A bound user
+  whose token has no email, or a malformed one, signs in as usual.
 - **Direct subject binding** is the escape hatch. An admin who has the `sub`
   (from the Keycloak console) binds it immediately with no email involved. This
   covers providers that put `email` only in UserInfo, accounts with no
@@ -111,11 +132,13 @@ Resolution order at the callback, after the ID token is fully validated:
 1. A user with `(oidc_issuer, oidc_subject) = (iss, sub)` → that user. Email is
    not read. An active pending expectation elsewhere for the same email does
    not matter.
-2. Otherwise a user whose pending `(oidc_expected_issuer,
-   oidc_expected_email)` equals `(iss, normalize(email))`, not expired, with
-   `email_verified` true → bind (D4).
-3. Otherwise refuse. The response is the same generic page as every other
-   OIDC refusal.
+2. Otherwise, if `email` is not `None` and normalizes, a user whose pending
+   `(oidc_expected_issuer, oidc_expected_email)` equals `(iss,
+   normalize(email))` and is not expired. If `email_verified` is `True`, bind
+   (D4); otherwise refuse `email_unverified`.
+3. Otherwise refuse `unlinked`. That covers a `None` or unnormalizable email,
+   no matching expectation, and an expired one. The response is the same
+   generic page as every other OIDC refusal.
 
 An expired expectation is not deleted on the read path. It simply doesn't
 match, and the panel shows it as "expired". Re-arming means setting it again.
@@ -125,11 +148,38 @@ match, and the panel shows it as "expired". Re-arming means setting it again.
 Two sources of truth for one binding ("the env says sub X is user 1, the row
 says user 2") would mean a precedence rule nobody remembers under pressure. The
 field stays in `Settings` only so it can be refused. A non-empty value fails
-validation with: *"OIDC_SUBJECT_USER_IDS is retired (#416): remove it and bind
-each subject on the user's edit page (Single sign-on → Bind subject)."* #415
-shipped disabled by default, two days before this change, with a mandatory
-manual activation checklist, so the population that hits the refusal is at
-most the owner's own instance. That is an owner question in the report.
+validation, with OIDC on or off, with:
+
+> *OIDC_SUBJECT_USER_IDS is retired (#416). Upgrade: (1) confirm a local admin
+> password works; (2) set LOCAL_LOGIN_ENABLED=true; (3) remove
+> OIDC_SUBJECT_USER_IDS; (4) start; (5) bind each former subject on its user's
+> edit page (Single sign-on → Bind subject); (6) verify SSO and /authorize;
+> (7) optionally set LOCAL_LOGIN_ENABLED=false. See docs/native-oidc.md,
+> "Upgrading from OIDC_SUBJECT_USER_IDS".*
+
+**The upgrade sequence for an existing #415 deployment**, which may run
+`LOCAL_LOGIN_ENABLED=false` with the env map as its only way in:
+
+1. Before upgrading, confirm a local admin password works. If no admin knows
+   one, reset it while still on the old release, or out of band.
+2. Set `LOCAL_LOGIN_ENABLED=true`. During the upgrade, password login is the
+   only way into the panel, because the env bindings are gone and the panel
+   bindings don't exist yet.
+3. Remove `OIDC_SUBJECT_USER_IDS`. Copy its subjects somewhere first; they are
+   needed in step 5.
+4. Deploy and start. Migration 037 runs. With password login enabled, the
+   lockout CRITICAL (D13) does not apply.
+5. Sign in with the password and bind each former subject on its user's edit
+   page. Direct subject binding binds immediately, so nothing is re-linked by
+   email.
+6. Verify an SSO sign-in for each user and one `/authorize` consent round trip.
+7. Optionally set `LOCAL_LOGIN_ENABLED=false` again. The boot check (D13) and
+   the last-reachable-admin rule (D15) then guard it.
+
+Startup refuses until step 3 is done, so no path runs the new code with
+stale env bindings in force. The owner confirmed (2026-11-04) that no
+production deployment has #415's OIDC enabled. The sequence is still the
+public upgrade contract.
 
 ### D4. Binding and minting: one guarded transaction
 
@@ -254,7 +304,7 @@ With `OIDC_ENABLED=false`, no new setting is validated beyond its type, the
 retired-field refusal still applies, and no route, template branch or column
 read changes the rendered output. The new columns exist but are read only by
 OIDC code and by the panel card, which renders only when OIDC is enabled. Each
-rendered page must be byte-identical with OIDC off (a snapshot test, task 7.3).
+rendered page must be byte-identical with OIDC off (golden tests captured on the base commit, task 0.3).
 
 ### D8. Failure modes
 
@@ -270,8 +320,10 @@ rendered page must be byte-identical with OIDC off (a snapshot test, task 7.3).
   The token is checked seconds after the provider minted it, so a skew large
   enough to matter is a broken NTP setup that should fail loudly. The docs say
   so. (Accepted: L6.)
-- **`email_verified` false or missing** on the pending branch: refusal
-  `email_unverified`. On the bound branch it is irrelevant.
+- **`email_verified` not the boolean `true`**, with the email matching a live
+  expectation: refusal `email_unverified`. **Email absent or malformed:**
+  irrelevant on the bound branch; on the pending branch it matches nothing,
+  so the refusal is `unlinked`.
 - **Inactive user:** `account`, before any bind write. That is unchanged.
 - **Unknown identity:** `unlinked` (renamed from #415's `mapping`, which no
   longer describes a map).
@@ -332,7 +384,15 @@ All unchanged from #415, restated as contract:
     `_lock_admin_guard`, no commit before the writes). It uses the existing
     `type="button"` + `data-confirm` delegated listener in `panel.js`, which
     fails closed. It is refused for `is_self` when `LOCAL_LOGIN_ENABLED=false`
-    (flash `err`).
+    (flash `err`), and in every case by the D15 rule.
+
+  **Every one of the three handlers** enters `_lock_admin_guard` and then
+  immediately re-runs `_actor_still_privileged(session, user)`, **before
+  reading the target row**. On failure it takes `actor_snapshot(user)`, rolls
+  back, calls `_log_actor_revoked`, and answers with the established
+  `_ACTOR_REVOKED_MSG` refusal: the same sequence `edit_user_submit` and
+  `delete_user` use. Only then does it read the target `FOR UPDATE`, apply the
+  D15 check (unlink), write, and commit.
 
   To change a bound user's identity, unlink first. That two-step act is the
   point: a bound user is never silently re-pointed. Conflicts (email already
@@ -384,8 +444,8 @@ session lives (L3).
   Startup continues: an outage of one login method must not become an outage
   of `/mcp`. A failure of the query itself logs a WARNING (class name only) and
   continues.
-- The self-unlink refusal (D11) closes the obvious foot-gun of an admin
-  unlinking their only way in.
+- The self-unlink refusal (D11) and the last-reachable-admin rule (D15)
+  close the foot-gun of the panel removing its own last way in.
 
 ### D14. Security events
 
@@ -407,6 +467,75 @@ exception text. `panel_oidc_refused` carries no `user_id` on `unlinked`,
 `email_unverified` or `link_conflict`. On `account` it carries none either:
 the record would confirm that the identity resolves to a local user, and it
 is subject-keyed by address like `panel_login_account_throttled`.
+
+### D15. The last reachable administrator (password login disabled)
+
+With `LOCAL_LOGIN_ENABLED=false`, an admin who is not bound under the
+configured issuer cannot sign in at all. The existing "last active admin"
+guard counts admins who *exist*, not admins who can *reach* the panel. So
+while password login is disabled, **every panel mutation that can reduce the
+set of reachable admins refuses any resulting state with zero of them**.
+A reachable admin is a row with `is_admin AND is_active AND oidc_issuer =
+<configured issuer> AND oidc_subject IS NOT NULL`.
+
+- **The helper:** `oidc_links.reachable_admins_after(session, issuer, *,
+  target_id, target_after)` counts reachable admins as if the target row had
+  the post-mutation state `target_after` (`unlinked`, `demoted`,
+  `deactivated` or `deleted`). It is evaluated **inside `_lock_admin_guard`,
+  after `_actor_still_privileged`**, in the same transaction as the write, so
+  the check and the act are atomic against every other guarded mutation.
+- **Call sites, each refusing with a flash `err` and nothing written:**
+  1. `POST /admin/users/{id}/oidc/unlink` (new).
+  2. `edit_user_submit` when the edit clears `is_admin` or `is_active`, next
+     to the existing last-active-admin check.
+  3. `delete_user`, soft delete (clears `is_active`).
+  4. `delete_user`, permanent delete.
+
+  Nothing else in the panel reduces the set. `oidc/expect` and `oidc/bind`
+  are refused on bound rows. The first-login bind and the admin create only
+  add to it. Password reset doesn't touch it, and an admin's self-service
+  password change doesn't either. A test asserts that the four sites are the
+  only `src/` writers of `users.is_admin`, `users.is_active` or
+  `users.oidc_subject`, and the only deleters of a `users` row, apart from
+  the first-login bind, bootstrap and create. So a fifth mutation site can't
+  silently skip the rule.
+- **Not applied** when `LOCAL_LOGIN_ENABLED=true`. There, the password form
+  reaches every active admin, and the existing guard is the whole rule.
+- **Outside the panel:** changing `OIDC_ISSUER`, disabling the account at the
+  provider, or setting `LOCAL_LOGIN_ENABLED=false` with no bound admin is
+  operator config. The boot CRITICAL (D13) reports it; the panel can't
+  prevent it.
+- **Concurrency:** two admins A and B, both bound, password login disabled.
+  Requests "A unlinks B" and "B deactivates A" race. The guard serializes
+  them. The second to take the lock re-runs `_actor_still_privileged`, so if
+  its actor was just deactivated or demoted it gets the actor-revoked
+  refusal; otherwise the D15 count sees the first one's committed result.
+  Exactly one succeeds and one reachable admin always remains. The tests force
+  that order deterministically: the first request holds the guard on a
+  barrier while the second is issued.
+
+### D16. The OIDC-off regression contract
+
+"Byte-for-byte unchanged" is enforced by golden tests captured on the base
+commit (bd9b386) **before** any slice starts, committed with the spec and
+green on that base. After the merge, they must pass unchanged. Normalized: the
+CSRF token, the CSP nonce, `Set-Cookie` values, dates, generated ids and codes.
+Each golden runs in a matrix of OIDC disabled (single-user and multi-user) and
+OIDC enabled (multi-user, fake provider). The goldens:
+
+1. Unauthenticated `GET /authorize?…` (a DCR client and a CIMD client): the
+   302 to `/admin/auth/login?next=<encoded>`, byte-for-byte.
+2. Authenticated consent render for a DCR client and for a CIMD client.
+3. Consent approval: the redirect, the code's user and the `grant_id` lineage
+   are preserved, and the code exchanges for a token owned by the same user.
+4. `/admin/register` GET and POST: OIDC disabled → the existing empty-table
+   bootstrap and the closed-once-users-exist redirect, unchanged; OIDC enabled
+   → 404 for both, as #415 shipped.
+5. The login, users list, user edit and account pages.
+
+In the OIDC-enabled column, items 1–3 must equal the disabled column. OIDC
+changes only *how* the session is minted, never what `/authorize` does with
+it. Item 5 must differ only by the OIDC blocks.
 
 ## Accepted limitations
 
