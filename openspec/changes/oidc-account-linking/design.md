@@ -602,6 +602,11 @@ it. Item 5 must differ only by the OIDC blocks.
   #415. Real client requests are well under that.
 - **L10.** The in-memory transaction store is lost on restart (one worker,
   #415). The user retries.
+- **L11.** D15 is applied to the resulting state, not to the target. With
+  `LOCAL_LOGIN_ENABLED=false` and zero reachable admins already (the boot
+  CRITICAL state), every demote, deactivate or delete of an admin is refused,
+  even of one who could not sign in anyway. It fails closed; the recovery is
+  the documented break-glass (`LOCAL_LOGIN_ENABLED=true`, restart).
 
 ## Risks / Trade-offs
 

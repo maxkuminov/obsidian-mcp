@@ -164,7 +164,7 @@ listener does not cover the unlink form), `src/main.py` (lifespan warning),
 ## 5. Verification gates
 
 - [ ] 5.1 `openspec-verifier` against these deltas (non-author)
-- [ ] 5.2 Adversarial Codex (mandatory: an auth and tenancy boundary), two rounds per the review budget
+- [x] 5.2 Adversarial Codex (mandatory: an auth and tenancy boundary): round 1 on d32e70b PASS with zero findings (349 offline OIDC tests run by the reviewer); no fixes, so no re-review round. L11 recorded from the supervisor's own review
 - [ ] 5.3 `make audit`, `make test-schema`, `make db-check`, `make test-integration`, `pytest tests`
 - [ ] 5.4 Archive (`openspec archive oidc-account-linking -y`) in the feature PR, `Closes #416`
 
