@@ -70,14 +70,14 @@ only), `src/services/transport_security.py` (a new `load_oidc_ca_context`
 only), and the slice-B test files above. Do NOT touch routes, templates,
 models or the migration.
 
-- [ ] 2.1 Settings per D7. `OIDC_SUBJECT_USER_IDS` non-empty is refused with the **exact D3 message** (the upgrade sequence plus the docs section name), whether OIDC is on or off; no network at validation
-- [ ] 2.2 `load_oidc_ca_context`, parsed once; `BoundedTransport` passes `verify=` that context, else certifi (confirm the parameter against pinned httpx2 2.16.0)
-- [ ] 2.3 `exchange()` returns `VerifiedIdentity(iss, sub, email: str | None, email_verified: bool)`. It **never refuses on email**: non-string / absent / > 254 → `None`; `email_verified` is `True` only for the JSON boolean `true`. It refuses only on signature, `iss`/`aud`/`azp`/`exp`/`iat`/`nonce`/`sub` (≤ 255) and group. Remove the `oidc_subject_user_ids` lookup
-- [ ] 2.4 Algorithms: `{RS256, PS256, ES256}` ∩ discovery-advertised (RS256 if absent), passed to `jwt.decode(algorithms=…)`
-- [ ] 2.5 Token endpoint auth method from settings; refused `provider` at start when discovery lists methods and omits it
-- [ ] 2.6 Scopes `openid email profile` + extra; group check only when configured
-- [ ] 2.7 `metadata()` exposes `iss_parameter_required` for slice C
-- [ ] 2.8 Tests with a fake provider (real RS256/PS256/ES256 keys):
+- [x] 2.1 Settings per D7. `OIDC_SUBJECT_USER_IDS` non-empty is refused with the **exact D3 message** (the upgrade sequence plus the docs section name), whether OIDC is on or off; no network at validation
+- [x] 2.2 `load_oidc_ca_context`, parsed once; `BoundedTransport` passes `verify=` that context, else certifi (confirm the parameter against pinned httpx2 2.16.0)
+- [x] 2.3 `exchange()` returns `VerifiedIdentity(iss, sub, email: str | None, email_verified: bool)`. It **never refuses on email**: non-string / absent / > 254 → `None`; `email_verified` is `True` only for the JSON boolean `true`. It refuses only on signature, `iss`/`aud`/`azp`/`exp`/`iat`/`nonce`/`sub` (≤ 255) and group. Remove the `oidc_subject_user_ids` lookup
+- [x] 2.4 Algorithms: `{RS256, PS256, ES256}` ∩ discovery-advertised (RS256 if absent), passed to `jwt.decode(algorithms=…)`
+- [x] 2.5 Token endpoint auth method from settings; refused `provider` at start when discovery lists methods and omits it
+- [x] 2.6 Scopes `openid email profile` + extra; group check only when configured
+- [x] 2.7 `metadata()` exposes `iss_parameter_required` for slice C
+- [x] 2.8 Tests with a fake provider (real RS256/PS256/ES256 keys):
   - each algorithm is accepted when advertised and refused when not; HS256 and `none` are refused;
   - basic vs post (header vs body, never both);
   - the CA file is accepted, or refused when it has no CA or is unreadable;

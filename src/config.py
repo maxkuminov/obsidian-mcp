@@ -342,6 +342,55 @@ class _FieldFilteredSource(PydanticBaseSettingsSource):
         return f"{self.__class__.__name__}({self._inner!r})"
 
 
+# ── Native OIDC (#415, #416) ────────────────────────────────────────────────
+#
+# The startup refusal for the retired subject map (design D3). The section
+# name at the end must match the heading in docs/native-oidc.md.
+OIDC_SUBJECT_USER_IDS_RETIRED = (
+    "OIDC_SUBJECT_USER_IDS is retired (#416). Upgrade: (1) confirm a local admin "
+    "password works; (2) set LOCAL_LOGIN_ENABLED=true; (3) remove "
+    "OIDC_SUBJECT_USER_IDS; (4) start; (5) bind each former subject on its user's "
+    "edit page (Single sign-on → Bind subject); (6) verify SSO and /authorize; "
+    "(7) optionally set LOCAL_LOGIN_ENABLED=false. See docs/native-oidc.md, "
+    "\"Upgrading from OIDC_SUBJECT_USER_IDS\"."
+)
+OIDC_TOKEN_AUTH_METHODS = ("client_secret_basic", "client_secret_post")
+OIDC_BASE_SCOPES = ("openid", "email", "profile")
+OIDC_MAX_ISSUER_CHARS = 2048
+OIDC_MAX_EXTRA_SCOPES = 8
+OIDC_MAX_SCOPE_CHARS = 64
+OIDC_MAX_DISPLAY_NAME_CHARS = 40
+# RFC 6749 §3.3: scope-token = 1*( %x21 / %x23-5B / %x5D-7E )
+_OIDC_SCOPE_TOKEN_CHARS = frozenset(
+    chr(c) for c in (0x21, *range(0x23, 0x5C), *range(0x5D, 0x7F))
+)
+
+
+def _normalise_oidc_extra_scopes(value: str) -> str:
+    """`OIDC_EXTRA_SCOPES` → its canonical space-joined form, or `ValueError`.
+
+    Separated by spaces only (a tab is not a scope-token character, so it is
+    refused rather than split on); each token an RFC 6749 scope-token of at
+    most 64 characters; at most eight distinct extra tokens. `offline_access`
+    is refused — no refresh token is ever wanted. `openid`, `email`,
+    `profile` and repeats are dropped, as they are already requested.
+    """
+    tokens = [t for t in value.split(" ") if t]
+    if len(tokens) > OIDC_MAX_EXTRA_SCOPES:
+        raise ValueError(f"OIDC_EXTRA_SCOPES accepts at most {OIDC_MAX_EXTRA_SCOPES} scopes")
+    kept: list[str] = []
+    for token in tokens:
+        if len(token) > OIDC_MAX_SCOPE_CHARS or not set(token) <= _OIDC_SCOPE_TOKEN_CHARS:
+            raise ValueError(
+                "OIDC_EXTRA_SCOPES must be space-separated RFC 6749 scope tokens "
+                f"of at most {OIDC_MAX_SCOPE_CHARS} characters")
+        if token.casefold() == "offline_access":
+            raise ValueError("OIDC_EXTRA_SCOPES must not request offline_access")
+        if token not in OIDC_BASE_SCOPES and token not in kept:
+            kept.append(token)
+    return " ".join(kept)
+
+
 class Settings(BaseSettings):
     # No password in the default (#324): an unset DATABASE_URL must not
     # authenticate with a known value. The bundled compose files set it from
@@ -1022,19 +1071,46 @@ class Settings(BaseSettings):
     oidc_issuer: str = ""
     oidc_client_id: str = ""
     oidc_client_secret: str = Field("", repr=False)
+    # Optional since #416: empty means no group check; set, the exact
+    # case-sensitive element check of #415 applies.
     oidc_required_group: str = ""
-    oidc_subject_user_ids: dict[str, int] = Field(default_factory=dict)
+    # `client_secret_basic` (Authorization header) or `client_secret_post`
+    # (form body) — never both. Checked against discovery at login (D5).
+    oidc_token_auth_method: str = "client_secret_basic"
+    # Space-separated scopes requested after `openid email profile`; RFC 6749
+    # scope-tokens, ≤ 8 of ≤ 64 characters; `offline_access` refused.
+    oidc_extra_scopes: str = ""
+    # The login button reads "Sign in with {OIDC_DISPLAY_NAME}".
+    oidc_display_name: str = "SSO"
+    # PEM trust anchor for the OIDC back-channel only (not EMBEDDING_CA_FILE:
+    # different operators, different roots). Unset → certifi's bundle.
+    # Parsed once, when OIDC is enabled, by `_validate_oidc`.
+    oidc_ca_file: Annotated[str | None, BeforeValidator(_off_means_none)] = None
+    # Retired (#416). Kept only so that a non-empty value can be refused with
+    # the upgrade sequence; linking now lives on the `users` row.
+    oidc_subject_user_ids: dict[str, Any] = Field(default_factory=dict, repr=False)
     local_login_enabled: bool = True
+
+    _oidc_ssl_context: Any = PrivateAttr(default=None)
+
+    @property
+    def oidc_ssl_context(self):
+        """The parsed `OIDC_CA_FILE` context, or `None` (certifi applies)."""
+        return self._oidc_ssl_context
+
+    @field_validator("oidc_ca_file", mode="before")
+    @classmethod
+    def _oidc_ca_off(cls, value):
+        if isinstance(value, str) and value.strip().casefold() == "off":
+            return None
+        return value
 
     @field_validator("oidc_subject_user_ids", mode="before")
     @classmethod
-    def _oidc_mapping(cls, value):
-        if not isinstance(value, dict) or len(value) > 256 or any(
-            not isinstance(k, str) or not k or len(k) > 255
-            or type(v) is not int or v < 1 for k, v in value.items()
-        ):
-            raise ValueError("OIDC_SUBJECT_USER_IDS must map subjects to positive integer user IDs")
-        return value
+    def _oidc_mapping_retired(cls, value):
+        if value is None or value == {} or (isinstance(value, str) and not value.strip()):
+            return {}
+        raise ValueError(OIDC_SUBJECT_USER_IDS_RETIRED)
 
     session_max_age: int = 60 * 60 * 24 * 7
     session_cookie_name: str = "omcp_session"
@@ -1987,11 +2063,26 @@ class Settings(BaseSettings):
                     or (origin_only and parsed.path not in ("", "/"))):
                 raise ValueError("OIDC requires an HTTPS issuer and HTTPS BASE_URL origin")
             _ = parsed.port  # invalid port fails at startup
-        if not all((self.oidc_client_id.strip(), self.oidc_client_secret.strip(),
-                    self.oidc_required_group.strip(), self.oidc_subject_user_ids)):
-            raise ValueError("OIDC requires client credentials, required group and subject mappings")
+        if len(self.oidc_issuer) > OIDC_MAX_ISSUER_CHARS:
+            raise ValueError(f"OIDC_ISSUER must be at most {OIDC_MAX_ISSUER_CHARS} characters")
+        if not all((self.oidc_client_id.strip(), self.oidc_client_secret.strip())):
+            raise ValueError("OIDC requires OIDC_CLIENT_ID and OIDC_CLIENT_SECRET")
         if len(self.oidc_required_group) > 512:
             raise ValueError("OIDC_REQUIRED_GROUP must be at most 512 characters")
+        if self.oidc_required_group and not self.oidc_required_group.strip():
+            raise ValueError("OIDC_REQUIRED_GROUP must be empty or name a group")
+        if self.oidc_token_auth_method not in OIDC_TOKEN_AUTH_METHODS:
+            raise ValueError("OIDC_TOKEN_AUTH_METHOD must be one of " + ", ".join(OIDC_TOKEN_AUTH_METHODS))
+        self.oidc_extra_scopes = _normalise_oidc_extra_scopes(self.oidc_extra_scopes)
+        name = self.oidc_display_name
+        if (not 1 <= len(name) <= OIDC_MAX_DISPLAY_NAME_CHARS or not name.isprintable()
+                or not name.strip()):
+            raise ValueError(
+                f"OIDC_DISPLAY_NAME must be 1-{OIDC_MAX_DISPLAY_NAME_CHARS} printable characters")
+        if self.oidc_ca_file is not None:
+            from src.services.transport_security import load_oidc_ca_context
+
+            self._oidc_ssl_context = load_oidc_ca_context(self.oidc_ca_file)
         return self
 
 

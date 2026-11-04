@@ -438,7 +438,13 @@ async def oidc_callback(request: Request, session: AsyncSession = Depends(get_se
         if "error" in params or ("iss" in params and params["iss"] != settings.oidc_issuer):
             raise oidc.LoginRefused("provider")
         # get_session has not checked out a connection: all network I/O precedes DB access.
-        user_id = await oidc.exchange(params.get("code", ""), tx)
+        identity = await oidc.exchange(params.get("code", ""), tx, iss=params.get("iss"))
+        # TODO(#416 slice C): transitional shim. Replace with oidc_links.resolve /
+        # prepare_login; until then the retired map (refused at startup, reachable
+        # only by in-process assignment, as the 0.3 goldens do) resolves the subject.
+        user_id = settings.oidc_subject_user_ids.get(identity.sub)
+        if user_id is None:
+            raise oidc.LoginRefused("mapping")
     except Exception as exc:
         reason = exc.reason if isinstance(exc, oidc.LoginRefused) else "provider"
         return _oidc_refused(request, reason)
