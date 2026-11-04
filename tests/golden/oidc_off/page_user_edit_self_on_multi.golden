@@ -1755,6 +1755,47 @@ content-security-policy: default-src 'self'; script-src 'nonce-<NONCE>'; style-s
 
     </div>
 
+    <!-- Single sign-on (#416). The subject is shown truncated, the issuer never.
+         Expect and bind are offered only on an unlinked or pending row: a
+         bound user is never re-pointed without an explicit unlink. -->
+    <div class="card anim-3 u-margin-top-20px">
+        <div class="card-header">
+            <span class="card-title">Single sign-on</span>
+        </div>
+        <div class="card-body">
+            <div class="kv">
+                <div class="kv-k">Status</div>
+                <div class="kv-v">
+                    
+                    Linked (since <time datetime="<DATETIME>" data-localize="date"><DATETIME></time>)
+                    <span class="mono u-color-text-3">immutabl…</span>
+                    
+                </div>
+            </div>
+            
+            
+            <div class="kv u-margin-top-12px">
+                <div>
+                    <div class="kv-k">Unlink</div>
+                    <div class="u-color-text-3 u-font-size-12px u-margin-top-4px">
+                        Clears the link or the pending address and signs this user out
+                        of every browser.
+                        
+                    </div>
+                </div>
+                <form method="POST" action="/admin/users/<UID:admin>/oidc/unlink">
+                    <input type="hidden" name="csrf_token" value="<CSRF>">
+                    <button type="button" class="btn btn-danger"
+                            
+                            data-confirm="Unlink this user from single sign-on? Their live sessions end.">
+                        Unlink
+                    </button>
+                </form>
+            </div>
+            
+        </div>
+    </div>
+
     <!-- Danger zone -->
     <div class="card anim-3 u-margin-top-20px u-border-color-error-border">
         <div class="card-header">

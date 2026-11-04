@@ -1681,6 +1681,7 @@ content-security-policy: default-src 'self'; script-src 'nonce-<NONCE>'; style-s
                     <th>Username</th>
                     <th>Role</th>
                     <th>Status</th>
+                    <th>SSO</th>
                     <th>Vault Path</th>
                     <th>API Keys</th>
                     <th>Notes</th>
@@ -1703,6 +1704,9 @@ content-security-policy: default-src 'self'; script-src 'nonce-<NONCE>'; style-s
                         <span class="badge badge-green">Active</span>
                         
                     </td>
+                    <td>
+                        <span class="badge badge-green">linked</span>
+                    </td>
                     <td class="mono users-td-vault">
                         <VAULT>
                     </td>
@@ -1717,7 +1721,7 @@ content-security-policy: default-src 'self'; script-src 'nonce-<NONCE>'; style-s
                         
                     </td>
                     <td class="mono users-td-meta">
-                        —
+                        <time datetime="<DATETIME>" data-localize><DATETIME></time>
                     </td>
                     <td class="mono users-td-meta">
                         <time datetime="<DATETIME>" data-localize="date"><DATETIME></time>
@@ -1738,6 +1742,9 @@ content-security-policy: default-src 'self'; script-src 'nonce-<NONCE>'; style-s
                         
                         <span class="badge badge-green">Active</span>
                         
+                    </td>
+                    <td>
+                        —
                     </td>
                     <td class="mono users-td-vault">
                         <span class="u-color-warning">(unassigned)</span>
