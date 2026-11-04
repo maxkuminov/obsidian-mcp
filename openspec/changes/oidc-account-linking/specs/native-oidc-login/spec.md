@@ -1,0 +1,189 @@
+## MODIFIED Requirements
+
+### Requirement: Optional existing-account OIDC
+The server SHALL keep OIDC disabled by default and, when enabled, require an HTTPS issuer and callback and confidential client credentials, and SHALL resolve a verified identity only to an existing local user through a database-held link, never by provisioning a user, changing a role or assigning a vault. When `OIDC_REQUIRED_GROUP` is non-empty a valid ID token lacking that exact group SHALL be refused; when it is empty no group check SHALL be applied.
+
+#### Scenario: Unlinked identity
+- **WHEN** a valid ID token's `(iss, sub)` is bound to no user and matches no live pending expectation
+- **THEN** login is denied with the generic OIDC refusal page and no user, role or vault is created or changed
+
+#### Scenario: Configured group missing
+- **WHEN** `OIDC_REQUIRED_GROUP` is set and a valid ID token for a bound user lacks the exact group
+- **THEN** login is denied with reason `entitlement`
+
+#### Scenario: No group configured
+- **WHEN** `OIDC_REQUIRED_GROUP` is empty and a valid ID token for a bound user carries no `groups` claim
+- **THEN** login proceeds
+
+### Requirement: Safe activation and provider profile
+The server SHALL reject startup with OIDC enabled unless multi-user mode is enabled and sandbox mode is disabled, SHALL reject multi-user configuration with both login methods disabled, and SHALL reject any non-empty `OIDC_SUBJECT_USER_IDS` with a message naming the panel action that replaces it. The supported provider profile SHALL be any OpenID Connect provider whose discovery document, authorization, token and JWKS endpoints are HTTPS on the issuer's origin; providers whose endpoints span origins SHALL remain unsupported.
+
+#### Scenario: Single-user exposure
+- **WHEN** OIDC is enabled in single-user mode
+- **THEN** startup fails before routes serve
+
+#### Scenario: Retired mapping setting
+- **WHEN** `OIDC_SUBJECT_USER_IDS` is set to a non-empty object, with OIDC enabled or not
+- **THEN** startup fails with a message that names binding the subject on the user's edit page
+
+#### Scenario: Cross-origin endpoint
+- **WHEN** discovery advertises a token or JWKS endpoint on a host other than the issuer's
+- **THEN** login is refused with reason `provider`
+
+### Requirement: Strict protocol and entitlement validation
+The server SHALL require exact discovery issuer, a signature validated against the issuer's freshly fetched JWKS using an algorithm in `{RS256, PS256, ES256}` intersected with the discovery document's `id_token_signing_alg_values_supported` (RS256 when that field is absent), nonempty string `iss`/`sub`/`nonce` with `sub` at most 255 characters, integer `exp`/`iat`, `aud` equal to the client ID or its singleton array, `azp` equal to the client ID if present, and zero clock skew. Discovery endpoints SHALL use HTTPS on the issuer origin without credentials or fragment; HTTP requests SHALL disable redirects and environment proxies and use bounded time and response size. When a group is required, the groups claim SHALL be an array of at most 256 strings of at most 512 characters and admission SHALL require exact case-sensitive element equality.
+
+#### Scenario: Wrong audience or malformed groups
+- **WHEN** a signed token includes an extra audience, a foreign azp, scalar groups or a case-variant group while a group is required
+- **THEN** login is denied
+
+#### Scenario: ES256 provider
+- **WHEN** discovery advertises `ES256` and the ID token is ES256-signed by a key in the JWKS
+- **THEN** signature validation succeeds
+
+#### Scenario: Symmetric or unsigned token
+- **WHEN** the ID token header names `HS256` or `none`, whatever discovery advertises
+- **THEN** login is denied with reason `token`
+
+#### Scenario: Algorithm not advertised
+- **WHEN** discovery advertises only `RS256` and the token is PS256-signed
+- **THEN** login is denied with reason `token`
+
+### Requirement: Ephemeral provider credentials
+The server SHALL request the scopes `openid email profile` plus any configured `OIDC_EXTRA_SCOPES`, never `offline_access`, and keep provider codes/tokens only transiently during callback. They SHALL NOT enter cookies, app sessions, databases, caches, events, exceptions or application access logs. Callback tokens SHALL be discarded before the database phase of the callback; deployments SHALL suppress callback query logging at their external proxy.
+
+#### Scenario: Callback audit
+- **WHEN** a callback succeeds or fails
+- **THEN** application logs contain no callback query, provider credential, subject or email
+
+#### Scenario: offline_access cannot be requested
+- **WHEN** `OIDC_EXTRA_SCOPES` contains `offline_access`
+- **THEN** startup fails
+
+## ADDED Requirements
+
+### Requirement: OIDC links SHALL be stored on the user row with uniqueness enforced by the database
+Migration 037 SHALL add to `users` the nullable columns `oidc_issuer`, `oidc_subject`, `oidc_linked_at`, `oidc_expected_issuer`, `oidc_expected_email` and `oidc_expected_set_at`, a UNIQUE constraint on `(oidc_issuer, oidc_subject)`, a UNIQUE constraint on `(oidc_expected_issuer, oidc_expected_email)`, and CHECK constraints making each triple all-NULL or all-non-NULL and forbidding a row that is both bound and pending. The ORM model SHALL declare the same constraints so that `alembic check` reports no operations.
+
+#### Scenario: One identity, one user
+- **WHEN** a write would bind an `(issuer, subject)` pair already bound to another user
+- **THEN** the database SHALL reject it and the write SHALL be reported as a conflict
+
+#### Scenario: Bound and pending at once is unrepresentable
+- **WHEN** a write sets the expected columns on a bound row
+- **THEN** the database SHALL reject it
+
+#### Scenario: Schema gate
+- **WHEN** migrations are applied to head
+- **THEN** `alembic check` SHALL report "No new upgrade operations detected"
+
+### Requirement: A pending expectation SHALL bind only on a verified, exactly matching email within seven days, once
+When no user is bound to a validated token's `(iss, sub)`, the server SHALL bind it to the user whose pending expectation has `oidc_expected_issuer` equal to `iss`, `oidc_expected_email` equal to the token's `email` after the same normalization (surrounding ASCII whitespace stripped, ASCII letters lower-cased, nothing else folded), `oidc_expected_set_at` no more than seven days ago, and only if the token's `email_verified` claim is the JSON boolean `true`. A bind SHALL write the issuer, subject and link time, clear the three expected columns and stamp `last_login_at` under the account guard, after re-checking every condition on a `FOR UPDATE` re-read, in the same transaction that `start_session` commits, so that a refused mint leaves no binding.
+
+#### Scenario: First sign-in binds
+- **WHEN** an active user is pending for `max@example.com` under the configured issuer, set yesterday, and a valid token carries `email` `Max@Example.com` with `email_verified: true`
+- **THEN** the user SHALL become bound to the token's `(iss, sub)`, the expectation SHALL be cleared, and a session SHALL be minted for that user
+
+#### Scenario: Unverified email does not bind
+- **WHEN** the token's email matches but `email_verified` is false, absent or the string `"true"`
+- **THEN** nothing SHALL be written and login SHALL be refused with reason `email_unverified`
+
+#### Scenario: Expired expectation does not bind
+- **WHEN** the matching expectation was set eight days ago
+- **THEN** nothing SHALL be written and login SHALL be refused with reason `unlinked`
+
+#### Scenario: Expectation set under another issuer
+- **WHEN** the expectation's issuer differs from the token's `iss`
+- **THEN** it SHALL NOT match
+
+#### Scenario: Refused mint leaves no binding
+- **WHEN** a pending match passes every check but the session mint is refused because the account's session version changed
+- **THEN** the user SHALL remain pending and unbound
+
+#### Scenario: Concurrent bind of the same identity
+- **WHEN** a second user's pending bind would write an `(iss, sub)` committed to another user in the meantime
+- **THEN** the second bind SHALL roll back and login SHALL be refused with reason `link_conflict`
+
+### Requirement: A bound user SHALL be resolved by issuer and subject alone
+Once a user is bound, the callback SHALL resolve that user only by equality of `(oidc_issuer, oidc_subject)` with the validated token's `(iss, sub)`, and SHALL NOT consult the token's `email`, `preferred_username` or any other claim to resolve, re-bind or refuse that user, except the group check when a group is required.
+
+#### Scenario: Provider account renamed
+- **WHEN** a bound user's provider account changes its username and email
+- **THEN** that user still signs in by `(iss, sub)`
+
+#### Scenario: Address reassigned to another provider account
+- **WHEN** a different provider account, with a new `sub`, now holds the bound user's former verified email
+- **THEN** it SHALL NOT sign in as the bound user and SHALL be refused `unlinked`
+
+#### Scenario: Bound identity matching another pending expectation
+- **WHEN** a token's `(iss, sub)` is bound to user A and its email matches user B's pending expectation
+- **THEN** the session SHALL be minted for A and B's expectation SHALL be left unchanged
+
+### Requirement: OIDC refusals SHALL NOT reveal which local users exist
+Every OIDC callback refusal SHALL render the same login page, the same message and the same status (401, or 503 with `Retry-After` for `capacity`), whatever the reason, including an unlinked identity, an unverified email, an expired expectation, a link conflict and an inactive account.
+
+#### Scenario: Unlinked versus inactive
+- **WHEN** one callback is refused `unlinked` and another `account`
+- **THEN** the two response bodies SHALL be identical apart from the CSRF token and the nonce
+
+### Requirement: The callback SHALL require the RFC 9207 iss parameter when the provider advertises it
+After consuming the state and fetching discovery, and before the token request, the callback SHALL refuse a response whose `iss` parameter is present and differs from the configured issuer, and SHALL refuse one that omits `iss` when discovery advertises `authorization_response_iss_parameter_supported: true`.
+
+#### Scenario: Missing iss from an advertising provider
+- **WHEN** discovery advertises the parameter and the callback carries no `iss`
+- **THEN** login is refused with reason `provider` and no token request is made
+
+#### Scenario: Provider that does not advertise
+- **WHEN** discovery does not advertise the parameter and the callback carries no `iss`
+- **THEN** the flow continues
+
+### Requirement: The OIDC back-channel SHALL use a dedicated transport policy with an optional private trust anchor
+Every discovery, token and JWKS request SHALL be made over HTTPS with environment proxies disabled, redirects not followed, identity content encoding and bounded response bodies, verifying the server certificate against `OIDC_CA_FILE` when set and otherwise against the certifi bundle. `OIDC_CA_FILE` SHALL be parsed once at settings construction and refused when unreadable or containing no CA certificate. There SHALL be no setting that permits plaintext HTTP for the issuer, and the SSRF deny list of user-supplied fetches SHALL NOT apply, the issuer being operator configuration.
+
+#### Scenario: Private-CA issuer
+- **WHEN** the issuer's certificate chains to the CA in `OIDC_CA_FILE`
+- **THEN** discovery succeeds
+
+#### Scenario: Plaintext issuer
+- **WHEN** `OIDC_ISSUER` is an `http://` URL
+- **THEN** startup fails
+
+### Requirement: OIDC settings SHALL be validated at boot and contact no provider
+`OIDC_TOKEN_AUTH_METHOD` SHALL be `client_secret_basic` (default) or `client_secret_post`; `OIDC_EXTRA_SCOPES` SHALL be at most eight space-separated RFC 6749 scope tokens of at most 64 characters each; `OIDC_DISPLAY_NAME` SHALL be 1 to 40 printable characters (default `SSO`); `OIDC_ISSUER` SHALL be at most 2,048 characters. Validation SHALL NOT make any network request, so an unreachable provider SHALL NOT prevent startup, `/health` or password login.
+
+#### Scenario: Provider down at boot
+- **WHEN** the issuer is unreachable while the process starts with OIDC enabled
+- **THEN** startup completes, `/health` answers as before, and password login works
+
+#### Scenario: Auth method not offered by the provider
+- **WHEN** `OIDC_TOKEN_AUTH_METHOD=client_secret_post` and discovery's `token_endpoint_auth_methods_supported` omits it
+- **THEN** login is refused with reason `provider` at the start route
+
+### Requirement: An OIDC login SHALL stamp last_login_at and stay independent of the password-failure budget
+A successful OIDC callback SHALL set the user's `last_login_at` in the transaction that commits the session mint. OIDC refusals SHALL NOT charge the per-account failed-login budget, the budget SHALL NOT refuse an OIDC login, and an OIDC success SHALL NOT reset it.
+
+#### Scenario: Last login recorded
+- **WHEN** a bound user signs in through OIDC
+- **THEN** that user's `last_login_at` SHALL be updated
+
+#### Scenario: Exhausted password budget
+- **WHEN** a user's per-account failed-login budget is exhausted and that user signs in through OIDC
+- **THEN** the OIDC login SHALL succeed and the budget SHALL remain exhausted
+
+### Requirement: Disabled password login SHALL warn when no administrator can sign in through OIDC
+At lifespan start, with OIDC enabled and `LOCAL_LOGIN_ENABLED=false`, the server SHALL count active administrators bound under the configured issuer and SHALL log one CRITICAL line naming the recovery step when the count is zero, and SHALL continue starting in every case, including when the count query fails.
+
+#### Scenario: No bound administrator
+- **WHEN** password login is disabled and no active admin is bound under the configured issuer
+- **THEN** one CRITICAL line is logged and startup continues
+
+### Requirement: Deployments without OIDC SHALL be byte-for-byte unchanged
+With `OIDC_ENABLED=false`, in single-user or multi-user mode, every panel, login, account, user list, user edit and consent page SHALL render identically to the release before this change, and no route added by this change SHALL be reachable.
+
+#### Scenario: Panel snapshot with OIDC off
+- **WHEN** the login, users list, user edit and account pages are rendered with OIDC disabled
+- **THEN** each equals the pre-change rendering apart from the CSRF token and the nonce
+
+#### Scenario: Link routes absent
+- **WHEN** OIDC is disabled and an admin POSTs to `/admin/users/{id}/oidc/expect`
+- **THEN** the response is 404 and nothing is written
