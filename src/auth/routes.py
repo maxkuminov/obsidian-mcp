@@ -388,6 +388,10 @@ async def login_submit(
 
 
 def _oidc_refused(request: Request, reason: str):
+    # The closed set (#416 D14): anything else is recorded as `provider`
+    # rather than letting an unlisted value reach the log.
+    if reason not in security_events.OIDC_REFUSAL_REASONS:
+        reason = "provider"
     security_events.emit(
         "panel_oidc_refused", subject=security_events.subject_for(request=request),
         reason=reason, client_ip=security_events.client_ip(request), route=request.url.path,

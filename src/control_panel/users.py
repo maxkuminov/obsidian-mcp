@@ -506,6 +506,8 @@ async def _oidc_link_action(
     """
     if not settings.oidc_enabled:
         raise HTTPException(404)
+    if mode != "unlink" and mode not in security_events.OIDC_LINK_SET_MODES:
+        raise ValueError(f"unknown link mode {mode!r}")
     await _lock_admin_guard(session)
     if not await _actor_still_privileged(session, user):
         actor = actor_snapshot(user)  # before the rollback expires `user` (#332)
