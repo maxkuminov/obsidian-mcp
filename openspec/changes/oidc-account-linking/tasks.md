@@ -137,7 +137,7 @@ listener does not cover the unlink form), `src/main.py` (lifespan warning),
 
 ## 4. Slice D: docs (last commits of the feature branch)
 
-- [ ] 4.1 **Settings × docs matrix.** Each of the following appears, with default, validation and purpose, in **all four** of README.md (settings table), DEPLOYMENT.md, `.env.example` and `docs/native-oidc.md`:
+- [x] 4.1 **Settings × docs matrix.** Each of the following appears, with default, validation and purpose, in **all four** of README.md (settings table), DEPLOYMENT.md, `.env.example` and `docs/native-oidc.md`:
   - `OIDC_TOKEN_AUTH_METHOD`
   - `OIDC_EXTRA_SCOPES`, including that `offline_access` is refused
   - `OIDC_DISPLAY_NAME`
@@ -147,19 +147,19 @@ listener does not cover the unlink form), `src/main.py` (lifespan warning),
   - `OIDC_SUBJECT_USER_IDS`, marked retired with a pointer to the upgrade section (in `.env.example`, a commented "retired" line, not a live example)
 
   A grep check over the four files for each name is part of the task.
-- [ ] 4.2 README: the feature section rewritten for linking, plus an **upgrade note** that reproduces the D3 sequence and links to the docs section
-- [ ] 4.3 `docs/native-oidc.md`:
+- [x] 4.2 README: the feature section rewritten for linking, plus an **upgrade note** that reproduces the D3 sequence and links to the docs section
+- [x] 4.3 `docs/native-oidc.md`:
   - generic provider requirements;
   - the linking workflow;
   - bootstrap order and break-glass;
   - the D15 rule;
   - an **"Upgrading from OIDC_SUBJECT_USER_IDS"** section with the exact D3 sequence (its title must match the startup message);
   - a **Keycloak walkthrough**: realm → client, Client authentication ON, Standard flow only, PKCE S256, redirect URI `https://<MCP_HOSTNAME>/admin/auth/oidc/callback`, no wildcards; client scopes `email` + `profile`; "Verify email" on, "Duplicate emails" off; an optional Group Membership mapper (`groups`, ID token, full path) with `OIDC_REQUIRED_GROUP`; where to find a user's `sub`; an NTP note.
-- [ ] 4.4 DEPLOYMENT.md: the pointer section, k3s break-glass (edit the config, rollout restart), and the upgrade sequence (or a pointer to it)
-- [ ] 4.5 `docs/architecture/control-panel.md`: linking, the matching rule, bind/mint ordering, the actor re-check, D15
-- [ ] 4.6 `docs/architecture/security-event-logging.md`: the three events and the reason set
-- [ ] 4.7 `docs/architecture/schema-and-migrations.md`: a 037 section (columns with no FK, markers, the gate's head literal `037`, the 037 cases)
-- [ ] 4.8 CLAUDE.md: a Key-decisions bullet replacing the #414 paragraph (including D15); a `docs/native-oidc.md` row in the architecture table
+- [x] 4.4 DEPLOYMENT.md: the pointer section, k3s break-glass (edit the config, rollout restart), and the upgrade sequence (or a pointer to it)
+- [x] 4.5 `docs/architecture/control-panel.md`: linking, the matching rule, bind/mint ordering, the actor re-check, D15
+- [x] 4.6 `docs/architecture/security-event-logging.md`: the three events and the reason set
+- [x] 4.7 `docs/architecture/schema-and-migrations.md`: a 037 section (columns with no FK, markers, the gate's head literal `037`, the 037 cases)
+- [x] 4.8 CLAUDE.md: a Key-decisions bullet replacing the #414 paragraph (including D15); a `docs/native-oidc.md` row in the architecture table
 
 ## 5. Verification gates
 

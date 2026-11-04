@@ -1116,3 +1116,82 @@ the column would leave rows no URL can reach, and deleting them would cascade
 their grants. Delete those clients in the panel first.
 `tests/integration/test_oauth_cimd_migration_pg.py` pins the refusal and the
 CHECK.
+
+## 037: OIDC account links on `users` (#416)
+
+Six nullable columns on `users`, in two triples, and five named constraints.
+No new table, no foreign key, no backfill.
+
+| column | type | meaning |
+| --- | --- | --- |
+| `oidc_issuer` | `VARCHAR(2048)` | issuer the subject is bound under (exact `iss`) |
+| `oidc_subject` | `VARCHAR(255)` | the bound `sub` |
+| `oidc_linked_at` | `TIMESTAMPTZ` | when the binding was made |
+| `oidc_expected_issuer` | `VARCHAR(2048)` | issuer a pending expectation was set under |
+| `oidc_expected_email` | `VARCHAR(254)` | the normalized expected email |
+| `oidc_expected_set_at` | `TIMESTAMPTZ` | when the admin set it (drives the 7-day expiry) |
+
+- `uq_users_oidc_identity UNIQUE (oidc_issuer, oidc_subject)` — one identity,
+  at most one user. NULLs are distinct, so unlinked rows never collide.
+- `uq_users_oidc_expected UNIQUE (oidc_expected_issuer, oidc_expected_email)`
+  — two users cannot wait for one address, so a match is never ambiguous.
+- `ck_users_oidc_bound_complete` / `ck_users_oidc_expected_complete` — each
+  triple is all NULL or all set.
+- `ck_users_oidc_not_both` — a row is never bound and pending at once.
+
+All five are declared on the ORM model, so `alembic check` stays clean. The
+email is stored already normalized, which is why a plain UNIQUE suffices: a
+`lower()` expression index would not autogenerate cleanly. The btree row
+bound (2,048 + 255 plus overhead) is under PostgreSQL's 2,704-byte index row
+limit; `OIDC_ISSUER` is validated to ≤ 2,048 characters and `sub` to ≤ 255.
+
+**Columns, not a `user_oidc_identities` table, because a table needs an FK to
+`users`**, and an FK to `users` is what reopened the permanent-deletion
+deadlock for the change-feed tables (033). On the row, deleting a user removes
+its link with no purge step, and the user-row lock every admin action already
+takes covers the link. #415 kept its mapping in the environment, so there was
+nothing to migrate: every existing row reads NULL in all six, meaning "not
+linked".
+
+**Marker-owned, reconcile or refuse** — 029's and 030's shape, applied to
+eleven objects:
+
+- Each column carries `OIDC account link (037_oidc_account_links)` as its
+  COMMENT, mirrored byte-identically as `_OIDC_LINK_COLUMN_MARKER` in
+  `src/models/db.py` and passed as `comment=`, so `alembic check` compares it
+  (a drift shows as a pending `alter_column(comment=…)`). The migration's
+  `COLUMN_MARKER` and the model constant must stay identical.
+- Each constraint carries `OIDC account link constraint
+  (037_oidc_account_links)`. Autogenerate does not compare constraint
+  comments, so the gate reads them from the catalogue.
+- **All eleven objects are checked before anything is touched.** A same-named
+  column is adopted only with the exact type, nullable, no default and the
+  marker; a same-named constraint only with the canonical
+  `pg_get_constraintdef` (measured off a scratch TEMP table, 013's device, so
+  it is the server's own normalization), `convalidated` and the marker.
+  Anything else is refused by name and nothing changes — **including the right
+  shape without a marker**: an unmarked object has unknown provenance, and
+  adopting it would let `downgrade()` drop something 037 did not create. A
+  relation squatting a constraint's name is refused too.
+- `downgrade()` decides each object on its own marker, constraints before
+  columns, and prints a skip line for each unmarked one. **It loses every
+  link**; the docstring says so.
+- `search_path` is pinned to `public` and asserted, `lock_timeout` /
+  `statement_timeout` are set, and all are `RESET` afterwards. Nothing needs
+  superuser; `test_nonsuperuser_migrations_pg.py` runs it as the owning role.
+
+**The gate.** `HEAD_REVISION` in `tests/integration/test_schema_check.py` is
+`"037"`. Its 037 cases: chains from 036 and is head; a fresh upgrade has the
+exact marked shape (per column: type, nullability, absent default,
+`col_description`; per constraint: `pg_get_constraintdef`, `convalidated`,
+`obj_description`); the upgrade from 036 leaves existing users unchanged with
+all six NULL; a stamp-back re-run over the marked shape changes nothing; the
+valid row shapes are admitted and every invalid one rejected (half-bound,
+half-pending, bound-and-pending, a duplicate identity, a duplicate
+expectation, setting an expectation on a bound row); impostor refusals for a
+column (wrong type, NOT NULL, a default, unmarked) and for a constraint (wrong
+definition, `NOT VALID`, unmarked), all eleven checked before any is created;
+a squatting index name refused; a partial marked set adopted and completed;
+downgrade drops marked objects and keeps users, skips unmarked ones, and a
+downgrade to 036 followed by a re-upgrade recreates the shape identically
+with `alembic check` clean.
