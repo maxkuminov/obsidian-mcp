@@ -133,7 +133,7 @@ listener does not cover the unlink form), `src/main.py` (lifespan warning),
   - an unbound active admin does not count;
   - concurrency, deterministic via a barrier: "A unlinks B" vs "B deactivates A", "A demotes B" vs "B deletes A", and two unlinks of each other; exactly one succeeds each time and one reachable admin always remains.
 - [x] 3.12 `tests/test_oidc_mutation_sites.py`: an AST or grep guard that every `src/` write of `User.is_admin`, `User.is_active`, `User.oidc_subject`, and every `users` delete, is in the D15 allow-list (the four sites plus first-login bind, bootstrap and create)
-- [ ] 3.13 The 0.3 goldens pass unmodified — OPEN: every OIDC-off golden and every non-page on_multi golden is byte-identical; the four `page_*_on_multi` goldens were regenerated in a separate commit (OIDC blocks + the stamped last login only), because the 0.3 harness compares whole pages and has no way to hold the blocks in a separate file. Supervisor decision pending.
+- [x] 3.13 The 0.3 goldens pass: every OIDC-off golden and every non-page on_multi golden is byte-identical. Supervisor decision (2026-11-04): the four `page_*_on_multi` goldens are regenerated in b6cdbd4, because the 0.3 harness compares whole pages; their diff is exactly the D11 OIDC blocks plus the stamped last login. The blocks are also asserted on their own in `tests/test_oidc_panel.py`.
 
 ## 4. Slice D: docs (last commits of the feature branch)
 
