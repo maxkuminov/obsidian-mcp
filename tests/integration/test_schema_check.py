@@ -61,7 +61,7 @@ DIM = 64  # irrelevant here; keeps the migration cheap.
 # The current head. Every case that migrates forward asserts it, so adding a
 # revision without teaching this module about it fails loudly rather than
 # leaving the new migration unexercised.
-HEAD_REVISION = "036"
+HEAD_REVISION = "037"
 
 CONSTRAINT = "ck_oauth_clients_auth_method_secret"
 MARKER = "created by 013_schema_reconciliation"
@@ -7771,7 +7771,7 @@ def test_035_chains_from_034():
     assert script.get_revision("035").down_revision == "034"
 
 
-def test_036_chains_from_035_and_is_head():
+def test_036_chains_from_035():
     """Migration 036 (#357): the CIMD column and its shape CHECK."""
     from alembic.config import Config
     from alembic.script import ScriptDirectory
@@ -7779,7 +7779,6 @@ def test_036_chains_from_035_and_is_head():
     config = Config()
     config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_current_head() == HEAD_REVISION == "036"
     assert script.get_revision("036").down_revision == "035"
 
 
@@ -8161,3 +8160,456 @@ def test_the_multi_config_operator_statement_flags_every_preflight_rejection():
         assert fetch(url, statement)[0]["ids"] == [1]
         assert union <= PREFLIGHT_MAX_035 < union_all, "UNION would pass the row"
         assert preflight_rejected_ids(url) == {1}
+
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 037 — OIDC account links on `users` (#416)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# `alembic check` sees the six columns (type, nullability, comment) and the
+# two UNIQUEs by name. It cannot see the three CHECK predicates, a constraint's
+# `convalidated`, or a constraint comment, so those are asserted through the
+# catalogue, and the forbidden row shapes are attempted.
+
+OIDC_COLUMNS = (
+    ("oidc_issuer", "character varying(2048)"),
+    ("oidc_subject", "character varying(255)"),
+    ("oidc_linked_at", "timestamp with time zone"),
+    ("oidc_expected_issuer", "character varying(2048)"),
+    ("oidc_expected_email", "character varying(254)"),
+    ("oidc_expected_set_at", "timestamp with time zone"),
+)
+OIDC_COLUMN_NAMES = tuple(n for n, _t in OIDC_COLUMNS)
+OIDC_COLUMN_MARKER = "OIDC account link (037_oidc_account_links)"
+OIDC_CONSTRAINT_MARKER = "OIDC account link constraint (037_oidc_account_links)"
+# What PostgreSQL 16 prints for 037's five constraints. The migration measures
+# the same strings off a scratch table at runtime; this pin tells us if either
+# side moves.
+OIDC_CONSTRAINTS = {
+    "uq_users_oidc_identity": "UNIQUE (oidc_issuer, oidc_subject)",
+    "uq_users_oidc_expected": "UNIQUE (oidc_expected_issuer, oidc_expected_email)",
+    "ck_users_oidc_bound_complete": (
+        "CHECK ((((oidc_issuer IS NULL) AND (oidc_subject IS NULL) AND "
+        "(oidc_linked_at IS NULL)) OR ((oidc_issuer IS NOT NULL) AND "
+        "(oidc_subject IS NOT NULL) AND (oidc_linked_at IS NOT NULL))))"
+    ),
+    "ck_users_oidc_expected_complete": (
+        "CHECK ((((oidc_expected_issuer IS NULL) AND (oidc_expected_email IS NULL) "
+        "AND (oidc_expected_set_at IS NULL)) OR ((oidc_expected_issuer IS NOT NULL) "
+        "AND (oidc_expected_email IS NOT NULL) AND (oidc_expected_set_at IS NOT NULL))))"
+    ),
+    "ck_users_oidc_not_both": (
+        "CHECK (((oidc_subject IS NULL) OR (oidc_expected_email IS NULL)))"
+    ),
+}
+OIDC_ISS = "https://idp.example.test/realms/home"
+
+
+def oidc_column_state(url, column):
+    """`(coltype, attnotnull, default, comment)` on public.users, or None."""
+    rows = fetch(
+        url,
+        "SELECT format_type(a.atttypid, a.atttypmod) AS coltype, a.attnotnull, "
+        "       pg_get_expr(d.adbin, d.adrelid) AS coldefault, "
+        "       col_description(a.attrelid, a.attnum) AS comment "
+        "FROM pg_attribute a "
+        "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
+        "WHERE a.attrelid = 'public.users'::regclass "
+        "  AND a.attname = $1 AND a.attnum > 0 AND NOT a.attisdropped",
+        column,
+    )
+    return tuple(rows[0]) if rows else None
+
+
+def oidc_constraint_state(url, name):
+    """`(definition, convalidated, comment)` of the named constraint, or None."""
+    rows = fetch(
+        url,
+        "SELECT pg_get_constraintdef(oid) AS def, convalidated, "
+        "       obj_description(oid, 'pg_constraint') AS comment "
+        "FROM pg_constraint WHERE conrelid = 'public.users'::regclass AND conname = $1",
+        name,
+    )
+    return tuple(rows[0]) if rows else None
+
+
+def oidc_catalogue(url):
+    """Everything 037 owns, for before/after comparisons."""
+    return (
+        {c: oidc_column_state(url, c) for c in OIDC_COLUMN_NAMES},
+        {n: oidc_constraint_state(url, n) for n in OIDC_CONSTRAINTS},
+    )
+
+
+def assert_oidc_shape(url):
+    for column, coltype in OIDC_COLUMNS:
+        state = oidc_column_state(url, column)
+        assert state == (coltype, False, None, OIDC_COLUMN_MARKER), (column, state)
+    for name, definition in OIDC_CONSTRAINTS.items():
+        state = oidc_constraint_state(url, name)
+        assert state == (definition, True, OIDC_CONSTRAINT_MARKER), (name, state)
+
+
+def users_snapshot(url):
+    return [
+        tuple(r)
+        for r in fetch(
+            url,
+            "SELECT id, username, password_hash, is_admin, is_active, session_version, "
+            "       vault_path, created_at, last_login_at FROM users ORDER BY id",
+        )
+    ]
+
+
+def oidc_values(url):
+    return {
+        r["id"]: tuple(r[c] for c in OIDC_COLUMN_NAMES)
+        for r in fetch(url, f"SELECT id, {', '.join(OIDC_COLUMN_NAMES)} FROM users")
+    }
+
+
+def insert_oidc_user(url, user_id, username, *, bound=None, pending=None):
+    """`bound=(iss, sub)` / `pending=(iss, email)`; either, both or neither."""
+    iss, sub = bound if bound else (None, None)
+    eiss, email = pending if pending else (None, None)
+    sql(
+        url,
+        "INSERT INTO users (id, username, password_hash, is_admin, is_active, "
+        " session_version, oidc_issuer, oidc_subject, oidc_linked_at, "
+        " oidc_expected_issuer, oidc_expected_email, oidc_expected_set_at) "
+        "VALUES ($1, $2, 'x', false, true, 1, $3::varchar, $4::varchar, "
+        " CASE WHEN $3::varchar IS NULL THEN NULL ELSE now() END, $5::varchar, "
+        " $6::varchar, CASE WHEN $5::varchar IS NULL THEN NULL ELSE now() END)",
+        user_id, username, iss, sub, eiss, email,
+    )
+
+
+def refuse_037(url, *, must_mention):
+    """Run 037 from 036, require a refusal naming the problem, nothing recorded."""
+    if alembic_version(url) != "036":
+        _harness.run_alembic(url, "stamp", "036", dimensions=DIM)
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    assert result.returncode != 0, "037 should have refused"
+    combined = result.stdout + result.stderr
+    for phrase in must_mention + ["Nothing has been changed"]:
+        assert phrase in combined, f"refusal did not mention {phrase!r}:\n{combined}"
+    assert alembic_version(url) == "036", "nothing should have been recorded"
+    return combined
+
+
+def test_037_chains_from_036_and_is_head():
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config()
+    config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+    assert script.get_current_head() == HEAD_REVISION == "037"
+    assert script.get_revision("037").down_revision == "036"
+
+
+def test_037_fresh_upgrade_has_the_exact_marked_shape():
+    with throwaway_db("schema_037_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION
+        assert_oidc_shape(url)
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_037_from_036_leaves_existing_users_unchanged_and_all_null():
+    with throwaway_db("schema_037_chain", revision="036") as url:
+        insert_user(url, 1, "alice")
+        insert_user(url, 2, "bob")
+        sql(url, "UPDATE users SET is_admin = true, last_login_at = now(), "
+                 "vault_path = '/v/a' WHERE id = 1")
+        before = users_snapshot(url)
+        assert oidc_column_state(url, "oidc_issuer") is None
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert users_snapshot(url) == before
+        assert oidc_values(url) == {1: (None,) * 6, 2: (None,) * 6}
+        assert_oidc_shape(url)
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_037_stamp_back_rerun_over_the_marked_shape_changes_nothing():
+    with throwaway_db("schema_037_rerun") as url:
+        insert_oidc_user(url, 1, "alice", bound=(OIDC_ISS, "sub-a"))
+        insert_oidc_user(url, 2, "bob", pending=(OIDC_ISS, "bob@example.com"))
+        insert_oidc_user(url, 3, "carol")
+        catalogue = oidc_catalogue(url)
+        values = oidc_values(url)
+        users = users_snapshot(url)
+
+        _harness.run_alembic(url, "stamp", "036", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert oidc_catalogue(url) == catalogue
+        assert oidc_values(url) == values
+        assert users_snapshot(url) == users
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_037_admits_the_valid_row_shapes():
+    with throwaway_db("schema_037_valid") as url:
+        insert_oidc_user(url, 1, "a")  # unlinked
+        insert_oidc_user(url, 2, "b")  # NULLs are distinct: two unlinked rows
+        insert_oidc_user(url, 3, "c", bound=(OIDC_ISS, "s1"))
+        insert_oidc_user(url, 4, "d", pending=(OIDC_ISS, "d@example.com"))
+        # The same subject under another issuer is another identity.
+        insert_oidc_user(url, 5, "e", bound=("https://other.example.test", "s1"))
+        # The same address under another issuer is another expectation.
+        insert_oidc_user(url, 6, "f", pending=("https://other.example.test", "d@example.com"))
+        assert fetchval(url, "SELECT count(*) FROM users") == 6
+
+
+@pytest.mark.parametrize(
+    "label,statement,error",
+    [
+        (
+            "half_bound",
+            "INSERT INTO users (id, username, password_hash, oidc_issuer, oidc_subject) "
+            "VALUES (10, 'x', 'x', 'https://i', 's')",
+            asyncpg.CheckViolationError,
+        ),
+        (
+            "bound_without_issuer",
+            "INSERT INTO users (id, username, password_hash, oidc_subject, oidc_linked_at) "
+            "VALUES (10, 'x', 'x', 's', now())",
+            asyncpg.CheckViolationError,
+        ),
+        (
+            "half_pending",
+            "INSERT INTO users (id, username, password_hash, oidc_expected_issuer, "
+            " oidc_expected_email) VALUES (10, 'x', 'x', 'https://i', 'a@b')",
+            asyncpg.CheckViolationError,
+        ),
+        (
+            "pending_without_email",
+            "INSERT INTO users (id, username, password_hash, oidc_expected_issuer, "
+            " oidc_expected_set_at) VALUES (10, 'x', 'x', 'https://i', now())",
+            asyncpg.CheckViolationError,
+        ),
+        (
+            "bound_and_pending",
+            "INSERT INTO users (id, username, password_hash, oidc_issuer, oidc_subject, "
+            " oidc_linked_at, oidc_expected_issuer, oidc_expected_email, "
+            " oidc_expected_set_at) VALUES (10, 'x', 'x', 'https://i', 's', now(), "
+            " 'https://i', 'a@b', now())",
+            asyncpg.CheckViolationError,
+        ),
+        (
+            "duplicate_identity",
+            "INSERT INTO users (id, username, password_hash, oidc_issuer, oidc_subject, "
+            f" oidc_linked_at) VALUES (10, 'x', 'x', '{OIDC_ISS}', 'taken', now())",
+            asyncpg.UniqueViolationError,
+        ),
+        (
+            "duplicate_expected",
+            "INSERT INTO users (id, username, password_hash, oidc_expected_issuer, "
+            f" oidc_expected_email, oidc_expected_set_at) VALUES (10, 'x', 'x', "
+            f" '{OIDC_ISS}', 'taken@example.com', now())",
+            asyncpg.UniqueViolationError,
+        ),
+    ],
+)
+def test_037_rejects_every_invalid_row_shape(label, statement, error):
+    with throwaway_db(f"schema_037_invalid_{label}") as url:
+        insert_oidc_user(url, 1, "holder", bound=(OIDC_ISS, "taken"))
+        insert_oidc_user(url, 2, "waiter", pending=(OIDC_ISS, "taken@example.com"))
+        with pytest.raises(error):
+            sql(url, statement)
+        assert fetchval(url, "SELECT count(*) FROM users") == 2
+
+
+def test_037_rejects_setting_an_expectation_on_a_bound_row():
+    with throwaway_db("schema_037_update_both") as url:
+        insert_oidc_user(url, 1, "holder", bound=(OIDC_ISS, "s"))
+        with pytest.raises(asyncpg.CheckViolationError):
+            sql(url, "UPDATE users SET oidc_expected_issuer = 'https://i', "
+                     "oidc_expected_email = 'a@b', oidc_expected_set_at = now() WHERE id = 1")
+
+
+@pytest.mark.parametrize(
+    "label,ddl,fragment",
+    [
+        (
+            "wrong_type",
+            "ALTER TABLE users ADD COLUMN oidc_subject varchar(1024)",
+            "users.oidc_subject already exists but it is character varying(1024), "
+            "not character varying(255)",
+        ),
+        (
+            "not_null",
+            "ALTER TABLE users ADD COLUMN oidc_issuer varchar(2048) NOT NULL DEFAULT ''; "
+            "ALTER TABLE users ALTER COLUMN oidc_issuer DROP DEFAULT; "
+            f"COMMENT ON COLUMN users.oidc_issuer IS '{OIDC_COLUMN_MARKER}'",
+            "users.oidc_issuer already exists but it is NOT NULL",
+        ),
+        (
+            "server_default",
+            "ALTER TABLE users ADD COLUMN oidc_linked_at timestamptz DEFAULT now(); "
+            f"COMMENT ON COLUMN users.oidc_linked_at IS '{OIDC_COLUMN_MARKER}'",
+            "users.oidc_linked_at already exists but it has a server default",
+        ),
+        (
+            # The spec's own example: the right shape, no marker.
+            "unmarked_column",
+            "ALTER TABLE users ADD COLUMN oidc_subject varchar(255)",
+            "users.oidc_subject already exists but it does not carry 037's column marker",
+        ),
+    ],
+)
+def test_037_refuses_an_impostor_column(label, ddl, fragment):
+    with throwaway_db(f"schema_037_col_{label}", revision="036") as url:
+        sql(url, ddl)
+        before = oidc_catalogue(url)
+        refuse_037(url, must_mention=[fragment])
+        assert oidc_catalogue(url) == before
+
+
+def _readd_constraint(url, name, body, *, marked=True, not_valid=False):
+    sql(url, f"ALTER TABLE users DROP CONSTRAINT {name}")
+    sql(url, f"ALTER TABLE users ADD CONSTRAINT {name} {body}"
+             + (" NOT VALID" if not_valid else ""))
+    if marked:
+        sql(url, f"COMMENT ON CONSTRAINT {name} ON users IS '{OIDC_CONSTRAINT_MARKER}'")
+
+
+@pytest.mark.parametrize(
+    "label,mutate,fragment",
+    [
+        (
+            "wrong_check_definition",
+            lambda url: _readd_constraint(url, "ck_users_oidc_not_both", "CHECK (true)"),
+            "constraint ck_users_oidc_not_both on users already exists but its "
+            "definition is 'CHECK (true)'",
+        ),
+        (
+            "wrong_unique_definition",
+            lambda url: _readd_constraint(
+                url, "uq_users_oidc_identity", "UNIQUE (oidc_subject)"
+            ),
+            "constraint uq_users_oidc_identity on users already exists but its "
+            "definition is 'UNIQUE (oidc_subject)'",
+        ),
+        (
+            "not_valid_check",
+            lambda url: _readd_constraint(
+                url,
+                "ck_users_oidc_bound_complete",
+                "CHECK ((oidc_issuer IS NULL AND oidc_subject IS NULL AND "
+                "oidc_linked_at IS NULL) OR (oidc_issuer IS NOT NULL AND "
+                "oidc_subject IS NOT NULL AND oidc_linked_at IS NOT NULL))",
+                not_valid=True,
+            ),
+            "constraint ck_users_oidc_bound_complete on users already exists but "
+            "it is NOT VALID",
+        ),
+        (
+            # The spec's own example: the canonical definition, no marker.
+            "unmarked_constraint",
+            lambda url: sql(url, "COMMENT ON CONSTRAINT uq_users_oidc_identity ON users IS NULL"),
+            "constraint uq_users_oidc_identity on users already exists but it does "
+            "not carry 037's constraint marker",
+        ),
+    ],
+)
+def test_037_refuses_an_impostor_constraint(label, mutate, fragment):
+    with throwaway_db(f"schema_037_con_{label}") as url:
+        mutate(url)
+        before = oidc_catalogue(url)
+        refuse_037(url, must_mention=[fragment])
+        assert oidc_catalogue(url) == before
+
+
+def test_037_checks_all_eleven_objects_before_creating_any():
+    """Atomic across the set: a column problem found last stops the five
+    columns before it from being added, and a constraint problem stops the
+    missing column and the other constraints too."""
+    with throwaway_db("schema_037_atomic_columns", revision="036") as url:
+        sql(url, "ALTER TABLE users ADD COLUMN oidc_expected_set_at timestamp")
+        combined = refuse_037(url, must_mention=["users.oidc_expected_set_at"])
+        assert "timestamp without time zone" in combined
+        for column in OIDC_COLUMN_NAMES[:-1]:
+            assert oidc_column_state(url, column) is None, column
+
+    with throwaway_db("schema_037_atomic_constraints", revision="036") as url:
+        # Five of the six columns of the exact marked shape, the sixth absent,
+        # and an unmarked last constraint over the present ones.
+        for column, coltype in OIDC_COLUMNS[:-1]:
+            sql(url, f"ALTER TABLE users ADD COLUMN {column} {coltype}")
+            sql(url, f"COMMENT ON COLUMN users.{column} IS '{OIDC_COLUMN_MARKER}'")
+        sql(url, "ALTER TABLE users ADD CONSTRAINT ck_users_oidc_not_both "
+                 "CHECK (oidc_subject IS NULL OR oidc_expected_email IS NULL)")
+        before = oidc_catalogue(url)
+        refuse_037(url, must_mention=["constraint ck_users_oidc_not_both"])
+        assert oidc_catalogue(url) == before
+        assert oidc_column_state(url, "oidc_expected_set_at") is None
+        assert oidc_constraint_state(url, "uq_users_oidc_identity") is None
+
+
+def test_037_refuses_a_squatting_index_name():
+    with throwaway_db("schema_037_squat", revision="036") as url:
+        sql(url, "CREATE INDEX uq_users_oidc_identity ON users (username)")
+        refuse_037(url, must_mention=["a relation named uq_users_oidc_identity"])
+        assert oidc_column_state(url, "oidc_issuer") is None
+
+
+def test_037_adopts_a_partial_marked_set_and_completes_it():
+    """Marked columns of the exact shape are adopted; the rest is created."""
+    with throwaway_db("schema_037_partial", revision="036") as url:
+        for column, coltype in OIDC_COLUMNS[:3]:
+            sql(url, f"ALTER TABLE users ADD COLUMN {column} {coltype}")
+            sql(url, f"COMMENT ON COLUMN users.{column} IS '{OIDC_COLUMN_MARKER}'")
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert_oidc_shape(url)
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_downgrade_037_drops_the_marked_objects_and_keeps_users():
+    with throwaway_db("schema_037_downgrade") as url:
+        insert_oidc_user(url, 1, "alice", bound=(OIDC_ISS, "s"))
+        insert_oidc_user(url, 2, "bob", pending=(OIDC_ISS, "b@example.com"))
+        _harness.run_alembic(url, "downgrade", "036", dimensions=DIM)
+        assert alembic_version(url) == "036"
+        columns, constraints = oidc_catalogue(url)
+        assert all(v is None for v in columns.values()), columns
+        assert all(v is None for v in constraints.values()), constraints
+        assert [r[1] for r in users_snapshot(url)] == ["alice", "bob"]
+
+
+def test_downgrade_037_skips_unmarked_objects():
+    with throwaway_db("schema_037_downgrade_foreign") as url:
+        sql(url, "COMMENT ON COLUMN users.oidc_issuer IS 'somebody else made this'")
+        sql(url, "COMMENT ON CONSTRAINT ck_users_oidc_not_both ON users IS NULL")
+        result = _harness.run_alembic(url, "downgrade", "036", dimensions=DIM)
+        out = result.stdout
+        assert "leaving users.oidc_issuer in place" in out, out
+        assert "leaving constraint ck_users_oidc_not_both on users in place" in out, out
+        # The surviving constraint still references these two marked columns.
+        assert "leaving users.oidc_subject in place" in out, out
+        assert "leaving users.oidc_expected_email in place" in out, out
+        assert alembic_version(url) == "036"
+        assert oidc_constraint_state(url, "ck_users_oidc_not_both") is not None
+        for name in OIDC_CONSTRAINTS:
+            if name != "ck_users_oidc_not_both":
+                assert oidc_constraint_state(url, name) is None, name
+        kept = {"oidc_issuer", "oidc_subject", "oidc_expected_email"}
+        for column in OIDC_COLUMN_NAMES:
+            assert (oidc_column_state(url, column) is not None) == (column in kept), column
+
+
+def test_downgrade_037_then_reupgrade_recreates_it_identically():
+    with throwaway_db("schema_037_roundtrip") as url:
+        insert_oidc_user(url, 1, "alice", bound=(OIDC_ISS, "s"))
+        catalogue = oidc_catalogue(url)
+        _harness.run_alembic(url, "downgrade", "036", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert oidc_catalogue(url) == catalogue
+        # The link is lost by design (the docstring says so).
+        assert oidc_values(url) == {1: (None,) * 6}
+        assert_alembic_check_clean(url, DIM)
