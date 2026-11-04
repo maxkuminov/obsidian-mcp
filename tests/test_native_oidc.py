@@ -10,7 +10,6 @@ import json
 import logging
 import ssl
 import time
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import parse_qs, urlsplit
 
@@ -40,7 +39,7 @@ def configured(monkeypatch):
     for name, value in dict(oidc_enabled=True, multi_user_mode=True, oidc_issuer=ISSUER,
                             oidc_client_id=CLIENT, oidc_client_secret=SECRET,
                             oidc_required_group=GROUP, oidc_token_auth_method="client_secret_basic",
-                            oidc_extra_scopes="", oidc_subject_user_ids={"immutable-sub": 7},
+                            oidc_extra_scopes="",
                             base_url="https://notes.example.test").items():
         monkeypatch.setattr(settings, name, value)
     monkeypatch.setattr(settings, "_oidc_ssl_context", None)
@@ -468,11 +467,26 @@ async def test_provider_body_limits(encoded, oversized):
             await http.get(ISSUER)
 
 
-# ── the callback (through slice B's transitional shim in routes.py) ─────────
+# ── the callback (slice C: resolution through src/services/oidc_links.py) ──
+#
+# The database phase is stubbed at `oidc_links.resolve` / `prepare_login`; the
+# real-database behaviour is `tests/test_oidc_callback_linking.py` and
+# `tests/integration/test_oidc_callback_pg.py`.
 
 
 def verified(sub="immutable-sub"):
     return oidc.VerifiedIdentity(ISSUER, sub, None, False)
+
+
+def stub_links(monkeypatch, *, kind="bound", user_id=7, version=12, reason=None):
+    from src.services import oidc_links
+    resolution = oidc_links.Resolution(kind, ISSUER, "immutable-sub",
+                                       user_id=None if kind == "none" else user_id)
+    monkeypatch.setattr(oidc_links, "resolve", AsyncMock(return_value=resolution))
+    if reason is not None or kind == "bound":
+        monkeypatch.setattr(oidc_links, "prepare_login", AsyncMock(return_value=(
+            oidc_links.PrepareResult(reason) if reason else
+            oidc_links.PrepareResult(None, user_id=user_id, session_version=version))))
 
 
 @pytest.mark.asyncio
@@ -482,9 +496,9 @@ async def test_callback_uses_existing_session_guard_and_safe_next(monkeypatch):
     req = request(query="state=" + state + "&code=test", session=browser)
     exchange = AsyncMock(return_value=verified())
     monkeypatch.setattr(oidc, "exchange", exchange)
-    user = SimpleNamespace(id=7, is_active=True, session_version=12, username="existing")
+    stub_links(monkeypatch, user_id=7, version=12)
     db = AsyncMock()
-    db.execute.return_value = MagicMock(scalar_one_or_none=lambda: user)
+    db.execute.return_value = MagicMock(scalar_one_or_none=lambda: "existing")
     mint = AsyncMock(return_value="new-app-session")
     monkeypatch.setattr(routes, "start_session", mint)
     monkeypatch.setattr(routes, "warm_user_vault_cache", AsyncMock())
@@ -502,9 +516,8 @@ async def test_inactive_and_session_race_refuse(monkeypatch, active, minted):
     browser = {}
     state, _ = oidc.begin(browser, "/admin/")
     monkeypatch.setattr(oidc, "exchange", AsyncMock(return_value=verified()))
+    stub_links(monkeypatch, version=3, reason=None if active else "account")
     db = AsyncMock()
-    db.execute.return_value = MagicMock(scalar_one_or_none=lambda: SimpleNamespace(
-        id=7, is_active=active, session_version=3, username="existing"))
     mint = AsyncMock(return_value=minted)
     monkeypatch.setattr(routes, "start_session", mint)
     monkeypatch.setattr(routes, "warm_user_vault_cache", AsyncMock())
@@ -514,14 +527,16 @@ async def test_inactive_and_session_race_refuse(monkeypatch, active, minted):
 
 
 @pytest.mark.asyncio
-async def test_callback_refuses_unresolved_identity_without_db(monkeypatch):
+async def test_callback_refuses_unresolved_identity_without_db_writes(monkeypatch):
     browser = {}
     state, _ = oidc.begin(browser, "/admin/")
     monkeypatch.setattr(oidc, "exchange", AsyncMock(return_value=verified("someone-else")))
+    stub_links(monkeypatch, kind="none")  # the real prepare_login refuses `unlinked`
     db = AsyncMock()
     response = await routes.oidc_callback(request(query="state="+state+"&code=test", session=browser), db)
     assert response.status_code == 401
     db.execute.assert_not_awaited()
+    db.commit.assert_not_awaited()
 
 
 @pytest.mark.parametrize("path", [oidc.CALLBACK_PATH, "/admin/auth/oidc/%63allback", "/admin/auth%2Foidc/callback"])

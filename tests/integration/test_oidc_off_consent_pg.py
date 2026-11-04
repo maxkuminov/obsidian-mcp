@@ -185,6 +185,14 @@ async def sign_in(http, ctx):
         })
         assert response.status_code == 302, response.text[:300]
         return
+    # #416 slice C: the subject is bound through the database (the link
+    # service's direct bind), replacing #415's retired environment map.
+    from src.services import oidc_links
+
+    async with oauth.async_session() as session:
+        bound = await oidc_links.bind_subject(session, ctx["admin_id"], g.ISSUER, g.OIDC_SUBJECT)
+        assert bound.ok, bound
+        await session.commit()
     await ctx["provider"].sign_in(http)
 
 

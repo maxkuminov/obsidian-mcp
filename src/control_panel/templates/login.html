@@ -12,7 +12,7 @@
     {% endif %}
 
     {% if oidc_enabled %}
-        <a class="btn-submit" href="/admin/auth/oidc/start?next={{ (next or '/admin/') | urlencode }}">Sign in with SSO</a>
+        <a class="btn-submit" href="/admin/auth/oidc/start?next={{ (next or '/admin/') | urlencode }}">Sign in with {{ oidc_display_name or 'SSO' }}</a>
     {% endif %}
 
     {% if local_login_enabled is not defined or local_login_enabled %}

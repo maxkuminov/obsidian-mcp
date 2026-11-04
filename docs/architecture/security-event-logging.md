@@ -477,6 +477,9 @@ point of logging them at that level.
 | Event | Level | Fields | Meaning |
 | --- | --- | --- | --- |
 | `panel_oidc_started` | INFO | `client_ip`, `route` | Authlib produced the provider authorization redirect |
-| `panel_oidc_refused` | WARNING | `reason`, `client_ip`, `route` | Closed reasons: `capacity`, `state`, `provider`, `token`, `entitlement`, `mapping`, `account`, `session_mint` |
+| `panel_oidc_refused` | WARNING | `reason`, `client_ip`, `route` | Closed reasons (#416): `capacity`, `state`, `provider`, `token`, `entitlement`, `unlinked`, `email_unverified`, `link_conflict`, `account`, `session_mint`; never a `user_id` or `username` |
+| `panel_oidc_linked` | INFO | `user_id`, `username`, `client_ip`, `route` | A pending expectation bound at first sign-in, after the commit that also minted the session (#416) |
+| `panel_oidc_link_set` | INFO | `actor_user_id`, `user_id`, `username`, `mode`, `client_ip`, `route` | An admin set an expected email (`mode` `expect`) or bound a subject (`bind`), after the commit (#416) |
+| `panel_oidc_link_removed` | INFO | `actor_user_id`, `user_id`, `username`, `count`, `client_ip`, `route` | An admin unlinked an account, after the commit; `count` is the sessions revoked (#416) |
 
 OIDC successes reuse `panel_login_succeeded` after the existing session mint commits. Refusals use the normal bounded suppressor. No provider subject, group, code, token, state, nonce, verifier or upstream exception text enters these events. Uvicorn's callback access-log query is filtered in `configure_logging`; proxy logs need the corresponding deployment setting before activation. Other Uvicorn logs keep their existing formatting.

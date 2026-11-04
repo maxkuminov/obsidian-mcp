@@ -442,6 +442,48 @@ async def _warn_missing_keyword_excerpts() -> None:
         )
 
 
+OIDC_LOCKOUT_MESSAGE = (
+    "LOCAL_LOGIN_ENABLED=false and no active admin is linked to single sign-on "
+    "under OIDC_ISSUER: nobody can sign in to the panel as an administrator. "
+    "Recovery: set LOCAL_LOGIN_ENABLED=true, restart, sign in with a local admin "
+    "password and link an admin (user edit page, Single sign-on). The MCP "
+    "endpoint is unaffected."
+)
+
+
+async def _warn_oidc_lockout() -> None:
+    """#416 D13: with OIDC enabled and password sign-in disabled, count the
+    active admins bound under the configured issuer; zero logs one CRITICAL
+    naming the recovery step. **Never a refusal** — an outage of one login
+    method must not become an outage of `/mcp` — and a failure of the query
+    itself is a WARNING (class name only) and startup continues."""
+    if not (settings.oidc_enabled and not settings.local_login_enabled):
+        return
+    from sqlalchemy import func as _func, select as _select
+
+    from src.models.db import User
+
+    log = logging.getLogger(__name__)
+    try:
+        async with async_session() as session:
+            count = (await session.execute(
+                _select(_func.count(User.id)).where(
+                    User.is_admin.is_(True),
+                    User.is_active.is_(True),
+                    User.oidc_issuer == settings.oidc_issuer,
+                    User.oidc_subject.is_not(None),
+                )
+            )).scalar_one()
+    except Exception as exc:  # noqa: BLE001 - a warning, never a refusal
+        log.warning(
+            "OIDC lockout check skipped: the reachable-admin count failed (%s)",
+            type(exc).__name__,
+        )
+        return
+    if count == 0:
+        log.critical(OIDC_LOCKOUT_MESSAGE)
+
+
 def _log_retrieval_fingerprint() -> None:
     """One INFO line naming the non-stored retrieval fingerprint (heading-chunks
     D7): the embedding fingerprint's fields, the chunking version and the
@@ -631,6 +673,9 @@ async def lifespan(app: FastAPI):
         await _check_fts_fingerprint()
         # #344: a count, a WARNING, nothing else — see the function.
         await _warn_missing_keyword_excerpts()
+        # #416 D13: one CRITICAL when password sign-in is off and no admin can
+        # sign in with SSO. Never exits.
+        await _warn_oidc_lockout()
         # #367 (D8): the optional reranker. Its transport line, then one
         # two-order probe that needs no database. A failure disables reranking
         # with one CRITICAL and **never exits** — a reranker outage must not

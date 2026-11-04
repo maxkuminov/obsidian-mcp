@@ -95,24 +95,24 @@ context only), templates `login.html`, `user_edit.html`, `users.html`,
 listener does not cover the unlink form), `src/main.py` (lifespan warning),
 `src/services/security_events.py`, and the slice-C test files above.
 
-- [ ] 3.1 Callback order:
+- [x] 3.1 Callback order:
   1. consume the state, then fetch discovery;
   2. check `iss`;
   3. fetch the token and JWKS, then validate the identity;
   4. only then touch the DB: `resolve`, then `prepare_login` (or refuse), then `start_session(expected_session_version=…)`, rolling back on a refused mint;
   5. `warm_user_vault_cache`, then the events.
-- [ ] 3.2 Refusal reasons per D14, with one response builder that keeps every refusal byte-identical apart from the CSRF token and the nonce
-- [ ] 3.3 The callback never touches the per-account budget
-- [ ] 3.4 Panel POST routes `/admin/users/{id}/oidc/{expect,bind,unlink}`:
+- [x] 3.2 Refusal reasons per D14, with one response builder that keeps every refusal byte-identical apart from the CSRF token and the nonce
+- [x] 3.3 The callback never touches the per-account budget
+- [x] 3.4 Panel POST routes `/admin/users/{id}/oidc/{expect,bind,unlink}`:
   - `require_admin`, CSRF, 404 when OIDC is off;
   - `_lock_admin_guard`, then **immediately** `_actor_still_privileged`; on failure `actor_snapshot`, rollback, `_log_actor_revoked`, then `_ACTOR_REVOKED_MSG` (D11);
   - only then the target `FOR UPDATE`, the slice-A operation, the D15 check (unlink), commit, flash and the event;
   - the self-unlink refusal while password login is off.
-- [ ] 3.5 **D15 at the existing sites:** in `edit_user_submit` (clearing `is_admin` / `is_active`) and `delete_user` (soft and permanent), add `reachable_admins_after(...) == 0 → refuse` when `LOCAL_LOGIN_ENABLED=false`, inside the guard after `_actor_still_privileged`, beside the existing last-active-admin check, and without a commit before the check
-- [ ] 3.6 Templates per D11 under the nonce CSP; every new block wrapped in `{% if oidc_enabled %}`
-- [ ] 3.7 The lifespan warning (D13)
-- [ ] 3.8 Catalogue entries for the three events and the reason set
-- [ ] 3.9 Callback tests:
+- [x] 3.5 **D15 at the existing sites:** in `edit_user_submit` (clearing `is_admin` / `is_active`) and `delete_user` (soft and permanent), add `reachable_admins_after(...) == 0 → refuse` when `LOCAL_LOGIN_ENABLED=false`, inside the guard after `_actor_still_privileged`, beside the existing last-active-admin check, and without a commit before the check
+- [x] 3.6 Templates per D11 under the nonce CSP; every new block wrapped in `{% if oidc_enabled %}`
+- [x] 3.7 The lifespan warning (D13)
+- [x] 3.8 Catalogue entries for the three events and the reason set
+- [x] 3.9 Callback tests:
   - bound login with the email absent, a number, a list, 300 characters, or two `@` and `email_verified: "true"` → signs in;
   - pending bind with a verified email; `email_verified` false / absent / `"true"` with a matching email → `email_unverified`;
   - a pending branch with the email absent or malformed → `unlinked`; an expired expectation;
@@ -122,18 +122,18 @@ listener does not cover the unlink form), `src/main.py` (lifespan warning),
   - `iss` required, optional and mismatched;
   - the `/authorize` round trip returns to the exact encoded URL;
   - refusal bodies are identical across reasons; no subject or email appears in any log record.
-- [ ] 3.10 Panel tests:
+- [x] 3.10 Panel tests:
   - each action's success, conflict and re-point refusal; CSRF missing; a non-admin gets 403; OIDC off gives 404;
   - unlink revokes sessions; self-unlink is refused with password login off;
   - a CSP scan of the rendered pages;
   - **actor re-check, deterministic:** hold A's link request at the guard with a barrier, commit B's demotion of A, release, and expect A's request to be refused with `_ACTOR_REVOKED_MSG` with nothing written (once per route).
-- [ ] 3.11 `tests/integration/test_oidc_reachable_admin_pg.py`:
+- [x] 3.11 `tests/integration/test_oidc_reachable_admin_pg.py`:
   - each D15 site refuses the zero-reachable outcome: unlink, demote, deactivate, soft delete, permanent delete;
   - each proceeds when another reachable admin exists, or when password login is enabled;
   - an unbound active admin does not count;
   - concurrency, deterministic via a barrier: "A unlinks B" vs "B deactivates A", "A demotes B" vs "B deletes A", and two unlinks of each other; exactly one succeeds each time and one reachable admin always remains.
-- [ ] 3.12 `tests/test_oidc_mutation_sites.py`: an AST or grep guard that every `src/` write of `User.is_admin`, `User.is_active`, `User.oidc_subject`, and every `users` delete, is in the D15 allow-list (the four sites plus first-login bind, bootstrap and create)
-- [ ] 3.13 The 0.3 goldens pass unmodified
+- [x] 3.12 `tests/test_oidc_mutation_sites.py`: an AST or grep guard that every `src/` write of `User.is_admin`, `User.is_active`, `User.oidc_subject`, and every `users` delete, is in the D15 allow-list (the four sites plus first-login bind, bootstrap and create)
+- [ ] 3.13 The 0.3 goldens pass unmodified — OPEN: every OIDC-off golden and every non-page on_multi golden is byte-identical; the four `page_*_on_multi` goldens were regenerated in a separate commit (OIDC blocks + the stamped last login only), because the 0.3 harness compares whole pages and has no way to hold the blocks in a separate file. Supervisor decision pending.
 
 ## 4. Slice D: docs (last commits of the feature branch)
 

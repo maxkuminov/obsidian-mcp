@@ -41,7 +41,7 @@ from src.database import get_session
 from src.limiter import limiter
 from src.models.db import APIKey, NoteMetadata, OAuthClient, OAuthCode, OAuthToken, UsageLog, User
 from src.oauth.grants import USER_BOOTSTRAP_LOCK_KEY
-from src.services import panel_csp, rate_limits, security_events
+from src.services import oidc_links, panel_csp, rate_limits, security_events
 from src.services.vault import validate_vault_root_path, warm_user_vault_cache
 
 router = APIRouter(tags=["auth"], dependencies=[Depends(verify_csrf)])
@@ -163,7 +163,8 @@ def _render_login(
         request,
         "login.html",
         {"error": error, "next": next_url, "username": username, "csrf_token": generate_csrf_token(request),
-         "oidc_enabled": settings.oidc_enabled, "local_login_enabled": settings.local_login_enabled},
+         "oidc_enabled": settings.oidc_enabled, "oidc_display_name": settings.oidc_display_name,
+         "local_login_enabled": settings.local_login_enabled},
         status_code=status_code,
     )
 
@@ -428,6 +429,25 @@ async def oidc_start(request: Request, next: str = "/admin/"):
 @router.get(oidc.CALLBACK_PATH)
 @limiter.limit("10/minute")
 async def oidc_callback(request: Request, session: AsyncSession = Depends(get_session)):
+    """The OIDC callback (#416 design D4, task 3.1). In this order:
+
+    1. consume the browser-bound state, then (inside `exchange`) fetch
+       discovery;
+    2. check the RFC 9207 `iss` parameter (`oidc.check_iss_parameter`, which
+       needs discovery to know whether `iss` is mandatory);
+    3. fetch the token and the JWKS and validate the ID token;
+    4. only then touch the database: `resolve` (unlocked), `prepare_login`
+       (account guard, `FOR UPDATE` re-read, the first-login bind and
+       `last_login_at`, no commit), then `start_session`, which commits the
+       bind, the stamp and the session row together — a refused mint rolls
+       all three back;
+    5. warm the vault cache, then the events.
+
+    Every refusal goes through `_oidc_refused`, the one response builder, so
+    the body is identical whatever the reason (D14). The per-account
+    password-failure budget is neither consulted nor charged here (D10).
+    Nothing logs the subject, the issuer claim or an email.
+    """
     if not settings.oidc_enabled:
         raise HTTPException(404)
     try:
@@ -435,27 +455,45 @@ async def oidc_callback(request: Request, session: AsyncSession = Depends(get_se
         if any(len(params.getlist(k)) > 1 for k in ("state", "code", "error", "iss")):
             raise oidc.LoginRefused("state")
         tx = oidc.consume(request.session, params.get("state", ""))
-        if "error" in params or ("iss" in params and params["iss"] != settings.oidc_issuer):
+        if "error" in params:
             raise oidc.LoginRefused("provider")
-        # get_session has not checked out a connection: all network I/O precedes DB access.
+        # get_session has not checked out a connection: all network I/O
+        # precedes DB access. `exchange` checks `iss` after discovery and
+        # before the token request.
         identity = await oidc.exchange(params.get("code", ""), tx, iss=params.get("iss"))
-        # TODO(#416 slice C): transitional shim. Replace with oidc_links.resolve /
-        # prepare_login; until then the retired map (refused at startup, reachable
-        # only by in-process assignment, as the 0.3 goldens do) resolves the subject.
-        user_id = settings.oidc_subject_user_ids.get(identity.sub)
-        if user_id is None:
-            raise oidc.LoginRefused("mapping")
     except Exception as exc:
         reason = exc.reason if isinstance(exc, oidc.LoginRefused) else "provider"
         return _oidc_refused(request, reason)
-    user = (await session.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
-    if user is None or not user.is_active:
-        return _oidc_refused(request, "account")
-    version, username = user.session_version, user.username
-    await warm_user_vault_cache(session, user_id)
+
+    # The database phase: `(iss, sub)` first; email only on the pending branch.
+    resolution = await oidc_links.resolve(
+        session, identity.iss, identity.sub, identity.email, identity.email_verified
+    )
+    prepared = await oidc_links.prepare_login(session, resolution)
+    if not prepared.ok:
+        # `prepare_login` has rolled back: nothing was written.
+        return _oidc_refused(request, prepared.reason)
+    user_id = prepared.user_id
     # Reuse the one guarded mint. No provider identity or role enters the cookie.
-    if await start_session(request, session, user_id, expected_session_version=version) is None:
+    if await start_session(
+        request, session, user_id, expected_session_version=prepared.session_version
+    ) is None:
+        # `start_session` rolls back on its refusal paths; this is the route's
+        # own guarantee that a refused mint leaves no binding and no
+        # `last_login_at` (D4 step 4), whatever that helper does.
+        await session.rollback()
         return _oidc_refused(request, "session_mint")
+    username = (
+        await session.execute(select(User.username).where(User.id == user_id))
+    ).scalar_one_or_none()
+    await warm_user_vault_cache(session, user_id)
+    if prepared.linked:
+        security_events.emit(
+            "panel_oidc_linked", level=logging.INFO,
+            subject=security_events.subject_for(user_id=user_id, request=request),
+            user_id=user_id, username=username,
+            client_ip=security_events.client_ip(request), route=request.url.path,
+        )
     security_events.emit(
         "panel_login_succeeded", level=logging.INFO,
         subject=security_events.subject_for(user_id=user_id, request=request),

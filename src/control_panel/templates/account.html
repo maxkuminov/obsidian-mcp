@@ -44,7 +44,11 @@
                 <div class="kv">
                     <div class="kv-k">Role</div>
                     <div class="kv-v">{% if is_admin %}Admin{% else %}User{% endif %}</div>
-                </div>
+                </div>{% if oidc_enabled %}
+                <div class="kv">
+                    <div class="kv-k">Single sign-on</div>
+                    <div class="kv-v">{% if oidc_linked %}Linked{% else %}Not linked{% endif %}</div>
+                </div>{% endif %}
                 <div class="u-color-text-3 u-font-size-12px u-margin-top-12px">
                     Your username and role are set by an administrator. If you cannot
                     sign in at all, an administrator can reset your password for you.
