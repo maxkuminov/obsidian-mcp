@@ -202,6 +202,13 @@ both loaded with `envFrom`. Anything unset takes the default below. Invalid
 values refuse startup with a message naming the setting. The server does not
 silently fall back.
 
+The `migrate` initContainer and the example Jobs load the same two objects and
+validate the same settings. Keep it that way. A credential added to the app
+container alone, for example `OIDC_CLIENT_SECRET` through `env`/`secretKeyRef`
+when you turn on [native OIDC](native-oidc.md), passes the app's checks but
+makes the initContainer refuse to start. Under `Recreate` that is an outage,
+not a stalled rollout.
+
 List-valued settings: `TRUSTED_PROXY_IPS`, `FTS_CONFIGS` and
 `OAUTH_KNOWN_REDIRECT_HOSTS` accept CSV or a JSON list. `ALLOWED_ORIGINS`,
 `ALLOWED_HOSTS` and `EMBEDDING_EXCLUDE_PATTERNS` accept **JSON lists only**
@@ -931,6 +938,7 @@ unverified archive.
 | Startup, readiness or liveness probe fails with **400** | The probe lost its `Host: localhost` header, or `ALLOWED_HOSTS` was set explicitly without `localhost` (it is always added, so check the override). |
 | Every request through the ingress gets **400** | The ingress rewrites `Host`. It must reach the app as `MCP_HOSTNAME`. |
 | Container exits at start with a `critical` log line | Each startup check names itself: `openat2` unavailable (kernel or seccomp), pgvector < 0.8.0, `EMBEDDING_DIMENSIONS` or model disagreeing with the stored vectors, a placeholder `SECRET_KEY`, a plaintext embedding URL without `EMBEDDING_ALLOW_PLAINTEXT`, a TLS key in `DATABASE_URL`. |
+| `migrate` initContainer exits 1 with `OIDC requires OIDC_CLIENT_ID and OIDC_CLIENT_SECRET` (or another settings `ValidationError`) | The initContainer does not get the same environment as the app. Add the missing variable to the Secret every container loads, or add the same `secretKeyRef` to the initContainer. To restore service at once, set `OIDC_ENABLED=false`. |
 | `migrate` initContainer fails with `permission denied to create extension "vector"` | Create the extension once as a superuser in the app database. |
 | Container exits at start: `Database role … is a PostgreSQL superuser. Refusing to start` | The role in `DATABASE_URL` is a superuser. Point it at a non-superuser role that owns the app database (the bundled Postgres and CloudNativePG both create one). `DATABASE_ALLOW_SUPERUSER=true` turns the refusal into a warning, as a stop-gap only. |
 | Container exits at start: `DATABASE_URL carries a placeholder password (changeme / CHANGE_ME)` | The Secret still carries a shipped placeholder. Generate one (`openssl rand -hex 32`), set it on the database role, and put it in `DATABASE_URL`. |
