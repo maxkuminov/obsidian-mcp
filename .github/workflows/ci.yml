@@ -28,7 +28,9 @@ jobs:
   tests:
     name: tests
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Offline suite + the real-Postgres integration modules in one job: ~27 min
+    # on main before #416, which adds ~380 tests. 30 was cancelling green runs.
+    timeout-minutes: 45
     services:
       postgres:
         image: pgvector/pgvector:pg16
