@@ -776,6 +776,51 @@ content-security-policy: default-src 'self'; script-src 'nonce-<NONCE>'; style-s
         .gem-facet { fill: var(--gem-facet); stroke: none; }
         .gem-facet-2 { fill: var(--gem-facet-2); stroke: none; }
     </style>
+    <style nonce="<NONCE>">
+        /* Single sign-on button and the divider before the password form.
+           Here, not in auth_base, so a deployment with OIDC off renders
+           byte-identical pages. */
+        .btn-sso {
+            display: block;
+            text-align: center;
+            text-decoration: none;
+            margin-top: 0;
+        }
+        .btn-sso:focus-visible,
+        .btn-local:focus-visible {
+            outline: 2px solid var(--primary);
+            outline-offset: 2px;
+        }
+        .auth-divider {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin: 24px 0 20px;
+            font-size: 11px;
+            font-weight: 600;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            color: var(--text-3);
+        }
+        .auth-divider::before,
+        .auth-divider::after {
+            content: "";
+            flex: 1;
+            height: 1px;
+            background: var(--border);
+        }
+        .btn-local {
+            background: var(--surface-2);
+            color: var(--text);
+            border: 1px solid var(--control-border);
+            box-shadow: none;
+        }
+        .btn-local:hover {
+            background: var(--surface-3);
+            border-color: var(--control-border-strong);
+            box-shadow: none;
+        }
+    </style>
 </head>
 <body>
 
@@ -803,7 +848,10 @@ content-security-policy: default-src 'self'; script-src 'nonce-<NONCE>'; style-s
     
 
     
-        <a class="btn-submit" href="/admin/auth/oidc/start?next=/admin/">Sign in with SSO</a>
+        <a class="btn-submit btn-sso" href="/admin/auth/oidc/start?next=/admin/">Sign in with SSO</a>
+        
+        <div class="auth-divider">or use a password</div>
+        
     
 
     
@@ -837,7 +885,7 @@ content-security-policy: default-src 'self'; script-src 'nonce-<NONCE>'; style-s
                 required>
         </div>
 
-        <button class="btn-submit" type="submit">Sign in</button>
+        <button class="btn-submit btn-local" type="submit">Sign in</button>
     </form>
     
 

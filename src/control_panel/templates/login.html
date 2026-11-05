@@ -3,6 +3,53 @@
 {% block title %}Sign in — Obsidian MCP{% endblock %}
 {% block tagline %}Sign in{% endblock %}
 
+{% block head_extra %}{% if oidc_enabled %}    <style nonce="{{ csp_nonce }}">
+        /* Single sign-on button and the divider before the password form.
+           Here, not in auth_base, so a deployment with OIDC off renders
+           byte-identical pages. */
+        .btn-sso {
+            display: block;
+            text-align: center;
+            text-decoration: none;
+            margin-top: 0;
+        }
+        .btn-sso:focus-visible,
+        .btn-local:focus-visible {
+            outline: 2px solid var(--primary);
+            outline-offset: 2px;
+        }
+        .auth-divider {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin: 24px 0 20px;
+            font-size: 11px;
+            font-weight: 600;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            color: var(--text-3);
+        }
+        .auth-divider::before,
+        .auth-divider::after {
+            content: "";
+            flex: 1;
+            height: 1px;
+            background: var(--border);
+        }
+        .btn-local {
+            background: var(--surface-2);
+            color: var(--text);
+            border: 1px solid var(--control-border);
+            box-shadow: none;
+        }
+        .btn-local:hover {
+            background: var(--surface-3);
+            border-color: var(--control-border-strong);
+            box-shadow: none;
+        }
+    </style>
+{% endif %}{% endblock %}
+
 {% block content %}
     <div class="auth-heading">Welcome back</div>
     <div class="auth-sub">Sign in to manage your Obsidian vault.</div>
@@ -12,7 +59,10 @@
     {% endif %}
 
     {% if oidc_enabled %}
-        <a class="btn-submit" href="/admin/auth/oidc/start?next={{ (next or '/admin/') | urlencode }}">Sign in with {{ oidc_display_name or 'SSO' }}</a>
+        <a class="btn-submit btn-sso" href="/admin/auth/oidc/start?next={{ (next or '/admin/') | urlencode }}">Sign in with {{ oidc_display_name or 'SSO' }}</a>
+        {% if local_login_enabled is not defined or local_login_enabled %}
+        <div class="auth-divider">or use a password</div>
+        {% endif %}
     {% endif %}
 
     {% if local_login_enabled is not defined or local_login_enabled %}
@@ -46,7 +96,7 @@
                 required>
         </div>
 
-        <button class="btn-submit" type="submit">Sign in</button>
+        <button class="btn-submit{% if oidc_enabled %} btn-local{% endif %}" type="submit">Sign in</button>
     </form>
     {% endif %}
 {% endblock %}
