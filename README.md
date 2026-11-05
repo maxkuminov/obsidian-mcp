@@ -1061,8 +1061,9 @@ Across the OIDC account-linking release (migration 037, #416):
   it refuses to start. If yours did, do this in order (it is also in
   the startup message): (1) on the old release, confirm a local admin
   password works; (2) set `LOCAL_LOGIN_ENABLED=true`; (3) copy the
-  map's subject-to-user pairs, then remove `OIDC_SUBJECT_USER_IDS`;
-  (4) deploy and start; (5) sign in with the password and, on each
+  map's subject-to-user pairs, then remove the `OIDC_SUBJECT_USER_IDS`
+  line (delete it; an empty `OIDC_SUBJECT_USER_IDS=` fails to parse at
+  startup); (4) deploy and start; (5) sign in with the password and, on each
   user's edit page, **Single sign-on → Bind subject** with their
   former subject; (6) verify an SSO sign-in per user and one MCP
   client's `/authorize` consent; (7) optionally set

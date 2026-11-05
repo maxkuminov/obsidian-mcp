@@ -31,7 +31,7 @@ Each of `/admin/users/{id}/oidc/expect`, `/oidc/bind` and `/oidc/unlink` SHALL t
 - **THEN** A's request SHALL be refused with the actor-revoked message and the target's link SHALL be unchanged
 
 ### Requirement: With password login disabled, no panel mutation SHALL leave zero reachable administrators
-While `LOCAL_LOGIN_ENABLED` is false, the OIDC unlink, the user edit that clears `is_admin` or `is_active`, the soft delete and the permanent delete SHALL each, under the admin guard and after the actor re-check, refuse with nothing written any change whose resulting state has no row that is an active administrator bound under the configured issuer. No other panel handler SHALL be able to reduce that set. While password login is enabled this requirement SHALL NOT apply and the existing last-active-administrator rule SHALL be unchanged.
+While `LOCAL_LOGIN_ENABLED` is false, the OIDC unlink, the user edit that clears `is_admin` or `is_active`, the soft delete and the permanent delete SHALL each, under the admin guard, after the actor re-check and before any write, refuse with nothing written a change whose target is currently a reachable administrator (an active administrator bound under the configured issuer) and whose resulting state has no other reachable administrator. A change whose target is not currently a reachable administrator cannot reduce that set and SHALL NOT be refused by this rule, even when no reachable administrator exists. No other panel handler SHALL be able to reduce that set. While password login is enabled this requirement SHALL NOT apply and the existing last-active-administrator rule SHALL be unchanged.
 
 #### Scenario: Unlinking the only reachable admin
 - **WHEN** password login is disabled and admin A unlinks admin B, the only other admin, while A is not bound
@@ -44,6 +44,10 @@ While `LOCAL_LOGIN_ENABLED` is false, the OIDC unlink, the user edit that clears
 #### Scenario: Deleting the only reachable admin
 - **WHEN** password login is disabled and a soft or permanent delete targets the only bound active admin
 - **THEN** the delete SHALL be refused and the row SHALL be unchanged
+
+#### Scenario: A target that is not a reachable admin is never refused by this rule
+- **WHEN** password login is disabled, no reachable admin exists, and an admin deactivates or deletes an ordinary user, or demotes an admin who is not bound under the configured issuer
+- **THEN** the change SHALL proceed
 
 #### Scenario: Concurrent mutations keep one reachable admin
 - **WHEN** password login is disabled, admins A and B are both bound, and "A unlinks B" and "B deactivates A" are issued with the first deterministically holding the guard

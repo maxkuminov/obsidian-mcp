@@ -133,7 +133,7 @@ listener does not cover the unlink form), `src/main.py` (lifespan warning),
   - an unbound active admin does not count;
   - concurrency, deterministic via a barrier: "A unlinks B" vs "B deactivates A", "A demotes B" vs "B deletes A", and two unlinks of each other; exactly one succeeds each time and one reachable admin always remains.
 - [x] 3.12 `tests/test_oidc_mutation_sites.py`: an AST or grep guard that every `src/` write of `User.is_admin`, `User.is_active`, `User.oidc_subject`, and every `users` delete, is in the D15 allow-list (the four sites plus first-login bind, bootstrap and create)
-- [x] 3.13 The 0.3 goldens pass: every OIDC-off golden and every non-page on_multi golden is byte-identical. Supervisor decision (2026-11-04): the four `page_*_on_multi` goldens are regenerated in b6cdbd4, because the 0.3 harness compares whole pages; their diff is exactly the D11 OIDC blocks plus the stamped last login. The blocks are also asserted on their own in `tests/test_oidc_panel.py`.
+- [x] 3.13 The 0.3 goldens pass: every OIDC-off golden and every non-page on_multi golden is byte-identical. Supervisor decision (2026-11-04): the four `page_*_on_multi` goldens are regenerated in b6cdbd4, because the 0.3 harness compares whole pages; their diff is exactly the D11 OIDC blocks plus the stamped last login. The blocks are also asserted on their own in `tests/test_oidc_panel.py`. `tests/integration/test_oidc_off_consent_pg.py`'s OIDC-on `sign_in` step was changed in 28fddcf to bind through `oidc_links.bind_subject`, because the `OIDC_SUBJECT_USER_IDS` env map is retired; the change is harness only, with no golden bytes.
 
 ## 4. Slice D: docs (last commits of the feature branch)
 
@@ -163,9 +163,9 @@ listener does not cover the unlink form), `src/main.py` (lifespan warning),
 
 ## 5. Verification gates
 
-- [ ] 5.1 `openspec-verifier` against these deltas (non-author)
+- [x] 5.1 `openspec-verifier` against these deltas (non-author): 0 blocking, 8 non-blocking notes, fixed in the verifier-fix commit except the `mapping` strictness one, which the security-event-logging doc fix covers
 - [x] 5.2 Adversarial Codex (mandatory: an auth and tenancy boundary): round 1 on d32e70b PASS with zero findings (349 offline OIDC tests run by the reviewer); no fixes, so no re-review round. L11 recorded from the supervisor's own review
-- [ ] 5.3 `make audit`, `make test-schema`, `make db-check`, `make test-integration`, `pytest tests`
+- [x] 5.3 `make audit`, `make test-schema` (375), `make test-integration` (1333), `pytest tests`; `make db-check` is left for the deploy
 - [ ] 5.4 Archive (`openspec archive oidc-account-linking -y`) in the feature PR, `Closes #416`
 
 ## 6. Post-deploy (owner)

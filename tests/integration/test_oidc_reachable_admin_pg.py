@@ -12,6 +12,9 @@ multi-user) against a throwaway migrated Postgres:
   permanent delete — refusing a zero-reachable result while password sign-in
   is disabled, proceeding when another reachable admin exists or password
   sign-in is enabled, and an unbound active admin not counting;
+* D15 narrowed to its target: with zero reachable admins and password sign-in
+  off, a mutation of an ordinary user, an unbound admin or an admin bound
+  under a previous issuer proceeds, because it cannot reduce the count;
 * the D15 races, deterministic: the first request holds the guard on a
   barrier while the second is issued; exactly one succeeds and one reachable
   admin always remains.
@@ -424,6 +427,76 @@ async def test_an_unbound_admin_does_not_count(env):
     assert await env.reachable() == 1
     await edit(http, b, admin=False, active=True)
     assert (await env.row(b)).is_admin is True
+
+
+async def _none_reachable(env):
+    """Zero reachable admins, password sign-in off (the boot CRITICAL state):
+    Alice, an unbound admin signed in by password before it was disabled;
+    Dave, a second unbound admin; Erin, an admin bound under a previous
+    issuer; Olive, an ordinary active user with a pending expectation."""
+    a = await env.user("alice", admin=True)
+    d = await env.user("dave", admin=True)
+    e = await env.user("erin", admin=True)
+    async with env.maker() as session:
+        await session.execute(update(User).where(User.id == e).values(
+            oidc_issuer="https://old-issuer.example", oidc_subject="sub-erin",
+            oidc_linked_at=text("now()")))
+        await session.commit()
+    o = await env.user("olive", pending="olive@example.com")
+    http = await env.password_login("alice")
+    password_login_off(env)
+    assert await env.reachable() == 0
+    return a, d, e, o, http
+
+
+@pytest.mark.parametrize("site", ["deactivate", "soft", "permanent", "unlink"])
+async def test_an_ordinary_user_is_not_held_by_d15_at_zero_reachable(env, site):
+    a, d, e, o, http = await _none_reachable(env)
+    if site == "deactivate":
+        response = await edit(http, o, admin=False, active=False)
+    elif site == "unlink":
+        response = await unlink(http, o)
+    else:
+        response = await delete(http, o, permanent=site == "permanent")
+    page = await http.get(response.headers["location"])
+    assert D15_TEXT not in page.text
+    row = await env.row(o)
+    if site == "permanent":
+        assert row is None
+    elif site == "unlink":
+        assert row.oidc_expected_email is None
+    else:
+        assert row.is_active is False
+
+
+@pytest.mark.parametrize("site", ["demote", "deactivate", "soft", "permanent"])
+async def test_an_unbound_admin_is_not_held_by_d15_at_zero_reachable(env, site):
+    a, d, e, o, http = await _none_reachable(env)
+    if site in ("demote", "deactivate"):
+        response = await edit(http, d, admin=site != "demote", active=site != "deactivate")
+    else:
+        response = await delete(http, d, permanent=site == "permanent")
+    page = await http.get(response.headers["location"])
+    assert D15_TEXT not in page.text
+    row = await env.row(d)
+    if site == "permanent":
+        assert row is None
+    else:
+        assert (row.is_admin and row.is_active) is False
+
+
+@pytest.mark.parametrize("site", ["demote", "unlink"])
+async def test_an_admin_under_a_previous_issuer_is_not_held_by_d15(env, site):
+    a, d, e, o, http = await _none_reachable(env)
+    response = await (unlink(http, e) if site == "unlink"
+                      else edit(http, e, admin=False, active=True))
+    page = await http.get(response.headers["location"])
+    assert D15_TEXT not in page.text
+    row = await env.row(e)
+    if site == "unlink":
+        assert row.oidc_subject is None
+    else:
+        assert row.is_admin is False
 
 
 # ── D15 races, deterministic ────────────────────────────────────────────────

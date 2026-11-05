@@ -424,15 +424,17 @@ All unchanged from #415, restated as contract:
     `_lock_admin_guard`, no commit before the writes). It uses the existing
     `type="button"` + `data-confirm` delegated listener in `panel.js`, which
     fails closed. It is refused for `is_self` when `LOCAL_LOGIN_ENABLED=false`
-    (flash `err`), and in every case by the D15 rule.
+    (flash `err`), and by the D15 rule when the target is the last reachable
+    admin.
 
   **Every one of the three handlers** enters `_lock_admin_guard` and then
   immediately re-runs `_actor_still_privileged(session, user)`, **before
   reading the target row**. On failure it takes `actor_snapshot(user)`, rolls
   back, calls `_log_actor_revoked`, and answers with the established
   `_ACTOR_REVOKED_MSG` refusal: the same sequence `edit_user_submit` and
-  `delete_user` use. Only then does it read the target `FOR UPDATE`, apply the
-  D15 check (unlink), write, and commit.
+  `delete_user` use. Only then does it read the target, apply the D15 check
+  (unlink, on that pre-write state), lock the target `FOR UPDATE`, write, and
+  commit.
 
   To change a bound user's identity, unlink first. That two-step act is the
   point: a bound user is never silently re-pointed. Conflicts (email already
@@ -514,16 +516,26 @@ With `LOCAL_LOGIN_ENABLED=false`, an admin who is not bound under the
 configured issuer cannot sign in at all. The existing "last active admin"
 guard counts admins who *exist*, not admins who can *reach* the panel. So
 while password login is disabled, **every panel mutation that can reduce the
-set of reachable admins refuses any resulting state with zero of them**.
-A reachable admin is a row with `is_admin AND is_active AND oidc_issuer =
-<configured issuer> AND oidc_subject IS NOT NULL`.
+set of reachable admins refuses a change that would take the count from one
+to zero**: one whose target is a reachable admin now and whose resulting
+state has no other. A reachable admin is a row with `is_admin AND is_active
+AND oidc_issuer = <configured issuer> AND oidc_subject IS NOT NULL`. A
+change whose target is not reachable now (an ordinary user, an inactive
+account, an unbound admin, an admin bound under a previous issuer) cannot
+reduce the count and is never refused by D15, even when the count is already
+zero; refusing it would only obstruct cleanup.
 
 - **The helper:** `oidc_links.reachable_admins_after(session, issuer, *,
   target_id, target_after)` counts reachable admins as if the target row had
   the post-mutation state `target_after` (`unlinked`, `demoted`,
-  `deactivated` or `deleted`). It is evaluated **inside `_lock_admin_guard`,
-  after `_actor_still_privileged`**, in the same transaction as the write, so
-  the check and the act are atomic against every other guarded mutation.
+  `deactivated` or `deleted`). The panel's `_leaves_no_reachable_admin(session,
+  target, target_after)` refuses exactly when password login is disabled, the
+  target's pre-write state is a reachable admin, and that count is zero. It is
+  evaluated **inside `_lock_admin_guard`, after `_actor_still_privileged`,
+  before any write**, in the same transaction as the write, so the check and
+  the act are atomic against every other guarded mutation. For the unlink,
+  the target's pre-write state is the row read under the guard, and the
+  check runs before `oidc_links.unlink`.
 - **Call sites, each refusing with a flash `err` and nothing written:**
   1. `POST /admin/users/{id}/oidc/unlink` (new).
   2. `edit_user_submit` when the edit clears `is_admin` or `is_active`, next
@@ -602,10 +614,12 @@ it. Item 5 must differ only by the OIDC blocks.
   #415. Real client requests are well under that.
 - **L10.** The in-memory transaction store is lost on restart (one worker,
   #415). The user retries.
-- **L11.** D15 is applied to the resulting state, not to the target. With
-  `LOCAL_LOGIN_ENABLED=false` and zero reachable admins already (the boot
-  CRITICAL state), every demote, deactivate or delete of an admin is refused,
-  even of one who could not sign in anyway. It fails closed; the recovery is
+- **L11.** D15 refuses only a change to a target that is a reachable admin
+  now. With `LOCAL_LOGIN_ENABLED=false` and zero reachable admins already (the
+  boot CRITICAL state), D15 refuses nothing: every edit, unlink or delete
+  proceeds, since none can reduce a count that is already zero (the existing
+  last-active-admin rule still applies), so a session that is still live can
+  clean up. No new sign-in reaches the panel in that state; the recovery is
   the documented break-glass (`LOCAL_LOGIN_ENABLED=true`, restart).
 
 ## Risks / Trade-offs

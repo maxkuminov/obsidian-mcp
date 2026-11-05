@@ -403,25 +403,41 @@ def _reachable_admin_rule_applies() -> bool:
 
 
 async def _leaves_no_reachable_admin(
-    session: AsyncSession, target_id: int, target_after: str
+    session: AsyncSession, target: Any, target_after: str
 ) -> bool:
     """True when the mutation must be refused under D15: password sign-in is
-    disabled and, once `target_id` takes `target_after`, no active admin is
-    bound under the configured issuer.
+    disabled, `target` is **currently** a reachable admin (active, admin and
+    bound under the configured issuer), and once it takes `target_after` no
+    other reachable admin remains.
 
-    Called **inside `_lock_admin_guard`, after `_actor_still_privileged`**, in
-    the transaction that writes, so the count and the write are one atomic
-    step against every other guarded mutation (design D15).
+    `target` is the row's state before the write (a `User`, or any row with
+    `is_admin`, `is_active`, `oidc_issuer` and `oidc_subject`). A target that
+    is not reachable now — an ordinary user, an inactive account, an admin
+    who is unbound or bound under a previous issuer — cannot reduce the count,
+    so its mutation is never refused here, even when the count is already
+    zero: refusing it would only obstruct cleanup.
+
+    Called **inside `_lock_admin_guard`, after `_actor_still_privileged`**,
+    before any write, in the transaction that writes, so the count and the
+    write are one atomic step against every other guarded mutation (design
+    D15).
     """
     if not _reachable_admin_rule_applies():
         return False
+    if not _is_reachable_admin(target):
+        return False
     remaining = await oidc_links.reachable_admins_after(
-        session, settings.oidc_issuer, target_id=target_id, target_after=target_after
+        session, settings.oidc_issuer, target_id=target.id, target_after=target_after
     )
     return remaining == 0
 
 
-def _bound_under_current_issuer(u: User) -> bool:
+def _is_reachable_admin(u: Any) -> bool:
+    """D15's reachable admin: active, admin and bound under the configured issuer."""
+    return bool(u.is_active and u.is_admin) and _bound_under_current_issuer(u)
+
+
+def _bound_under_current_issuer(u: Any) -> bool:
     return u.oidc_subject is not None and u.oidc_issuer == settings.oidc_issuer
 
 
@@ -514,9 +530,15 @@ async def _oidc_link_action(
         await session.rollback()
         _log_actor_revoked(request, actor)
         return _back_to_list_with_error(request, _ACTOR_REVOKED_MSG)
+    # The target's pre-write state, read under the guard: every writer of
+    # these columns that could change it takes the same guard.
     exists = (
-        await session.execute(select(User.id).where(User.id == user_id))
-    ).scalar_one_or_none()
+        await session.execute(
+            select(
+                User.id, User.is_admin, User.is_active, User.oidc_issuer, User.oidc_subject
+            ).where(User.id == user_id)
+        )
+    ).one_or_none()
     if exists is None:
         await session.rollback()
         raise HTTPException(404, "User not found")
@@ -531,14 +553,14 @@ async def _oidc_link_action(
                 "You can't unlink your own account while password sign-in is "
                 "disabled — it would sign you out with no way back in.",
             )
-        result = await oidc_links.unlink(session, user_id)
-        # D15 after the operation, in its transaction and before the commit
-        # (`reachable_admins_after` excludes the target, so the count is the
-        # same either side of the write); a refusal rolls the unlink and its
-        # session revocations back together.
-        if result.ok and await _leaves_no_reachable_admin(session, user_id, "unlinked"):
+        # D15 before the operation writes anything: refused only when the
+        # target is a reachable admin now and no other would remain. Unlinking
+        # a row that is not reachable (unbound, pending only, under a previous
+        # issuer, or not an active admin) cannot reduce the count.
+        if await _leaves_no_reachable_admin(session, exists, "unlinked"):
             await session.rollback()
             return _back_with_error(request, user_id, _NO_REACHABLE_ADMIN_MSG)
+        result = await oidc_links.unlink(session, user_id)
     elif mode == "expect":
         result = await oidc_links.set_expectation(
             session, user_id, settings.oidc_issuer, value
@@ -889,12 +911,13 @@ async def edit_user_submit(
 
     # D15 (#416): with password sign-in disabled, the last *reachable* admin —
     # active, admin and bound under the configured issuer — is the one the
-    # check above cannot see. Inside the guard, after the actor re-check,
-    # before any write; nothing commits before it.
+    # check above cannot see. Refused only when the target is that admin now;
+    # editing anyone else cannot reduce the count. Inside the guard, after the
+    # actor re-check, before any write; nothing commits before it.
     clears_admin = target.is_admin and not new_admin
     clears_active = target.is_active and not new_active
     if (clears_admin or clears_active) and await _leaves_no_reachable_admin(
-        session, target.id, "demoted" if clears_admin else "deactivated"
+        session, target, "demoted" if clears_admin else "deactivated"
     ):
         return _back_with_error(request, user_id, _NO_REACHABLE_ADMIN_MSG)
 
@@ -1069,9 +1092,11 @@ async def delete_user(
             )
 
     # D15 (#416): the last reachable admin, for both forms — after the actor
-    # re-check, beside the check above, before anything is written.
+    # re-check, beside the check above, before anything is written. Only a
+    # target that is a reachable admin now can be refused; deleting anyone
+    # else proceeds even when no reachable admin exists.
     if await _leaves_no_reachable_admin(
-        session, target.id, "deleted" if permanent else "deactivated"
+        session, target, "deleted" if permanent else "deactivated"
     ):
         return _back_to_list_with_error(request, _NO_REACHABLE_ADMIN_MSG)
 

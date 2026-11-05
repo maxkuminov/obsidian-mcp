@@ -203,11 +203,16 @@ def test_login_button_label_is_the_display_name_autoescaped(monkeypatch):
 # ── handler order and refusals (stubbed session) ────────────────────────────
 
 
-def stub_session(*, privileged=True, exists=True, username="bob"):
+def stub_session(*, privileged=True, exists=True, username="bob", target=None):
+    """`target` is the row `_oidc_link_action` reads under the guard; by
+    default a reachable admin (active, admin, bound under the issuer)."""
     session = AsyncMock()
+    row = target or SimpleNamespace(id=5, is_admin=True, is_active=True,
+                                    oidc_issuer=ISSUER, oidc_subject="sub-bob")
 
     async def execute(stmt, *args, **kwargs):
         return MagicMock(scalar_one_or_none=lambda: 5 if exists else None,
+                         one_or_none=lambda: row if exists else None,
                          scalar_one=lambda: username)
 
     session.execute.side_effect = execute
@@ -305,7 +310,7 @@ async def test_operation_refusals_flash_and_roll_back(monkeypatch, guard, outcom
 
 
 @pytest.mark.asyncio
-async def test_unlink_runs_d15_after_the_operation_and_before_the_commit(monkeypatch, guard):
+async def test_unlink_runs_d15_before_the_operation(monkeypatch, guard):
     order = []
     monkeypatch.setattr(settings, "local_login_enabled", False)
 
@@ -321,10 +326,31 @@ async def test_unlink_runs_d15_after_the_operation_and_before_the_commit(monkeyp
     monkeypatch.setattr(oidc_links, "reachable_admins_after", reachable)
     session = stub_session()
     response = await users._oidc_link_action(request(), session, ACTOR, 5, "unlink")
-    assert order == ["unlink", ("reachable", ISSUER, 5, "unlinked")]
+    assert order == [("reachable", ISSUER, 5, "unlinked")]
     session.commit.assert_not_awaited()
     session.rollback.assert_awaited()
     assert response.headers["location"] == "/admin/users/5/edit"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", [
+    SimpleNamespace(id=5, is_admin=False, is_active=True, oidc_issuer=ISSUER, oidc_subject="s"),
+    SimpleNamespace(id=5, is_admin=True, is_active=False, oidc_issuer=ISSUER, oidc_subject="s"),
+    SimpleNamespace(id=5, is_admin=True, is_active=True, oidc_issuer="https://old.example",
+                    oidc_subject="s"),
+    SimpleNamespace(id=5, is_admin=True, is_active=True, oidc_issuer=None, oidc_subject=None),
+], ids=["not_admin", "inactive", "previous_issuer", "pending_only"])
+async def test_unlink_of_a_target_that_is_not_reachable_skips_d15(monkeypatch, guard, target):
+    """D15 refuses only when the target is a reachable admin now (#416)."""
+    monkeypatch.setattr(settings, "local_login_enabled", False)
+    reachable = AsyncMock(return_value=0)
+    monkeypatch.setattr(oidc_links, "reachable_admins_after", reachable)
+    monkeypatch.setattr(oidc_links, "unlink",
+                        AsyncMock(return_value=oidc_links.AdminResult("ok", revoked_sessions=0)))
+    session = stub_session(target=target)
+    await users._oidc_link_action(request(), session, ACTOR, 5, "unlink")
+    reachable.assert_not_awaited()
+    session.commit.assert_awaited_once()
 
 
 @pytest.mark.asyncio

@@ -151,8 +151,9 @@
                     {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
                     <div class="field">
                         <label class="field-label" for="oidc-email">Expect email</label>
-                        <input type="email" name="email" id="oidc-email" required maxlength="254"
-                               class="field-input" autocomplete="off" placeholder="name@example.com">
+                        <input type="text" inputmode="email" name="email" id="oidc-email" required maxlength="254"
+                               class="field-input" autocomplete="off" spellcheck="false"
+                               placeholder="name@example.com">
                         <div class="u-font-size-11px u-color-text-3 u-margin-top-6px">
                             The first sign-in whose provider-verified email matches, within
                             7 days, links this account. Replaces a pending address.

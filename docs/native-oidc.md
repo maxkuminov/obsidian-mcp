@@ -18,7 +18,9 @@ What it is not:
   `is_admin`.
 - **No provider tokens kept.** The ID token is validated during the callback
   and then discarded. Nothing from the provider enters the cookie, the session
-  registry or the database except the subject an admin linked.
+  registry or the database except the issuer and subject of a linked account,
+  stored when an admin binds it or when the first sign-in binds an expected
+  email.
 
 SSO is disabled by default (`OIDC_ENABLED=false`). With it off, every page,
 the login form and `/authorize` behave exactly as before; the link routes
@@ -113,10 +115,12 @@ After the ID token has been fully validated, the callback resolves it:
 3. Otherwise the login is refused.
 
 The link and the first session are written in one transaction, under the same
-lock every admin action and every session mint takes. If the session cannot
-be minted (the account was deactivated, its password was reset, or it was
-unlinked in the meantime), nothing is written: the account stays pending. An
-inactive account is refused before anything is written. A successful SSO
+lock every admin action and every session mint takes, so nothing can change
+the account between the bind and the mint: a password reset or an admin edit
+either commits before the sign-in (which then sees it) or waits for it. If the
+session still cannot be minted, nothing is written and the account stays
+pending; that refusal (`session_mint`) is defensive and should not occur in
+practice. An inactive account is refused before anything is written. A successful SSO
 login stamps the user's "last login", as a password login does.
 
 Every refusal renders the same login page with the same message, "Single
@@ -448,7 +452,9 @@ exist yet.
 2. **Set `LOCAL_LOGIN_ENABLED=true`.**
 3. **Copy the map's subject-to-user pairs somewhere safe, then remove
    `OIDC_SUBJECT_USER_IDS`** from the configuration. You need the pairs in
-   step 5.
+   step 5. Delete the whole line; do not leave it blank. An empty
+   `OIDC_SUBJECT_USER_IDS=` fails to parse at startup before the retirement
+   message is reached.
 4. **Deploy and start.** Migration 037 runs (it adds the link columns to
    `users`; nothing is backfilled).
 5. **Sign in with the password and bind each former subject** on its user's
@@ -479,7 +485,7 @@ in the security log, as the `panel_oidc_refused` event's `reason` field:
 | `email_unverified` | An expectation matches the email, but `email_verified` is not `true`. Verify the address at the provider. |
 | `link_conflict` | Another account was linked to the same identity at the same moment. |
 | `account` | The linked account is deactivated or was deleted. |
-| `session_mint` | The account's password was reset (or the account otherwise changed) between verification and sign-in. Retry. |
+| `session_mint` | The session could not be minted after the account was resolved. The bind and the mint run in one guarded transaction, so a password reset or an admin edit cannot cause it; it is a defensive refusal that should not occur in practice. Retry, and check the server log if it repeats. |
 
 Other events: `panel_oidc_linked` when a first sign-in links an account,
 `panel_oidc_link_set` and `panel_oidc_link_removed` for the admin actions, and
@@ -505,8 +511,9 @@ address, 60 starts per minute across the server.
   once, and disappear on restart; the user just starts again. One pending
   login per browser: starting a new one cancels the previous one.
 - **Changing `OIDC_ISSUER`** (a realm rename, a new hostname) orphans every
-  link and expectation. The panel shows them as "linked under a previous
-  issuer"; unlink and link each user again.
+  link and expectation. The panel shows a binding as "linked under a previous
+  issuer" and a pending expectation as "Expired"; unlink (or set a new
+  expectation) and link each user again.
 - **One issuer per deployment.**
 - **Return to consent.** A login started from the consent page returns to it,
   unless the encoded `/authorize` URL is longer than 4,096 characters, in

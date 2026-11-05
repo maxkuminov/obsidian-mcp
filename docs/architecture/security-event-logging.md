@@ -494,9 +494,9 @@ parameters), `provider` (discovery, token or JWKS failure, a provider `error`,
 a wrong or missing RFC 9207 `iss`, an endpoint off the issuer's host, an
 unoffered auth method, a compressed or oversized body), `token` (signature,
 algorithm, claims) and `entitlement` (the configured group is absent). The
-rest come from the callback's database phase: `unlinked` (no binding and no
-live matching expectation — this replaced #415's `mapping`, which described an
-environment map that no longer exists), `email_unverified` (an expectation
+rest come from the callback's database phase: `unlinked` (the reason for an
+identity with no linked user: no binding and no live matching expectation),
+`email_unverified` (an expectation
 matched but `email_verified` was not the boolean `true`), `link_conflict`
 (another row took the identity first), `account` (the resolved row is gone or
 inactive) and `session_mint` (`start_session` refused). `_oidc_refused` maps
