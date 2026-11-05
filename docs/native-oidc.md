@@ -221,6 +221,21 @@ except `OIDC_SUBJECT_USER_IDS`, which is refused either way. Validation never
 contacts the provider, so an unreachable provider cannot stop the server from
 starting. An invalid value refuses startup with a message naming the setting.
 
+**Every process that loads the settings validates them, not only the server.**
+That includes the migration step (`alembic upgrade head`, the Kubernetes
+`migrate` initContainer), `alembic check`, and one-off Jobs or `make` targets
+run from the image. With `OIDC_ENABLED=true`, each of them refuses to start
+unless it sees the complete OIDC configuration, `OIDC_CLIENT_SECRET`
+included (`OIDC requires OIDC_CLIENT_ID and OIDC_CLIENT_SECRET`). Give all of
+them the same environment. The simplest way is to keep `OIDC_CLIENT_SECRET`
+in the one Secret (or `.env`) that every container already loads. If you
+keep it in a separate Secret and inject it with `secretKeyRef`, add that
+reference to the migration initContainer and to every Job too. Otherwise
+the first rollout after you set `OIDC_ENABLED=true` crash-loops in the
+migration step. With a `Recreate` strategy the old pod is already gone at
+that point, so the server is down until you fix it. Roll back with
+`OIDC_ENABLED=false`.
+
 | Setting | Default | Validation | Purpose |
 | --- | --- | --- | --- |
 | `OIDC_ENABLED` | `false` | Requires `MULTI_USER_MODE=true`; refused with `MCP_SANDBOX_MODE=true`. Requires `BASE_URL` (or `MCP_HOSTNAME`) to be an HTTPS origin with no path. | Turns SSO on. |
@@ -470,6 +485,12 @@ the check is unchanged. The server now requests `openid email profile` (it
 used to request `openid profile`).
 
 ## Troubleshooting
+
+**The server, or its migration step, does not start after `OIDC_ENABLED=true`**
+with `OIDC requires OIDC_CLIENT_ID and OIDC_CLIENT_SECRET`: that process did
+not receive the secret. The usual cause is a `secretKeyRef` on the app
+container only, with nothing on the migration initContainer. See
+[Settings](#settings). `OIDC_ENABLED=false` restores service while you fix it.
 
 The login page says only "Single sign-on could not be completed." The reason is
 in the security log, as the `panel_oidc_refused` event's `reason` field:

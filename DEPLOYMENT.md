@@ -1778,6 +1778,16 @@ changes. The full guide, including a click-by-click Keycloak walkthrough, is
    All `OIDC_*` values are validated at startup (only when `OIDC_ENABLED=true`,
    except the retired one) and never contact the provider, so a provider
    outage cannot stop the server from starting.
+
+   The same validation runs in **every process that loads the settings**: the
+   migration step (`alembic upgrade head`, the Kubernetes `migrate`
+   initContainer), `alembic check` and one-off Jobs. Each needs the full OIDC
+   environment, `OIDC_CLIENT_SECRET` included, or it refuses to start. Keep
+   the secret in the Secret or `.env` that all of them load. If you inject it
+   separately (`secretKeyRef`), add it to the initContainer and to the Jobs
+   as well. Otherwise turning SSO on crash-loops the migration, and with
+   `Recreate` the server stays down. See
+   [native OIDC](docs/native-oidc.md#settings).
 5. **Link the accounts** in the panel (user edit page, **Single sign-on**:
    Expect email or Bind subject), have each user sign in once, and complete one
    MCP client's consent round trip through SSO.
