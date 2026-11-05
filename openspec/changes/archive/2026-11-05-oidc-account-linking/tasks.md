@@ -166,7 +166,7 @@ listener does not cover the unlink form), `src/main.py` (lifespan warning),
 - [x] 5.1 `openspec-verifier` against these deltas (non-author): 0 blocking, 8 non-blocking notes, fixed in the verifier-fix commit except the `mapping` strictness one, which the security-event-logging doc fix covers
 - [x] 5.2 Adversarial Codex (mandatory: an auth and tenancy boundary): round 1 on d32e70b PASS with zero findings (349 offline OIDC tests run by the reviewer); no fixes, so no re-review round. L11 recorded from the supervisor's own review
 - [x] 5.3 `make audit`, `make test-schema` (375), `make test-integration` (1333), `pytest tests`; `make db-check` is left for the deploy
-- [ ] 5.4 Archive (`openspec archive oidc-account-linking -y`) in the feature PR, `Closes #416`
+- [x] 5.4 Archive (`openspec archive oidc-account-linking -y`) in the feature PR, `Closes #416`
 
 ## 6. Post-deploy (owner)
 
