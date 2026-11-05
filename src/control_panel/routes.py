@@ -594,6 +594,14 @@ async def account_page(
     return templates.TemplateResponse(request, "account.html", _panel_context(request, user, {
         "active": "account",
         "min_password_length": MIN_PASSWORD_LENGTH,
+        # #416 D11: a read-only status line, only while OIDC is enabled. No
+        # self-service control — the binding is an administrator's act.
+        "oidc_enabled": bool(settings.oidc_enabled),
+        "oidc_linked": bool(
+            settings.oidc_enabled
+            and getattr(user, "oidc_subject", None) is not None
+            and getattr(user, "oidc_issuer", None) == settings.oidc_issuer
+        ),
     }))
 
 

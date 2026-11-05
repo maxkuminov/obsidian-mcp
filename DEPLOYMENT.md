@@ -1743,4 +1743,98 @@ release works with either shape of cluster:
 
 ## Optional native browser SSO
 
-Follow [Native OIDC login](docs/native-oidc.md) for client configuration, existing-account mappings, network/logging prerequisites, recovery, and the mandatory browser/consent checks before retiring an external login gate. Shipping this code does not enable SSO: `OIDC_ENABLED` defaults to false. Do not remove a proxy gate by changing multi-user mode to false.
+Multi-user deployments can sign existing users in to the panel, and to the
+MCP consent page, through an OpenID Connect provider. Shipping this code does
+not enable it: `OIDC_ENABLED` defaults to `false`, and with it off nothing
+changes. The full guide, including a click-by-click Keycloak walkthrough, is
+[docs/native-oidc.md](docs/native-oidc.md). What a deployment needs:
+
+1. **Users exist first.** There is no SSO bootstrap: `/admin/register` is 404
+   while OIDC is on. Register the first admin and create the other users with
+   OIDC off, and confirm a local admin password works.
+2. **A confidential client at the provider** with the exact redirect URI
+   `https://<MCP_HOSTNAME>/admin/auth/oidc/callback` (no wildcards),
+   authorization code flow with PKCE S256, and ID tokens signed RS256, PS256
+   or ES256. The provider's discovery, token and JWKS endpoints must be HTTPS
+   on the issuer's own host and port.
+3. **Egress** from the server to the issuer over HTTPS. On Kubernetes, add the
+   rule to the app's NetworkPolicy. Provider requests ignore `HTTP(S)_PROXY`.
+   For an issuer behind a private CA, mount the CA and set `OIDC_CA_FILE`.
+4. **Settings**, in `.env` (compose) or the ConfigMap/Secret (Kubernetes):
+
+   | Setting | Default | Notes |
+   | --- | --- | --- |
+   | `OIDC_ENABLED` | `false` | Requires `MULTI_USER_MODE=true` and an HTTPS `BASE_URL`/`MCP_HOSTNAME`; refused in sandbox mode. |
+   | `OIDC_ISSUER` | — | HTTPS; must equal discovery's `issuer` byte for byte; at most 2,048 characters. |
+   | `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET` | — | Both required. The secret belongs in the Secret, not the ConfigMap. |
+   | `OIDC_TOKEN_AUTH_METHOD` | `client_secret_basic` | Or `client_secret_post`. Refused at login if discovery lists methods without it. |
+   | `OIDC_REQUIRED_GROUP` | — | Optional. When set (at most 512 characters), the ID token's `groups` array must contain it exactly. |
+   | `OIDC_EXTRA_SCOPES` | — | Space-separated scope tokens after `openid email profile`, at most 8 of 64 characters; `offline_access` refuses startup. |
+   | `OIDC_DISPLAY_NAME` | `SSO` | Button label "Sign in with {name}", 1–40 printable characters. |
+   | `OIDC_CA_FILE` | — | PEM CA trusted for provider requests only (replaces certifi for them); empty or `off` means unset; refused if unreadable or holding no CA. |
+   | `LOCAL_LOGIN_ENABLED` | `true` | The password form. `false` hides it and refuses its POST. Multi-user mode needs this or OIDC. Turning it back on is the break-glass below. |
+   | `OIDC_SUBJECT_USER_IDS` | — | **Retired.** Any non-empty value refuses startup. See the upgrade below. |
+
+   All `OIDC_*` values are validated at startup (only when `OIDC_ENABLED=true`,
+   except the retired one) and never contact the provider, so a provider
+   outage cannot stop the server from starting.
+5. **Link the accounts** in the panel (user edit page, **Single sign-on**:
+   Expect email or Bind subject), have each user sign in once, and complete one
+   MCP client's consent round trip through SSO.
+6. **Access logs:** suppress query strings on `/admin/auth/oidc/callback` in
+   the reverse proxy or ingress logs and in tracing. The query carries the
+   authorization code.
+
+If an external login gate (forward auth, basic auth) protects the panel today,
+keep it until SSO works end to end, then remove it. Do not remove a gate by
+switching `MULTI_USER_MODE` off: that removes the boundaries between users'
+vaults.
+
+### Turning password login off, and break-glass
+
+`LOCAL_LOGIN_ENABLED=false` is optional, and only safe once an admin is linked.
+After setting it, check the startup log: one CRITICAL line starting
+`LOCAL_LOGIN_ENABLED=false and no active admin is linked to single sign-on`
+means nobody can sign in as an administrator. The server still starts and
+`/mcp` keeps serving. While password login is off, the panel refuses any
+change that would leave no active admin linked under the configured issuer,
+and you cannot unlink yourself.
+
+When the provider is down, or nobody can sign in with SSO, re-enable the
+password form and sign in with a local admin password:
+
+- **Kubernetes:** set `LOCAL_LOGIN_ENABLED: "true"` in the ConfigMap (or
+  wherever the deployment sets it), apply it, then restart so the pod
+  re-reads its environment:
+
+  ```bash
+  kubectl -n <namespace> edit configmap <app-config>
+  kubectl -n <namespace> rollout restart deployment/<app>
+  kubectl -n <namespace> rollout status deployment/<app>
+  ```
+
+- **Compose:** set `LOCAL_LOGIN_ENABLED=true` in the deploy directory's
+  `.env`, then `docker compose up -d --force-recreate`.
+
+There is no bypass URL; recovery requires access to the deployment's
+configuration, by design. Keep multi-user mode on throughout.
+
+### Upgrading from `OIDC_SUBJECT_USER_IDS`
+
+The first SSO release kept subject-to-user mappings in
+`OIDC_SUBJECT_USER_IDS`. That setting is retired (#416) and a non-empty value
+refuses startup. In order:
+
+1. On the old release, confirm a local admin password works (reset one if
+   needed).
+2. Set `LOCAL_LOGIN_ENABLED=true`.
+3. Record the map's subject-to-user pairs, then remove `OIDC_SUBJECT_USER_IDS`.
+4. Deploy. Migration 037 runs.
+5. Sign in with the password and, for each former subject, open the user's
+   edit page and use **Single sign-on → Bind subject**.
+6. Verify an SSO sign-in per user and one `/authorize` consent round trip.
+7. Optionally set `LOCAL_LOGIN_ENABLED=false` again, once the startup log shows
+   no CRITICAL lockout line.
+
+The same sequence, with more detail, is in
+[docs/native-oidc.md](docs/native-oidc.md#upgrading-from-oidc_subject_user_ids).

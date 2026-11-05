@@ -42,7 +42,8 @@
                 <tr>
                     <th>Username</th>
                     <th>Role</th>
-                    <th>Status</th>
+                    <th>Status</th>{% if oidc_enabled %}
+                    <th>SSO</th>{% endif %}
                     <th>Vault Path</th>
                     <th>API Keys</th>
                     <th>Notes</th>
@@ -68,7 +69,10 @@
                         {% else %}
                         <span class="badge badge-red">Inactive</span>
                         {% endif %}
-                    </td>
+                    </td>{% if oidc_enabled %}
+                    <td>
+                        {% if u.oidc_state == 'linked' %}<span class="badge badge-green">linked</span>{% elif u.oidc_state == 'pending' %}<span class="badge badge-gray">pending</span>{% else %}—{% endif %}
+                    </td>{% endif %}
                     <td class="mono users-td-vault">
                         {% if u.vault_path %}{{ u.vault_path }}{% else %}<span class="u-color-warning">(unassigned)</span>{% endif %}
                     </td>
@@ -130,7 +134,7 @@
                 {% endfor %}
                 {% if not users %}
                 <tr>
-                    <td colspan="9" class="users-td-empty">No users yet.</td>
+                    <td colspan="{% if oidc_enabled %}10{% else %}9{% endif %}" class="users-td-empty">No users yet.</td>
                 </tr>
                 {% endif %}
             </tbody>

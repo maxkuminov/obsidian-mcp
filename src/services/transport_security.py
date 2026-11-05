@@ -566,6 +566,27 @@ def load_embedding_ca_context(path: str) -> ssl.SSLContext:
     return ctx
 
 
+def load_oidc_ca_context(path: str) -> ssl.SSLContext:
+    """Parse `OIDC_CA_FILE` once, at settings construction (#416, design D6).
+
+    The same shape as `load_embedding_ca_context`, for a different hop with a
+    different operator and trust root: only that file is loaded (no system
+    store), and a file holding no CA certificate is refused. The result is
+    `verify=` on the OIDC back-channel's transport (`src/auth/oidc.py`).
+    """
+    check_certificate_file(path, "OIDC_CA_FILE")
+    try:
+        ctx = ssl.create_default_context(cafile=path)
+    except (ssl.SSLError, OSError, ValueError) as exc:
+        raise ValueError(
+            "OIDC_CA_FILE could not be loaded as a PEM CA certificate "
+            f"({type(exc).__name__})"
+        ) from None
+    if not ctx.get_ca_certs():
+        raise ValueError("OIDC_CA_FILE contains no CA certificate")
+    return ctx
+
+
 _certifi_context: ssl.SSLContext | None = None
 
 

@@ -1,0 +1,9 @@
+HTTP 302
+location: /admin/
+vary: Cookie, Origin
+set-cookie: omcp_session=<COOKIE>; path=/; Max-Age=604800; httponly; samesite=lax; secure
+strict-transport-security: max-age=31536000; includeSubDomains
+x-content-type-options: nosniff
+x-frame-options: DENY
+referrer-policy: no-referrer
+

@@ -472,11 +472,53 @@ point of logging them at that level.
   refuses. They are durability notes on operations that succeeded, and keeping
   them off the destructive publication path is the reason.
 
-## Native OIDC events (#414)
+## Native OIDC events (#414, #416)
 
 | Event | Level | Fields | Meaning |
 | --- | --- | --- | --- |
 | `panel_oidc_started` | INFO | `client_ip`, `route` | Authlib produced the provider authorization redirect |
-| `panel_oidc_refused` | WARNING | `reason`, `client_ip`, `route` | Closed reasons: `capacity`, `state`, `provider`, `token`, `entitlement`, `mapping`, `account`, `session_mint` |
+| `panel_oidc_refused` | WARNING | `reason`, `client_ip`, `route` | Closed reasons (#416): `capacity`, `state`, `provider`, `token`, `entitlement`, `unlinked`, `email_unverified`, `link_conflict`, `account`, `session_mint`; never a `user_id` or `username` |
+| `panel_oidc_linked` | INFO | `user_id`, `username`, `client_ip`, `route` | A pending expectation bound at first sign-in, after the commit that also minted the session (#416) |
+| `panel_oidc_link_set` | INFO | `actor_user_id`, `user_id`, `username`, `mode`, `client_ip`, `route` | An admin set an expected email (`mode` `expect`) or bound a subject (`bind`), after the commit (#416) |
+| `panel_oidc_link_removed` | INFO | `actor_user_id`, `user_id`, `username`, `count`, `client_ip`, `route` | An admin unlinked an account, after the commit; `count` is the sessions revoked (#416) |
 
 OIDC successes reuse `panel_login_succeeded` after the existing session mint commits. Refusals use the normal bounded suppressor. No provider subject, group, code, token, state, nonce, verifier or upstream exception text enters these events. Uvicorn's callback access-log query is filtered in `configure_logging`; proxy logs need the corresponding deployment setting before activation. Other Uvicorn logs keep their existing formatting.
+
+**The refusal reasons are a closed set** (`security_events.OIDC_REFUSAL_REASONS`;
+`tests/test_oidc_callback_linking.py` checks that the reasons the code can emit,
+that set and the table row above are the same three things). The first five
+come from `src/auth/oidc.py` before any database access: `capacity` (the
+in-memory login store is full or the process-wide start rate is spent),
+`state` (missing, replayed, expired or foreign-browser state; duplicated query
+parameters), `provider` (discovery, token or JWKS failure, a provider `error`,
+a wrong or missing RFC 9207 `iss`, an endpoint off the issuer's host, an
+unoffered auth method, a compressed or oversized body), `token` (signature,
+algorithm, claims) and `entitlement` (the configured group is absent). The
+rest come from the callback's database phase: `unlinked` (the reason for an
+identity with no linked user: no binding and no live matching expectation),
+`email_unverified` (an expectation
+matched but `email_verified` was not the boolean `true`), `link_conflict`
+(another row took the identity first), `account` (the resolved row is gone or
+inactive) and `session_mint` (`start_session` refused). `_oidc_refused` maps
+any value outside the set to `provider` rather than letting it reach the log.
+
+**No `user_id` or `username` on any refusal, `account` included.** The record
+would confirm that a provider identity resolves to a local user, the one fact
+the uniform refusal page exists to withhold. The refusal is keyed by address,
+like `panel_login_account_throttled`'s subject.
+
+**The three linking events name the account by its row only.**
+`panel_oidc_linked` (a first-login bind) is emitted after the commit that
+minted the session, so it never records a bind that was rolled back with a
+refused mint; it is followed by the ordinary `panel_login_succeeded`.
+`panel_oidc_link_set` (`mode` is the closed `OIDC_LINK_SET_MODES`, `expect` or
+`bind`) and `panel_oidc_link_removed` (`count` = sessions revoked by the
+unlink) are emitted after the admin action's commit, with `actor_user_id` the
+acting admin; a refused admin action (conflict, `bound_already`, the
+last-reachable-admin rule, self-unlink) emits nothing of its own, and an
+actor-revoked refusal records the existing `panel_forbidden` with reason
+`actor_revoked`. **None of
+the OIDC events carries a subject, an issuer (expected or claimed), an email,
+a group, or anything else the provider sent**; nothing logs the issuer at all.
+The `VerifiedIdentity` dataclass has a redacted `repr` so a stray log line
+cannot carry one either.

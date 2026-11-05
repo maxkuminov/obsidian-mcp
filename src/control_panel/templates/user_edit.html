@@ -115,7 +115,90 @@
             </div>
         </div>
 
-    </div>
+    </div>{% if oidc_enabled %}
+
+    <!-- Single sign-on (#416). The subject is shown truncated, the issuer never.
+         Expect and bind are offered only on an unlinked or pending row: a
+         bound user is never re-pointed without an explicit unlink. -->
+    <div class="card anim-3 u-margin-top-20px">
+        <div class="card-header">
+            <span class="card-title">Single sign-on</span>
+        </div>
+        <div class="card-body">
+            <div class="kv">
+                <div class="kv-k">Status</div>
+                <div class="kv-v">
+                    {% if oidc.state == 'linked' %}
+                    Linked (since <time datetime="{{ oidc.linked_at }}" data-localize="date">{{ oidc.linked_at }}</time>)
+                    <span class="mono u-color-text-3">{{ oidc.subject_prefix }}{% if oidc.subject_truncated %}…{% endif %}</span>
+                    {% elif oidc.state == 'foreign' %}
+                    <span class="u-color-warning">Linked under a previous issuer — will not sign in.</span>
+                    Unlink, then link again.
+                    {% elif oidc.state == 'pending' %}
+                    Waiting for first sign-in from <span class="mono">{{ oidc.email }}</span>
+                    (expires <time datetime="{{ oidc.expires_at }}" data-localize>{{ oidc.expires_at }}</time>)
+                    {% elif oidc.state == 'expired' %}
+                    <span class="u-color-warning">Expired</span> — was waiting for
+                    <span class="mono">{{ oidc.email }}</span>. Set it again to re-arm.
+                    {% else %}
+                    Not linked
+                    {% endif %}
+                </div>
+            </div>
+            {% if oidc.state in ('none', 'pending', 'expired') %}
+            <div class="split-2 u-margin-top-12px">
+                <form method="POST" action="/admin/users/{{ target.id }}/oidc/expect">
+                    {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
+                    <div class="field">
+                        <label class="field-label" for="oidc-email">Expect email</label>
+                        <input type="text" inputmode="email" name="email" id="oidc-email" required maxlength="254"
+                               class="field-input" autocomplete="off" spellcheck="false"
+                               placeholder="name@example.com">
+                        <div class="u-font-size-11px u-color-text-3 u-margin-top-6px">
+                            The first sign-in whose provider-verified email matches, within
+                            7 days, links this account. Replaces a pending address.
+                        </div>
+                    </div>
+                    <button type="submit" class="btn btn-primary">Expect email</button>
+                </form>
+                <form method="POST" action="/admin/users/{{ target.id }}/oidc/bind">
+                    {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
+                    <div class="field">
+                        <label class="field-label" for="oidc-subject">Bind subject</label>
+                        <input type="text" name="subject" id="oidc-subject" required maxlength="255"
+                               class="field-input mono" autocomplete="off" spellcheck="false"
+                               placeholder="the provider's sub for this person">
+                        <div class="u-font-size-11px u-color-text-3 u-margin-top-6px">
+                            Links immediately, with no email involved.
+                        </div>
+                    </div>
+                    <button type="submit" class="btn btn-primary">Bind subject</button>
+                </form>
+            </div>
+            {% endif %}
+            {% if oidc.state != 'none' %}
+            <div class="kv u-margin-top-12px">
+                <div>
+                    <div class="kv-k">Unlink</div>
+                    <div class="u-color-text-3 u-font-size-12px u-margin-top-4px">
+                        Clears the link or the pending address and signs this user out
+                        of every browser.
+                        {% if is_self and not local_login_enabled %}Not available for your
+                        own account while password sign-in is disabled.{% endif %}
+                    </div>
+                </div>
+                <form method="POST" action="/admin/users/{{ target.id }}/oidc/unlink">
+                    {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
+                    <button type="button" class="btn btn-danger"
+                            {% if is_self and not local_login_enabled %}disabled{% endif %}
+                            data-confirm="Unlink this user from single sign-on? Their live sessions end.">
+                        Unlink
+                    </button>
+                </form>
+            </div>
+            {% endif %}
+        </div>
+    </div>{% endif %}
 
     <!-- Danger zone -->
     <div class="card anim-3 u-margin-top-20px u-border-color-error-border">

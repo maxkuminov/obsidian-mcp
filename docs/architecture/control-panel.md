@@ -1280,10 +1280,128 @@ The lifecycle, in one table — one implementation per phase:
   actually passes the key — a template reading it off a context that has none
   renders `minlength=""`, which is silently no minimum at all.
 
-## Optional native OIDC (#414)
+## Optional native OIDC (#414, #416)
 
-`src/auth/oidc.py` implements a deliberately narrow Keycloak profile for browser login; see [configuration and recovery](../native-oidc.md). It never alters local MCP OAuth protocols. A signed ID token must pass Authlib/JOSE verification, exact issuer and singleton audience, RS256, nonce, expiry, optional authorized-party and group-array checks. Only an explicit issuer-scoped immutable-subject mapping resolves a local user ID. Existing local active/admin/vault state remains authoritative.
+`src/auth/oidc.py` is the protocol half: discovery, PKCE S256 authorization,
+the token exchange and ID-token validation (Authlib + joserfc, RS256 / PS256 /
+ES256 intersected with what discovery advertises, exact `iss`, singleton
+`aud`, `azp`, `nonce`, integer `exp`/`iat` with zero leeway, `sub` ≤ 255, the
+group check only when `OIDC_REQUIRED_GROUP` is set). It returns a
+`VerifiedIdentity(iss, sub, email, email_verified)` — **claims, never a user
+id**. Which local user that identity is, if any, is decided by
+`src/services/oidc_links.py` in the callback's database phase. Operator
+guide: [docs/native-oidc.md](../native-oidc.md). The server's own MCP OAuth
+(DCR, CIMD, grants, rotation) is untouched; OIDC changes only how a panel
+session is minted.
 
-The new callback calls the same `start_session` with the version of the local user it resolved; the existing guard re-reads and commits before emitting success. Provider credentials never enter the app session registry. Random state is bound to a signed browser cookie and consumed from a bounded server-side store before exchange; replaying an old signed cookie cannot revive it. One worker remains required. Lost/restarted/expired transactions fail closed.
+- **The link is on the `users` row** (migration 037, see
+  [schema and migrations](schema-and-migrations.md#037-oidc-account-links-on-users-416)):
+  a bound triple `(oidc_issuer, oidc_subject, oidc_linked_at)` or a pending
+  one `(oidc_expected_issuer, oidc_expected_email, oidc_expected_set_at)`,
+  never both. `OIDC_SUBJECT_USER_IDS` is retired and refuses startup (two
+  sources of truth for one binding is a precedence rule nobody remembers under
+  pressure); the message's last sentence names the docs heading, so the two
+  must change together.
 
-OIDC activation requires multi-user mode and forbids sandbox mode. Bootstrap is disabled and the panel never redirects to it under OIDC, even with an empty database. An explicit local-login switch hides the password form and denies POST; at least one login method must remain enabled in multi-user mode. Existing application sessions and MCP credentials survive upstream offboarding until local revocation/expiry. This limitation and independent operator recovery are rollout requirements, not implicit account synchronization.
+- **Resolution order: `(iss, sub)` first, email only after it fails.**
+  `oidc_links.resolve` is unlocked SELECTs. A row bound to `(iss, sub)` is the
+  user and the email claim is not read — so `exchange()` never refuses on
+  email: anything but a string of ≤ 254 characters becomes `None`, a
+  non-matching sentinel, and `email_verified` is `True` only for the JSON
+  boolean. Only when nothing is bound is the email normalized (strip ASCII
+  whitespace, lower-case ASCII letters only, exactly one `@`, no whitespace or
+  control characters, 3–254 characters; no IDN/Unicode folding, which would be
+  a homograph surface) and matched against a pending expectation under the
+  same issuer set less than `PENDING_DAYS` (7, a module constant, not a
+  setting) ago by the database clock. Match + verified → `pending` (may bind);
+  match + unverified → `email_unverified`; anything else → `unlinked`. An
+  expired expectation is not deleted on the read path, it just stops matching.
+  `preferred_username` is never consulted (OIDC Core says not to rely on its
+  uniqueness).
+
+- **Bind and mint are one transaction.** `prepare_login` takes
+  `lock_account_guard` — the same key `_lock_admin_guard` and `start_session`
+  take, transaction-scoped and re-entrant, so the mint re-taking it is a
+  no-op — re-reads the row `FOR UPDATE` with `populate_existing=True`, and
+  re-checks everything `resolve` saw: active (else `account`, before any
+  write); on the bound branch still bound to `(iss, sub)` (an unlink may have
+  committed, else `unlinked`); on the pending branch still pending with the
+  same issuer and email, live, unbound, and no other row holding `(iss, sub)`
+  (else `unlinked` / `link_conflict`; a unique violation at flush is also
+  `link_conflict`). It writes the bind and `last_login_at`, flushes and
+  **does not commit**. `start_session(expected_session_version=<the locked
+  re-read's version>)` commits bind, stamp and session row together; on a
+  refused mint the route rolls back again explicitly. So a refused mint leaves
+  no binding and no `last_login_at` — the admin's intent and the first session
+  are one fact. All provider I/O happens before the first statement, so no
+  connection is held during it.
+
+- **Every refusal is one response.** `_oidc_refused` maps any reason outside
+  `security_events.OIDC_REFUSAL_REASONS` to `provider`, records
+  `panel_oidc_refused`, and renders the same login page and message (401; 503 +
+  `Retry-After: 60` for `capacity`). `unlinked` and `account` bodies are
+  identical apart from the CSRF token and nonce, so the page never confirms
+  that an identity resolves to a local user. The callback never consults or
+  charges the per-account failed-password budget (it is about password
+  guessing, and must not let a password sprayer lock someone out of SSO).
+
+- **The admin actions** are `POST /admin/users/{id}/oidc/{expect,bind,unlink}`
+  in `src/control_panel/users.py`, sharing `_oidc_link_action`: 404 while OIDC
+  is off; `require_admin_panel` + CSRF; `_lock_admin_guard`, then
+  **immediately** `_actor_still_privileged` (on failure `actor_snapshot`,
+  rollback, `_log_actor_revoked`, `_ACTOR_REVOKED_MSG` — the last-admin
+  guard's sequence above, because the wait for the lock is exactly when this
+  actor's demotion can commit); only then the target, the `oidc_links`
+  operation (which re-reads the target `FOR UPDATE` and writes inside a
+  SAVEPOINT, so a uniqueness violation is a `conflict` flash without aborting
+  the guarded transaction), the commit, and after it the flash and the event.
+  Expect and bind are refused on a bound row (`bound_already`): **a bound user
+  is never re-pointed without an explicit unlink.** Unlink clears all six
+  columns and calls `revoke_user_sessions` in the same transaction. Bind is
+  always under the *configured* issuer.
+
+- **D15, the last reachable administrator.** The last-admin guard counts
+  admins who exist; with `LOCAL_LOGIN_ENABLED=false` an admin not bound under
+  the configured issuer cannot reach the panel at all. So while password login
+  is off (`_reachable_admin_rule_applies`), unlink, the edit form's clearing of
+  `is_admin` or `is_active`, soft delete and permanent delete refuse any
+  outcome with zero rows `is_admin AND is_active AND oidc_issuer = <configured>
+  AND oidc_subject IS NOT NULL` (`oidc_links.reachable_admins_after`, which
+  excludes the target, so it gives the same answer before or after the
+  target's write). It runs inside the guard, after the actor re-check, in the
+  writing transaction, beside the existing last-active-admin check; unlink
+  evaluates it after the operation and before the commit, so a refusal rolls
+  the unlink and its session revocations back together. Self-unlink is refused
+  outright while password login is off. `tests/test_oidc_mutation_sites.py`
+  pins that these four sites (plus the first-login bind, bootstrap and create,
+  which only add) are the only `src/` writers of `is_admin`, `is_active`,
+  `oidc_subject` and the only `users` deleters, so a fifth site cannot skip the
+  rule. With password login on, the rule does not apply: the form reaches
+  every active admin. What the panel cannot see — a changed `OIDC_ISSUER`, an
+  account disabled at the provider, `LOCAL_LOGIN_ENABLED=false` set with
+  nobody bound — is reported by `_warn_oidc_lockout` in the lifespan: one
+  CRITICAL line, never a refusal (an outage of one login method must not
+  become an outage of `/mcp`); a failure of its own query is a WARNING.
+
+- **Templates, under the nonce CSP.** Every new block is inside
+  `{% if oidc_enabled %}`, so with OIDC off the login, users, user edit and
+  account pages are byte-identical to before (the `tests/golden/oidc_off/`
+  goldens). The login button is a GET link labelled "Sign in with
+  `OIDC_DISPLAY_NAME`" (autoescaped), so `form-action` is unaffected. The
+  user edit page's "Single sign-on" card shows not linked / pending (with
+  expiry) / expired / linked (subject truncated to 8 characters) / linked
+  under a previous issuer; the issuer itself is never rendered. Unlink uses
+  the existing `type="button"` + `data-confirm` listener. The users list has
+  an SSO column (`linked` / `pending` / `—`), and `/admin/account` a read-only
+  line; there is no self-service linking.
+
+- **Unchanged from #414.** State is 32 random bytes bound to the signed
+  session cookie and consumed from a bounded in-memory store (5 min, 1,024
+  slots, 60 starts/min/process; one worker required) before any network I/O;
+  nonce and PKCE verifier never reach a cookie. `next` passes `_safe_next` at
+  start and at redirect. Activation requires multi-user mode and forbids
+  sandbox mode; `/admin/register` is 404 under OIDC even on an empty table
+  (no SSO bootstrap: the first identity would race for admin). At least one
+  login method must stay enabled in multi-user mode. Provider-side
+  offboarding does not end app sessions or MCP credentials (L2); logout is
+  local (L3).

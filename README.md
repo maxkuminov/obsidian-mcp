@@ -1052,6 +1052,33 @@ too.
 Pull, then `make deploy` (or rebuild your compose stack); migrations
 run on start.
 
+Across the OIDC account-linking release (migration 037, #416):
+
+- **Migration 037** adds six nullable link columns and five
+  constraints to `users`, with no backfill, and takes seconds. With
+  SSO off nothing else changes. Its downgrade drops every link.
+- **`OIDC_SUBJECT_USER_IDS` is retired.** A deployment that still sets
+  it refuses to start. If yours did, do this in order (it is also in
+  the startup message): (1) on the old release, confirm a local admin
+  password works; (2) set `LOCAL_LOGIN_ENABLED=true`; (3) copy the
+  map's subject-to-user pairs, then remove the `OIDC_SUBJECT_USER_IDS`
+  line (delete it; an empty `OIDC_SUBJECT_USER_IDS=` fails to parse at
+  startup); (4) deploy and start; (5) sign in with the password and, on each
+  user's edit page, **Single sign-on → Bind subject** with their
+  former subject; (6) verify an SSO sign-in per user and one MCP
+  client's `/authorize` consent; (7) optionally set
+  `LOCAL_LOGIN_ENABLED=false` again, once the startup log shows no
+  CRITICAL lockout line. Details:
+  [docs/native-oidc.md, "Upgrading from OIDC_SUBJECT_USER_IDS"](./docs/native-oidc.md#upgrading-from-oidc_subject_user_ids).
+- **Wider provider profile.** RS256, PS256 and ES256 ID tokens (as
+  advertised by discovery), `client_secret_post` via
+  `OIDC_TOKEN_AUTH_METHOD`, `OIDC_EXTRA_SCOPES`, `OIDC_DISPLAY_NAME`
+  and `OIDC_CA_FILE` are new. `OIDC_REQUIRED_GROUP` is now optional;
+  set, it works as before. The requested scopes become
+  `openid email profile`. A provider that advertises RFC 9207 must now
+  return `iss` on the callback.
+- SSO logins now stamp the user's last-login time.
+
 Across the reranker-documents release (#402):
 
 - **No migration, nothing re-derived or re-embedded.** `rerank=true` now
@@ -1408,6 +1435,42 @@ Traefik-OAuth-only mode. The schema stays in place, so flipping back
 to multi-user later resumes where you left off without re-bootstrapping
 (the `users` table is non-empty, so `/admin/register` is closed).
 
+### Single sign-on (optional)
+
+Multi-user deployments can add "Sign in with SSO" through any
+standards-compliant OpenID Connect provider (Keycloak, Authentik,
+Authelia, Zitadel, Kanidm, Okta, Entra ID, …). It is off by default
+(`OIDC_ENABLED=false`), and with it off nothing changes.
+
+- **It signs in existing accounts only.** An admin links each account
+  on its edit page, **Single sign-on** card: **Expect email** (the
+  first sign-in within 7 days whose provider-*verified* email matches
+  links the account, once) or **Bind subject** (paste the provider's
+  `sub`, linked immediately). After that only the provider's issuer
+  and subject identify the user; a renamed or re-addressed provider
+  account changes nothing. An identity that is not linked is refused
+  with a page that does not say why.
+- **No provisioning, no role mapping.** Signing in never creates a
+  user, changes the admin flag or assigns a vault, and
+  `/admin/register` is closed while SSO is on. Create users first.
+- **The server stays the OAuth server for MCP clients.** SSO only
+  changes how the panel session is made; that session also covers the
+  consent page, so connecting a client can go through SSO. API keys,
+  grants and tokens are unchanged.
+- **Password login stays** unless you set `LOCAL_LOGIN_ENABLED=false`.
+  While it is off, the panel refuses any change that would leave no
+  active admin linked to SSO, and startup logs a CRITICAL line if
+  there is none. Re-enabling it and restarting is the recovery path.
+- **Unlinking** clears the link and signs that user out everywhere.
+  Removing someone at the provider stops new logins but does not end
+  their existing sessions, keys or grants: deactivate the local
+  account for that.
+
+[docs/native-oidc.md](./docs/native-oidc.md) has the provider
+requirements, every setting, a click-by-click Keycloak walkthrough,
+the setup order, break-glass recovery and troubleshooting by refusal
+reason.
+
 ### Constraints and known limits
 
 - The indexer iterates active users sequentially each cycle. Fine for
@@ -1496,6 +1559,16 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `ALLOWED_HOSTS` | derived | Accepted `Host` headers, JSON list. `localhost` is always added. |
 | `SESSION_MAX_AGE` | `604800` | Panel session lifetime, seconds (multi-user mode). Absolute — the server-side row is never extended, so a session used daily still expires |
 | `SESSION_COOKIE_NAME` | `omcp_session` | Panel session cookie name |
+| `LOCAL_LOGIN_ENABLED` | `true` | The panel's password form (multi-user mode). `false` hides it and refuses its POST; multi-user mode needs this or `OIDC_ENABLED`. Setting it back to `true` and restarting is the recovery path when SSO is unavailable. See [docs/native-oidc.md](./docs/native-oidc.md#recovery-break-glass). |
+| `OIDC_ENABLED` | `false` | Browser SSO through an OpenID Connect provider ([Single sign-on](#single-sign-on-optional)). Requires multi-user mode and an HTTPS `BASE_URL`; refused in sandbox mode. The `OIDC_*` settings below are validated only when it is `true`, without contacting the provider. |
+| `OIDC_ISSUER` | — | Required with SSO. HTTPS issuer URL exactly as the provider's discovery `issuer` states it; no query or fragment; at most 2,048 characters. |
+| `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` | — | Required with SSO. The confidential client registered at the provider, redirect URI `<BASE_URL>/admin/auth/oidc/callback`. Keep the secret in your secret store. |
+| `OIDC_TOKEN_AUTH_METHOD` | `client_secret_basic` | `client_secret_basic` (Authorization header) or `client_secret_post` (form body). A login is refused when discovery lists auth methods without this one. |
+| `OIDC_REQUIRED_GROUP` | — | Optional. When set (at most 512 characters), the ID token's `groups` array must contain this exact, case-sensitive string. Empty means no group check. |
+| `OIDC_EXTRA_SCOPES` | — | Extra scopes requested after `openid email profile`: space-separated RFC 6749 scope tokens, at most 8 of at most 64 characters. `offline_access` is refused at startup. |
+| `OIDC_DISPLAY_NAME` | `SSO` | The login button reads "Sign in with {name}". 1–40 printable characters. |
+| `OIDC_CA_FILE` | — | PEM CA file trusted for the provider requests only, for an issuer behind a private CA; when set, only this file is trusted for them. Unset, empty or `off` uses the certifi bundle. Refused if unreadable or holding no CA. |
+| `OIDC_SUBJECT_USER_IDS` | — | **Retired.** Any non-empty value refuses startup; links are made in the panel. See [Upgrading](#upgrading) and [docs/native-oidc.md](./docs/native-oidc.md#upgrading-from-oidc_subject_user_ids). |
 | `PANEL_CSP` | `enforce` | Content-Security-Policy on the panel, login and consent pages: `enforce`, `report-only` (same policy, reports only), or `off`. A rollback lever — change it and recreate the container, no rebuild. Anything but `enforce` logs a WARNING at each start. |
 | `SESSION_TOUCH_INTERVAL_SECONDS` | `60` | How stale a session's `last_seen_at` may get before a validated `GET`/`HEAD` rewrites it. Telemetry only — nothing authorizes on it. Must be ≥ 1. |
 | `SESSION_PURGE_RETAIN_DAYS` | `7` | How long a dead panel session row is kept, measured from the *later* of its expiry and its revocation, so a revocation stays visible for the full window. Must be ≥ 1. |
@@ -2282,7 +2355,3 @@ as plain markdown you can open in Obsidian.
 ## License
 
 MIT. See `LICENSE`.
-
-### Optional native browser SSO
-
-[Native OIDC login](docs/native-oidc.md) supports a Keycloak issuer with explicit mappings to existing users and application-group admission. It ships disabled, preserves vault ownership and the local MCP OAuth issuer/credentials, and can replace an external Google login gate after validation. See the guide for configuration, recovery and offboarding limitations.

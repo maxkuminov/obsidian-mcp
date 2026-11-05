@@ -123,6 +123,8 @@ EMITTER_CONTROL: frozenset[str] = frozenset(
 ALLOWED_FIELDS: dict[str, _FieldSpec] = {
     "reason": _S(str, 64),
     "outcome": _S(str, 16),
+    # `panel_oidc_link_set`'s closed `expect` / `bind` (#416 D14).
+    "mode": _S(str, 8),
     "route": _S(str, 200),
     "method": _S(str, 8),
     "status": _S(int),

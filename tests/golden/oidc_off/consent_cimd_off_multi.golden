@@ -1,0 +1,1058 @@
+HTTP 200
+content-type: text/html; charset=utf-8
+set-cookie: oauth_state=<COOKIE>; HttpOnly; Max-Age=600; Path=/; SameSite=lax; Secure
+vary: Accept-Encoding, Cookie, Origin
+content-encoding: gzip
+strict-transport-security: max-age=31536000; includeSubDomains
+x-content-type-options: nosniff
+x-frame-options: DENY
+referrer-policy: no-referrer
+content-security-policy: default-src 'self'; script-src 'nonce-<NONCE>'; style-src 'nonce-<NONCE>' https://fonts.googleapis.com; style-src-elem 'nonce-<NONCE>' https://fonts.googleapis.com; style-src-attr 'none'; img-src 'self' data:; font-src https://fonts.gstatic.com; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self' https: http://localhost:* http://127.0.0.1:*
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#070910" data-theme-color-token="--bg">
+    <title>Authorize — Obsidian MCP</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;600&family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+    
+    <style nonce="<NONCE>">
+    :root {
+        color-scheme: dark;
+
+        /* ── Core surfaces and text ── */
+        --bg: #070910;
+        --bg-2: #1c1c20;
+        --surface: #0c1018;
+        --surface-2: #141b2c;
+        --surface-3: #1b2440;
+        --border: #222c44;
+        --border-2: #2d3a5a;
+        --control-border: #222c44;
+        --control-border-strong: #2d3a5a;
+        --scrollbar-thumb: #2d3a5a;
+        --disabled-opacity: 0.6;
+        --primary: #9b82e8;
+        --primary-dim: #6d57c2;
+        --primary-text: #c4b4f5;
+        --text: #eef1f8;
+        --text-2: #a8b4cc;
+        --text-3: #7d8ba6;
+        --success: #5fd9a0;
+        --error: #f58888;
+        --warning: #f0b555;
+        --info: #7abde6;
+
+        /* ── Accent washes, borders, glows ──
+           Given explicit per-theme values rather than derived from --primary:
+           an rgba glow that reads as a halo on a near-black ground reads as
+           dirt on a white one. */
+        --primary-glow: rgba(155, 130, 232, 0.12);
+        --primary-glow-strong: rgba(155, 130, 232, 0.28);
+        --primary-glow-xs: rgba(155,130,232,0.05);
+        --primary-glow-md: rgba(155,130,232,0.08);
+        --primary-glow-amb: rgba(155,130,232,0.07);
+        --sidebar-glow: rgba(155,130,232,0.16);
+        --primary-border: rgba(155,130,232,0.25);
+        --primary-border-soft: rgba(155,130,232,0.15);
+        --primary-border-strong: rgba(155,130,232,0.3);
+        --primary-shadow: rgba(155,130,232,0.25);
+        --primary-shadow-hover: rgba(155,130,232,0.45);
+        --primary-halo: rgba(155,130,232,0.55);
+        --primary-halo-strong: rgba(155,130,232,0.95);
+        --gem-facet: rgba(155,130,232,0.22);
+        --gem-facet-2: rgba(155,130,232,0.06);
+        --auth-card-glow: rgba(155,130,232,0.06);
+
+        /* ── Status tints, borders, text ── */
+        --success-surface: rgba(95,217,160,0.12);
+        --success-surface-soft: rgba(95,217,160,0.1);
+        --success-surface-faint: rgba(95,217,160,0.08);
+        --success-border: rgba(95,217,160,0.25);
+        --success-text: #8deabf;
+        --error-surface: rgba(245,136,136,0.12);
+        --error-surface-soft: rgba(245,136,136,0.1);
+        --error-surface-faint: rgba(245,136,136,0.08);
+        --error-surface-strong: rgba(245,136,136,0.2);
+        --error-border: rgba(245,136,136,0.25);
+        --error-border-strong: rgba(245,136,136,0.28);
+        --error-text: #f5abab;
+        --error-text-hover: #f7a5a5;
+        --warning-surface: rgba(240,181,85,0.12);
+        --warning-border: rgba(240,181,85,0.25);
+        --info-surface: rgba(122,189,230,0.12);
+        --info-surface-faint: rgba(122,189,230,0.08);
+        --info-border: rgba(122,189,230,0.25);
+        --info-text: #a6d2ea;
+        --neutral-surface: rgba(125,139,166,0.12);
+        --danger-border: rgba(240,110,110,0.25);
+        --danger-border-soft: rgba(240,110,110,0.2);
+        --key-text: #a0f0cc;
+
+        /* ── Text drawn on a filled accent ── */
+        --on-primary: #efe9ff;
+        --on-primary-strong: white;
+
+        /* ── Overlays, scrims, elevation ── */
+        --topbar-bg: rgba(12, 16, 24, 0.92);
+        --backdrop: rgba(7, 9, 16, 0.6);
+        --modal-scrim: rgba(7, 9, 16, 0.75);
+        --modal-scrim-2: rgba(0,0,0,0.55);
+        --shadow-card: rgba(0,0,0,0.35);
+        --shadow-sidebar: rgba(0,0,0,0.6);
+        --shadow-modal: rgba(0,0,0,0.7);
+        --shadow-auth: rgba(0,0,0,0.65);
+        --code-bg: rgba(0,0,0,0.3);
+        --code-bg-soft: rgba(0,0,0,0.28);
+        --inset-highlight: rgba(255,255,255,0.12);
+        --inset-highlight-strong: rgba(255,255,255,0.2);
+
+        /* Select chevron. A data-URI image cannot read a custom property, so
+           the whole url() is the token and each theme ships its own. */
+        --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%237d8ba6' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+
+        /* ── Chart.js (usage.html) ── */
+        --chart-bar-bg: rgba(139,111,223,0.35);
+        --chart-bar-border: rgba(139,111,223,0.8);
+        --chart-tooltip-bg: #12192a;
+        --chart-tooltip-border: #223050;
+        --chart-tooltip-title: #d8dce8;
+        --chart-tooltip-body: #6e7e9c;
+        --chart-tick: #7d8ba6;
+        --chart-grid: #222c44;
+
+        /* ── OAuth consent page ──
+           A palette that drifted away from the panel's years ago. Dark keeps
+           it byte-for-byte (zero-visual-diff gate); light folds it back onto
+           the panel's own light values, which is where the two surfaces
+           finally converge. */
+        --consent-text: #d8dce8;
+        --consent-text-2: #9fa8b8;
+        --consent-text-3: #6e7e9c;
+        --consent-label: #364155;
+        --consent-border: #1a2336;
+        --consent-border-hover: #223050;
+        --consent-control-border: #1a2336;
+        --consent-control-border-hover: #223050;
+        --consent-primary: #8b6fdf;
+        --consent-primary-dim: #5a45a8;
+        --consent-primary-text: #e0d9f8;
+        --consent-warn: #c9a227;
+        --consent-glow-amb: rgba(139,111,223,0.07);
+        --consent-halo: rgba(139,111,223,0.55);
+        --consent-halo-strong: rgba(139,111,223,0.9);
+        --consent-surface: rgba(139,111,223,0.07);
+        --consent-surface-border: rgba(139,111,223,0.18);
+        --consent-option-hover: rgba(139,111,223,0.04);
+        --consent-option-active: rgba(139,111,223,0.10);
+        --consent-gem-facet: rgba(139,111,223,0.18);
+        --consent-gem-facet-2: rgba(139,111,223,0.05);
+        --consent-primary-glow: rgba(139,111,223,0.3);
+        --consent-neutral-surface: rgba(110,126,156,0.1);
+        --consent-neutral-surface-hover: rgba(110,126,156,0.18);
+    }
+
+    /* ── Light palette ──
+       Selected by `data-theme="light"` on <html>, which the pre-paint
+       bootstrap below stamps from localStorage. Every token defined for dark
+       has a light value here; none falls through. */
+    :root[data-theme="light"] {
+        color-scheme: light;
+
+        /* ── Core surfaces and text ── */
+        --bg: #f5f6fa;
+        --bg-2: #ffffff;
+        --surface: #ffffff;
+        --surface-2: #eef0f6;
+        --surface-3: #e3e6ef;
+        --border: #dfe3ec;
+        --border-2: #c3c9d8;
+        --control-border: #767e91;
+        --control-border-strong: #5e677b;
+        --scrollbar-thumb: #767e91;
+        --disabled-opacity: 0.75;
+        --primary: #6440c8;
+        --primary-dim: #573ab0;
+        --primary-text: #4b2fa6;
+        --text: #14171f;
+        --text-2: #454c5e;
+        --text-3: #5d6577;
+        --success: #0a6b41;
+        --error: #b32218;
+        --warning: #7a4d00;
+        --info: #10557f;
+
+        /* ── Accent washes, borders, glows ── */
+        --primary-glow: rgba(100, 64, 200, 0.10);
+        --primary-glow-strong: rgba(100, 64, 200, 0.22);
+        --primary-glow-xs: rgba(100,64,200,0.05);
+        --primary-glow-md: rgba(100,64,200,0.10);
+        --primary-glow-amb: rgba(100,64,200,0.06);
+        --sidebar-glow: rgba(100,64,200,0.10);
+        --primary-border: rgba(100,64,200,0.32);
+        --primary-border-soft: rgba(100,64,200,0.20);
+        --primary-border-strong: rgba(100,64,200,0.40);
+        --primary-shadow: rgba(100,64,200,0.28);
+        --primary-shadow-hover: rgba(100,64,200,0.40);
+        --primary-halo: rgba(100,64,200,0.30);
+        --primary-halo-strong: rgba(100,64,200,0.50);
+        --gem-facet: rgba(100,64,200,0.30);
+        --gem-facet-2: rgba(100,64,200,0.12);
+        --auth-card-glow: rgba(100,64,200,0.08);
+
+        /* ── Status tints, borders, text ── */
+        --success-surface: rgba(10,107,65,0.10);
+        --success-surface-soft: rgba(10,107,65,0.08);
+        --success-surface-faint: rgba(10,107,65,0.07);
+        --success-border: rgba(10,107,65,0.38);
+        --success-text: #075232;
+        --error-surface: rgba(179,34,24,0.09);
+        --error-surface-soft: rgba(179,34,24,0.07);
+        --error-surface-faint: rgba(179,34,24,0.06);
+        --error-surface-strong: rgba(179,34,24,0.15);
+        --error-border: rgba(179,34,24,0.36);
+        --error-border-strong: rgba(179,34,24,0.8);
+        --error-text: #8f1b13;
+        --error-text-hover: #6f150f;
+        --warning-surface: rgba(122,77,0,0.10);
+        --warning-border: rgba(122,77,0,0.36);
+        --info-surface: rgba(16,85,127,0.10);
+        --info-surface-faint: rgba(16,85,127,0.07);
+        --info-border: rgba(16,85,127,0.36);
+        --info-text: #0c4363;
+        --neutral-surface: rgba(93,101,119,0.12);
+        --danger-border: rgba(179,34,24,0.36);
+        --danger-border-soft: rgba(179,34,24,0.26);
+        --key-text: #075232;
+
+        /* ── Text drawn on a filled accent ── */
+        --on-primary: #ffffff;
+        --on-primary-strong: #ffffff;
+
+        /* ── Overlays, scrims, elevation ──
+           Inverted deliberately: on a white ground a scrim has to darken and a
+           shadow has to be a soft neutral, not the near-opaque black that
+           reads as depth against #070910. */
+        --topbar-bg: rgba(255, 255, 255, 0.92);
+        --backdrop: rgba(20, 23, 31, 0.38);
+        --modal-scrim: rgba(20, 23, 31, 0.46);
+        --modal-scrim-2: rgba(20,23,31,0.42);
+        --shadow-card: rgba(20,23,31,0.10);
+        --shadow-sidebar: rgba(20,23,31,0.12);
+        --shadow-modal: rgba(20,23,31,0.20);
+        --shadow-auth: rgba(20,23,31,0.14);
+        --code-bg: rgba(20,23,31,0.05);
+        --code-bg-soft: rgba(20,23,31,0.04);
+        --inset-highlight: rgba(255,255,255,0.30);
+        --inset-highlight-strong: rgba(255,255,255,0.45);
+
+        --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%235d6577' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+
+        /* ── Chart.js (usage.html) ── */
+        --chart-bar-bg: rgba(100,64,200,0.42);
+        --chart-bar-border: rgba(100,64,200,0.95);
+        --chart-tooltip-bg: #ffffff;
+        --chart-tooltip-border: #c3c9d8;
+        --chart-tooltip-title: #14171f;
+        --chart-tooltip-body: #454c5e;
+        --chart-tick: #5d6577;
+        --chart-grid: #c3c9d8;
+
+        /* ── OAuth consent page ──
+           In light the consent surface stops being its own thing and folds
+           onto the panel's values. */
+        --consent-text: #14171f;
+        --consent-text-2: #454c5e;
+        --consent-text-3: #5d6577;
+        --consent-label: #5d6577;
+        --consent-border: #dfe3ec;
+        --consent-border-hover: #c3c9d8;
+        --consent-control-border: #767e91;
+        --consent-control-border-hover: #5e677b;
+        --consent-primary: #6440c8;
+        --consent-primary-dim: #573ab0;
+        --consent-primary-text: #ffffff;
+        --consent-warn: #7a4d00;
+        --consent-glow-amb: rgba(100,64,200,0.06);
+        --consent-halo: rgba(100,64,200,0.30);
+        --consent-halo-strong: rgba(100,64,200,0.50);
+        --consent-surface: rgba(100,64,200,0.07);
+        --consent-surface-border: rgba(100,64,200,0.22);
+        --consent-option-hover: rgba(100,64,200,0.05);
+        --consent-option-active: rgba(100,64,200,0.11);
+        --consent-gem-facet: rgba(100,64,200,0.28);
+        --consent-gem-facet-2: rgba(100,64,200,0.10);
+        --consent-primary-glow: rgba(100,64,200,0.30);
+        --consent-neutral-surface: rgba(93,101,119,0.10);
+        --consent-neutral-surface-hover: rgba(93,101,119,0.18);
+    }
+
+    /* OS default, for a visitor who has never chosen. Guarded on
+       `:not([data-theme="dark"])` so an explicit dark choice still wins on a
+       light machine — and so the OS default works with JavaScript off. */
+    @media (prefers-color-scheme: light) {
+        :root:not([data-theme="dark"]) {
+            color-scheme: light;
+
+/* ── Core surfaces and text ── */
+            --bg: #f5f6fa;
+            --bg-2: #ffffff;
+            --surface: #ffffff;
+            --surface-2: #eef0f6;
+            --surface-3: #e3e6ef;
+            --border: #dfe3ec;
+            --border-2: #c3c9d8;
+            --control-border: #767e91;
+            --control-border-strong: #5e677b;
+            --scrollbar-thumb: #767e91;
+            --disabled-opacity: 0.75;
+            --primary: #6440c8;
+            --primary-dim: #573ab0;
+            --primary-text: #4b2fa6;
+            --text: #14171f;
+            --text-2: #454c5e;
+            --text-3: #5d6577;
+            --success: #0a6b41;
+            --error: #b32218;
+            --warning: #7a4d00;
+            --info: #10557f;
+
+/* ── Accent washes, borders, glows ── */
+            --primary-glow: rgba(100, 64, 200, 0.10);
+            --primary-glow-strong: rgba(100, 64, 200, 0.22);
+            --primary-glow-xs: rgba(100,64,200,0.05);
+            --primary-glow-md: rgba(100,64,200,0.10);
+            --primary-glow-amb: rgba(100,64,200,0.06);
+            --sidebar-glow: rgba(100,64,200,0.10);
+            --primary-border: rgba(100,64,200,0.32);
+            --primary-border-soft: rgba(100,64,200,0.20);
+            --primary-border-strong: rgba(100,64,200,0.40);
+            --primary-shadow: rgba(100,64,200,0.28);
+            --primary-shadow-hover: rgba(100,64,200,0.40);
+            --primary-halo: rgba(100,64,200,0.30);
+            --primary-halo-strong: rgba(100,64,200,0.50);
+            --gem-facet: rgba(100,64,200,0.30);
+            --gem-facet-2: rgba(100,64,200,0.12);
+            --auth-card-glow: rgba(100,64,200,0.08);
+
+/* ── Status tints, borders, text ── */
+            --success-surface: rgba(10,107,65,0.10);
+            --success-surface-soft: rgba(10,107,65,0.08);
+            --success-surface-faint: rgba(10,107,65,0.07);
+            --success-border: rgba(10,107,65,0.38);
+            --success-text: #075232;
+            --error-surface: rgba(179,34,24,0.09);
+            --error-surface-soft: rgba(179,34,24,0.07);
+            --error-surface-faint: rgba(179,34,24,0.06);
+            --error-surface-strong: rgba(179,34,24,0.15);
+            --error-border: rgba(179,34,24,0.36);
+            --error-border-strong: rgba(179,34,24,0.8);
+            --error-text: #8f1b13;
+            --error-text-hover: #6f150f;
+            --warning-surface: rgba(122,77,0,0.10);
+            --warning-border: rgba(122,77,0,0.36);
+            --info-surface: rgba(16,85,127,0.10);
+            --info-surface-faint: rgba(16,85,127,0.07);
+            --info-border: rgba(16,85,127,0.36);
+            --info-text: #0c4363;
+            --neutral-surface: rgba(93,101,119,0.12);
+            --danger-border: rgba(179,34,24,0.36);
+            --danger-border-soft: rgba(179,34,24,0.26);
+            --key-text: #075232;
+
+/* ── Text drawn on a filled accent ── */
+            --on-primary: #ffffff;
+            --on-primary-strong: #ffffff;
+
+/* ── Overlays, scrims, elevation ──
+               Inverted deliberately: on a white ground a scrim has to darken and a
+               shadow has to be a soft neutral, not the near-opaque black that
+               reads as depth against #070910. */
+            --topbar-bg: rgba(255, 255, 255, 0.92);
+            --backdrop: rgba(20, 23, 31, 0.38);
+            --modal-scrim: rgba(20, 23, 31, 0.46);
+            --modal-scrim-2: rgba(20,23,31,0.42);
+            --shadow-card: rgba(20,23,31,0.10);
+            --shadow-sidebar: rgba(20,23,31,0.12);
+            --shadow-modal: rgba(20,23,31,0.20);
+            --shadow-auth: rgba(20,23,31,0.14);
+            --code-bg: rgba(20,23,31,0.05);
+            --code-bg-soft: rgba(20,23,31,0.04);
+            --inset-highlight: rgba(255,255,255,0.30);
+            --inset-highlight-strong: rgba(255,255,255,0.45);
+
+--select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%235d6577' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+
+/* ── Chart.js (usage.html) ── */
+            --chart-bar-bg: rgba(100,64,200,0.42);
+            --chart-bar-border: rgba(100,64,200,0.95);
+            --chart-tooltip-bg: #ffffff;
+            --chart-tooltip-border: #c3c9d8;
+            --chart-tooltip-title: #14171f;
+            --chart-tooltip-body: #454c5e;
+            --chart-tick: #5d6577;
+            --chart-grid: #c3c9d8;
+
+/* ── OAuth consent page ──
+               In light the consent surface stops being its own thing and folds
+               onto the panel's values. */
+            --consent-text: #14171f;
+            --consent-text-2: #454c5e;
+            --consent-text-3: #5d6577;
+            --consent-label: #5d6577;
+            --consent-border: #dfe3ec;
+            --consent-border-hover: #c3c9d8;
+            --consent-control-border: #767e91;
+            --consent-control-border-hover: #5e677b;
+            --consent-primary: #6440c8;
+            --consent-primary-dim: #573ab0;
+            --consent-primary-text: #ffffff;
+            --consent-warn: #7a4d00;
+            --consent-glow-amb: rgba(100,64,200,0.06);
+            --consent-halo: rgba(100,64,200,0.30);
+            --consent-halo-strong: rgba(100,64,200,0.50);
+            --consent-surface: rgba(100,64,200,0.07);
+            --consent-surface-border: rgba(100,64,200,0.22);
+            --consent-option-hover: rgba(100,64,200,0.05);
+            --consent-option-active: rgba(100,64,200,0.11);
+            --consent-gem-facet: rgba(100,64,200,0.28);
+            --consent-gem-facet-2: rgba(100,64,200,0.10);
+            --consent-primary-glow: rgba(100,64,200,0.30);
+            --consent-neutral-surface: rgba(93,101,119,0.10);
+            --consent-neutral-surface-hover: rgba(93,101,119,0.18);
+        }
+    }
+
+    /* ── Theme toggle ──
+       Markup lives in `_theme_toggle.html`; the icon swap is pure CSS on the
+       same selectors as the palette, so the right glyph is showing before any
+       script runs. */
+    .theme-toggle {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 34px;
+        height: 34px;
+        flex-shrink: 0;
+        padding: 0;
+        border-radius: 7px;
+        border: 1px solid var(--control-border);
+        background: var(--surface-2);
+        color: var(--text-2);
+        cursor: pointer;
+        transition: background 0.15s, border-color 0.15s, color 0.15s;
+    }
+    .theme-toggle:hover {
+        background: var(--surface-3);
+        border-color: var(--control-border-strong);
+        color: var(--text);
+    }
+    .theme-toggle:focus-visible {
+        outline: 2px solid var(--primary);
+        outline-offset: 2px;
+    }
+    .theme-toggle svg { width: 16px; height: 16px; display: block; }
+    .theme-toggle .icon-moon { display: none; }
+    :root[data-theme="light"] .theme-toggle .icon-sun { display: none; }
+    :root[data-theme="light"] .theme-toggle .icon-moon { display: block; }
+    @media (prefers-color-scheme: light) {
+        :root:not([data-theme="dark"]) .theme-toggle .icon-sun { display: none; }
+        :root:not([data-theme="dark"]) .theme-toggle .icon-moon { display: block; }
+    }
+</style>
+<script nonce="<NONCE>">
+/* Pre-paint theme bootstrap. It runs in <head>, before the body is parsed, so
+   a stored choice is on <html> before the first paint and there is no flash of
+   the other theme.
+
+   It stays inline, carrying the response's CSP nonce (see
+   docs/architecture/control-panel.md): a script file would be fetched after
+   first paint and bring the flash back. The panel policy refuses inline event
+   handlers, so the toggle's click listener is registered here too, delegated
+   from `document` — this partial is included by all three roots, including
+   the login and consent pages that do not load panel.js, and a listener on
+   `document` works before the body exists. The script body is kept free of
+   Jinja delimiters so `{` and `}` never have to be escaped.
+
+   The attribute is stamped ONLY when an explicit choice is stored. With no
+   choice the attribute stays absent and the `prefers-color-scheme` block above
+   decides, which is what keeps the OS default working with JavaScript off. */
+(function () {
+    var KEY = 'omcp-theme';
+    var root = document.documentElement;
+
+    function stored() {
+        try { return localStorage.getItem(KEY); } catch (e) { return null; }
+    }
+    function osLight() {
+        return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches);
+    }
+    function effective() {
+        var set = root.getAttribute('data-theme');
+        if (set === 'light' || set === 'dark') { return set; }
+        return osLight() ? 'light' : 'dark';
+    }
+
+    var choice = stored();
+    if (choice === 'light' || choice === 'dark') {
+        root.setAttribute('data-theme', choice);
+    }
+
+    /* A <meta> cannot read a custom property, so the color is copied across by
+       script; the token name rides on the tag itself. */
+    function syncMeta() {
+        var m = document.querySelector('meta[name="theme-color"][data-theme-color-token]');
+        if (!m) { return; }
+        var v = getComputedStyle(root).getPropertyValue(m.getAttribute('data-theme-color-token')).trim();
+        if (v) { m.setAttribute('content', v); }
+    }
+
+    function label(theme) {
+        return theme === 'light' ? 'Switch to dark theme' : 'Switch to light theme';
+    }
+    function syncButtons() {
+        var text = label(effective());
+        var all = document.querySelectorAll('[data-theme-toggle]');
+        for (var i = 0; i < all.length; i += 1) {
+            all[i].setAttribute('aria-label', text);
+            all[i].setAttribute('title', text);
+        }
+    }
+
+    window.__themeToggle = function () {
+        var next = effective() === 'light' ? 'dark' : 'light';
+        root.setAttribute('data-theme', next);
+        /* Storage may throw (private mode, blocked site data). The document
+           has already switched by this point, so the toggle still works; only
+           the persistence is lost and the next load follows the OS. */
+        try { localStorage.setItem(KEY, next); } catch (e) { /* not fatal */ }
+        syncMeta();
+        syncButtons();
+        window.dispatchEvent(new CustomEvent('themechange', { detail: { theme: next } }));
+    };
+
+    /* With no explicit choice the palette follows the OS, and the OS can flip
+       under a page that is already open. CSS re-evaluates itself; the Chart.js
+       canvas does not, so the same event has to fire for it. An explicit
+       choice wins, so this stays quiet once the user has picked. */
+    if (window.matchMedia) {
+        var mq = window.matchMedia('(prefers-color-scheme: dark)');
+        var onSystemChange = function () {
+            var s = stored();
+            if (s === 'light' || s === 'dark') { return; }
+            syncMeta();
+            syncButtons();
+            window.dispatchEvent(new CustomEvent('themechange', { detail: { theme: effective() } }));
+        };
+        if (mq.addEventListener) { mq.addEventListener('change', onSystemChange); }
+        else if (mq.addListener) { mq.addListener(onSystemChange); }
+    }
+
+    /* The toggle button carries `data-theme-toggle` and no handler of its own. */
+    document.addEventListener('click', function (event) {
+        var t = event.target;
+        if (t && t.nodeType !== 1) { t = t.parentElement; }
+        if (t && t.closest && t.closest('[data-theme-toggle]')) {
+            window.__themeToggle();
+        }
+    });
+
+    syncMeta();
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', syncButtons);
+    } else {
+        syncButtons();
+    }
+})();
+</script>
+    <style nonce="<NONCE>">
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            background: var(--bg);
+            color: var(--consent-text);
+            font-family: 'DM Sans', sans-serif;
+            font-size: 14px;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        body::after {
+            content: '';
+            position: fixed;
+            inset: 0;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='300' height='300'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='300' height='300' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
+            pointer-events: none;
+            z-index: 9999;
+        }
+
+        /* Background glow */
+        body::before {
+            content: '';
+            position: fixed;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            width: 600px;
+            height: 600px;
+            background: radial-gradient(ellipse, var(--consent-glow-amb) 0%, transparent 70%);
+            pointer-events: none;
+        }
+
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--consent-border);
+            border-radius: 12px;
+            width: 100%;
+            max-width: 400px;
+            overflow: hidden;
+            box-shadow: 0 32px 80px var(--shadow-modal);
+            animation: in 0.3s ease;
+            position: relative;
+        }
+
+        @keyframes in {
+            from { opacity: 0; transform: translateY(12px); }
+            to   { opacity: 1; transform: translateY(0); }
+        }
+
+        /* Top border gradient */
+        .card::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0;
+            height: 1px;
+            background: linear-gradient(90deg, transparent 0%, var(--consent-primary-dim) 40%, transparent 100%);
+        }
+
+        .card-top {
+            padding: 28px 28px 20px;
+            border-bottom: 1px solid var(--consent-border);
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+
+        .gem {
+            width: 28px;
+            height: 28px;
+            flex-shrink: 0;
+            animation: glow 4s ease-in-out infinite;
+        }
+
+        @keyframes glow {
+            0%, 100% { filter: drop-shadow(0 0 4px var(--consent-halo)); }
+            50%       { filter: drop-shadow(0 0 10px var(--consent-halo-strong)); }
+        }
+
+        .wordmark {
+            font-family: 'Cormorant Garamond', serif;
+            font-size: 20px;
+            font-weight: 600;
+            color: var(--consent-text);
+            letter-spacing: 0.02em;
+        }
+
+        .card-body { padding: 24px 28px; }
+
+        /* ── Client identity (#183) ──
+           Who registered, and where the authorization code would be
+           delivered. Every value here is either server-generated
+           (`client_id`, `created_at`) or derived from the registered
+           redirect URI by `src/oauth/trust.py`; the one piece of
+           client-chosen text, the name, sits in its own labelled row and is
+           escaped like any other Jinja value. No token is added — the
+           `--consent-*` group already carries everything this block needs. */
+        .identity {
+            border: 1px solid var(--consent-surface-border);
+            border-radius: 7px;
+            padding: 12px 16px;
+            margin-bottom: 12px;
+        }
+
+        .identity-row {
+            display: flex;
+            gap: 12px;
+            align-items: baseline;
+            padding: 3px 0;
+        }
+
+        .identity-label {
+            flex: 0 0 76px;
+            font-size: 10px;
+            font-weight: 600;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: var(--consent-label);
+        }
+
+        .identity-value {
+            flex: 1;
+            min-width: 0;
+            font-size: 12.5px;
+            color: var(--consent-text);
+            word-break: break-all;
+        }
+
+        /* The destination is the value the whole disclosure turns on, so it
+           is set in the mono face: a host is a string to be read character by
+           character, not prose. */
+        .identity-value.host {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12.5px;
+        }
+
+        .identity-value.mono {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            color: var(--consent-text-2);
+        }
+
+        .identity-value.undetermined {
+            font-family: 'DM Sans', sans-serif;
+            color: var(--consent-warn);
+        }
+
+        .self-registered {
+            font-size: 11.5px;
+            color: var(--consent-text-3);
+            line-height: 1.45;
+            margin-bottom: 12px;
+        }
+
+        .trust {
+            border-radius: 7px;
+            padding: 10px 14px;
+            margin-bottom: 20px;
+            font-size: 11.5px;
+            line-height: 1.5;
+        }
+
+        .trust strong { font-weight: 600; }
+
+        .trust.known {
+            background: var(--consent-surface);
+            border: 1px solid var(--consent-surface-border);
+            color: var(--consent-text-2);
+        }
+
+        .trust.unverified {
+            background: var(--consent-neutral-surface);
+            border: 1px solid var(--consent-warn);
+            color: var(--consent-warn);
+        }
+
+        .request-box {
+            background: var(--consent-surface);
+            border: 1px solid var(--consent-surface-border);
+            border-radius: 7px;
+            padding: 14px 16px;
+            margin-bottom: 22px;
+            font-size: 13px;
+            color: var(--consent-text-2);
+            line-height: 1.5;
+        }
+
+        .request-box strong { color: var(--consent-text); font-weight: 500; }
+
+        .request-note {
+            margin-top: 8px;
+            font-size: 11.5px;
+            color: var(--consent-text-3);
+            line-height: 1.45;
+        }
+
+        .request-note.warn { color: var(--consent-warn); }
+
+        /* ── Credential lifetimes (#326, ASVS V10.7.2) ──
+           Every value comes from `consent_lifetimes()`, so the page can
+           never state a period longer than the server enforces. */
+        .lifetime-box {
+            border-left: 2px solid var(--consent-surface-border);
+            padding: 2px 0 2px 12px;
+            margin-bottom: 22px;
+            font-size: 12px;
+            color: var(--consent-text-2);
+            line-height: 1.5;
+        }
+
+        .lifetime-box strong { color: var(--consent-text); font-weight: 500; }
+
+        .scope-label {
+            font-size: 10px;
+            font-weight: 600;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+            color: var(--consent-label);
+            margin-bottom: 10px;
+        }
+
+        .scope-option {
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+            padding: 12px 14px;
+            border-radius: 6px;
+            border: 1px solid var(--consent-control-border);
+            margin-bottom: 8px;
+            cursor: pointer;
+            transition: border-color 0.15s, background 0.15s;
+        }
+
+        .scope-option:hover {
+            border-color: var(--consent-control-border-hover);
+            background: var(--consent-option-hover);
+        }
+
+        /* Mark the level that is actually selected. Kept in its own rule
+           blocks (never grouped with a selector that must keep working): a
+           browser without `:has()` treats the whole selector list as invalid
+           and drops the rule, falling back to the native radio dot — which
+           `accent-color` below styles and which stays the baseline signal. */
+        .scope-option:has(input[type="radio"]:checked) {
+            border-color: var(--consent-primary-dim);
+            background: var(--consent-option-active);
+        }
+
+        .scope-option:has(input[type="radio"]:checked) .scope-option-title {
+            color: var(--consent-primary-text);
+        }
+
+        .scope-option input[type="radio"] {
+            margin-top: 3px;
+            accent-color: var(--consent-primary);
+            flex-shrink: 0;
+        }
+
+        .scope-option-title {
+            font-size: 13px;
+            font-weight: 500;
+            color: var(--consent-text);
+            margin-bottom: 2px;
+        }
+
+        .scope-option-desc {
+            font-size: 11.5px;
+            color: var(--consent-text-3);
+            line-height: 1.4;
+        }
+
+        .actions {
+            display: flex;
+            gap: 10px;
+            margin-top: 24px;
+        }
+
+        .btn-approve {
+            flex: 1;
+            padding: 10px;
+            background: var(--consent-primary-dim);
+            color: var(--consent-primary-text);
+            border: none;
+            border-radius: 6px;
+            font-family: 'DM Sans', sans-serif;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background 0.15s, box-shadow 0.15s;
+        }
+
+        .btn-approve:hover {
+            background: var(--consent-primary);
+            box-shadow: 0 0 20px var(--consent-primary-glow);
+        }
+
+        .btn-deny {
+            flex: 1;
+            padding: 10px;
+            background: var(--consent-neutral-surface);
+            color: var(--consent-text-3);
+            border: 1px solid var(--consent-control-border);
+            border-radius: 6px;
+            font-family: 'DM Sans', sans-serif;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: color 0.15s, background 0.15s;
+        }
+
+        .btn-deny:hover {
+            color: var(--consent-text);
+            background: var(--consent-neutral-surface-hover);
+        }
+
+        /* Gem mark, in the consent tokens. Stylesheet rules, not fill=/stroke= presentation
+           attributes: var() in a presentation attribute does not substitute
+           dependably and falls back to black (#289, design D2). */
+        .gem-edge { stroke: var(--consent-primary); }
+        .gem-facet { fill: var(--consent-gem-facet); stroke: none; }
+        .gem-facet-2 { fill: var(--consent-gem-facet-2); stroke: none; }
+
+        /* Header text column beside the gem, and its caption (#289). */
+        .consent-brand {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .consent-request-label {
+            font-size: 10px;
+            font-weight: 600;
+            letter-spacing: 0.16em;
+            text-transform: uppercase;
+            color: var(--consent-label);
+            margin-top: 3px;
+        }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="card-top">
+            <svg class="gem" viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <polygon points="14,2 24,9 22,22 6,22 4,9" fill="none" stroke-width="1.4" class="gem-edge"/>
+                <polygon points="14,2 24,9 14,7" class="gem-facet"/>
+                <polygon points="14,7 24,9 22,22 6,22 4,9" class="gem-facet-2"/>
+                <line x1="14" y1="2" x2="14" y2="7" stroke-width="0.8" opacity="0.7" class="gem-edge"/>
+                <line x1="14" y1="7" x2="4" y2="9"  stroke-width="0.5" opacity="0.4" class="gem-edge"/>
+                <line x1="14" y1="7" x2="24" y2="9" stroke-width="0.5" opacity="0.4" class="gem-edge"/>
+            </svg>
+            <div class="consent-brand">
+                <div class="wordmark">Obsidian MCP</div>
+                <div class="consent-request-label">Authorization Request</div>
+            </div>
+            <button type="button" class="theme-toggle" data-theme-toggle
+        aria-label="Switch to light theme" title="Switch to light theme">
+    <svg class="icon-sun" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+         stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+        <circle cx="8" cy="8" r="3.1"/>
+        <path d="M8 1v1.8M8 13.2V15M1 8h1.8M13.2 8H15M3.05 3.05l1.27 1.27M11.68 11.68l1.27 1.27M3.05 12.95l1.27-1.27M11.68 4.32l1.27-1.27"/>
+    </svg>
+    <svg class="icon-moon" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+         stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M13.5 9.6A5.9 5.9 0 0 1 6.4 2.5a5.9 5.9 0 1 0 7.1 7.1Z"/>
+    </svg>
+</button>
+        </div>
+
+        <div class="card-body">
+            
+            
+            <div class="identity">
+                
+                <div class="identity-row">
+                    <div class="identity-label">Application</div>
+                    <div class="identity-value host">claude.ai</div>
+                </div>
+                
+                <div class="identity-row">
+                    <div class="identity-label">Destination</div>
+                    
+                    <div class="identity-value host">localhost</div>
+                    
+                </div>
+                
+                <div class="identity-row">
+                    <div class="identity-label">Client ID</div>
+                    <div class="identity-value mono">https://claude.ai/oauth/claude-code-client-metadata</div>
+                </div>
+                <div class="identity-row">
+                    <div class="identity-label">First approved</div>
+                    <div class="identity-value mono">first time</div>
+                </div>
+                
+            </div>
+
+            
+            
+            <div class="self-registered">
+                This application identified itself with a document published at
+                <strong>claude.ai</strong>. This server fetched that document; it does
+                not verify who operates claude.ai.
+            </div>
+            
+            <div class="trust unverified">
+                <strong>Code goes to a program on this computer.</strong>
+                This application only receives authorizations on a local address. Any program
+                running on this computer can claim that address. Approve only if you started
+                this yourself from a program you trust.
+            </div>
+            
+            
+
+            
+            
+            <div class="trust unverified">
+                
+                <strong>Unrecognised destination.</strong>
+                <strong>localhost</strong> is not on this server's list of known
+                connector destinations. If you approve, the authorization code for your vault
+                is sent to localhost. Deny unless you started this yourself from
+                that application.
+                
+            </div>
+            
+
+            <div class="request-box">
+                <strong>claude.ai</strong> is requesting
+                <strong>Read only</strong>
+                access to your Obsidian vault.
+                
+                
+                <div class="request-note">Read only is preselected. Read + Write is granted only if you select it below.</div>
+                
+            </div>
+
+            
+            <div class="lifetime-box">
+                <strong>How long this access lasts.</strong>
+                The application receives an access token valid for 1 hour,
+                which it renews using a refresh token valid for 30 days from
+                its last renewal. Renewal stops 90 days after the application
+                first receives its tokens (moments after you approve); after that it must ask
+                you again. You can revoke this access at any time from the control panel.
+            </div>
+
+            
+            <form method="post" action="/authorize" autocomplete="off">
+                <input type="hidden" name="client_id"             value="https://claude.ai/oauth/claude-code-client-metadata">
+                <input type="hidden" name="redirect_uri"          value="http://localhost:3118/callback">
+                <input type="hidden" name="code_challenge"        value="w1TpKUdYE9hUAcNSeeSRFioHDxfUxuHho_JHAfZ_vDM">
+                <input type="hidden" name="code_challenge_method" value="S256">
+                <input type="hidden" name="state"                 value="<STATE>">
+                <input type="hidden" name="client_state"          value="client-state-golden">
+                
+
+                <div class="scope-label">Grant access level</div>
+
+                
+                <label class="scope-option">
+                    <input type="radio" name="scope" value="read offline_access" autocomplete="off" checked>
+                    <div>
+                        <div class="scope-option-title">Read only</div>
+                        <div class="scope-option-desc">Search and read notes. Cannot create or edit.</div>
+                    </div>
+                </label>
+
+                
+                <label class="scope-option">
+                    <input type="radio" name="scope" value="readwrite offline_access" autocomplete="off">
+                    <div>
+                        <div class="scope-option-title">Read + Write</div>
+                        <div class="scope-option-desc">Full access: search, read, create, and edit notes.</div>
+                    </div>
+                </label>
+                
+
+                <div class="actions">
+                    <button type="submit" name="action" value="approve" class="btn-approve">Approve</button>
+                    <button type="submit" name="action" value="deny"    class="btn-deny">Deny</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</body>
+</html>

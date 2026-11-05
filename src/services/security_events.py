@@ -92,7 +92,23 @@ class SecurityEventFieldError(AssertionError):
 EVENT_FIELDS: dict[str, frozenset[str]] = {
     # ── Panel authentication (Slice B) ──
     "panel_oidc_started": frozenset({"client_ip", "route"}),
+    # `reason` is closed (#416 D14): `capacity`, `state`, `provider`, `token`,
+    # `entitlement`, `unlinked`, `email_unverified`, `link_conflict`,
+    # `account`, `session_mint` — `OIDC_REFUSAL_REASONS` below. **No
+    # `user_id` or `username` for any reason**: on `account` the record would
+    # confirm that the identity resolves to a local user.
     "panel_oidc_refused": frozenset({"reason", "client_ip", "route"}),
+    # OIDC account linking (#416). None of the three carries a subject, an
+    # issuer, an email, a group or anything else the provider sent: the
+    # account is named by its row id and username only. Each is emitted after
+    # the commit that makes it true.
+    "panel_oidc_linked": frozenset({"user_id", "username", "client_ip", "route"}),
+    "panel_oidc_link_set": frozenset(
+        {"actor_user_id", "user_id", "username", "mode", "client_ip", "route"}
+    ),
+    "panel_oidc_link_removed": frozenset(
+        {"actor_user_id", "user_id", "username", "count", "client_ip", "route"}
+    ),
     "panel_login_succeeded": frozenset({"user_id", "username", "client_ip", "route"}),
     "panel_login_failed": frozenset(
         {"reason", "username_submitted", "user_id", "client_ip", "route"}
@@ -474,6 +490,19 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
 
 #: The closed `outcome` vocabulary of `mcp_concurrency_pressure` (#188).
 MCP_CONCURRENCY_PRESSURE_OUTCOMES = frozenset({"shadow", "refused", "overrun", "waited"})
+
+#: The closed `reason` vocabulary of `panel_oidc_refused` (#416 D14). The first
+#: five are raised by `src/auth/oidc.py` before any database access; the rest
+#: by the callback's database phase (`oidc_links.prepare_login`, the mint).
+#: #415's `mapping` is retired: it described an environment map that no
+#: longer exists, and its case is now `unlinked`.
+OIDC_REFUSAL_REASONS = frozenset({
+    "capacity", "state", "provider", "token", "entitlement",
+    "unlinked", "email_unverified", "link_conflict", "account", "session_mint",
+})
+
+#: The closed `mode` vocabulary of `panel_oidc_link_set` (#416 D14).
+OIDC_LINK_SET_MODES = frozenset({"expect", "bind"})
 
 #: The suppressor's summary. Never itself suppressed, never counted.
 SUMMARY_EVENT = "events_suppressed"

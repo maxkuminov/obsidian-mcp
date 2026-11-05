@@ -1,0 +1,8 @@
+HTTP 302
+location: /admin/auth/login?next=%2Fauthorize%3Fresponse_type%3Dcode%26client_id%3Da3f19c7e5b2d4081a3f19c7e5b2d4081%26redirect_uri%3Dhttps%253A%252F%252Fclient.example%252Fcallback%26code_challenge%3Daaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa%26code_challenge_method%3DS256%26scope%3Dread%2Boffline_access%26state%3Dclient-state-golden
+vary: Cookie, Origin
+strict-transport-security: max-age=31536000; includeSubDomains
+x-content-type-options: nosniff
+x-frame-options: DENY
+referrer-policy: no-referrer
+

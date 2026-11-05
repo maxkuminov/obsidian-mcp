@@ -248,6 +248,40 @@ update it in the same change.** What stays here is the short list:
   content-identical to an ordinary failed login — not a 429, not a lockout;
   the window expires on its own. The new timing signal (attempt 11 skips
   bcrypt) is an accepted limitation.
+- **Native OIDC is federated panel login onto existing accounts, linked by an
+  admin and pinned to `(iss, sub)`** (#414, #415, #416, migration 037). Off by
+  default; off, every page and `/authorize` is byte-identical
+  (`tests/golden/oidc_off/`) and the link routes 404. The server stays the MCP
+  OAuth server — OIDC only mints the panel session (via the one guarded
+  `start_session`), which also covers consent. `oidc.exchange()` returns
+  `VerifiedIdentity` claims, never a user id, and **never refuses on email**
+  (non-string/> 254 → `None`; `email_verified` only the JSON `true`).
+  `oidc_links.resolve`: a row bound to `(iss, sub)` wins and email is not
+  read; only otherwise an exact normalized (ASCII-only lower-casing, no
+  IDN folding) verified email matching a pending expectation under the same
+  issuer, < 7 days old (`PENDING_DAYS`, a constant), binds — once.
+  `prepare_login` (account guard, `FOR UPDATE` + `populate_existing`, every
+  check re-run, no commit) then `start_session(expected_session_version=…)`
+  commit bind + `last_login_at` + session together; a refused mint leaves no
+  binding. No provisioning, no group→admin mapping, no SSO bootstrap
+  (`/admin/register` 404 under OIDC), no provider tokens kept, one issuer;
+  every refusal is one page (reason only in `panel_oidc_refused`, never a
+  user id). Admin actions `POST /admin/users/{id}/oidc/{expect,bind,unlink}`:
+  `_lock_admin_guard`, **immediately** `_actor_still_privileged`, then the
+  target; a bound row is never re-pointed (unlink first); unlink revokes the
+  user's sessions. **D15:** while `LOCAL_LOGIN_ENABLED=false`, unlink,
+  demote, deactivate, soft and permanent delete refuse a result with zero
+  active admins bound under the configured issuer (inside the guard, after
+  the actor re-check; `tests/test_oidc_mutation_sites.py` pins the writer
+  allow-list), self-unlink is refused, and the lifespan logs one CRITICAL
+  (never a refusal) when none exists. Provider profile: same-host HTTPS
+  endpoints, RS256/PS256/ES256 ∩ discovery, `client_secret_basic|post`,
+  optional group, RFC 9207 `iss` required when advertised, zero clock leeway,
+  per-login discovery/JWKS (no cache). `OIDC_SUBJECT_USER_IDS` is **retired**
+  and refuses startup; its message names the docs heading "Upgrading from
+  OIDC_SUBJECT_USER_IDS" — change both together. See
+  [native OIDC](docs/native-oidc.md) and
+  [control panel](docs/architecture/control-panel.md).
 - **Unused dynamically registered OAuth clients expire** (#194).
   `oauth_clients.last_used_at` is stamped by consent approval, code exchange
   and refresh; migration 025 stamped every pre-existing row, so **NULL means
@@ -682,12 +716,8 @@ summaries.
 | [rate-limits.md](docs/architecture/rate-limits.md) | `src/services/rate_limits.py`, `src/services/concurrency.py`, `src/services/pool_budget.py`, `src/services/concurrency_counters.py`, `src/services/concurrency_readiness.py`, `src/services/refusals.py`, the pool subclass in `src/database.py`, the failed-auth budget in `APIKeyMiddleware`, the gate order in `_tracked`, the worker count, the key-creation budget and active-key cap (`src/services/api_keys.py`), and every `MCP_RATE_LIMIT_*` / `MCP_AUTH_FAILURE_*` / `MCP_CONCURRENCY_*` / `KEY_CREATION_*` / `KEY_MAX_ACTIVE_PER_ACCOUNT` / `DEFAULT_DAILY_REQUEST_LIMIT` setting |
 | [usage-attribution.md](docs/architecture/usage-attribution.md) | `usage_logs`, `_log_usage`, actor columns |
 | [control-panel.md](docs/architecture/control-panel.md) | panel templates, flash messages, admin guards, the Danger zone |
+| [native-oidc.md](docs/native-oidc.md) | `src/auth/oidc.py`, `src/services/oidc_links.py`, the OIDC callback and the `/admin/users/{id}/oidc/*` routes, `_warn_oidc_lockout`, any `OIDC_*` / `LOCAL_LOGIN_ENABLED` setting, migration 037's link columns (operator guide; the invariants are in control-panel.md) |
 
 Formal requirements live in `openspec/specs/`; the change history and its
 reasoning in `openspec/changes/archive/`.
 
-Native browser OIDC is optional and disabled by default (#414). Read
-[docs/native-oidc.md](docs/native-oidc.md) before changing `src/auth/oidc.py` or
-its rollout. Preserve existing user IDs, vault assignments, local MCP OAuth
-issuer/credentials, and the guarded `start_session` mint. No email linking or
-provisioning; explicit immutable subjects and exact signed app-group admission.

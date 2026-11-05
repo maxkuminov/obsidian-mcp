@@ -171,7 +171,7 @@ _EXPECTED_CONFIRMS = {
     "keys.html": 3,
     "oauth.html": 2,
     "settings.html": 1,
-    "user_edit.html": 2,
+    "user_edit.html": 3,  # + the OIDC unlink (#416 D11), rendered only with OIDC on
     "empty_vault_confirm.html": 1,
 }
 

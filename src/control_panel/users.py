@@ -37,6 +37,7 @@ restart.
 import asyncio
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -63,7 +64,7 @@ from src.csrf import verify_csrf
 from src.database import get_session
 from src.models.db import APIKey, NoteMetadata, UsageLog, User
 from src.oauth.grants import ACCOUNT_GUARD_LOCK_KEY, lock_account_guard
-from src.services import change_feed, panel_csp, security_events, vault_overlap
+from src.services import change_feed, oidc_links, panel_csp, security_events, vault_overlap
 from src.services.vault import clear_user_vault_cache, validate_vault_root_path
 
 logger = logging.getLogger(__name__)
@@ -383,6 +384,246 @@ def _log_actor_revoked(request: Request, user) -> None:
     _log_panel_forbidden(request, "actor_revoked", user, None)
 
 
+# --- OIDC account links (#416) --------------------------------------------
+
+
+_NO_REACHABLE_ADMIN_MSG = (
+    "Refused: password sign-in is disabled, and this would leave no active "
+    "admin who can sign in with single sign-on. Link another admin first, or "
+    "re-enable password sign-in."
+)
+
+
+def _reachable_admin_rule_applies() -> bool:
+    """D15 applies only while password sign-in is disabled. With it enabled
+    the password form reaches every active admin, and the last-active-admin
+    rule is the whole rule. (`LOCAL_LOGIN_ENABLED=false` without OIDC is
+    refused at startup, so this is in practice the OIDC-on case.)"""
+    return bool(settings.oidc_enabled) and not settings.local_login_enabled
+
+
+async def _leaves_no_reachable_admin(
+    session: AsyncSession, target: Any, target_after: str
+) -> bool:
+    """True when the mutation must be refused under D15: password sign-in is
+    disabled, `target` is **currently** a reachable admin (active, admin and
+    bound under the configured issuer), and once it takes `target_after` no
+    other reachable admin remains.
+
+    `target` is the row's state before the write (a `User`, or any row with
+    `is_admin`, `is_active`, `oidc_issuer` and `oidc_subject`). A target that
+    is not reachable now — an ordinary user, an inactive account, an admin
+    who is unbound or bound under a previous issuer — cannot reduce the count,
+    so its mutation is never refused here, even when the count is already
+    zero: refusing it would only obstruct cleanup.
+
+    Called **inside `_lock_admin_guard`, after `_actor_still_privileged`**,
+    before any write, in the transaction that writes, so the count and the
+    write are one atomic step against every other guarded mutation (design
+    D15).
+    """
+    if not _reachable_admin_rule_applies():
+        return False
+    if not _is_reachable_admin(target):
+        return False
+    remaining = await oidc_links.reachable_admins_after(
+        session, settings.oidc_issuer, target_id=target.id, target_after=target_after
+    )
+    return remaining == 0
+
+
+def _is_reachable_admin(u: Any) -> bool:
+    """D15's reachable admin: active, admin and bound under the configured issuer."""
+    return bool(u.is_active and u.is_admin) and _bound_under_current_issuer(u)
+
+
+def _bound_under_current_issuer(u: Any) -> bool:
+    return u.oidc_subject is not None and u.oidc_issuer == settings.oidc_issuer
+
+
+def _pending_live(u: User) -> bool:
+    if u.oidc_expected_email is None or u.oidc_expected_set_at is None:
+        return False
+    if u.oidc_expected_issuer != settings.oidc_issuer:
+        return False
+    return oidc_links.pending_expires_at(u.oidc_expected_set_at) > datetime.now(timezone.utc)
+
+
+def _oidc_list_state(u: User) -> str | None:
+    """The users list's SSO cell: `linked`, `pending` or None (D11)."""
+    if _bound_under_current_issuer(u):
+        return "linked"
+    if _pending_live(u):
+        return "pending"
+    return None
+
+
+def _oidc_card_state(u: User) -> dict[str, Any]:
+    """The user edit page's "Single sign-on" card (D11).
+
+    `state` is one of `none`, `pending`, `expired`, `linked`, `foreign`
+    (bound under an issuer other than the configured one — it cannot sign in,
+    L7). The subject is shown truncated to 8 characters, never in full; the
+    issuer itself is never rendered.
+    """
+    if u.oidc_subject is not None:
+        return {
+            "state": "linked" if _bound_under_current_issuer(u) else "foreign",
+            "linked_at": u.oidc_linked_at.isoformat() if u.oidc_linked_at else None,
+            "subject_prefix": u.oidc_subject[:8],
+            "subject_truncated": len(u.oidc_subject) > 8,
+        }
+    if u.oidc_expected_email is not None and u.oidc_expected_set_at is not None:
+        expires = oidc_links.pending_expires_at(u.oidc_expected_set_at)
+        return {
+            "state": "pending" if _pending_live(u) else "expired",
+            "email": u.oidc_expected_email,
+            "expires_at": expires.isoformat(),
+        }
+    return {"state": "none"}
+
+
+def _back_to_edit(request: Request | None, user_id: int, msg: str) -> RedirectResponse:
+    flash(request, msg)
+    return RedirectResponse(f"/admin/users/{user_id}/edit", status_code=303)
+
+
+_OIDC_REFUSAL_MSGS = {
+    "bound_already": (
+        "This account is already linked to single sign-on. Unlink it first to "
+        "change the identity it signs in with."
+    ),
+    "conflict": "That value is already used by another account.",
+}
+_OIDC_INVALID_MSGS = {
+    "expect": "Enter a valid email address (one @, no spaces, at most 254 characters).",
+    "bind": "Enter a subject of 1–255 printable characters with no spaces.",
+    "unlink": "This account has no single sign-on link to remove.",
+}
+
+
+async def _oidc_link_action(
+    request: Request,
+    session: AsyncSession,
+    user: User | _SingleUserSentinel,
+    user_id: int,
+    mode: str,
+    value: str | None = None,
+):
+    """The three link handlers' shared critical section (D11, D15).
+
+    404 while OIDC is off. Then, in order: `_lock_admin_guard`, **immediately**
+    `_actor_still_privileged` (failure: snapshot, rollback, `actor_revoked`,
+    `_ACTOR_REVOKED_MSG`), the target's existence (404), for unlink the
+    self-unlink refusal and the D15 count, the `oidc_links` operation (which
+    re-reads the target `FOR UPDATE` and does not commit), the commit, and only
+    then the flash and the event. A refusal writes nothing: the guarded
+    transaction is rolled back with the session.
+    """
+    if not settings.oidc_enabled:
+        raise HTTPException(404)
+    if mode != "unlink" and mode not in security_events.OIDC_LINK_SET_MODES:
+        raise ValueError(f"unknown link mode {mode!r}")
+    await _lock_admin_guard(session)
+    if not await _actor_still_privileged(session, user):
+        actor = actor_snapshot(user)  # before the rollback expires `user` (#332)
+        await session.rollback()
+        _log_actor_revoked(request, actor)
+        return _back_to_list_with_error(request, _ACTOR_REVOKED_MSG)
+    # The target's pre-write state, read under the guard: every writer of
+    # these columns that could change it takes the same guard.
+    exists = (
+        await session.execute(
+            select(
+                User.id, User.is_admin, User.is_active, User.oidc_issuer, User.oidc_subject
+            ).where(User.id == user_id)
+        )
+    ).one_or_none()
+    if exists is None:
+        await session.rollback()
+        raise HTTPException(404, "User not found")
+
+    if mode == "unlink":
+        is_self = isinstance(user, User) and user.id == user_id
+        if is_self and not settings.local_login_enabled:
+            await session.rollback()
+            return _back_with_error(
+                request,
+                user_id,
+                "You can't unlink your own account while password sign-in is "
+                "disabled — it would sign you out with no way back in.",
+            )
+        # D15 before the operation writes anything: refused only when the
+        # target is a reachable admin now and no other would remain. Unlinking
+        # a row that is not reachable (unbound, pending only, under a previous
+        # issuer, or not an active admin) cannot reduce the count.
+        if await _leaves_no_reachable_admin(session, exists, "unlinked"):
+            await session.rollback()
+            return _back_with_error(request, user_id, _NO_REACHABLE_ADMIN_MSG)
+        result = await oidc_links.unlink(session, user_id)
+    elif mode == "expect":
+        result = await oidc_links.set_expectation(
+            session, user_id, settings.oidc_issuer, value
+        )
+    else:
+        result = await oidc_links.bind_subject(
+            session, user_id, settings.oidc_issuer, value
+        )
+
+    if not result.ok:
+        await session.rollback()
+        message = _OIDC_REFUSAL_MSGS.get(result.outcome) or _OIDC_INVALID_MSGS[mode]
+        return _back_with_error(request, user_id, message)
+
+    username = (
+        await session.execute(select(User.username).where(User.id == user_id))
+    ).scalar_one()
+    await session.commit()
+
+    # After the commit (D17), with literal field names so the allow-list
+    # sweep can police them. Never a subject, an issuer or an email.
+    actor_user_id, _actor_username = _actor(user)
+    if mode == "unlink":
+        security_events.emit(
+            "panel_oidc_link_removed",
+            level=logging.INFO,
+            subject=security_events.subject_for(user_id=actor_user_id, request=request),
+            actor_user_id=actor_user_id,
+            user_id=user_id,
+            username=username,
+            count=result.revoked_sessions,
+            client_ip=security_events.client_ip(request),
+            route=_request_route(request),
+        )
+        sessions = result.revoked_sessions
+        return _back_to_edit(
+            request,
+            user_id,
+            f"Unlinked '{username}' from single sign-on; "
+            f"{sessions} live session{'s' if sessions != 1 else ''} ended.",
+        )
+    security_events.emit(
+        "panel_oidc_link_set",
+        level=logging.INFO,
+        subject=security_events.subject_for(user_id=actor_user_id, request=request),
+        actor_user_id=actor_user_id,
+        user_id=user_id,
+        username=username,
+        mode=mode,
+        client_ip=security_events.client_ip(request),
+        route=_request_route(request),
+    )
+    if mode == "expect":
+        return _back_to_edit(
+            request,
+            user_id,
+            f"Waiting for '{username}' to sign in with single sign-on: the first "
+            f"verified sign-in from that address within {oidc_links.PENDING_DAYS} "
+            "days links the account.",
+        )
+    return _back_to_edit(request, user_id, f"Linked '{username}' to single sign-on.")
+
+
 # --- Routes ---------------------------------------------------------------
 
 
@@ -451,6 +692,8 @@ async def list_users(
             "api_keys_total": key_counts.get(u.id, (0, 0))[1],
             "notes": note_counts.get(u.id, 0),
             "quarantine": _quarantine_display(entry) if entry is not None else None,
+            # OIDC off reads no link column (D7).
+            "oidc_state": _oidc_list_state(u) if settings.oidc_enabled else None,
         })
 
     # `flash` / `flash_kind` come from the session, through `_panel_context`
@@ -460,6 +703,9 @@ async def list_users(
     return templates.TemplateResponse(request, "users.html", _panel_context(request, user, {
         "active": "users",
         "users": users,
+        # Read only by `{% if oidc_enabled %}` blocks; with OIDC off the page
+        # renders byte-identically to before #416 (D16).
+        "oidc_enabled": bool(settings.oidc_enabled),
         # The create form's `minlength` and hint read the server's constant
         # (#197). Written into the markup they said eight while `create_user`
         # refused anything under twelve — a form that let an administrator
@@ -554,6 +800,10 @@ async def edit_user_form(
         "is_self": (isinstance(user, User) and user.id == target.id),
         # As on the list page: the reset form's minimum is the server's.
         "min_password_length": MIN_PASSWORD_LENGTH,
+        # The "Single sign-on" card (#416 D11), rendered only when enabled.
+        "oidc_enabled": bool(settings.oidc_enabled),
+        "oidc": _oidc_card_state(target) if settings.oidc_enabled else None,
+        "local_login_enabled": bool(settings.local_login_enabled),
     }))
 
 
@@ -658,6 +908,18 @@ async def edit_user_submit(
                 user_id,
                 "Refusing to demote or deactivate the last active admin.",
             )
+
+    # D15 (#416): with password sign-in disabled, the last *reachable* admin —
+    # active, admin and bound under the configured issuer — is the one the
+    # check above cannot see. Refused only when the target is that admin now;
+    # editing anyone else cannot reduce the count. Inside the guard, after the
+    # actor re-check, before any write; nothing commits before it.
+    clears_admin = target.is_admin and not new_admin
+    clears_active = target.is_active and not new_active
+    if (clears_admin or clears_active) and await _leaves_no_reachable_admin(
+        session, target, "demoted" if clears_admin else "deactivated"
+    ):
+        return _back_with_error(request, user_id, _NO_REACHABLE_ADMIN_MSG)
 
     # Awaited: the existence-and-type check is a syscall against a bind mount
     # and runs off the event loop under `VAULT_ROOT_OBSERVE_TIMEOUT_SECONDS`.
@@ -829,6 +1091,15 @@ async def delete_user(
                 "Refusing to delete the last active admin — promote someone else first."
             )
 
+    # D15 (#416): the last reachable admin, for both forms — after the actor
+    # re-check, beside the check above, before anything is written. Only a
+    # target that is a reachable admin now can be refused; deleting anyone
+    # else proceeds even when no reachable admin exists.
+    if await _leaves_no_reachable_admin(
+        session, target, "deleted" if permanent else "deactivated"
+    ):
+        return _back_to_list_with_error(request, _NO_REACHABLE_ADMIN_MSG)
+
     if permanent:
         # `usage_logs.key_id` has no `ON DELETE` — deliberately, so a log row
         # outlives the credential that wrote it (see CLAUDE.md, #77). The
@@ -960,6 +1231,50 @@ async def reset_password(
         request, user, target.id, "admin_password_reset", revoked
     )
     return _back_to_list(request, f"Password reset for '{target.username}'.")
+
+
+@router.post("/{user_id}/oidc/expect")
+async def oidc_expect(
+    user_id: int,
+    request: Request,
+    email: str = Form(""),
+    session: AsyncSession = Depends(get_session),
+    user: User | _SingleUserSentinel = Depends(require_admin_panel),
+):
+    """Record an expected email: the first verified sign-in from it, under the
+    configured issuer, within 7 days, binds this user (#416 D2/D11). Refused on
+    a bound row; replaces a pending one."""
+    return await _oidc_link_action(request, session, user, user_id, "expect", email)
+
+
+@router.post("/{user_id}/oidc/bind")
+async def oidc_bind(
+    user_id: int,
+    request: Request,
+    subject: str = Form(""),
+    session: AsyncSession = Depends(get_session),
+    user: User | _SingleUserSentinel = Depends(require_admin_panel),
+):
+    """Bind a known subject under the configured issuer immediately, clearing
+    any expectation (#416 D2/D11). Refused on a bound row."""
+    # Surrounding whitespace from a paste is dropped; anything inside is
+    # refused by `oidc_links.valid_subject`.
+    return await _oidc_link_action(
+        request, session, user, user_id, "bind", (subject or "").strip(" \t\r\n")
+    )
+
+
+@router.post("/{user_id}/oidc/unlink")
+async def oidc_unlink(
+    user_id: int,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    user: User | _SingleUserSentinel = Depends(require_admin_panel),
+):
+    """Clear the link (bound or pending) and revoke the user's live sessions in
+    one transaction (#416 D11). Refused for yourself while password sign-in is
+    disabled, and by the last-reachable-admin rule (D15)."""
+    return await _oidc_link_action(request, session, user, user_id, "unlink")
 
 
 @router.get("/{user_id}/confirm-empty-vault", response_class=HTMLResponse)
