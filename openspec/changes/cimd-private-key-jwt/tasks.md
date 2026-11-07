@@ -181,7 +181,7 @@ Post-merge, the orchestrator greps for production callers of every new export. E
 - [x] 6.2 No lock across the hop, for both triggers. While the fake JWKS fetch is suspended in the pre-phase, `pg_stat_activity` for the app's connections shows no `idle in transaction` and `pg_locks` shows no lock held by them.
 - [x] 6.3 CAS. An approval re-pins `jwks_uri` during a suspended refetch, and the refetch's UPDATE affects 0 rows.
 - [x] 6.4 Regression. The existing `test_oauth_cimd_pg.py`, `test_oauth_grants_pg.py` and `test_oauth_grant_lifetime_pg.py` pass unchanged.
-- [ ] 6.5 `make test-integration` is green (not concurrently with `make test-schema`).
+- [x] 6.5 `make test-integration` is green (not concurrently with `make test-schema`).
 
 ## 7. Gates
 
