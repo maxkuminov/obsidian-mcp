@@ -53,7 +53,9 @@ After the document validates, a `private_key_jwt` projection's JWKS is resolved 
 
 **A second charge, not a shared one.** A document cache hit charges nothing. If the JWKS rode the document's charge, every cached-document `GET /authorize` would be a free outbound request to the client's origin, an amplifier any caller could drive. Each outbound request therefore costs one charge. The document's flight has already released its slot when the JWKS fetch starts, so the per-slot cap of 1 is not self-blocking. A ChatGPT consent spends at most 2 of the address's 10 per minute, and nothing once both are cached.
 
-The JWKS cache is a second bounded LRU of 256 entries with the document cache's TTL rules: `max-age` clamped to `OAUTH_CIMD_CACHE_MAX_SECONDS`, 300 s when the header is absent, and nothing stored under `no-store`/`no-cache`. It stores only a **validated** snapshot (D3).
+The JWKS cache is a second bounded LRU of 256 entries with the document cache's TTL rules: `max-age` clamped to `OAUTH_CIMD_CACHE_MAX_SECONDS`, 300 s when the header is absent, and nothing stored under `no-store`/`no-cache`. It stores only a **validated** snapshot (D3). Every `JwksSnapshot` carries an immutable `fetched_at`, the moment its bytes were received from the origin. A cache hit returns that original time, never the time of the hit.
+
+**`jwks_fetched_at` is always that origin fetch time** (Codex spec R1-2), at approval and at a refetch alike, and never the approval time. Otherwise an approval served from a 23 h-old cache entry would restart the 24 h staleness clock, and a removed key could survive about 48 h.
 
 JWKS refusals are `client_metadata.jwks_<sub>`, behind the same constant `invalid_client`. The subs are `jwks_fetch_failed`, `jwks_fetch_timeout`, `jwks_http_status`, `jwks_too_large`, `jwks_content_encoded`, `jwks_ssrf_refused`, `jwks_not_json`, `jwks_invalid`, `jwks_private_key` and `jwks_no_usable_key`. Admission refusals reuse `fetch_cooldown`, `fetch_budget_exhausted` and `fetch_busy`. A JWKS failure does not arm the *document's* cooldown.
 
@@ -99,7 +101,7 @@ It replaces two CHECKs and adds one, each reconciled against a probe definition 
 
 DCR rows can therefore never be `private_key_jwt`, and the database says so. The **downgrade** refuses while any `private_key_jwt` row exists, naming the count (dropping the columns would strand those grants). Otherwise it drops the new constraint and columns and restores 036's two CHECK definitions. The migration needs only table ownership, so it passes `test_nonsuperuser_migrations_pg.py`.
 
-**The approve upsert** writes `token_endpoint_auth_method`, `jwks_uri`, the alg, the snapshot and `jwks_fetched_at = now()`, and refreshes them `ON CONFLICT`. A later approval therefore refreshes the snapshot.
+**The approve upsert** writes `token_endpoint_auth_method`, `jwks_uri`, the alg, the snapshot and `jwks_fetched_at = <the snapshot's origin fetch time>`, and refreshes them `ON CONFLICT`. A later approval therefore refreshes the snapshot.
 
 **Downgrade at approve is refused.** An existing row is already read `FOR UPDATE` in the approve transaction. If that row is `private_key_jwt` and the re-resolved document now says `none`, the approve refuses `client_metadata.auth_method_downgrade` and writes nothing. A refresh token issued to a key-holding client must never become redeemable without the key. The way out is the panel's Delete, which cascades that user's grants, followed by a fresh consent. Upgrading `none` → `private_key_jwt` is allowed. The existing `none` families of that row must then present assertions; that is the declared method taking effect.
 
@@ -160,13 +162,33 @@ Both triggers take one path, a **pre-phase** that runs before the handler's main
 1. **Gate.** All of these must hold, or the pre-phase does nothing:
    - `client_assertion` is present, parses (steps 2–3 of D6, without verifying the signature), and has an allowed `alg`. A `kid` is required for the kid-miss trigger only.
    - The request carries a credential: a `code`, a `refresh_token`, or at `/revoke` a `token`.
-2. **Read.** A short read-only session resolves the credential by hash: code → `client_id`, refresh token → `client_id`, revoke token → `client_id`. It reads that row's `token_endpoint_auth_method`, `client_id_metadata_url`, `jwks_uri`, snapshot kids and `jwks_fetched_at`, without `FOR UPDATE`, then **closes the session**. The pre-phase continues only when all of these hold:
-   - the row is `private_key_jwt`;
-   - the unverified `iss` equals the row's URL;
-   - at least one trigger holds.
+2. **Read and eligibility.** A short read-only session resolves the credential by hash and reads the client row. It reads that row's `token_endpoint_auth_method`, `client_id_metadata_url`, `jwks_uri`, snapshot kids and `jwks_fetched_at`, without `FOR UPDATE`, then **closes the session**.
+
+   Egress is gated on **credential eligibility**: everything the main phase would require of the credential that can be checked without network I/O (Codex spec R1-1). The pre-phase continues only when all of these hold:
+   - **For a code:**
+     - the code is unspent and unexpired;
+     - the caller's `client_id`, when present, matches the row (`_caller_matches`; never a `cimd_` id);
+     - `redirect_uri` equals the code's;
+     - the PKCE verifier is well-formed and its S256 matches the code's challenge, using the same constant-time comparison.
+   - **For a refresh token:**
+     - the row is unrevoked and unexpired;
+     - it is inside the grant's absolute lifetime (`grant_deadline(grant_issued_at)`);
+     - the caller's `client_id`, when present, matches.
+
+     A revoked (rotated-away) token is ineligible, so **the #182 reuse branch never triggers a fetch** and never reads the assertion.
+   - **For `/revoke`:**
+     - the token row is unrevoked and unexpired;
+     - it is inside its grant's absolute lifetime, so revocation can still act on something live;
+     - the caller's `client_id`, when present, matches the row.
+   - **In every case:**
+     - the row is `private_key_jwt`;
+     - the unverified `iss` equals the row's URL;
+     - at least one trigger holds.
+
+   These pre-phase checks are **advisory, never decisive**. They run on an unlocked read and produce no response, record or state change. A request that fails them simply skips the fetch, and the main transaction re-runs every check under its locks in D8's order. All existing responses, including #325's spent-code concealment and #326's lifetime refusal, are therefore exactly as they would be without the pre-phase. The pre-phase does not consume the code, does not mark anything, and never consults the replay cache.
 3. **Fetch.** First the process JWKS cache (D2) is consulted for that `jwks_uri`. A hit is used instead of fetching only if both of these hold:
    - for the kid-miss trigger, it contains the `kid`;
-   - for the stale trigger, its own fetch time is within `JWKS_MAX_AGE_SECONDS`. The cache records each entry's fetch time.
+   - for the stale trigger, its `fetched_at` is within `JWKS_MAX_AGE_SECONDS` and newer than the row's `jwks_fetched_at`.
 
    Otherwise:
    - a per-`jwks_uri` refetch cooldown applies: `JWKS_REFETCH_COOLDOWN_SECONDS = 60` since the last refetch attempt, success or failure, in a 1,024-entry table with the oldest replaced;
@@ -180,7 +202,7 @@ Both triggers take one path, a **pre-phase** that runs before the handler's main
 
    `UPDATE oauth_clients SET jwks_snapshot = :s, jwks_fetched_at = :t WHERE client_id = :row AND jwks_uri = :uri_read AND jwks_fetched_at < :t`
 
-   Here `:t` is the result's fetch time: now for a fetch, the entry's time for a cache hit. This is a compare-and-set on the URI, so an approval that re-pinned a different `jwks_uri` in between is never overwritten. The `jwks_fetched_at < :t` clause means a snapshot never moves backwards. A fetch also updates the process JWKS cache, so other rows of the same client do not refetch.
+   Here `:t` is the snapshot's `fetched_at`: the origin fetch time, carried through a cache hit. This is a compare-and-set on the URI, so an approval that re-pinned a different `jwks_uri` in between is never overwritten. The `jwks_fetched_at < :t` clause means a snapshot never moves backwards. A fetch also updates the process JWKS cache, so other rows of the same client do not refetch.
 5. **Failure.** A network error, a fetch refusal, an invalid JWKS, a cooldown or a busy cap writes nothing. **`jwks_fetched_at` is not bumped**, so the next request after the cooldown tries again. The cooldown is armed by every attempt. What the main phase sees then depends on the trigger:
    - **stale only** (the `kid` is in the stored snapshot): the main phase verifies against the **stored snapshot**. An outage at the client's origin never breaks an exchange or a refresh.
    - **kid miss:** the `kid` is still not in the stored snapshot, so the main phase refuses `assertion_kid_unknown`.
@@ -208,12 +230,12 @@ Assertion verification sits **exactly** where `_client_authenticated` sits today
 
 | Endpoint / credential | Order (new step in **bold**) | Assertion failure answers | Revokes? |
 | --- | --- | --- | --- |
-| `/token` pre-phase (all) | **D7, only on a kid miss or a snapshot older than 24 h; no lock; decides no response** | — | never |
+| `/token` / `/revoke` pre-phase | **D7, only for an eligible credential (live code with matching redirect URI and PKCE; live, in-lifetime refresh or revoke token; matching `client_id` if given) and only on a kid miss or a snapshot older than 24 h; no lock; decides no response, re-checked below** | — | never |
 | `/token` code, **live** | bootstrap lock → code by hash `FOR UPDATE` → `cimd_` id refused → caller `client_id` vs row → client row exists → **client authentication (D6)** → code expiry → `redirect_uri` → PKCE → ownerless / cross-user / scope → mint | `invalid_client` 401, the existing `authentication_failed` body byte for byte; `invalid_client.assertion_<sub>` | no |
 | `/token` code, **spent** | same up to the client row → **client authentication (D6)** → `redirect_uri` → PKCE → replay branch (revokes) | the unknown-code `invalid_grant` 400 byte for byte; `invalid_grant.spent_code_assertion_<sub>` | no. Only a fully revalidated replay, with a valid fresh assertion, reaches the replay branch |
 | `/token` refresh, **rotated away** | bootstrap lock → grant id by hash → grant lock → row `FOR UPDATE` → **#182 reuse branch, unchanged: the assertion is not read, verified or consumed** | — (constant reuse `invalid_grant`) | yes, as today, for every client (L7) |
 | `/token` refresh, **live** | … → `cimd_` id refused → caller `client_id` vs row → client row exists → **client authentication (D6)** → #326 grant deadline → token expiry → rotation | `invalid_client` 401, the existing body; `invalid_client.assertion_<sub>` | no |
-| `/revoke` | `cimd_` prefix (constant 200) → missing token (200) → **pre-phase** → token by hash → unknown token (200) → client row → unknown client (200) → caller identity = `client_id` if present, else, **for a `private_key_jwt` row only, the assertion's unverified `iss`** → mismatch (constant 200, `client_mismatch`) → **client authentication (D6)** → revoke family | `invalid_client` 401, the existing "right client, failed auth" case; `oauth_revoke_refused reason=assertion_<sub>` | no |
+| `/revoke` | `cimd_` prefix (constant 200) → missing token (200) → **pre-phase** → token by hash → unknown token (200) → client row → unknown client (200) → `client_id` present: mismatch → constant 200 (`client_mismatch`), match → **client authentication (D6)**; `client_id` **absent**: `private_key_jwt` row → **client authentication (D6) directly against the credential-resolved row** (no identity comparison; the verified `iss`/`sub` bind it), any other row → constant 200 (`client_mismatch`, as today) → revoke family | `invalid_client` 401, the existing "right client, failed auth" case; `oauth_revoke_refused reason=assertion_<sub>` | no |
 
 Consequences, stated so they are not "fixed" later:
 - **A replayed, invalid or missing assertion never revokes anything.** Every assertion failure exits before any revocation write. The two revoking branches are untouched:
@@ -223,7 +245,16 @@ Consequences, stated so they are not "fixed" later:
   - A spent code fails assertion checks with the unknown-code response.
   - A live credential gets the same `invalid_client` 401 for every assertion sub-reason.
   - `/revoke`'s `cimd_` and mismatch paths stay the constant 200.
-  - `/revoke` without `client_id` was a hole for public clients and remains a no-op for them. A `private_key_jwt` caller may omit it, because the assertion, not the parameter, identifies and authenticates it.
+  - `/revoke` without `client_id` was a hole for public clients and remains a no-op for them. A `private_key_jwt` caller may omit it, because the assertion, not the parameter, identifies and authenticates it (Codex spec R1-3). With a live `private_key_jwt` token and no `client_id`, the exact outcomes are:
+
+    | Assertion | Response | Record |
+    | --- | --- | --- |
+    | none | `invalid_client` 401 | `oauth_revoke_refused reason=assertion_missing` |
+    | malformed | `invalid_client` 401 | `reason=assertion_malformed` |
+    | wrong `iss` or `sub` | `invalid_client` 401 | `reason=assertion_claims_invalid` |
+    | valid | `{}` 200, family revoked | `oauth_grant_revoked` |
+
+    Every other assertion failure is the same 401 with its own sub.
 - **Cross-tenant.**
   - The assertion is always verified against the row the *credential* resolved, never a row looked up by URL.
   - Its `iss` must equal that row's URL.
@@ -267,7 +298,7 @@ The pre-phase's no-lock property is tested against real Postgres. While the fake
 ## Threats considered
 
 - **Assertion replay.** `jti` is single-use per client URL until `exp`. A full cache refuses rather than evicting. Lifetime is bounded to 330 s. An assertion alone redeems nothing without the code and verifier, or the refresh token. A restart forgets the cache (L1).
-- **Refetch amplification (kid miss or stale) by unauthenticated POSTs naming a known client_id.** The refetch is keyed on a **credential**, not on a `client_id`. A POST carrying only `client_id=https://chatgpt.com/...` and a random-`kid` assertion resolves no row and fetches nothing. With a credential, the limits are one fetch per `jwks_uri` per 60 s process-wide, joined flights, the global cap of 8, and slowapi on the endpoint. The stale trigger adds no new reach: it has the same precondition and the same cooldown.
+- **Refetch amplification (kid miss or stale) by unauthenticated POSTs naming a known client_id, or by dead credentials.** The refetch is keyed on an **eligible credential**, not on a `client_id`: a live code with its redirect URI and PKCE verifier, or a live, in-lifetime refresh or revoke token. A spent or expired code, a failed PKCE verifier, and a revoked, rotated-away, expired or past-lifetime token never cause a fetch. A POST carrying only `client_id=https://chatgpt.com/...` and a random-`kid` assertion resolves no row and fetches nothing. With a credential, the limits are one fetch per `jwks_uri` per 60 s process-wide, joined flights, the global cap of 8, and slowapi on the endpoint. The stale trigger adds no new reach: it has the same precondition and the same cooldown.
 - **Key substitution via `jku`/`jwk`/`x5u`/`x5c`.** These headers are refused outright. Keys come only from the row's snapshot, which came from the pinned same-origin `jwks_uri`.
 - **Alg confusion.** The alg allow-list is RS256/PS256/ES256, intersected with the pin. Key type must match the alg family. The key's `alg` must match when present. One key and one alg are passed to the verifier. `none`, HS* and symmetric `oct` keys cannot be reached; an `oct` key's `k` refuses the whole set.
 - **Downgrade to unauthenticated.**
@@ -306,6 +337,8 @@ The pre-phase's no-lock property is tested against real Postgres. While the fake
 - L12 The token-endpoint URL is accepted as `aud` besides the issuer, which keeps the residual audience-injection exposure of clients that build `aud` from a malicious AS's metadata.
 - L13 The metadata advertises no revocation-endpoint auth methods, as today.
 - L14 A compromise of the client's origin is a compromise of the client: the JWKS is trusted on the same basis as the document.
+- L15 At `/revoke`, a holder of a live `private_key_jwt` client's token who omits `client_id` and the assertion gets `invalid_client` 401 rather than the concealed 200. That tells them the token is live, which a bearer token's holder can learn at `/mcp` anyway.
+- L16 The pre-phase's eligibility checks run on an unlocked read. A credential that is spent, rotated or revoked concurrently can still cause one bounded refetch, which the cooldown caps. The main transaction decides the response.
 
 ## Migration Plan
 

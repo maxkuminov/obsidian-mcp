@@ -7,13 +7,22 @@
 
 Wave 1 runs in parallel, in worktrees. The file scopes are disjoint:
 
-- **Slice S (schema):** `alembic/versions/038_oauth_cimd_private_key_jwt.py` and `src/models/db.py` only.
+- **Slice S (schema):** `alembic/versions/038_oauth_cimd_private_key_jwt.py`, `src/models/db.py`, `tests/integration/test_schema_check.py`, `tests/integration/test_oauth_cimd_migration_pg.py` and the new `tests/integration/test_oauth_cimd_pkjwt_migration_pg.py`.
 - **Slice J (CIMD document + JWKS):** `src/oauth/cimd.py`, `tests/test_oauth_cimd.py` and a new `tests/test_oauth_cimd_jwks.py`.
 - **Slice A (assertion module):** the new `src/oauth/client_assertion.py` and a new `tests/test_oauth_client_assertion.py`.
 
 Wave 2 is one agent, after the Wave 1 merge:
 
 - **Slice R (wiring):** `src/oauth/routes.py`, `src/services/security_events.py`, `src/logging_setup.py`, and the route and integration tests.
+
+Test files that pin what this change alters (grep for `HEAD_REVISION`, `ck_oauth_clients_`, `token_endpoint_auth_methods_supported` and `client_id_metadata_document_supported`, done 2026-11-07):
+- `tests/integration/test_schema_check.py` pins `HEAD_REVISION = "037"` and the canonical `ck_oauth_clients_auth_method_secret` definition. Owned by **S** (2.4).
+- `tests/integration/test_oauth_cimd_migration_pg.py` asserts `ck_oauth_clients_cimd_shape` after `upgrade head`. Owned by **S**: re-check it against 038's replacement definition.
+- `tests/test_oauth_cimd.py` pins the AS metadata. Its document and hash tests belong to **J**. Its metadata test belongs to **R** (5.1), which runs after J's merge, so there is no concurrent edit.
+- `tests/test_native_oidc.py` pins an *upstream provider's* metadata, not ours, and is not touched.
+- `tests/test_oidc_links.py:258` asserts 037's own `revision`/`down_revision`, which 038 leaves true. It is not touched.
+
+S re-runs the grep before finishing and reports any further hit.
 
 Wave 3 is the docs slice (§9). It may run in parallel with the gates once R is merged.
 
@@ -27,6 +36,7 @@ Wave 3 is the docs slice (§9). It may run in parallel with the gates once R is 
 - `client_assertion.authenticate(form, *, metadata_url, snapshot, pinned_alg, endpoint, now) -> None`.
 - `client_assertion.prephase(form, *, credential_kind, credential, route, client_ip) -> None` (async). It owns its short sessions and is the only place that refetches.
 - `client_assertion.reset_state_for_tests()`.
+- `JwksSnapshot.fetched_at: datetime` (UTC) is the origin fetch time. It is immutable, preserved by the cache, and is the only value ever written to `jwks_fetched_at`.
 
 The model's new attribute names are `jwks_uri`, `token_endpoint_auth_signing_alg`, `jwks_snapshot` and `jwks_fetched_at`.
 
@@ -43,7 +53,13 @@ Post-merge, the orchestrator greps for production callers of every new export. E
   - The docstring says why the existing method column is reused.
 - [ ] 2.2 `src/models/db.py`: mirror the columns, with the comment markers byte-identical to the migration, and the three CHECKs. Update the `OAuthClient` docstring.
 - [ ] 2.3 `make test-schema` is clean. `make db-check` reports "No new upgrade operations detected." `tests/integration/test_nonsuperuser_migrations_pg.py` passes.
-- [ ] 2.4 New `tests/integration/test_oauth_cimd_pkjwt_migration_pg.py` covers:
+- [ ] 2.4 `tests/integration/test_schema_check.py`:
+  - change the head-chain assertion to `HEAD_REVISION = "038"` and its `037 → 038` chain;
+  - change the canonical `ck_oauth_clients_auth_method_secret` expectation to 038's definition;
+  - **keep** every existing `none` / `client_secret_post` enforcement case (`none` with a secret fails, `client_secret_post` without one fails);
+  - add `private_key_jwt` cases: with a secret fails; on a DCR id fails; without a snapshot fails; well-formed on a `cimd_` row passes;
+  - add an "absent constraint" case for `ck_oauth_clients_private_key_jwt_shape`, mirroring the #53 test.
+- [ ] 2.5 New `tests/integration/test_oauth_cimd_pkjwt_migration_pg.py` covers:
   - the upgrade on a database holding DCR and `none` CIMD rows (unchanged, all CHECKs valid);
   - a re-run (reconciles);
   - a foreign column or constraint of the same name (refuses, changes nothing);
@@ -68,14 +84,15 @@ Post-merge, the orchestrator greps for production callers of every new export. E
   - redirect, 404, gzip and non-JSON responses;
   - the SSRF deny-list parameterisation for the `jwks_uri`;
   - a cached document plus an uncached JWKS charging one unit;
-  - a joined JWKS flight charging nothing.
+  - a joined JWKS flight charging nothing;
+  - a cache hit returning the original `fetched_at`, never the hit time.
 
 ## 4. Assertion verification and replay cache (Slice A)
 
 - [ ] 4.1 `authenticate`: D6 steps 1–9, in order, each with its sub-reason. Verify with `joserfc.jwt.decode` against **one** imported key and **one** algorithm. Claims are validated by our own code, not the library's registry defaults.
 - [ ] 4.2 The replay cache: 16,384 entries, keyed by SHA-256 of `iss` and `jti`, held until `exp`, purged before insert, refusing when full and never evicting a live entry. It is recorded only after steps 1–8 pass.
 - [ ] 4.3 `parse_unverified`, bounded by the same size limits and never raising. `prephase` implements D7, with both triggers (kid miss, and `jwks_fetched_at` older than `JWKS_MAX_AGE_SECONDS = 86400`) sharing one refetch:
-  - a credential-keyed read in a short session that is closed before I/O;
+  - a credential-keyed read in a short session that is closed before I/O, then the D7 eligibility checks: code unspent and unexpired with redirect URI and PKCE verified; refresh or revoke token unrevoked, unexpired and in its lifetime; `client_id` matching when present. These are advisory only: no response, record or write;
   - the cache, then the cooldown (60 s per `jwks_uri`, 1,024 entries), then join, then the global cap, then `fetch_jwks_guarded`;
   - a CAS `UPDATE … WHERE client_id = :row AND jwks_uri = :uri AND jwks_fetched_at < :t` in its own short transaction;
   - on failure, nothing is written and `jwks_fetched_at` is not advanced. A stale-only failure falls back to the stored snapshot; a kid-miss failure leads to `assertion_kid_unknown`;
@@ -114,7 +131,7 @@ Post-merge, the orchestrator greps for production callers of every new export. E
   - the #182 reuse branch is untouched.
 - [ ] 5.5 `/revoke`:
   - the pre-phase after the `cimd_` and missing-token checks;
-  - the caller identity falls back to the unverified `iss` for `private_key_jwt` rows only;
+  - with `client_id` absent and a `private_key_jwt` row, skip the identity comparison and authenticate directly against the credential-resolved row (design D8, the exact response table);
   - assertion failure returns the existing 401 with `oauth_revoke_refused reason=assertion_<sub>`.
 - [ ] 5.6 Events: add the new reasons and the `oauth_client_jwks_refetched` event to the `security_events` catalogue and the `logging_setup` allow-list. The catalogue/call-site drift test stays green.
 - [ ] 5.7 Route tests (offline):
@@ -134,6 +151,18 @@ Post-merge, the orchestrator greps for production callers of every new export. E
   - stale snapshot with the origin failing (timeout, 500, invalid JWKS, private-key JWKS, cooldown) → refresh succeeds on the stored snapshot, and snapshot and `jwks_fetched_at` are unchanged;
   - after a failed stale refetch, a request more than 60 s later fetches again; within 60 s it does not;
   - stale and kid-miss together → one fetch, event `trigger=kid_miss`;
+  - **zero-fetch eligibility** (fetch counter = 0, and the response byte-identical to the same request with the pre-phase patched out), each with an unknown-`kid` assertion whose `iss` is the row's URL:
+    - a spent code with a failed PKCE verifier;
+    - an expired code with a failed PKCE verifier;
+    - a live code with a wrong `redirect_uri`;
+    - a live code with a malformed verifier;
+    - a revoked refresh token;
+    - a rotated-away refresh token, which still revokes its family;
+    - a refresh token past its grant's absolute lifetime;
+    - a mismatched `client_id`;
+    - at `/revoke`, a revoked or expired token;
+  - an approval served from a JWKS cache entry 23 h 50 min old stores that entry's `fetched_at`. A token request 11 min later meets the stale trigger;
+  - `/revoke` with no `client_id` on a `private_key_jwt` row: no assertion → 401 `assertion_missing`; malformed → 401 `assertion_malformed`; wrong `iss` → 401 `assertion_claims_invalid`; valid → 200 and the family revoked. On a `none` row with no `client_id` → the constant 200 `client_mismatch`;
   - a stale-trigger cache hit older than 24 h is not used, and a fresh one is used without a fetch and writes the entry's fetch time;
   - 20 stale-trigger requests within a minute → ≤ 1 fetch;
   - a test that makes `cimd.resolve` and `cimd._fetch` raise still passes for exchange, refresh and revoke (the document is never fetched).

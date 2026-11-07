@@ -122,7 +122,7 @@ On an approval the server SHALL insert or refresh an `oauth_clients` row in the 
 - `user_id` set to the approving user;
 - no secret hash;
 - `token_endpoint_auth_method` set to the projection's auth method;
-- for a `private_key_jwt` projection, its `jwks_uri`, its signing alg, the validated normalised JWKS snapshot fetched for this approval, and `jwks_fetched_at`;
+- for a `private_key_jwt` projection, its `jwks_uri`, its signing alg, the validated normalised JWKS snapshot resolved for this approval, and `jwks_fetched_at`. `jwks_fetched_at` SHALL be that snapshot's origin fetch time, carried unchanged through any cache hit, and never the approval time;
 - the projection's name, redirect URIs and scope.
 
 The same statement SHALL stamp `last_used_at`.
@@ -151,6 +151,10 @@ Rows existing before this change SHALL keep auth method `none` without a backfil
 - **WHEN** a user denies a CIMD client that has no row
 - **THEN** no client row SHALL be created
 
+#### Scenario: A cache hit at approval does not reset the snapshot's age
+- **WHEN** a JWKS fetched at T0 is served from the cache to an approval at T0 + 23 h 50 min
+- **THEN** the row's `jwks_fetched_at` SHALL be T0, and a token request at T0 + 24 h 1 min SHALL meet the stale trigger
+
 #### Scenario: A key-authenticated row is never downgraded
 - **WHEN** a user's row for a URL is `private_key_jwt` and the document now declares `none`, and the user approves
 - **THEN** the approval SHALL be refused with `invalid_client`, the row SHALL be unchanged and no code SHALL be written
@@ -164,7 +168,7 @@ Rows existing before this change SHALL keep auth method `none` without a backfil
 - **THEN** grant families, code lineage, the absolute grant lifetime and refresh-reuse revocation SHALL behave exactly as for a registered client
 
 ### Requirement: The token and revocation endpoints SHALL accept a CIMD URL as the caller's client identifier
-Wherever `/token` or `/revoke` compares a caller-supplied `client_id` against a client row, a value byte-equal to that row's `client_id_metadata_url` SHALL match, and for a CIMD row nothing else SHALL match, through one shared definition. For a `private_key_jwt` row the `client_id` parameter SHALL be optional at both endpoints. At `/revoke`, when it is absent, the identity compared SHALL be the presented assertion's unverified `iss`, which the assertion's verification then binds. For every other row, `/revoke` SHALL continue to require `client_id`. All other refusal rules, lookups and constant responses of those endpoints SHALL be unchanged.
+Wherever `/token` or `/revoke` compares a caller-supplied `client_id` against a client row, a value byte-equal to that row's `client_id_metadata_url` SHALL match, and for a CIMD row nothing else SHALL match, through one shared definition. For a `private_key_jwt` row the `client_id` parameter SHALL be optional at both endpoints. At `/revoke`, when it is absent and the token's row is `private_key_jwt`, the caller-identity comparison SHALL be skipped and the client SHALL be authenticated directly against that credential-resolved row, whose verified `iss` and `sub` bind the identity. For every other row, `/revoke` SHALL continue to require `client_id` and answer its absence with the constant 200. All other refusal rules, lookups and constant responses of those endpoints SHALL be unchanged.
 
 #### Scenario: Claude Code exchanges with its URL
 - **WHEN** a code issued to a CIMD row is exchanged with `client_id` equal to the document URL
@@ -181,6 +185,10 @@ Wherever `/token` or `/revoke` compares a caller-supplied `client_id` against a 
 #### Scenario: A key-authenticated client revokes without client_id
 - **WHEN** `/revoke` presents a `private_key_jwt` client's token with a valid assertion and no `client_id`
 - **THEN** the grant family SHALL be revoked
+
+#### Scenario: Revocation without client_id and without an assertion is an authentication failure
+- **WHEN** `/revoke` presents a live `private_key_jwt` client's token with no `client_id` and no assertion, or with a malformed assertion, or with a validly signed assertion whose `iss` is another URL
+- **THEN** the response SHALL be `invalid_client` 401, nothing SHALL be revoked, and `oauth_revoke_refused` SHALL carry `reason` `assertion_missing`, `assertion_malformed` or `assertion_claims_invalid` respectively
 
 #### Scenario: A public client still cannot revoke without client_id
 - **WHEN** `/revoke` presents a `none` CIMD client's token with no `client_id`
@@ -311,7 +319,7 @@ A failed assertion on a live credential SHALL answer the existing `invalid_clien
 
 The refresh-reuse decision SHALL be unchanged: a rotated-away refresh token SHALL revoke its family without the assertion being read, verified or recorded.
 
-At `/revoke`, the order SHALL be: the synthetic-id check (constant 200) → the token lookup → the client-row lookup → the caller-identity comparison (constant 200 on mismatch) → assertion authentication (the existing `invalid_client` 401 on failure) → revocation.
+At `/revoke`, the order SHALL be: the synthetic-id check (constant 200) → the token lookup → the client-row lookup → the caller-identity comparison (constant 200 on mismatch), skipped only when `client_id` is absent and the row is `private_key_jwt` → assertion authentication (the existing `invalid_client` 401 on failure) → revocation.
 
 A failed, missing or replayed assertion MUST NOT revoke anything at any endpoint.
 
@@ -340,14 +348,20 @@ A `/token` or `/revoke` request SHALL trigger a pre-phase, run before the handle
 - it carries an assertion with an allowed `alg`;
 - its credential (a code, a refresh token, or at `/revoke` a token) resolves to a `private_key_jwt` client row;
 - the assertion's unverified `iss` equals that row's URL;
-- either the assertion's header names a `kid` absent from the row's snapshot (the kid-miss trigger), or the row's `jwks_fetched_at` is older than 24 hours, a constant equal to the JWKS cache ceiling (the stale trigger).
+- either the assertion's header names a `kid` absent from the row's snapshot (the kid-miss trigger), or the row's `jwks_fetched_at` is older than 24 hours, a constant equal to the JWKS cache ceiling (the stale trigger);
+- the credential is eligible by every check the main phase would make that needs no network I/O, as follows:
+  - **a code:** unspent and unexpired, the caller's `client_id` matching when present, `redirect_uri` equal to the code's, and a well-formed PKCE verifier matching its challenge;
+  - **a refresh token:** unrevoked, unexpired and inside its grant's absolute lifetime, with the caller's `client_id` matching when present;
+  - **at `/revoke`:** an unrevoked, unexpired token inside its grant's absolute lifetime, with the caller's `client_id` matching when present.
+
+A revoked refresh token SHALL never trigger a fetch, so the refresh-reuse branch never reads the assertion. The eligibility checks SHALL be advisory: they produce no response, record or state change. The main transaction SHALL re-run every check under its locks, so every response, including the spent-code and absolute-lifetime responses, SHALL be identical to the response without the pre-phase.
 
 The pre-phase SHALL behave as follows:
 - It SHALL resolve the row in a short read-only session and close that session before any network I/O. It SHALL hold no session, transaction or row lock across the fetch.
 - It SHALL first consult the process JWKS cache for that row's pinned `jwks_uri`. For the stale trigger, a cache entry counts only if it was fetched within the last 24 hours.
 - It SHALL fetch at most once per `jwks_uri` per 60 s process-wide, success or failure, whichever trigger caused it. It SHALL join an in-progress fetch of the same `jwks_uri` and observe the process-wide in-flight cap. One refetch SHALL serve both triggers.
 - The fetch SHALL go only through the hardened transfer fetch, and its result SHALL be validated by the authorization-time JWKS rules.
-- A validated result SHALL replace the row's snapshot, and set `jwks_fetched_at` to the result's fetch time, in a short transaction. That write SHALL be conditioned on the row's `jwks_uri` being unchanged and its `jwks_fetched_at` being older than the result's.
+- A validated result SHALL replace the row's snapshot, and set `jwks_fetched_at` to the snapshot's origin fetch time (carried through a cache hit), in a short transaction. That write SHALL be conditioned on the row's `jwks_uri` being unchanged and its `jwks_fetched_at` being older than the result's.
 - A failed refetch (network failure, fetch refusal, invalid JWKS, cooldown or busy cap) SHALL write nothing and MUST NOT advance `jwks_fetched_at`.
 - The pre-phase SHALL decide no response.
 
@@ -384,6 +398,19 @@ No refetch SHALL occur for a request whose credential resolves to no `private_ke
 
 #### Scenario: A client_id alone triggers nothing
 - **WHEN** an unauthenticated caller posts to `/token` with `client_id=https://chatgpt.com/oauth/client.json`, an unknown code value and an assertion naming a random `kid`
+- **THEN** no fetch SHALL be made
+
+#### Scenario: A dead or unproven code triggers no fetch
+- **WHEN** a request presents a `private_key_jwt` client's spent code, or its expired code, or its live code with a wrong or malformed PKCE verifier or a wrong redirect URI, together with an assertion whose `iss` is the row's URL and whose `kid` is unknown
+- **THEN** no fetch SHALL be made
+- **AND** the response SHALL be byte-identical to the one the same request receives with the pre-phase disabled
+
+#### Scenario: A revoked or rotated-away refresh token triggers no fetch
+- **WHEN** a revoked or rotated-away refresh token of a `private_key_jwt` client, or one past its grant's absolute lifetime, is presented with an unknown-`kid` assertion
+- **THEN** no fetch SHALL be made, and a rotated-away token SHALL still revoke its family with the constant reuse response
+
+#### Scenario: Revocation of a dead token triggers no fetch
+- **WHEN** `/revoke` presents a revoked or expired `private_key_jwt` token, or a live one under a mismatched `client_id`, with an unknown-`kid` assertion
 - **THEN** no fetch SHALL be made
 
 #### Scenario: Refetches are rate-bounded per key source
