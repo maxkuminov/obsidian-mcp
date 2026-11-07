@@ -219,7 +219,13 @@ def test_the_live_claude_code_document_validates():
         ({"redirect_uris": ["http://user@localhost/cb"]}, "redirect_uris_invalid"),
         ({"redirect_uris": "https://a.example/cb"}, "redirect_uris_invalid"),
         ({"token_endpoint_auth_method": "client_secret_post"}, "auth_method_unsupported"),
-        ({"token_endpoint_auth_method": "private_key_jwt"}, "auth_method_unsupported"),
+        # #420: private_key_jwt is admitted, so without a jwks_uri it is the
+        # key-source refusal, not an unsupported method (spec: "is absent,
+        # `none` or `private_key_jwt`").
+        ({"token_endpoint_auth_method": "private_key_jwt"}, "jwks_uri_invalid"),
+        ({"token_endpoint_auth_method": "client_secret_jwt"}, "auth_method_unsupported"),
+        ({"token_endpoint_auth_method": "tls_client_auth"}, "auth_method_unsupported"),
+        ({"token_endpoint_auth_method": ["none"]}, "auth_method_unsupported"),
         ({"client_secret": "s"}, "secret_present"),
         ({"client_secret_expires_at": 0}, "secret_present"),
         ({"grant_types": ["refresh_token"]}, "grant_types_invalid"),
@@ -289,6 +295,170 @@ def test_the_authorization_hash_changes_with_redirects_or_scope(overrides):
     base = cimd.validate_document(CLAUDE_CODE_URL, CLAUDE_CODE_DOC)
     changed = cimd.validate_document(CLAUDE_CODE_URL, dict(CLAUDE_CODE_DOC, **overrides))
     assert base.authorization_hash != changed.authorization_hash
+
+
+# ── #420: private_key_jwt documents (D1) and the hash (D4) ─────────────────
+
+
+CHATGPT_URL = "https://chatgpt.com/oauth/client.json"
+CHATGPT_DOC = {
+    "client_id": CHATGPT_URL,
+    "client_uri": "https://chatgpt.com/",
+    "redirect_uris": ["https://chatgpt.com/connector_platform_oauth_redirect"],
+    "token_endpoint_auth_method": "private_key_jwt",
+    "token_endpoint_auth_methods_supported": ["none", "private_key_jwt"],
+    "grant_types": ["authorization_code", "refresh_token"],
+    "response_types": ["code"],
+    "client_name": "ChatGPT",
+    "logo_uri": "https://persistent.oaistatic.com/sonic/misc/openai-logo.png",
+    "token_endpoint_auth_signing_alg": "RS256",
+    "jwks_uri": "https://chatgpt.com/oauth/jwks.json",
+}
+
+#: The Claude Code projection's hash before #420, computed on 4c22b24. A
+#: `none` projection must hash byte-identically after the change (D4).
+PRE_420_CLAUDE_CODE_HASH = "9cfbdc367c8d26866816c1a46a50ade537e14a9cd005a97ebe39b620b88916a0"
+
+
+def test_the_chatgpt_document_validates_as_private_key_jwt():
+    projection = cimd.validate_document(CHATGPT_URL, CHATGPT_DOC)
+    assert projection.auth_method == "private_key_jwt"
+    assert projection.jwks_uri == "https://chatgpt.com/oauth/jwks.json"
+    assert projection.signing_alg == "RS256"
+    assert projection.redirect_uris == ("https://chatgpt.com/connector_platform_oauth_redirect",)
+    # `none` in token_endpoint_auth_methods_supported never downgrades it.
+    assert projection.auth_method != "none"
+
+
+def test_an_absent_alg_is_unpinned():
+    document = dict(CHATGPT_DOC)
+    del document["token_endpoint_auth_signing_alg"]
+    projection = cimd.validate_document(CHATGPT_URL, document)
+    assert projection.signing_alg is None and projection.auth_method == "private_key_jwt"
+
+
+@pytest.mark.parametrize("alg", ["RS256", "PS256", "ES256"])
+def test_each_supported_alg_is_pinned(alg):
+    projection = cimd.validate_document(
+        CHATGPT_URL, dict(CHATGPT_DOC, token_endpoint_auth_signing_alg=alg)
+    )
+    assert projection.signing_alg == alg
+
+
+@pytest.mark.parametrize(
+    "overrides, reason",
+    [
+        ({"jwks_uri": "https://evil.example.com/oauth/jwks.json"}, "jwks_uri_cross_origin"),
+        ({"jwks_uri": "https://cdn.chatgpt.com/oauth/jwks.json"}, "jwks_uri_cross_origin"),
+        ({"jwks_uri": "https://chatgpt.com:8443/oauth/jwks.json"}, "jwks_uri_cross_origin"),
+        ({"jwks_uri": "https://chatgpt.com/oauth/jwks.json?v=1"}, "jwks_uri_invalid"),
+        ({"jwks_uri": "https://chatgpt.com/oauth/jwks.json#k"}, "jwks_uri_invalid"),
+        ({"jwks_uri": "https://chatgpt.com:443/oauth/jwks.json"}, "jwks_uri_invalid"),
+        ({"jwks_uri": "https://ChatGPT.com/oauth/jwks.json"}, "jwks_uri_invalid"),
+        ({"jwks_uri": "https://chatgpt.com/"}, "jwks_uri_invalid"),
+        ({"jwks_uri": "https://u@chatgpt.com/oauth/jwks.json"}, "jwks_uri_invalid"),
+        ({"jwks_uri": "https://chatgpt.com/oauth/../jwks.json"}, "jwks_uri_invalid"),
+        ({"jwks_uri": "http://chatgpt.com/oauth/jwks.json"}, "jwks_uri_invalid"),
+        ({"jwks_uri": None}, "jwks_uri_invalid"),
+        ({"jwks_uri": 7}, "jwks_uri_invalid"),
+        ({"jwks": {"keys": []}}, "jwks_inline_refused"),
+        ({"token_endpoint_auth_signing_alg": "HS256"}, "signing_alg_unsupported"),
+        ({"token_endpoint_auth_signing_alg": "none"}, "signing_alg_unsupported"),
+        ({"token_endpoint_auth_signing_alg": "EdDSA"}, "signing_alg_unsupported"),
+        ({"token_endpoint_auth_signing_alg": "rs256"}, "signing_alg_unsupported"),
+        ({"token_endpoint_auth_signing_alg": None}, "signing_alg_unsupported"),
+        ({"client_secret": "s"}, "secret_present"),
+    ],
+)
+def test_bad_private_key_jwt_documents_are_refused(overrides, reason):
+    with pytest.raises(cimd.CimdRefusal) as caught:
+        cimd.validate_document(CHATGPT_URL, dict(CHATGPT_DOC, **overrides))
+    assert caught.value.reason == reason
+
+
+def test_a_missing_jwks_uri_is_refused():
+    document = dict(CHATGPT_DOC)
+    del document["jwks_uri"]
+    with pytest.raises(cimd.CimdRefusal) as caught:
+        cimd.validate_document(CHATGPT_URL, document)
+    assert caught.value.reason == "jwks_uri_invalid"
+
+
+def test_a_cross_origin_document_is_refused_before_any_jwks_fetch(origin):
+    document = dict(CHATGPT_DOC, jwks_uri="https://evil.example.com/oauth/jwks.json")
+    origin.serve(CHATGPT_URL, document)
+    assert refusal(cimd.resolve(CHATGPT_URL, "198.51.100.1")).reason == "jwks_uri_cross_origin"
+    assert origin.requests == [CHATGPT_URL]
+
+
+def test_a_none_document_ignores_key_members():
+    projection = cimd.validate_document(
+        CLAUDE_CODE_URL,
+        dict(CLAUDE_CODE_DOC, jwks_uri="https://evil.example.com/k", jwks={"keys": []},
+             token_endpoint_auth_signing_alg="HS256"),
+    )
+    assert projection.auth_method == "none"
+    assert projection.jwks_uri is None and projection.signing_alg is None
+
+
+def test_the_none_hash_is_byte_identical_to_before_420():
+    projection = cimd.validate_document(CLAUDE_CODE_URL, CLAUDE_CODE_DOC)
+    assert projection.authorization_hash == PRE_420_CLAUDE_CODE_HASH
+    bare = cimd.Projection(
+        client_id=CLAUDE_CODE_URL, client_name="x",
+        redirect_uris=projection.redirect_uris, scope=projection.scope,
+    )
+    assert bare.authorization_hash == PRE_420_CLAUDE_CODE_HASH
+
+
+def test_the_private_key_jwt_hash_covers_the_key_source_not_the_name():
+    base = cimd.validate_document(CHATGPT_URL, CHATGPT_DOC)
+    expected = hashlib.sha256(json.dumps(
+        {
+            "client_id": CHATGPT_URL,
+            "jwks_uri": "https://chatgpt.com/oauth/jwks.json",
+            "redirect_uris": ["https://chatgpt.com/connector_platform_oauth_redirect"],
+            "scope": base.scope,
+            "token_endpoint_auth_method": "private_key_jwt",
+            "token_endpoint_auth_signing_alg": "RS256",
+        },
+        sort_keys=True, separators=(",", ":"),
+    ).encode()).hexdigest()
+    assert base.authorization_hash == expected
+    renamed = cimd.validate_document(CHATGPT_URL, dict(CHATGPT_DOC, client_name="Other"))
+    assert renamed.authorization_hash == base.authorization_hash
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"jwks_uri": "https://chatgpt.com/oauth/jwks2.json"},
+        {"token_endpoint_auth_signing_alg": "PS256"},
+        {"token_endpoint_auth_signing_alg": "ES256"},
+    ],
+)
+def test_the_private_key_jwt_hash_changes_with_the_key_source(overrides):
+    base = cimd.validate_document(CHATGPT_URL, CHATGPT_DOC)
+    changed = cimd.validate_document(CHATGPT_URL, dict(CHATGPT_DOC, **overrides))
+    assert base.authorization_hash != changed.authorization_hash
+
+
+def test_an_absent_alg_hashes_differently_from_a_pinned_one():
+    document = dict(CHATGPT_DOC)
+    del document["token_endpoint_auth_signing_alg"]
+    unpinned = cimd.validate_document(CHATGPT_URL, document)
+    pinned = cimd.validate_document(CHATGPT_URL, CHATGPT_DOC)
+    assert unpinned.authorization_hash != pinned.authorization_hash
+
+
+def test_a_method_flip_changes_the_hash():
+    # The same URL, redirects and scope under `none` and private_key_jwt.
+    pk = cimd.validate_document(CHATGPT_URL, CHATGPT_DOC)
+    public = cimd.Projection(
+        client_id=pk.client_id, client_name=pk.client_name,
+        redirect_uris=pk.redirect_uris, scope=pk.scope,
+    )
+    assert public.authorization_hash != pk.authorization_hash
 
 
 # ── D5: redirect matching ──────────────────────────────────────────────────
@@ -836,10 +1006,32 @@ def test_metadata_advertises_both_values_claude_needs(client, monkeypatch):
     assert "none" in body["token_endpoint_auth_methods_supported"]
     assert body["authorization_response_iss_parameter_supported"] is True
     assert body["registration_endpoint"].endswith("/register")
+    # #420 D9: `private_key_jwt` and the three algs, only while enabled.
+    assert body["token_endpoint_auth_methods_supported"] == [
+        "none", "client_secret_post", "private_key_jwt",
+    ]
+    assert body["token_endpoint_auth_signing_alg_values_supported"] == [
+        "RS256", "PS256", "ES256",
+    ]
     monkeypatch.setattr(settings, "oauth_cimd_enabled", False)
     body = client.get("/.well-known/oauth-authorization-server").json()
     assert "client_id_metadata_document_supported" not in body
     assert body["registration_endpoint"].endswith("/register")
+    # Disabled, exactly the pre-#420 document.
+    base = settings.base_url
+    assert body == {
+        "issuer": base,
+        "authorization_endpoint": f"{base}/authorize",
+        "token_endpoint": f"{base}/token",
+        "registration_endpoint": f"{base}/register",
+        "revocation_endpoint": f"{base}/revoke",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none", "client_secret_post"],
+        "scopes_supported": ["read", "readwrite", "offline_access"],
+        "authorization_response_iss_parameter_supported": True,
+    }
 
 
 # ── RFC 8707 classification ────────────────────────────────────────────────

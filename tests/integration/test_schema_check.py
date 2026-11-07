@@ -61,7 +61,7 @@ DIM = 64  # irrelevant here; keeps the migration cheap.
 # The current head. Every case that migrates forward asserts it, so adding a
 # revision without teaching this module about it fails loudly rather than
 # leaving the new migration unexercised.
-HEAD_REVISION = "037"
+HEAD_REVISION = "038"
 
 CONSTRAINT = "ck_oauth_clients_auth_method_secret"
 MARKER = "created by 013_schema_reconciliation"
@@ -72,11 +72,26 @@ MARKER = "created by 013_schema_reconciliation"
 # made explicit, parentheses added — not our guess at it. The migration derives
 # the same string at runtime instead of hard-coding it; this constant is the
 # pin that tells us if either side moves.
-CANONICAL_CONSTRAINTDEF = (
+#
+# This is the definition at any revision from 010 to 037. Migration 038 (#420)
+# replaces it with `CANONICAL_CONSTRAINTDEF`, which keeps both clauses and adds
+# a third, so every case that downgrades to 012 asserts this one and every case
+# at head asserts the successor.
+CANONICAL_CONSTRAINTDEF_010 = (
     "CHECK (((((token_endpoint_auth_method)::text = 'none'::text) "
     "AND (client_secret_hash IS NULL)) "
     "OR (((token_endpoint_auth_method)::text = 'client_secret_post'::text) "
     "AND (client_secret_hash IS NOT NULL))))"
+)
+
+# 038's definition at head, measured the same way.
+CANONICAL_CONSTRAINTDEF = (
+    "CHECK (((((token_endpoint_auth_method)::text = 'none'::text) "
+    "AND (client_secret_hash IS NULL)) "
+    "OR (((token_endpoint_auth_method)::text = 'client_secret_post'::text) "
+    "AND (client_secret_hash IS NOT NULL)) "
+    "OR (((token_endpoint_auth_method)::text = 'private_key_jwt'::text) "
+    "AND (client_secret_hash IS NULL))))"
 )
 
 # The rest of the 010 shape, likewise as PostgreSQL 16 prints it. `alembic
@@ -559,7 +574,7 @@ def test_wrong_column_type_is_reconciled():
         assert constraint_row(url) is not None, (
             "downgrade dropped a constraint 013 did not create"
         )
-        assert constraint_row(url)[1] == CANONICAL_CONSTRAINTDEF
+        assert constraint_row(url)[1] == CANONICAL_CONSTRAINTDEF_010
 
 
 def test_impostor_constraint_does_not_block_the_type_repair():
@@ -698,7 +713,7 @@ def test_downgrade_keeps_a_constraint_013_did_not_create():
         assert alembic_version(url) == "012"
         row = constraint_row(url)
         assert row is not None, "downgrade dropped 010's constraint"
-        assert row[1] == CANONICAL_CONSTRAINTDEF
+        assert row[1] == CANONICAL_CONSTRAINTDEF_010
         # Documented asymmetry: NOT NULL stays. Relaxing it would re-create the
         # very drift 013 exists to remove, and the models still declare it.
         assert all(not_null_flags(url).values())
@@ -8298,15 +8313,25 @@ def refuse_037(url, *, must_mention):
     return combined
 
 
-def test_037_chains_from_036_and_is_head():
+def test_037_chains_from_036():
     from alembic.config import Config
     from alembic.script import ScriptDirectory
 
     config = Config()
     config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_current_head() == HEAD_REVISION == "037"
     assert script.get_revision("037").down_revision == "036"
+
+
+def test_038_chains_from_037_and_is_head():
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config()
+    config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+    assert script.get_current_head() == HEAD_REVISION == "038"
+    assert script.get_revision("038").down_revision == "037"
 
 
 def test_037_fresh_upgrade_has_the_exact_marked_shape():
@@ -8613,3 +8638,117 @@ def test_downgrade_037_then_reupgrade_recreates_it_identically():
         # The link is lost by design (the docstring says so).
         assert oidc_values(url) == {1: (None,) * 6}
         assert_alembic_check_clean(url, DIM)
+
+
+# --------------------------------------------------------------------------
+# 038: private_key_jwt for CIMD clients (#420)
+# --------------------------------------------------------------------------
+
+PKJWT_CONSTRAINT = "ck_oauth_clients_private_key_jwt_shape"
+PKJWT_MARKER = "created by 038_oauth_cimd_private_key_jwt (#420)"
+PKJWT_URL = "https://chatgpt.com/oauth/client.json"
+PKJWT_JWKS_URI = "https://chatgpt.com/oauth/jwks.json"
+PKJWT_SNAPSHOT = '{"keys": [{"kty": "RSA", "kid": "k1", "n": "AQAB", "e": "AQAB"}]}'
+
+
+def insert_pkjwt_client(
+    url,
+    client_id,
+    *,
+    metadata_url=PKJWT_URL,
+    secret=None,
+    jwks_uri=PKJWT_JWKS_URI,
+    alg="RS256",
+    snapshot=PKJWT_SNAPSHOT,
+    fetched=True,
+    method="private_key_jwt",
+):
+    sql(
+        url,
+        "INSERT INTO oauth_clients "
+        "(client_id, client_secret_hash, token_endpoint_auth_method, client_name, "
+        " redirect_uris, scope, client_id_metadata_url, jwks_uri, "
+        " token_endpoint_auth_signing_alg, jwks_snapshot, jwks_fetched_at) "
+        "VALUES ($1, $2, $3, 'pkjwt', '[]'::jsonb, 'read', $4, $5, $6, $7::jsonb, "
+        " CASE WHEN $8 THEN now() ELSE NULL END)",
+        client_id,
+        secret,
+        method,
+        metadata_url,
+        jwks_uri,
+        alg,
+        snapshot,
+        fetched,
+    )
+
+
+def pkjwt_constraint_row(url):
+    rows = fetch(
+        url,
+        "SELECT convalidated, obj_description(oid, 'pg_constraint') AS comment "
+        "FROM pg_constraint WHERE conrelid = 'oauth_clients'::regclass "
+        "  AND contype = 'c' AND conname = $1",
+        PKJWT_CONSTRAINT,
+    )
+    return (rows[0]["convalidated"], rows[0]["comment"]) if rows else None
+
+
+def assert_pkjwt_enforced(url):
+    """The four `private_key_jwt` shapes the 038 CHECKs exist to decide."""
+    # With a secret: the replaced auth-method CHECK refuses it.
+    with pytest.raises(asyncpg.exceptions.CheckViolationError) as with_secret:
+        insert_pkjwt_client(url, "cimd_" + "1" * 59, secret="a" * 64)
+    assert "ck_oauth_clients_" in str(with_secret.value)
+
+    # On a DCR id (no metadata URL): the new shape CHECK refuses it.
+    with pytest.raises(asyncpg.exceptions.CheckViolationError) as on_dcr:
+        insert_pkjwt_client(url, "pkjwt-dcr", metadata_url=None)
+    assert PKJWT_CONSTRAINT in str(on_dcr.value)
+
+    # Without a snapshot: the new shape CHECK refuses it.
+    with pytest.raises(asyncpg.exceptions.CheckViolationError) as no_snapshot:
+        insert_pkjwt_client(url, "cimd_" + "2" * 59, snapshot=None)
+    assert PKJWT_CONSTRAINT in str(no_snapshot.value)
+
+    # Well-formed on a cimd_ row: admitted.
+    insert_pkjwt_client(url, "cimd_" + "3" * 59)
+    sql(url, "DELETE FROM oauth_clients WHERE client_id = $1", "cimd_" + "3" * 59)
+
+
+def test_038_private_key_jwt_shapes_on_a_fresh_database():
+    with throwaway_db("schema_038_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION
+        assert pkjwt_constraint_row(url) == (True, PKJWT_MARKER)
+        # The pre-038 enforcement is unchanged.
+        assert_constraint_enforced(url)
+        assert_pkjwt_enforced(url)
+
+
+def test_038_absent_private_key_jwt_constraint_is_recreated():
+    """#53's shape for the new CHECK: gone from a database stamped past 038."""
+    with throwaway_db("schema_038_absent") as url:
+        sql(url, f"ALTER TABLE oauth_clients DROP CONSTRAINT {PKJWT_CONSTRAINT}")
+        assert pkjwt_constraint_row(url) is None
+        # Absent, a malformed row is admitted: the constraint is the only guard.
+        insert_pkjwt_client(url, "pkjwt-dcr-absent", metadata_url=None)
+        sql(url, "DELETE FROM oauth_clients WHERE client_id = 'pkjwt-dcr-absent'")
+
+        _harness.run_alembic(url, "stamp", "037", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert pkjwt_constraint_row(url) == (True, PKJWT_MARKER)
+        assert_reconciled(url, marker_expected=False)
+        assert_pkjwt_enforced(url)
+
+
+def test_038_keeps_013s_marker_through_upgrade_and_downgrade():
+    """A drifted 012 database: 013 marks the CHECK, 038 replaces it and keeps
+    the mark, and 038's downgrade restores 010's definition with it intact."""
+    with throwaway_db("schema_038_marker", revision="012") as url:
+        drift_to_live_shape(url)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert constraint_row(url) == (True, CANONICAL_CONSTRAINTDEF, MARKER)
+
+        _harness.run_alembic(url, "downgrade", "037", dimensions=DIM)
+        assert constraint_row(url) == (True, CANONICAL_CONSTRAINTDEF_010, MARKER)

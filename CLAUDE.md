@@ -306,8 +306,8 @@ update it in the same change.** What stays here is the short list:
   to an unknown code — and so does **every failed revalidation of a spent
   code** (reason only in the log). A live code keeps its specific refusals
   and the pre-#325 check order (expiry first). See [oauth and grants](docs/architecture/oauth-and-grants.md).
-- **OAuth Client ID Metadata Documents, DCR as the fallback** (#357,
-  migration 036). An `https://` `client_id` at `/authorize` is fetched through
+- **OAuth Client ID Metadata Documents, DCR as the fallback** (#357, #420,
+  migrations 036/038). An `https://` `client_id` at `/authorize` is fetched through
   `transfer.fetch_url_guarded` (no redirects, 10 s, 64 KiB, the SSRF deny list,
   pinned). Admission: cache, then **join an in-progress fetch before any
   charge**, a 30 s failure cooldown, the failed-auth salted 4,096-slot table
@@ -320,8 +320,25 @@ update it in the same change.** What stays here is the short list:
   `cimd_` id is never caller input, and where it is refused differs by
   endpoint.** At `/authorize` it is refused before any lookup. At `/token`
   the credential and the unchanged #182/#325/#326 processing run first,
-  then it is refused. At `/revoke` it is a concealed 200 (`{}`). `/token` never
-  fetches. Consent shows the document's host and URL, never its
+  then it is refused. At `/revoke` it is a concealed 200 (`{}`). `/token` and
+  `/revoke` never fetch **the document**. **`private_key_jwt` is CIMD-only**
+  (#420; `/register` still refuses it): the declared method is honoured, never
+  downgraded; the document needs a same-origin `jwks_uri`, no inline `jwks`,
+  an optional RS256/PS256/ES256 pin; `/authorize` fetches the JWKS with its
+  own cache and a **second** per-address charge; the approve stores a
+  normalised snapshot with its **origin** fetch time (038's four columns and
+  three CHECKs), and a `private_key_jwt` row never becomes `none` — refused
+  under `FOR UPDATE` *and* by the conflict update's `WHERE` (two first
+  approvals race; L10 owner-accepted) — nor moves its snapshot backwards.
+  `src/oauth/client_assertion.py` verifies the assertion at the one
+  `_client_authenticated` position (one key, one alg; `jku`/`jwk`/`x5*`/`crit`
+  refused; `aud` = issuer or `/token`, single-valued; zero `exp` leeway, 300 s
+  life; `jti` single-use per client URL, a full cache refuses). A failed
+  assertion never revokes; #182 reuse is unchanged (L7 owner-accepted). The
+  JWKS refetch (kid miss, or snapshot > 24 h; 60 s cooldown per URI; a failed
+  stale refetch falls back to the stored snapshot) runs only in a pre-phase,
+  for an eligible credential, **before the main session, with no lock across
+  the hop**, decides no response, and runs while CIMD is disabled. Consent shows the document's host and URL, never its
   `client_name`. Loopback redirects match on any port for CIMD only. `iss` is
   on every authorization redirect. RFC 8707 `resource` is **classified, never
   refused** (`resource_class` on every record; `invalid_target` waits for a

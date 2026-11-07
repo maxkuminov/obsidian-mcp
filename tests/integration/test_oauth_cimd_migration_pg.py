@@ -77,6 +77,25 @@ def test_shape_check_refuses_malformed_rows(db_url, client_id, metadata_url, met
         _insert(db_url, client_id, metadata_url, method, secret)
 
 
+def test_head_carries_038s_replacement_of_the_shape_check(db_url):
+    """038 (#420) replaces this CHECK: a CIMD row may also be `private_key_jwt`.
+
+    The three refusals above still hold under 038's definition; the
+    `private_key_jwt` matrix lives in `test_oauth_cimd_pkjwt_migration_pg.py`.
+    """
+    definition = asyncio.run(
+        _fetchval(
+            db_url,
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+            "WHERE conname = 'ck_oauth_clients_cimd_shape'",
+        )
+    )
+    assert "'none'::character varying, 'private_key_jwt'::character varying" in definition
+    # private_key_jwt with no keys is still refused (by 038's shape CHECK).
+    with pytest.raises(asyncpg.CheckViolationError):
+        _insert(db_url, "cimd_" + "d" * 59, URL, "private_key_jwt")
+
+
 def test_a_decoy_schema_on_the_search_path_cannot_redirect_the_downgrade():
     """Codex impl R1: `search_path=tenant,public` with a CIMD-free decoy table.
 

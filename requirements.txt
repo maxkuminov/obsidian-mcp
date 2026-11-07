@@ -59,7 +59,9 @@ slowapi==0.1.10
 # File watching (Phase 6)
 # watchfiles==1.0.5
 
-# Optional browser OIDC: current Authlib uses HTTPX2 and joserfc.
+# Native browser OIDC (Authlib, which uses HTTPX2 and joserfc) and CIMD
+# private_key_jwt client assertions (joserfc, src/oauth/client_assertion.py).
+# Hard dependencies: both are imported unconditionally.
 Authlib==1.9.2
 httpx2==2.16.0
 joserfc==1.7.7

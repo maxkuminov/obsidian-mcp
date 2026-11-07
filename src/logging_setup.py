@@ -123,6 +123,8 @@ EMITTER_CONTROL: frozenset[str] = frozenset(
 ALLOWED_FIELDS: dict[str, _FieldSpec] = {
     "reason": _S(str, 64),
     "outcome": _S(str, 16),
+    # `oauth_client_jwks_refetched`'s closed `kid_miss` / `stale` (#420 D10).
+    "trigger": _S(str, 16),
     # `panel_oidc_link_set`'s closed `expect` / `bind` (#416 D14).
     "mode": _S(str, 8),
     "route": _S(str, 200),

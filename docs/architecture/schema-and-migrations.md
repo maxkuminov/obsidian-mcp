@@ -18,7 +18,10 @@ that their migrations left nullable (`api_keys.is_active/created_at`,
 `ck_oauth_clients_auth_method_secret` that migration 010 creates was **absent
 on the live database** while `alembic_version` read 012 — `alembic check`
 cannot see that at all, and neither can a lookup by constraint name, which a
-same-named `CHECK (true)` would satisfy while enforcing nothing.
+same-named `CHECK (true)` would satisfy while enforcing nothing. (038, #420,
+later replaces that CHECK's definition to admit `private_key_jwt` with no
+secret, keeping 013's COMMENT marker so this downgrade still reads it; see
+[038](#038-private_key_jwt-columns-on-oauth_clients-420).)
 
 Migration `013_schema_reconciliation` fixes both and enforces the *complete*
 010 shape rather than just the missing piece, because how the live database
@@ -1096,7 +1099,8 @@ version (027's vacuum thresholds). Only table ownership is needed
 
 One nullable `VARCHAR(2048)` and one CHECK, `ck_oauth_clients_cimd_shape`.
 The URL is present exactly when `client_id LIKE 'cimd\_%'`, and such a row is
-`token_endpoint_auth_method = 'none'` with no secret hash. There is no backfill:
+`token_endpoint_auth_method = 'none'` with no secret hash. (038 widens the
+method to `none` or `private_key_jwt`, still with no secret.) There is no backfill:
 every existing row is a DCR registration and already satisfies it.
 `client_id` is **not** widened. The synthetic id is `cimd_` + 59 hex of an
 HMAC, so `oauth_codes.client_id`, `oauth_tokens.client_id` and both
@@ -1195,3 +1199,90 @@ a squatting index name refused; a partial marked set adopted and completed;
 downgrade drops marked objects and keeps users, skips unmarked ones, and a
 downgrade to 036 followed by a re-upgrade recreates the shape identically
 with `alembic check` clean.
+
+## 038: `private_key_jwt` columns on `oauth_clients` (#420)
+
+Four nullable columns and three CHECKs, so the synthetic CIMD row can pin how
+its client authenticates at `/token` and `/revoke` and which keys it
+authenticates against. There is no backfill, and every existing row reads NULL
+in all four.
+
+| column | type | meaning |
+| --- | --- | --- |
+| `jwks_uri` | `VARCHAR(2048)` | the document's pinned, same-origin JWKS URL |
+| `token_endpoint_auth_signing_alg` | `VARCHAR(16)` | the document's pinned alg, if it declared one |
+| `jwks_snapshot` | `JSONB` | the validated, normalised `{"keys": [...]}` that verification reads |
+| `jwks_fetched_at` | `TIMESTAMPTZ` | the snapshot's **origin** fetch time, which drives the 24 h stale refetch |
+
+**The method is the existing `token_endpoint_auth_method` column** (010,
+reconciled by 013). It already reads `none` on every CIMD row, which is exactly
+what an existing CIMD client is. A second method column would need a backfill
+and would be a second answer to the question `_client_authenticated` already
+asks of this one, and the two could disagree.
+
+**The CHECKs:**
+- `ck_oauth_clients_auth_method_secret` is **replaced**. Its `none` and
+  `client_secret_post` clauses are unchanged, and a third admits
+  `private_key_jwt` with no secret hash. The replacement keeps the
+  constraint's COMMENT. 013 marks this CHECK, and 013's downgrade reads that
+  marker, so dropping the marker here would silently change what a later
+  downgrade to 012 does.
+- `ck_oauth_clients_cimd_shape` (036) is **replaced**. A metadata URL exists
+  exactly when the id starts `cimd_`, and such a row has no secret and a
+  method in (`none`, `private_key_jwt`).
+- `ck_oauth_clients_private_key_jwt_shape` is **new**:
+  - `private_key_jwt` implies a CIMD row with `jwks_uri`, `jwks_snapshot` and
+    `jwks_fetched_at` all set;
+  - any other method implies all four new columns NULL;
+  - the alg is NULL or one of `RS256`, `PS256`, `ES256`.
+
+  A DCR row can never be `private_key_jwt`, and a `private_key_jwt` row
+  without keys cannot be represented. That is the database's half of "a
+  key-holding client never authenticates without its key".
+
+**Re-runnable by reconciliation**, 036's rule. These are the rules:
+- `search_path` is pinned to `public` and asserted, `lock_timeout` /
+  `statement_timeout` are set, and all are `RESET` at the end.
+- Each column carries a comment marker (`created by
+  038_oauth_cimd_private_key_jwt: …`), mirrored byte-identically by the
+  `_OAUTH_CLIENT_PKJWT_*_MARKER` constants in `src/models/db.py`, so
+  `alembic check` compares it. Every column is judged before any is added. A
+  column is adopted only with the exact type, nullable, no default and its
+  marker. Anything else is refused by name, and nothing changes.
+- A replaced CHECK is handled by its current definition:
+  - 038's definition is kept;
+  - its predecessor's definition (left by a stamp-back) is replaced;
+  - an absent CHECK is created;
+  - anything else is refused.
+
+  Definitions are compared with what this server prints for a `NOT VALID`
+  probe constraint created and dropped in the same transaction, never with a
+  hand-written rendering.
+- The new CHECK is adopted only when it has 038's definition, is validated,
+  and carries `CONSTRAINT_MARKER`.
+
+**The downgrade refuses while any `private_key_jwt` row exists**, naming the
+count. Dropping the columns would leave grants whose client can no longer
+authenticate. Delete those clients in the panel first; their grants go with
+them. Otherwise the downgrade drops the new CHECK and the four columns and
+restores 036's exact two CHECK definitions, carrying their comments. 036's own
+downgrade then still refuses while any CIMD row exists. Nothing needs
+superuser: table ownership suffices, and `test_nonsuperuser_migrations_pg.py`
+runs it as the owning role.
+
+**The gate.** `HEAD_REVISION` in `tests/integration/test_schema_check.py` is
+now `"038"`. Its 038 cases:
+- 038 chains from 037 and is head;
+- the `private_key_jwt` shapes on a fresh database;
+- an absent `ck_oauth_clients_private_key_jwt_shape` is recreated (#53's
+  test);
+- 013's marker survives the upgrade and the downgrade.
+
+Every existing `none` / `client_secret_post` enforcement case is kept.
+`tests/integration/test_oauth_cimd_pkjwt_migration_pg.py` covers the rest:
+- the upgrade over DCR and `none` CIMD rows leaves them unchanged and valid;
+- a re-run reconciles, and a predecessor definition left by a stamp-back is
+  replaced;
+- foreign or unmarked columns and constraints of our names are refused;
+- the CHECK matrix;
+- the downgrade refusing with a `private_key_jwt` row present.
