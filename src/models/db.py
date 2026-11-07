@@ -412,6 +412,21 @@ _OAUTH_CLIENT_CIMD_URL_COLUMN_MARKER = (
     "created by 036_oauth_cimd: Client ID Metadata Document URL (#357)"
 )
 
+# Byte-identical to the four column markers in
+# 038_oauth_cimd_private_key_jwt.py (#420), same device.
+_OAUTH_CLIENT_PKJWT_JWKS_URI_MARKER = (
+    "created by 038_oauth_cimd_private_key_jwt: pinned JWKS URI (#420)"
+)
+_OAUTH_CLIENT_PKJWT_SIGNING_ALG_MARKER = (
+    "created by 038_oauth_cimd_private_key_jwt: pinned assertion signing alg (#420)"
+)
+_OAUTH_CLIENT_PKJWT_SNAPSHOT_MARKER = (
+    "created by 038_oauth_cimd_private_key_jwt: validated JWKS snapshot (#420)"
+)
+_OAUTH_CLIENT_PKJWT_FETCHED_AT_MARKER = (
+    "created by 038_oauth_cimd_private_key_jwt: JWKS snapshot origin fetch time (#420)"
+)
+
 # Same device, same rule: byte identical to `CODE_GRANT_MARKER` and
 # `ISSUED_AT_MARKER` in `alembic/versions/029_oauth_grant_lifetime.py`.
 _OAUTH_CODE_GRANT_ID_COLUMN_MARKER = (
@@ -1107,6 +1122,20 @@ class OAuthClient(Base):
     history is visible to it. The absence of child rows is still required as a
     second, independent guard; see
     `docs/architecture/oauth-and-grants.md`.
+
+    ## Client authentication methods (#357, #420)
+
+    `token_endpoint_auth_method` is the one pinned method, for DCR and CIMD
+    rows alike: `client_secret_post` (a DCR confidential client, with a
+    secret hash), `none` (a public client), or `private_key_jwt` (CIMD rows
+    only, migration 038). A `private_key_jwt` row authenticates at `/token`
+    and `/revoke` with a `client_assertion` verified against `jwks_snapshot`,
+    the validated JWKS fetched from the document's pinned, same-origin
+    `jwks_uri`; `jwks_fetched_at` is that snapshot's **origin** fetch time,
+    never the approval time, and drives the stale refetch. The four
+    `private_key_jwt` columns are NULL on every other row. The three CHECKs
+    below make a DCR `private_key_jwt` row, or one without keys,
+    unrepresentable.
     """
 
     __tablename__ = "oauth_clients"
@@ -1146,20 +1175,50 @@ class OAuthClient(Base):
     client_id_metadata_url: Mapped[str | None] = mapped_column(
         String(2048), nullable=True, comment=_OAUTH_CLIENT_CIMD_URL_COLUMN_MARKER
     )
+    # `private_key_jwt` CIMD clients only (#420, migration 038); NULL on every
+    # other row. See the class docstring and the CHECKs below.
+    jwks_uri: Mapped[str | None] = mapped_column(
+        String(2048), nullable=True, comment=_OAUTH_CLIENT_PKJWT_JWKS_URI_MARKER
+    )
+    token_endpoint_auth_signing_alg: Mapped[str | None] = mapped_column(
+        String(16), nullable=True, comment=_OAUTH_CLIENT_PKJWT_SIGNING_ALG_MARKER
+    )
+    jwks_snapshot: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=True, comment=_OAUTH_CLIENT_PKJWT_SNAPSHOT_MARKER
+    )
+    jwks_fetched_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment=_OAUTH_CLIENT_PKJWT_FETCHED_AT_MARKER,
+    )
 
     user: Mapped["User | None"] = relationship(back_populates="oauth_clients")
 
     __table_args__ = (
+        # The three predicates are 038's, verbatim (#420).
         CheckConstraint(
             "(token_endpoint_auth_method = 'none' AND client_secret_hash IS NULL) OR "
-            "(token_endpoint_auth_method = 'client_secret_post' AND client_secret_hash IS NOT NULL)",
+            "(token_endpoint_auth_method = 'client_secret_post' AND client_secret_hash IS NOT NULL) OR "
+            "(token_endpoint_auth_method = 'private_key_jwt' AND client_secret_hash IS NULL)",
             name="ck_oauth_clients_auth_method_secret",
         ),
         CheckConstraint(
             "((client_id LIKE 'cimd\\_%') = (client_id_metadata_url IS NOT NULL)) AND "
             "(client_id_metadata_url IS NULL OR "
-            "(token_endpoint_auth_method = 'none' AND client_secret_hash IS NULL))",
+            "(token_endpoint_auth_method IN ('none', 'private_key_jwt') "
+            "AND client_secret_hash IS NULL))",
             name="ck_oauth_clients_cimd_shape",
+        ),
+        CheckConstraint(
+            "((token_endpoint_auth_method = 'private_key_jwt' "
+            "AND client_id_metadata_url IS NOT NULL AND jwks_uri IS NOT NULL "
+            "AND jwks_snapshot IS NOT NULL AND jwks_fetched_at IS NOT NULL) OR "
+            "(token_endpoint_auth_method <> 'private_key_jwt' "
+            "AND jwks_uri IS NULL AND token_endpoint_auth_signing_alg IS NULL "
+            "AND jwks_snapshot IS NULL AND jwks_fetched_at IS NULL)) AND "
+            "(token_endpoint_auth_signing_alg IS NULL OR "
+            "token_endpoint_auth_signing_alg IN ('RS256', 'PS256', 'ES256'))",
+            name="ck_oauth_clients_private_key_jwt_shape",
         ),
     )
 

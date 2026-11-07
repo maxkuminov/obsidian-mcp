@@ -88,6 +88,15 @@ table, so the migration role needs the **TEMP privilege** on the database
 (`GRANT TEMPORARY ON DATABASE ... TO ...`). The owner/superuser role the deploy
 uses has it; a locked-down migration role may not.
 
+**A stamp-back re-run below 038 meets 038's definition, and keeps it**
+(#420). Migration 038 replaces this CHECK with a successor that adds one
+clause (`private_key_jwt` with no secret hash) and leaves the other two
+unchanged. Treating that successor as an impostor would drop it, re-add 010's
+predicate with 013's ownership marker, and so change what a later downgrade
+does. A validated constraint whose definition is the successor's is therefore
+accepted as reconciled, and the offender check then judges rows by the
+successor predicate. 038 itself still reconciles or refuses on its own re-run.
+
 Revision ID: 013
 Revises: 012
 Create Date: 2026-08-15
@@ -112,6 +121,15 @@ CONSTRAINT_NAME = "ck_oauth_clients_auth_method_secret"
 CANONICAL_PREDICATE = (
     "(token_endpoint_auth_method = 'none' AND client_secret_hash IS NULL) OR "
     "(token_endpoint_auth_method = 'client_secret_post' AND client_secret_hash IS NOT NULL)"
+)
+
+# 038's replacement for the predicate above (#420), verbatim from
+# `AUTH_SECRET_SQL` in 038_oauth_cimd_private_key_jwt.py. Accepted, never
+# created, here -- see the module docstring.
+SUCCESSOR_PREDICATE = (
+    "(token_endpoint_auth_method = 'none' AND client_secret_hash IS NULL) OR "
+    "(token_endpoint_auth_method = 'client_secret_post' AND client_secret_hash IS NOT NULL) OR "
+    "(token_endpoint_auth_method = 'private_key_jwt' AND client_secret_hash IS NULL)"
 )
 
 # What 010 declares for the column, and what the model's server_default says.
@@ -155,7 +173,7 @@ def _scratch_like_oauth_clients(bind, name: str) -> None:
     bind.execute(sa.text(f"CREATE TEMP TABLE {name} (LIKE oauth_clients) ON COMMIT DROP"))
 
 
-def _canonical_constraintdef(bind) -> str:
+def _canonical_constraintdef(bind, predicate: str = CANONICAL_PREDICATE) -> str:
     """What this server prints for the 010 predicate on `oauth_clients`.
 
     Hand-writing the expected `pg_get_constraintdef` output would pin us to one
@@ -171,7 +189,7 @@ def _canonical_constraintdef(bind) -> str:
     bind.execute(
         sa.text(
             f"ALTER TABLE _ck_canon ADD CONSTRAINT {CONSTRAINT_NAME} "
-            f"CHECK ({CANONICAL_PREDICATE})"
+            f"CHECK ({predicate})"
         )
     )
     definition = bind.execute(
@@ -254,6 +272,16 @@ def _require_check_columns(bind) -> None:
             )
 
 
+def _is_successor(existing, bind) -> bool:
+    """True when the named CHECK is 038's validated successor definition."""
+    if existing is None:
+        return False
+    validated, definition = existing
+    return bool(validated) and _normalize(definition) == _canonical_constraintdef(
+        bind, SUCCESSOR_PREDICATE
+    )
+
+
 def _assert_no_violating_rows(bind) -> None:
     """No row may violate the CHECK -- read *before* anything is reconciled.
 
@@ -266,11 +294,16 @@ def _assert_no_violating_rows(bind) -> None:
     less useful message. The explicit `IS NULL` disjunct is redundant with that
     -- it is there so the intent survives an edit to the predicate.
     """
+    predicate = (
+        SUCCESSOR_PREDICATE
+        if _is_successor(_existing_named_check(bind), bind)
+        else CANONICAL_PREDICATE
+    )
     offenders = bind.execute(
         sa.text(
             f"SELECT client_id FROM oauth_clients "
             f"WHERE token_endpoint_auth_method IS NULL "
-            f"   OR ({CANONICAL_PREDICATE}) IS DISTINCT FROM true "
+            f"   OR ({predicate}) IS DISTINCT FROM true "
             f"ORDER BY client_id"
         )
     ).scalars().all()
@@ -327,6 +360,8 @@ def _drop_stale_named_check(bind) -> None:
         return
     validated, definition = existing
     if validated and _normalize(definition) == _canonical_constraintdef(bind):
+        return
+    if _is_successor(existing, bind):
         return
     op.execute(f"ALTER TABLE oauth_clients DROP CONSTRAINT {CONSTRAINT_NAME}")
 
@@ -391,6 +426,9 @@ def _reconcile_check_constraint(bind) -> None:
             # rebuilt 010's constraint canonically for the repaired type. Leave
             # the comment alone: its presence or absence is what downgrade()
             # reads, and 013 adding nothing here must not claim ownership.
+            return
+        if _is_successor(existing, bind):
+            # 038's successor on a stamp-back re-run: reconciled, same rule.
             return
         # Backstop. Reaching it means a rebuild landed on a rendering the server
         # does not produce for a freshly created constraint; the data was

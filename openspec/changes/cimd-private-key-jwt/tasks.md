@@ -44,22 +44,22 @@ Post-merge, the orchestrator greps for production callers of every new export. E
 
 ## 2. Schema (Slice S)
 
-- [ ] 2.1 Write `038_oauth_cimd_private_key_jwt.py` (`revision "038"`, `down_revision "037"`):
+- [x] 2.1 Write `038_oauth_cimd_private_key_jwt.py` (`revision "038"`, `down_revision "037"`):
   - add four nullable, comment-marked columns (design D5);
   - replace `ck_oauth_clients_auth_method_secret` and `ck_oauth_clients_cimd_shape`, and add `ck_oauth_clients_private_key_jwt_shape`;
   - follow 036's devices throughout: search_path pin and assertion, lock and statement timeouts, reconcile-by-marker and probe-constraint re-run, `RESET` at the end.
   - No backfill.
   - The downgrade refuses while any `private_key_jwt` row exists, naming the count. Otherwise it restores 036's exact CHECK definitions.
   - The docstring says why the existing method column is reused.
-- [ ] 2.2 `src/models/db.py`: mirror the columns, with the comment markers byte-identical to the migration, and the three CHECKs. Update the `OAuthClient` docstring.
+- [x] 2.2 `src/models/db.py`: mirror the columns, with the comment markers byte-identical to the migration, and the three CHECKs. Update the `OAuthClient` docstring.
 - [ ] 2.3 `make test-schema` is clean. `make db-check` reports "No new upgrade operations detected." `tests/integration/test_nonsuperuser_migrations_pg.py` passes.
-- [ ] 2.4 `tests/integration/test_schema_check.py`:
+- [x] 2.4 `tests/integration/test_schema_check.py`:
   - change the head-chain assertion to `HEAD_REVISION = "038"` and its `037 → 038` chain;
   - change the canonical `ck_oauth_clients_auth_method_secret` expectation to 038's definition;
   - **keep** every existing `none` / `client_secret_post` enforcement case (`none` with a secret fails, `client_secret_post` without one fails);
   - add `private_key_jwt` cases: with a secret fails; on a DCR id fails; without a snapshot fails; well-formed on a `cimd_` row passes;
   - add an "absent constraint" case for `ck_oauth_clients_private_key_jwt_shape`, mirroring the #53 test.
-- [ ] 2.5 New `tests/integration/test_oauth_cimd_pkjwt_migration_pg.py` covers:
+- [x] 2.5 New `tests/integration/test_oauth_cimd_pkjwt_migration_pg.py` covers:
   - the upgrade on a database holding DCR and `none` CIMD rows (unchanged, all CHECKs valid);
   - a re-run (reconciles);
   - a foreign column or constraint of the same name (refuses, changes nothing);

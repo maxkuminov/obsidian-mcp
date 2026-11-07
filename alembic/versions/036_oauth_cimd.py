@@ -36,6 +36,10 @@ marker mirrored in `src/models/db.py`; the constraint with exactly the
 expected definition — and otherwise refuses, naming what disagreed. No backfill:
 every existing row is a DCR registration and already satisfies the CHECK.
 
+A stamp-back re-run below 038 finds 038's replacement of this CHECK (which
+also admits `private_key_jwt`, #420) and keeps it: 038's own re-run reconciles
+it. Refusing it would make every stamp-back below 036 fail.
+
 ## Downgrade
 
 Refuses while any CIMD row exists, naming the count: dropping the column would
@@ -66,6 +70,15 @@ CHECK_SQL = (
     "((client_id LIKE 'cimd\\_%') = (client_id_metadata_url IS NOT NULL)) AND "
     "(client_id_metadata_url IS NULL OR "
     "(token_endpoint_auth_method = 'none' AND client_secret_hash IS NULL))"
+)
+
+#: 038's replacement (#420), verbatim from `CIMD_SHAPE_SQL` in
+#: 038_oauth_cimd_private_key_jwt.py. Accepted on a re-run, never created here.
+SUCCESSOR_CHECK_SQL = (
+    "((client_id LIKE 'cimd\\_%') = (client_id_metadata_url IS NOT NULL)) AND "
+    "(client_id_metadata_url IS NULL OR "
+    "(token_endpoint_auth_method IN ('none', 'private_key_jwt') "
+    "AND client_secret_hash IS NULL))"
 )
 
 
@@ -163,20 +176,24 @@ def upgrade() -> None:
     if existing is None:
         op.create_check_constraint(CHECK, TABLE, CHECK_SQL)
     else:
-        # Compare against what PostgreSQL prints for our own definition, by
-        # creating it under a scratch name in this transaction and reading it.
-        op.execute(
-            f"ALTER TABLE {TABLE} ADD CONSTRAINT ck_036_probe CHECK ({CHECK_SQL}) NOT VALID"
-        )
-        probe = bind.execute(
-            sa.text(
-                "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
-                "WHERE conrelid = CAST('public.oauth_clients' AS regclass) "
-                "  AND conname = 'ck_036_probe'"
+        # Compare against what PostgreSQL prints for our own definition (and
+        # 038's successor), by creating it under a scratch name in this
+        # transaction and reading it.
+        accepted = set()
+        for predicate in (CHECK_SQL, SUCCESSOR_CHECK_SQL):
+            op.execute(
+                f"ALTER TABLE {TABLE} ADD CONSTRAINT ck_036_probe CHECK ({predicate}) NOT VALID"
             )
-        ).scalar()
-        op.execute(f"ALTER TABLE {TABLE} DROP CONSTRAINT ck_036_probe")
-        if existing != probe.replace(" NOT VALID", ""):
+            probe = bind.execute(
+                sa.text(
+                    "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                    "WHERE conrelid = CAST('public.oauth_clients' AS regclass) "
+                    "  AND conname = 'ck_036_probe'"
+                )
+            ).scalar()
+            op.execute(f"ALTER TABLE {TABLE} DROP CONSTRAINT ck_036_probe")
+            accepted.add(probe.replace(" NOT VALID", ""))
+        if existing not in accepted:
             raise RuntimeError(
                 f"{CHECK} already exists with a different definition ({existing!r}). "
                 "036 will not adopt it. Drop it and re-run. Nothing has been changed."
