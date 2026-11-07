@@ -101,7 +101,7 @@ The token endpoint, the refresh path and the revocation endpoint MUST NOT fetch 
 
 #### Scenario: A key rotation does not block approval
 - **WHEN** the JWKS served at approval contains different keys from the one fetched at the consent render, with the same `jwks_uri`
-- **THEN** the approval SHALL succeed and SHALL store the keys fetched at approval
+- **THEN** the approval SHALL succeed and SHALL store the keys fetched at approval, unless the row already holds a newer snapshot of the same `jwks_uri`, which it SHALL keep (a snapshot never moves backwards)
 
 #### Scenario: Existing public-client hashes are unchanged
 - **WHEN** the authorization hash of a `none` projection is computed before and after this change
@@ -158,6 +158,10 @@ Rows existing before this change SHALL keep auth method `none` without a backfil
 #### Scenario: A key-authenticated row is never downgraded
 - **WHEN** a user's row for a URL is `private_key_jwt` and the document now declares `none`, and the user approves
 - **THEN** the approval SHALL be refused with `invalid_client`, the row SHALL be unchanged and no code SHALL be written
+
+#### Scenario: Concurrent first approvals do not downgrade
+- **WHEN** two approvals for the same URL and user find no row, one declaring `private_key_jwt` and one `none`, and the `private_key_jwt` one commits first
+- **THEN** the `none` approval SHALL be refused `client_metadata.auth_method_downgrade` with `invalid_client`, the row SHALL stay `private_key_jwt` and no code SHALL be written for it
 
 #### Scenario: The database refuses a key-authenticated row without keys
 - **WHEN** a row with auth method `private_key_jwt` and a NULL `jwks_snapshot`, or a non-CIMD row with `private_key_jwt`, is inserted directly

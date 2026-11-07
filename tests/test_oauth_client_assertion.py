@@ -388,6 +388,33 @@ def test_non_numeric_or_missing_time_claims(override):
     refused("assertion_claims_invalid", form(sign(**override)))
 
 
+@pytest.mark.parametrize("claim", ["exp", "iat", "nbf"])
+@pytest.mark.parametrize("value", [
+    float("nan"), float("inf"), float("-inf"), 10**400, -(10**400),
+], ids=["nan", "+inf", "-inf", "huge-int", "-huge-int"])
+def test_non_finite_numeric_dates_are_malformed(claim, value):
+    """#420 review F2: NaN passes every comparison, inf/huge ints break the
+    arithmetic; none is a NumericDate, and nothing is recorded."""
+    refused("assertion_claims_invalid", form(sign(**{claim: value})))
+    assert ca.replay_cache_size() == 0
+
+
+@pytest.mark.parametrize("claim, value, sub", [
+    ("exp", 1e308, "assertion_lifetime_exceeded"),
+    ("exp", -1e308, "assertion_expired"),
+    ("iat", 1e308, "assertion_not_yet_valid"),
+    ("iat", -1e308, "assertion_lifetime_exceeded"),
+    ("nbf", 1e308, "assertion_not_yet_valid"),
+])
+def test_huge_finite_numeric_dates_do_not_overflow(claim, value, sub):
+    refused(sub, form(sign(**{claim: value})))
+    assert ca.replay_cache_size() == 0
+
+
+def test_huge_negative_nbf_is_accepted():
+    auth(form(sign(nbf=-1e308)))
+
+
 @pytest.mark.parametrize("jti", ["", "j" * 257, 5, None, _DROP])
 def test_jti_bounds(jti):
     refused("assertion_claims_invalid", form(sign(jti=jti)))

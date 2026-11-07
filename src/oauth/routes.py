@@ -11,7 +11,7 @@ from fastapi import APIRouter, Form, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
-from sqlalchemy import func, select
+from sqlalchemy import and_, case, func, not_, select
 from sqlalchemy import null as sa_null
 from sqlalchemy import update as sa_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -1638,6 +1638,16 @@ async def _authorize_post_cimd(
             last_used_at=func.now(),
             **key_source,
         )
+        # The D7 compare-and-set, evaluated against the row as it stands at
+        # the conflict (not as the earlier read saw it): a stored, newer
+        # snapshot of the same jwks_uri is kept, so a racing approval cannot
+        # move the snapshot backwards either.
+        keep_stored_snapshot = and_(
+            OAuthClient.jwks_uri == upsert.excluded.jwks_uri,
+            OAuthClient.jwks_snapshot.is_not(None),
+            OAuthClient.jwks_fetched_at.is_not(None),
+            OAuthClient.jwks_fetched_at > upsert.excluded.jwks_fetched_at,
+        )
         upsert = upsert.on_conflict_do_update(
             index_elements=[OAuthClient.client_id],
             set_={
@@ -1651,11 +1661,34 @@ async def _authorize_post_cimd(
                 "jwks_uri": upsert.excluded.jwks_uri,
                 "token_endpoint_auth_signing_alg":
                     upsert.excluded.token_endpoint_auth_signing_alg,
-                "jwks_snapshot": upsert.excluded.jwks_snapshot,
-                "jwks_fetched_at": upsert.excluded.jwks_fetched_at,
+                "jwks_snapshot": case(
+                    (keep_stored_snapshot, OAuthClient.jwks_snapshot),
+                    else_=upsert.excluded.jwks_snapshot,
+                ),
+                "jwks_fetched_at": case(
+                    (keep_stored_snapshot, OAuthClient.jwks_fetched_at),
+                    else_=upsert.excluded.jwks_fetched_at,
+                ),
             },
+            # #420 D5 under concurrency: two first approvals for an absent row
+            # both see no row to lock, so the FOR UPDATE check above cannot
+            # serialise them. The conflict update itself refuses the
+            # downgrade: a committed private_key_jwt row is never overwritten
+            # by a `none` projection.
+            where=not_(and_(
+                OAuthClient.token_endpoint_auth_method
+                == cimd.AUTH_METHOD_PRIVATE_KEY_JWT,
+                upsert.excluded.token_endpoint_auth_method == cimd.AUTH_METHOD_NONE,
+            )),
         ).returning(OAuthClient.client_id)
-        await session.execute(upsert)
+        if (await session.execute(upsert)).scalar_one_or_none() is None:
+            # The guarded update affected no row: a concurrent approval
+            # committed a key-holding row first. Same refusal as above.
+            await session.rollback()
+            return _cimd_refused(
+                request, cimd.CimdRefusal("auth_method_downgrade", client_host),
+                client_id, user_id=session_user_id,
+            )
         session.add(OAuthCode(
             code_hash=_hash(code),
             client_id=row_id,
@@ -1891,6 +1924,10 @@ async def _handle_auth_code(form, request=None):
                 request,
                 f"invalid_client.{auth_failure}",
                 client_id=client.client_id,
+                # A private_key_jwt caller may omit client_id (RFC 7523): the
+                # row's URL stands in for it, as on /revoke.
+                submitted_client_id=_SUBMITTED_CLIENT_ID.get()
+                or getattr(client, "client_id_metadata_url", None),
                 user_id=oauth_code.user_id,
             )
             return JSONResponse({"error": "invalid_client"}, status_code=401)
@@ -2552,6 +2589,10 @@ async def _handle_refresh(form, request=None):
                     request,
                     f"invalid_client.{auth_failure}",
                     client_id=client.client_id,
+                    # A private_key_jwt caller may omit client_id (RFC 7523):
+                    # the row's URL stands in for it, as on /revoke.
+                    submitted_client_id=_SUBMITTED_CLIENT_ID.get()
+                    or getattr(client, "client_id_metadata_url", None),
                     user_id=old_token.user_id,
                     grant_id=grant_id,
                 )

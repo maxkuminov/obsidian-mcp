@@ -458,3 +458,86 @@ async def test_an_approval_that_re_pins_the_jwks_uri_wins_over_a_suspended_refet
     assert results == [0]
     row = await the_row(db)
     assert row.jwks_uri == JWKS_URI_2 and row.jwks_snapshot == {"keys": [pub(RSA_B)]}
+
+
+# ── review F1: the downgrade rule under concurrent first approvals ──────────
+
+
+async def test_concurrent_first_approvals_never_downgrade_a_key_row(
+    db, origin, emitted, monkeypatch
+):
+    """Two approvals race for the same absent row: both run the `FOR UPDATE`
+    read before either upserts (there is no row to lock). The
+    `private_key_jwt` one commits first; the `none` one's conflict update must
+    then affect nothing and answer the ordinary downgrade refusal."""
+    import contextvars
+
+    from sqlalchemy.dialects.postgresql import Insert
+
+    role: contextvars.ContextVar = contextvars.ContextVar("role", default=None)
+    a_selected, b_selected, a_committed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    class Steered:
+        """Forces A.select → B.select → A.insert+commit → B.insert."""
+
+        def __init__(self, inner, who):
+            self._inner, self._who = inner, who
+
+        async def __aenter__(self):
+            await self._inner.__aenter__()
+            return self
+
+        async def __aexit__(self, *exc):
+            return await self._inner.__aexit__(*exc)
+
+        async def execute(self, stmt, *args, **kwargs):
+            insert = isinstance(stmt, Insert)
+            if insert and self._who == "A":
+                await asyncio.wait_for(b_selected.wait(), timeout=10)
+            if insert and self._who == "B":
+                await asyncio.wait_for(a_committed.wait(), timeout=10)
+            result = await self._inner.execute(stmt, *args, **kwargs)
+            if not insert:
+                (a_selected if self._who == "A" else b_selected).set()
+            return result
+
+        async def commit(self):
+            await self._inner.commit()
+            if self._who == "A":
+                a_committed.set()
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    def steered_session():
+        return Steered(db(), role.get())
+
+    monkeypatch.setattr(oauth, "async_session", steered_session)
+
+    async def as_role(who, document):
+        role.set(who)
+        return await approve(document)
+
+    none_doc = {k: v for k, v in DOC.items()
+                if k not in ("jwks_uri", "token_endpoint_auth_signing_alg")}
+    none_doc["token_endpoint_auth_method"] = "none"
+
+    # A resolves its (private_key_jwt) projection and reads the absent row
+    # before B puts its own projection in the document cache.
+    task_a = asyncio.create_task(as_role("A", DOC))
+    await asyncio.wait_for(a_selected.wait(), timeout=10)
+    task_b = asyncio.create_task(as_role("B", none_doc))
+    winner, loser = await asyncio.wait_for(asyncio.gather(task_a, task_b), timeout=20)
+
+    assert winner.status_code == 302, winner.body
+    assert loser.status_code == 400 and body(loser) == {"error": "invalid_client"}
+    assert named(emitted, "oauth_authorize_refused")[-1]["reason"] == (
+        "client_metadata.auth_method_downgrade"
+    )
+    assert len(named(emitted, "oauth_consent_granted")) == 1
+    row = await the_row(db)
+    assert row.token_endpoint_auth_method == "private_key_jwt"
+    assert row.jwks_uri == JWKS_URI and row.jwks_snapshot == {"keys": [pub(RSA_A)]}
+    async with db() as session:
+        codes = (await session.execute(select(OAuthCode))).scalars().all()
+    assert len(codes) == 1  # the loser minted no code

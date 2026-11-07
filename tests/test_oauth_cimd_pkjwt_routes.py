@@ -455,6 +455,9 @@ def test_a_live_refresh_bad_assertion_is_byte_identical_to_a_dcr_auth_failure(wo
     world.family()
     bad = refresh(world, sign(RSA_A, aud="https://evil.example/token"))
     assert refused_reasons(world) == ["invalid_client.assertion_audience_invalid"]
+    # client_id was omitted (RFC 7523 allows it): the host is the row's URL's.
+    [record] = world.named("oauth_token_refused")
+    assert record["client_id"] == ROW_ID and record["cimd_host"] == "chatgpt.com"
     # Today's `authentication_failed` 401, rendered by the same line.
     from fastapi.responses import JSONResponse
 
@@ -778,6 +781,9 @@ def test_a_live_code_with_a_bad_assertion_is_the_existing_401(world):
     response = exchange(world, sign(RSA_A, iss="https://other.example/oauth/client.json"))
     assert response.status_code == 401 and body(response) == {"error": "invalid_client"}
     assert refused_reasons(world) == ["invalid_client.assertion_claims_invalid"]
+    # client_id was omitted (RFC 7523 allows it): the host is the row's URL's.
+    [record] = world.named("oauth_token_refused")
+    assert record["client_id"] == ROW_ID and record["cimd_host"] == "chatgpt.com"
 
 
 def test_an_expired_live_code_with_a_bad_assertion_is_401_not_code_expired(world):
@@ -954,8 +960,11 @@ CHATGPT_DOC = {
 class _UpsertSession:
     """Captures the approve transaction: the `FOR UPDATE` read and the upsert."""
 
-    def __init__(self, existing=None):
+    def __init__(self, existing=None, upsert_lost=False):
         self.existing = existing
+        # True: the guarded conflict update affected no row (a concurrent
+        # approval committed a private_key_jwt row first).
+        self.upsert_lost = upsert_lost
         self.statements = []
         self.added = []
         self.commits = 0
@@ -968,7 +977,11 @@ class _UpsertSession:
         return False
 
     async def execute(self, stmt, params=None):
+        from sqlalchemy.dialects.postgresql import Insert
+
         self.statements.append(stmt)
+        if isinstance(stmt, Insert):
+            return _R(None if self.upsert_lost else "cimd_row")
         return _R(self.existing)
 
     def add(self, obj):
@@ -1049,6 +1062,41 @@ def test_a_private_key_jwt_row_is_never_downgraded_to_none(world, monkeypatch):
     from sqlalchemy.dialects.postgresql import Insert
 
     assert not any(isinstance(s, Insert) for s in session.statements)
+
+
+def test_a_none_approval_losing_the_race_to_a_key_row_is_the_downgrade_refusal(
+    world, monkeypatch
+):
+    """#420 review F1: both approvals saw no row; the key-holding one committed
+    first, so the guarded conflict update affects nothing and the `none` one
+    gets the same refusal the locked read gives."""
+    doc = {k: v for k, v in CHATGPT_DOC.items()
+           if k not in ("jwks_uri", "token_endpoint_auth_signing_alg")}
+    doc["token_endpoint_auth_method"] = "none"
+    projection = cimd.validate_document(URL, doc)
+    session = _UpsertSession(upsert_lost=True)
+    response = _approve(projection, monkeypatch, session)
+    assert response.status_code == 400 and response.body == b'{"error":"invalid_client"}'
+    assert refused_reasons(world, "oauth_authorize_refused") == [
+        "client_metadata.auth_method_downgrade"
+    ]
+    assert session.commits == 0 and session.rollbacks == 1
+    assert not world.named("oauth_consent_granted")
+
+
+def test_the_conflict_update_is_guarded_against_a_downgrade(world, monkeypatch):
+    from sqlalchemy.dialects import postgresql as pg
+    from sqlalchemy.dialects.postgresql import Insert
+
+    session = _UpsertSession()
+    response = _approve(cimd.validate_document(URL, CHATGPT_DOC), monkeypatch, session)
+    assert response.status_code == 302
+    [insert] = [s for s in session.statements if isinstance(s, Insert)]
+    sql = str(insert.compile(dialect=pg.dialect()))
+    assert "ON CONFLICT (client_id) DO UPDATE" in sql
+    where = sql.split("DO UPDATE", 1)[1].rsplit(" WHERE ", 1)[1]
+    assert "oauth_clients.token_endpoint_auth_method" in where
+    assert "excluded.token_endpoint_auth_method" in where
 
 
 def test_a_none_row_may_upgrade_to_private_key_jwt(world, monkeypatch):

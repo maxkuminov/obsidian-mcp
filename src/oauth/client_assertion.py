@@ -39,6 +39,7 @@ import hashlib
 import heapq
 import json
 import logging
+import math
 import secrets
 import time
 from collections import OrderedDict
@@ -310,7 +311,17 @@ def replay_cache_size() -> int:
 
 
 def _is_number(value) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    """A NumericDate: a finite int or float, never a bool.
+
+    NaN passes every comparison the time checks make, and an infinite or
+    float-overflowing integer breaks their arithmetic, so neither is a date.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:  # an int too large for a float
+        return False
 
 
 def _epoch(now) -> float:
