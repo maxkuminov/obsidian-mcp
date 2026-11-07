@@ -773,7 +773,8 @@ Bearer keys with `read` / `readwrite` scopes for API clients, and a
 separate OAuth 2.0 PKCE flow for clients like ChatGPT, Claude Desktop,
 and claude.ai that expect a proper authorization-code dance. The OAuth
 server supports public (`none`) and confidential (`client_secret_post`)
-token-endpoint authentication plus refresh tokens.
+token-endpoint authentication plus refresh tokens, and, for metadata-document
+clients only, `private_key_jwt` (RFC 7523 signed client assertions).
 
 Clients identify themselves in one of two ways:
 - **A Client ID Metadata Document** (CIMD, the MCP 2026-07-28 default). The
@@ -782,7 +783,13 @@ Clients identify themselves in one of two ways:
   `import_from_url`. Claude (claude.ai, Desktop, mobile), Claude Code and
   ChatGPT use this whenever the server advertises it, which it does by default.
   Claude Code's loopback callback (`http://localhost:<any port>/callback`) works
-  this way.
+  this way. Claude and Claude Code are public (`none`) clients. ChatGPT's
+  document declares `private_key_jwt`: the server also fetches the document's
+  same-origin `jwks_uri`, stores the validated public keys with the client,
+  and ChatGPT then signs a short-lived, single-use assertion for every token
+  exchange and refresh (and revocation). The server refetches the key set
+  from the same pinned URL when an assertion names a key it does not hold,
+  and before a token request once the stored set is more than a day old.
 - **Dynamic Client Registration** (`/register`, RFC 7591, deprecated by MCP but
   kept) remains the fallback for any client that sends no URL.
 
@@ -1051,6 +1058,27 @@ too.
 
 Pull, then `make deploy` (or rebuild your compose stack); migrations
 run on start.
+
+Across the ChatGPT `private_key_jwt` release (migration 038, #420):
+
+- **Migration 038** adds four nullable columns to `oauth_clients` and
+  replaces or adds three CHECKs, with no backfill, and takes seconds.
+  Existing DCR and CIMD clients and their grants are untouched. Its
+  downgrade refuses while any `private_key_jwt` client exists (delete it
+  in the panel first; its grants go with it).
+- **ChatGPT connects through CIMD.** It was refused `invalid_client` at
+  `/authorize` before this release, because its document declares
+  `private_key_jwt`. Nothing to configure; there are no new settings.
+- **Outbound access.** Besides each client's document, the server now
+  fetches a `private_key_jwt` client's key set (`jwks_uri`, same origin as
+  the document) at consent and, when keys rotate or the stored set is a day
+  old, before a token request. The same SSRF-guarded client and egress
+  rules apply.
+- **The AS metadata** gains `private_key_jwt` in
+  `token_endpoint_auth_methods_supported` and
+  `token_endpoint_auth_signing_alg_values_supported`, only while
+  `OAUTH_CIMD_ENABLED` is true. `/register` still does not accept
+  `private_key_jwt`.
 
 Across the OIDC account-linking release (migration 037, #416):
 
