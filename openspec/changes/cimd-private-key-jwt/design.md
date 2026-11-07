@@ -175,7 +175,7 @@ Both triggers take one path, a **pre-phase** that runs before the handler's main
      - it is inside the grant's absolute lifetime (`grant_deadline(grant_issued_at)`);
      - the caller's `client_id`, when present, matches.
 
-     A revoked (rotated-away) token is ineligible, so **the #182 reuse branch never triggers a fetch** and never reads the assertion.
+     A revoked (rotated-away) token is ineligible, so **the #182 reuse branch never triggers a fetch**; the assertion is never verified, recorded or allowed to affect the reuse decision (the pre-phase may have parsed its unverified header and `iss`, nothing more).
    - **For `/revoke`:**
      - the token row is unrevoked and unexpired;
      - it is inside its grant's absolute lifetime, so revocation can still act on something live;
@@ -233,14 +233,14 @@ Assertion verification sits **exactly** where `_client_authenticated` sits today
 | `/token` / `/revoke` pre-phase | **D7, only for an eligible credential (live code with matching redirect URI and PKCE; live, in-lifetime refresh or revoke token; matching `client_id` if given) and only on a kid miss or a snapshot older than 24 h; no lock; decides no response, re-checked below** | — | never |
 | `/token` code, **live** | bootstrap lock → code by hash `FOR UPDATE` → `cimd_` id refused → caller `client_id` vs row → client row exists → **client authentication (D6)** → code expiry → `redirect_uri` → PKCE → ownerless / cross-user / scope → mint | `invalid_client` 401, the existing `authentication_failed` body byte for byte; `invalid_client.assertion_<sub>` | no |
 | `/token` code, **spent** | same up to the client row → **client authentication (D6)** → `redirect_uri` → PKCE → replay branch (revokes) | the unknown-code `invalid_grant` 400 byte for byte; `invalid_grant.spent_code_assertion_<sub>` | no. Only a fully revalidated replay, with a valid fresh assertion, reaches the replay branch |
-| `/token` refresh, **rotated away** | bootstrap lock → grant id by hash → grant lock → row `FOR UPDATE` → **#182 reuse branch, unchanged: the assertion is not read, verified or consumed** | — (constant reuse `invalid_grant`) | yes, as today, for every client (L7) |
+| `/token` refresh, **rotated away** | bootstrap lock → grant id by hash → grant lock → row `FOR UPDATE` → **#182 reuse branch, unchanged: the assertion is not verified, recorded or consumed** | — (constant reuse `invalid_grant`) | yes, as today, for every client (L7) |
 | `/token` refresh, **live** | … → `cimd_` id refused → caller `client_id` vs row → client row exists → **client authentication (D6)** → #326 grant deadline → token expiry → rotation | `invalid_client` 401, the existing body; `invalid_client.assertion_<sub>` | no |
 | `/revoke` | `cimd_` prefix (constant 200) → missing token (200) → **pre-phase** → token by hash → unknown token (200) → client row → unknown client (200) → `client_id` present: mismatch → constant 200 (`client_mismatch`), match → **client authentication (D6)**; `client_id` **absent**: `private_key_jwt` row → **client authentication (D6) directly against the credential-resolved row** (no identity comparison; the verified `iss`/`sub` bind it), any other row → constant 200 (`client_mismatch`, as today) → revoke family | `invalid_client` 401, the existing "right client, failed auth" case; `oauth_revoke_refused reason=assertion_<sub>` | no |
 
 Consequences, stated so they are not "fixed" later:
 - **A replayed, invalid or missing assertion never revokes anything.** Every assertion failure exits before any revocation write. The two revoking branches are untouched:
   - the spent-code replay branch is reached only *after* a successful assertion;
-  - the #182 reuse branch never reads the assertion.
+  - the #182 reuse branch never verifies, records or acts on the assertion.
 - **Concealment is preserved.**
   - A spent code fails assertion checks with the unknown-code response.
   - A live credential gets the same `invalid_client` 401 for every assertion sub-reason.

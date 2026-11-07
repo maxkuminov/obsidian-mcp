@@ -354,7 +354,7 @@ A `/token` or `/revoke` request SHALL trigger a pre-phase, run before the handle
   - **a refresh token:** unrevoked, unexpired and inside its grant's absolute lifetime, with the caller's `client_id` matching when present;
   - **at `/revoke`:** an unrevoked, unexpired token inside its grant's absolute lifetime, with the caller's `client_id` matching when present.
 
-A revoked refresh token SHALL never trigger a fetch, so the refresh-reuse branch never reads the assertion. The eligibility checks SHALL be advisory: they produce no response, record or state change. The main transaction SHALL re-run every check under its locks, so every response, including the spent-code and absolute-lifetime responses, SHALL be identical to the response without the pre-phase.
+A revoked refresh token SHALL never trigger a fetch, and the refresh-reuse branch SHALL never verify the assertion, record its `jti`, or let it affect the reuse decision; the advisory pre-phase may parse its unverified header and `iss` only. The eligibility checks SHALL be advisory: they produce no response, record or state change. The main transaction SHALL re-run every check under its locks, so every response, including the spent-code and absolute-lifetime responses, SHALL be identical to the response without the pre-phase.
 
 The pre-phase SHALL behave as follows:
 - It SHALL resolve the row in a short read-only session and close that session before any network I/O. It SHALL hold no session, transaction or row lock across the fetch.
