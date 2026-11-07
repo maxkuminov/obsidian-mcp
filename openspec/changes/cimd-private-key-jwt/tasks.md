@@ -68,11 +68,11 @@ Post-merge, the orchestrator greps for production callers of every new export. E
 
 ## 3. Document rules, JWKS, hash (Slice J)
 
-- [ ] 3.1 `validate_document`: admit `none` and `private_key_jwt`, and apply the `jwks_uri` rules (the URL rules plus same origin), the inline-`jwks` refusal and the signing-alg rule. Add the new closed reasons to `REASONS`.
-- [ ] 3.2 `Projection` gains the three fields. `authorization_hash` includes them for `private_key_jwt` only. A test pins the `none` hash to its pre-change value for a fixed projection.
-- [ ] 3.3 `validate_jwks`, implementing every D3 rule, with RSA bit length computed from `n` and the exponent bounded. The snapshot is normalised.
-- [ ] 3.4 `resolve_jwks`, implementing the D2 admission order: its own LRU of 256, shared cooldown table, second per-address charge, slot and global caps, join. Plus `fetch_jwks_guarded` and the cache accessors for Slice A.
-- [ ] 3.5 Unit tests on the #357 fake document server extended with a JWKS route:
+- [x] 3.1 `validate_document`: admit `none` and `private_key_jwt`, and apply the `jwks_uri` rules (the URL rules plus same origin), the inline-`jwks` refusal and the signing-alg rule. Add the new closed reasons to `REASONS`.
+- [x] 3.2 `Projection` gains the three fields. `authorization_hash` includes them for `private_key_jwt` only. A test pins the `none` hash to its pre-change value for a fixed projection.
+- [x] 3.3 `validate_jwks`, implementing every D3 rule, with RSA bit length computed from `n` and the exponent bounded. The snapshot is normalised.
+- [x] 3.4 `resolve_jwks`, implementing the D2 admission order: its own LRU of 256, shared cooldown table, second per-address charge, slot and global caps, join. Plus `fetch_jwks_guarded` and the cache accessors for Slice A.
+- [x] 3.5 Unit tests on the #357 fake document server extended with a JWKS route:
   - the ChatGPT document;
   - cross-origin, port, query and inline `jwks`;
   - HS256, `none` and EdDSA algs;
