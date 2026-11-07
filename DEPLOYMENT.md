@@ -1337,10 +1337,23 @@ kubectl logs deploy/obsidian-mcp | grep '"msg": "oauth_consent_granted"' \
 # {"registration_kind":"cimd","cimd_host":"chatgpt.com","outcome":"created"}
 ```
 
+**A ChatGPT connector created before this release must be deleted and
+re-added in ChatGPT.** Reconnecting is not enough. ChatGPT caches the AS
+metadata per connector and chooses its token authentication method from that
+copy, using the intersection of its document's
+`token_endpoint_auth_methods_supported` with ours. With the pre-#420 metadata
+the intersection is only `none`, so it sends no assertion. Because the row is
+`private_key_jwt`, the `/token` request is refused with
+`reason=invalid_client.assertion_missing`. A newly added connector re-reads
+the metadata and signs. This was observed on the reference deployment on
+release day. Expect the same after any later change to
+`token_endpoint_auth_methods_supported`.
+
 A refused assertion is an `oauth_token_refused` with
-`reason=invalid_client.assertion_<sub>`, for example
-`assertion_not_yet_valid` (the client's clock is more than 30 s fast) or
-`assertion_kid_unknown`. The reasons are listed in
+`reason=invalid_client.<sub>`, for example
+`invalid_client.assertion_not_yet_valid` (the client's clock is more than
+30 s fast) or `invalid_client.assertion_kid_unknown`. `secret_presented` is
+the one sub without the `assertion_` prefix. The reasons are listed in
 `docs/architecture/security-event-logging.md`. A failed assertion never
 revokes anything. The full rules are in `docs/architecture/oauth-and-grants.md`,
 "`private_key_jwt` clients (#420)".

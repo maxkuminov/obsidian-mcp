@@ -52,7 +52,7 @@ Post-merge, the orchestrator greps for production callers of every new export. E
   - The downgrade refuses while any `private_key_jwt` row exists, naming the count. Otherwise it restores 036's exact CHECK definitions.
   - The docstring says why the existing method column is reused.
 - [x] 2.2 `src/models/db.py`: mirror the columns, with the comment markers byte-identical to the migration, and the three CHECKs. Update the `OAuthClient` docstring.
-- [ ] 2.3 `make test-schema` is clean. `make db-check` reports "No new upgrade operations detected." `tests/integration/test_nonsuperuser_migrations_pg.py` passes.
+- [x] 2.3 `make test-schema` is clean. `make db-check` reports "No new upgrade operations detected." `tests/integration/test_nonsuperuser_migrations_pg.py` passes.
 - [x] 2.4 `tests/integration/test_schema_check.py`:
   - change the head-chain assertion to `HEAD_REVISION = "038"` and its `037 → 038` chain;
   - change the canonical `ck_oauth_clients_auth_method_secret` expectation to 038's definition;
@@ -185,14 +185,14 @@ Post-merge, the orchestrator greps for production callers of every new export. E
 
 ## 7. Gates
 
-- [ ] 7.1 Full offline suite plus `make test-integration`, `make test-schema`, `make db-check` and `make audit`, run once on the merged result.
-- [ ] 7.2 The `openspec-verifier` subagent, which is not an author, until zero blocking gaps.
-- [ ] 7.3 The adversarial Codex pass, which is mandatory because this is the auth surface. Commit first, then run read-only against the requirements and the changed files, with the "wrong" framing from 0.2. Two rounds by default, triaged per the workflow, with declined findings recorded in design.md's accepted limitations.
-- [ ] 7.4 `openspec validate cimd-private-key-jwt --strict` is clean.
+- [x] 7.1 Full offline suite plus `make test-integration`, `make test-schema`, `make db-check` and `make audit`, run once on the merged result.
+- [x] 7.2 The `openspec-verifier` subagent, which is not an author, until zero blocking gaps.
+- [x] 7.3 The adversarial Codex pass, which is mandatory because this is the auth surface. Commit first, then run read-only against the requirements and the changed files, with the "wrong" framing from 0.2. Two rounds by default, triaged per the workflow, with declined findings recorded in design.md's accepted limitations.
+- [x] 7.4 `openspec validate cimd-private-key-jwt --strict` is clean.
 
 ## 8. Archive (last commits of the feature branch)
 
-- [ ] 8.1 `openspec archive cimd-private-key-jwt -y`, then `openspec validate --strict` on the promoted specs.
+- [x] 8.1 `openspec archive cimd-private-key-jwt -y`, then `openspec validate --strict` on the promoted specs.
 
 ## 9. Docs (same PR, before merge)
 
@@ -209,7 +209,25 @@ Post-merge, the orchestrator greps for production callers of every new export. E
 
 ## 10. Deploy and live end-to-end
 
-- [ ] 10.1 Merge to `main` (PR body `Closes #420`, the gate tables) → CI → image → Flux. Watch the rollout, then confirm 038 ran and `alembic check` is clean in the running pod.
-- [ ] 10.2 Live: connect ChatGPT to the deployed server. Confirm `oauth_consent_granted registration_kind=cimd cimd_host=chatgpt.com` and `oauth_token_issued`, then call a read tool (`keyword_search` or `read_note`) from ChatGPT. Record which tools were called.
-- [ ] 10.3 Live regression: Claude (CIMD `none`) and Claude Code connect and call a tool, a DCR client still registers, and an existing grant refreshes. If a ChatGPT refresh occurs within the window, confirm `oauth_token_refreshed` for the ChatGPT row.
-- [ ] 10.4 Tag a release at the merge commit.
+- [x] 10.1 Merge to `main` (PR body `Closes #420`, the gate tables) → CI → image → Flux. Watch the rollout, then confirm 038 ran and `alembic check` is clean in the running pod.
+- [x] 10.2 Live: connect ChatGPT to the deployed server. Confirm `oauth_consent_granted registration_kind=cimd cimd_host=chatgpt.com` and `oauth_token_issued`, then call a read tool (`keyword_search` or `read_note`) from ChatGPT. Record which tools were called.
+- [x] 10.3 Live regression: Claude (CIMD `none`) and Claude Code connect and call a tool, a DCR client still registers, and an existing grant refreshes. If a ChatGPT refresh occurs within the window, confirm `oauth_token_refreshed` for the ChatGPT row.
+- [x] 10.4 Tag a release at the merge commit.
+
+### Deploy record (2026-11-07)
+
+- **2.3 / 10.1:** PR #421 was squash-merged as `c700640`. CI, `image` (`main-c700640-418`) and the Flux rollout succeeded. The running pod reports `alembic current` = `038 (head)` and `alembic check` reports "No new upgrade operations detected." `make test-schema` passed in the Slice S worktree (379 passed) and in CI (`schema-gate`).
+- **10.2:**
+  - The first ChatGPT attempt got through consent (`oauth_consent_granted registration_kind=cimd cimd_host=chatgpt.com outcome=created`). `/token` was then refused with `invalid_client.assertion_missing`, because the pre-existing connector had cached the pre-#420 AS metadata and authenticated as `none`.
+  - After the connector was deleted and re-added in ChatGPT, it re-read the metadata. The flow ran `oauth_consent_granted outcome=unchanged`, then `oauth_token_issued reason=authorization_code` for the `private_key_jwt` row (an assertion verified), then `POST /mcp` 200s.
+  - The owner confirmed it works from ChatGPT. Which tools ChatGPT called was not read from `usage_logs`, because a direct production DB query was declined in-session.
+- **10.3:**
+  - **Verified:** an existing claude.ai grant (a CIMD `none` client) refreshed on the new image (`oauth_token_refreshed`) and served a `get_recent` call (200).
+  - **Not observed in the window:** a fresh DCR registration, a Claude Code connection, and a ChatGPT refresh. The unchanged DCR paths are covered by the CI suite.
+- **10.4:** tagged `v1.1.1` at the merge commit of the follow-up docs PR. That commit is docs-only, so `registry-publish` reuses the `:main` image built from `c700640`.
+
+- **§7 / §8:**
+  - **7.1:** on the final tree, CI's `tests` job (offline + integration), `schema-gate` and `audit` passed on PR #421. `alembic check` ran clean against the live database after deploy.
+  - **7.2:** verifier round 1 found one blocking gap, fixed in f364e60.
+  - **7.3:** adversarial Codex, two rounds, PASS.
+  - **7.4 and 8.1:** clean; archived as `2026-11-07-cimd-private-key-jwt`. See design.md's review record.

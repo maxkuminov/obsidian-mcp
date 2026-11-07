@@ -1069,6 +1069,16 @@ Across the ChatGPT `private_key_jwt` release (migration 038, #420):
 - **ChatGPT connects through CIMD.** It was refused `invalid_client` at
   `/authorize` before this release, because its document declares
   `private_key_jwt`. Nothing to configure; there are no new settings.
+- **Re-add an existing ChatGPT connector, don't just reconnect it.** ChatGPT
+  reads the server's OAuth metadata once, when a connector is created, and
+  picks its token authentication method from that copy. A connector created
+  before this release still works from the old metadata, which had no
+  `private_key_jwt`. It authenticates as a public client, and the token
+  request is refused (`oauth_token_refused
+  reason=invalid_client.assertion_missing`). Delete the connector in ChatGPT
+  and add it again with the same URL. Nothing needs changing on the server.
+  The same applies after any future change to
+  `token_endpoint_auth_methods_supported`.
 - **Outbound access.** Besides each client's document, the server now
   fetches a `private_key_jwt` client's key set (`jwks_uri`, same origin as
   the document) at consent and, when keys rotate or the stored set is a day
