@@ -582,20 +582,6 @@ def _cooldown_arm(uri: str) -> None:
         _refetch_cooldown.popitem(last=False)
 
 
-def _global_admit() -> bool:
-    """The existing process-wide in-flight cap of `cimd.GLOBAL_IN_FLIGHT`,
-    shared with document and `/authorize` JWKS fetches (D7 step 3)."""
-    current = getattr(cimd, "_global_inflight", 0)
-    if current >= cimd.GLOBAL_IN_FLIGHT:
-        return False
-    cimd._global_inflight = current + 1
-    return True
-
-
-def _global_release() -> None:
-    cimd._global_inflight = max(0, getattr(cimd, "_global_inflight", 1) - 1)
-
-
 def _fresh(fetched_at: datetime | None, now: datetime) -> bool:
     return fetched_at is not None and (now - fetched_at).total_seconds() <= JWKS_MAX_AGE_SECONDS
 
@@ -641,8 +627,16 @@ def _emit_refetched(view: _RowView, *, trigger, outcome, reason, route, client_i
 
 async def _refetch(view: _RowView, unverified: Unverified, *, trigger: str,
                    route, client_ip):
-    """Join, cap, fetch. Returns a validated snapshot or None. Emits exactly
-    one record for an actual attempt, none for a join or a busy cap."""
+    """Join, fetch. Returns a validated snapshot or None. Emits exactly one
+    record for an actual attempt, none for a join or a busy cap.
+
+    The process-wide in-flight cap of `cimd.GLOBAL_IN_FLIGHT` is enforced by
+    `cimd.fetch_jwks_guarded` itself (`fetch_busy`), which also joins an
+    `/authorize` flight of the same URI and fills the JWKS cache with the
+    origin's own cache directive. This function therefore takes no slot of
+    its own (one refetch is one slot) and never writes the cache (a second
+    put would replace the origin's TTL with the default).
+    """
     uri = view.jwks_uri
     flight = _refetch_flights.get(uri)
     if flight is not None:
@@ -650,15 +644,15 @@ async def _refetch(view: _RowView, unverified: Unverified, *, trigger: str,
             return await asyncio.shield(flight)
         except Exception:  # noqa: BLE001 - the attempter recorded the failure
             return None
-    if not _global_admit():
-        return None
     future: asyncio.Future = asyncio.get_running_loop().create_future()
     _refetch_flights[uri] = future
     snapshot = None
     reason = None
+    busy = False
     try:
         snapshot = await cimd.fetch_jwks_guarded(uri)
     except Exception as exc:  # noqa: BLE001 - every failure is a closed reason
+        busy = getattr(exc, "reason", None) == "fetch_busy"
         reason = _failure_reason(exc)
         future.set_exception(_RefetchFailed())
         future.exception()  # retrieved: a flight nobody joined must not warn
@@ -668,18 +662,14 @@ async def _refetch(view: _RowView, unverified: Unverified, *, trigger: str,
         raise
     else:
         future.set_result(snapshot)
-        # One fetch serves every row of the client (D7 step 4). The guarded
-        # fetch exposes no Cache-Control here, so the default TTL applies.
-        # TODO(#420): pass the origin's directive if Slice J exposes one.
-        try:
-            cimd.jwks_cache_put(uri, snapshot, None)
-        except Exception:  # noqa: BLE001 - a cache miss later is harmless
-            pass
     finally:
         # Every attempt, success or failure, arms the cooldown (D7 step 5).
-        _cooldown_arm(uri)
+        # A busy cap is not an attempt: nothing left the process.
+        if not busy:
+            _cooldown_arm(uri)
         _refetch_flights.pop(uri, None)
-        _global_release()
+    if busy:
+        return None
     if snapshot is None:
         _emit_refetched(view, trigger=trigger, outcome="failed", reason=reason,
                         route=route, client_ip=client_ip)
