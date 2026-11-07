@@ -1294,6 +1294,57 @@ argument is new and optional. Rolling back is a redeploy of the previous
 image; a client still sending `rerank` is then refused by the
 unknown-argument rule.
 
+## OAuth CIMD `private_key_jwt` clients: ChatGPT (#420)
+
+**Migration 038** adds four nullable columns to `oauth_clients`
+(`jwks_uri`, `token_endpoint_auth_signing_alg`, `jwks_snapshot`,
+`jwks_fetched_at`). It replaces `ck_oauth_clients_auth_method_secret` and
+`ck_oauth_clients_cimd_shape` and adds `ck_oauth_clients_private_key_jwt_shape`.
+There is no backfill, and it runs in seconds. Run `make test-schema` before
+merging, and `alembic check` must be clean afterwards. The previous image runs
+against the 038 schema, because it writes only `none` rows. The downgrade
+(`alembic downgrade 037`) **refuses while any `private_key_jwt` client row
+exists**, naming the count. Delete those clients on the panel's OAuth page
+first; their grants go with them. There are no new settings.
+
+**What changes.** ChatGPT's metadata document declares
+`token_endpoint_auth_method: private_key_jwt`. Before this release that was
+refused, with `oauth_authorize_refused
+reason=client_metadata.auth_method_unsupported`. ChatGPT now connects through
+CIMD and authenticates at `/token` and `/revoke` with a signed client
+assertion. While `OAUTH_CIMD_ENABLED` is true, the AS metadata adds
+`private_key_jwt` and `token_endpoint_auth_signing_alg_values_supported`.
+
+**Outbound access.** At consent the server also fetches the client's
+`jwks_uri`, which must be on the same origin as its document
+(`https://chatgpt.com/oauth/jwks.json` for ChatGPT). At `/token` and
+`/revoke` it refetches that URL, before opening any database transaction,
+in two cases:
+- the assertion names a key the stored set lacks;
+- the stored set is more than 24 h old.
+
+The refetch happens at most once per URL per minute. If a stale-only refetch
+fails, the request proceeds on the stored keys, so an outage at the client's
+origin does not break refreshes. The refetch runs even while
+`OAUTH_CIMD_ENABLED=false`. Each attempt is one `oauth_client_jwks_refetched`
+record (`trigger`, `outcome`; WARNING on `failed`).
+
+**Verifying a ChatGPT connection.**
+
+```bash
+kubectl logs deploy/obsidian-mcp | grep '"msg": "oauth_consent_granted"' \
+  | jq -c 'select(.cimd_host == "chatgpt.com") | {registration_kind, cimd_host, outcome}'
+# {"registration_kind":"cimd","cimd_host":"chatgpt.com","outcome":"created"}
+```
+
+A refused assertion is an `oauth_token_refused` with
+`reason=invalid_client.assertion_<sub>`, for example
+`assertion_not_yet_valid` (the client's clock is more than 30 s fast) or
+`assertion_kid_unknown`. The reasons are listed in
+`docs/architecture/security-event-logging.md`. A failed assertion never
+revokes anything. The full rules are in `docs/architecture/oauth-and-grants.md`,
+"`private_key_jwt` clients (#420)".
+
 ## OAuth CIMD and the resource gate (#357)
 
 **Migration 036** adds `oauth_clients.client_id_metadata_url` (nullable) and
@@ -1302,7 +1353,9 @@ and it runs in seconds. Run `make test-schema` before merging, as for every
 migration, and `alembic check` must be clean afterwards. The downgrade
 (`alembic downgrade 035`) **refuses while any CIMD client row exists**. Delete
 those clients on the panel's OAuth page first; their grants go with them, and
-their users reconnect.
+their users reconnect. On a database at 038 or later, the downgrade
+passes through 038's first, which refuses while a `private_key_jwt` row exists
+([above](#oauth-cimd-private_key_jwt-clients-chatgpt-420)).
 
 **What changes on the first request.** The AS metadata advertises
 `client_id_metadata_document_supported: true`. On their next fresh connection

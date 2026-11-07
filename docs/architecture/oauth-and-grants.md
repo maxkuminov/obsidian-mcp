@@ -637,7 +637,9 @@ Codex round, is in `openspec/changes/archive/*-oauth-cimd/design.md`.
 and only CIMD; it is never looked up as a DCR id (DCR ids are 32 hex). With
 `OAUTH_CIMD_ENABLED=false` it is an unknown client and the flag disappears from
 the metadata. Clients then fall back to DCR, and existing CIMD grants keep
-refreshing, because `/token` never fetches.
+refreshing, because `/token` never fetches the document. (A `private_key_jwt`
+client's JWKS refetch still runs while disabled; see
+[`private_key_jwt` clients](#private_key_jwt-clients-420).)
 
 **The URL** (`validate_client_id_url`, before any DNS) must meet every one of
 these, or it is refused:
@@ -675,13 +677,20 @@ One address can therefore hold one of the eight global slots and no more. Four s
 - be a JSON object;
 - have `client_id` byte-equal to the URL, and a non-empty `client_name` of at most 255 characters;
 - have `redirect_uris` of 1–20 distinct entries, each either `https` with a resolvable ASCII host (the #183 rule, stored normalised) or `http` to exactly `localhost`, `127.0.0.1` or `[::1]`;
-- have `token_endpoint_auth_method` absent or `none`, and no `client_secret` / `client_secret_expires_at`;
+- have `token_endpoint_auth_method` absent, `none` or (since #420) `private_key_jwt`, and no `client_secret` / `client_secret_expires_at`. Any other method is `auth_method_unsupported`. A `private_key_jwt` document has further rules ([below](#private_key_jwt-clients-420)); a `none` document's `jwks_uri` or `jwks` is ignored, as before;
 - name `authorization_code` / `code` in `grant_types` / `response_types` if those are present;
 - if it has a `scope`, have a valid one naming `read` or `readwrite`. An absent scope means the DCR default.
 
 The **authorization hash** covers only `{client_id, sorted redirect_uris,
 sorted scope}`. `client_name` is outside it (Codex R2-2), so a name-only or
-order-only edit never blocks a consent.
+order-only edit never blocks a consent. A `private_key_jwt` projection (#420)
+adds `token_endpoint_auth_method`, `jwks_uri` and
+`token_endpoint_auth_signing_alg` (or JSON `null`), never key material, which
+rotates. A `none` projection's hashed object is **byte-identical to the
+pre-#420 one**: the three members are omitted, not set to `none`/`null`, so a
+consent in flight across the deploy still matches. The method being in the
+hash is what turns a `none` ⇄ `private_key_jwt` flip between GET and POST into
+`metadata_changed`.
 
 **Cache.** In-process LRU of 256 entries, keyed by the exact URL. The TTL is `max-age` clamped to
 `OAUTH_CIMD_CACHE_MAX_SECONDS` (24 h). A missing header means 300 s, and
@@ -695,8 +704,8 @@ entry is never served after a failed refetch.
 
 **The synthetic row: one per (URL, user).**
 - `client_id = "cimd_" + HMAC-SHA256(K, url + "\n" + owner)[:59]` (64 characters, so every `VARCHAR(64)` and log bound holds). `K = HMAC-SHA256(SECRET_KEY, "oauth-cimd-client-id/v1")`, so the id cannot be computed from a public URL and integer user ids (Codex R2-1). Rotating `SECRET_KEY` derives new ids, so the next consent makes a new row (L13).
-- Migration 036 adds `client_id_metadata_url` (comment-marked so a re-run reconciles) and `ck_oauth_clients_cimd_shape`: the URL is present exactly when the id starts `cimd_`, and such a row is `none` with no secret.
-- The row is written **only by an approve**, in the code's transaction. A single `INSERT … ON CONFLICT DO UPDATE` refreshes the name, URIs and scope and stamps `last_used_at`. Because the owner is in the id, #68's cross-user rule, the panel's per-user listing and its cascading Delete keep their meaning, and two users connecting Claude get two rows.
+- Migration 036 adds `client_id_metadata_url` (comment-marked so a re-run reconciles) and `ck_oauth_clients_cimd_shape`: the URL is present exactly when the id starts `cimd_`. Since 038 (#420) such a row has no secret and a method of `none` or `private_key_jwt`; 038's columns and CHECKs are [below](#private_key_jwt-clients-420).
+- The row is written **only by an approve**, in the code's transaction. A single `INSERT … ON CONFLICT DO UPDATE` refreshes the name, URIs, scope and (since #420) the key source, and stamps `last_used_at`. Because the owner is in the id, #68's cross-user rule, the panel's per-user listing and its cascading Delete keep their meaning, and two users connecting Claude get two rows.
 - A GET or a deny writes nothing, which is what removes DCR exhaustion.
 
 **The consent pin (D7).** The GET puts the authorization hash into the signed
@@ -705,9 +714,26 @@ the plain string). The POST re-resolves under the cache and admission rules and
 refuses `metadata_changed` when the hash differs. **The invariant is that the
 approval binds the projection that was shown.** An origin edit inside a fresh
 cache entry is not seen (L12). The code then pins the client, the exact
-redirect URI and the clamped scope. `/token` and the refresh path never fetch,
-so a withdrawn document ends nothing; revocation and the 90-day lifetime do
-(L2).
+redirect URI and the clamped scope.
+
+**What `/token` and `/revoke` may fetch** (revised by #420; this replaces
+"`/token` never fetches"):
+- `/token` and `/revoke` **never fetch the document**.
+- They fetch a `private_key_jwt` row's pinned `jwks_uri` **only** through the
+  pre-phase, never while holding a session, transaction or lock, and only on
+  one of two triggers: the assertion's `kid` is missing from the snapshot, or
+  the snapshot is older than 24 h.
+- A failed stale refetch falls back to the stored snapshot. A successful
+  refetch is authoritative, including when it removes the assertion's key.
+- A withdrawn or changed document still ends nothing; revocation and the
+  90-day absolute lifetime do (L2).
+- The `jwks_uri` changes only at an approval.
+
+Not fetching the document means a withdrawn or edited document never changes
+an existing grant, and nothing an unauthenticated caller sends makes the token
+endpoint fetch it. The JWKS is the exception because without it a key rotation
+would strand every `private_key_jwt` grant. It is reachable only by a holder of
+an eligible credential for that row.
 
 **The order of checks per endpoint**, which is load-bearing (Codex round 3):
 
@@ -717,6 +743,22 @@ so a withdrawn document ends nothing; revocation and the 90-day lifetime do
 | `POST /authorize` | state (and the bound hash) → PKCE → scope → **`cimd_` prefix refused** → CIMD: session → re-resolve → hash pin → redirect match → clamp → deny (no row) / approve (upsert + code) |
 | `/token` | the credential **first, unchanged**: code or refresh row by hash alone → spent-code fork / #182 reuse decision / #326 precedence → **then** the caller's `client_id`: a `cimd_` value refused (`invalid_client` 401 on a live credential; the unknown-code response on a spent code, which fails #325's full revalidation and revokes nothing) → a CIMD row matches only its URL. A replayed refresh token under `client_id=cimd_nonexistent` still revokes its family |
 | `/revoke` | **`cimd_` prefix before the token lookup**, answered with the existing constant 200 response (`{}`) (`internal_id_submitted`, log only) → a CIMD row's `client_id` must equal its URL |
+
+**#420 adds client authentication by assertion** at exactly the position
+`_client_authenticated` always held; nothing else moves. The full order, new
+steps in bold:
+
+| Endpoint / credential | Order | Assertion failure answers | Revokes? |
+| --- | --- | --- | --- |
+| `/token` / `/revoke` pre-phase | **only for an eligible credential (live code with matching redirect URI and PKCE; live, in-lifetime refresh or revoke token; matching `client_id` if given) and only on a kid miss or a snapshot older than 24 h; no lock; decides no response, re-checked below** | — | never |
+| `/token` code, **live** | bootstrap lock → code by hash `FOR UPDATE` → `cimd_` id refused → caller `client_id` vs row → client row exists → **client authentication** → code expiry → `redirect_uri` → PKCE → ownerless / cross-user / scope → mint | `invalid_client` 401, the existing body byte for byte; logged `invalid_client.<sub>` | no |
+| `/token` code, **spent** | same up to the client row → **client authentication** → `redirect_uri` → PKCE → replay branch (revokes) | the unknown-code `invalid_grant` 400 byte for byte; logged `invalid_grant.spent_code_<sub>` | no. Only a fully revalidated replay, with a valid fresh assertion, reaches the replay branch |
+| `/token` refresh, **rotated away** | bootstrap lock → grant id by hash → grant lock → row `FOR UPDATE` → **#182 reuse branch, unchanged: the assertion is not verified, recorded or consumed** | — (constant reuse `invalid_grant`) | yes, as today, for every client (L7) |
+| `/token` refresh, **live** | … → `cimd_` id refused → caller `client_id` vs row → client row exists → **client authentication** → #326 grant deadline → token expiry → rotation | `invalid_client` 401, the existing body; logged `invalid_client.<sub>` | no |
+| `/revoke` | `cimd_` prefix (constant 200) → missing token (200) → **pre-phase** → token by hash → unknown token (200) → client row → unknown client (200) → `client_id` present: mismatch → constant 200 (`client_mismatch`), match → **client authentication**; `client_id` **absent**: `private_key_jwt` row → **client authentication directly against the credential-resolved row** (the verified `iss`/`sub` bind it), any other row → constant 200 (`client_mismatch`, as before) → revoke family | `invalid_client` 401, the existing "right client, failed auth" case; `oauth_revoke_refused reason=<sub>` | no |
+
+`<sub>` is one of `client_assertion.SUBS`. A DCR client keeps
+`authentication_failed` (`client_auth_failed` at `/revoke`) byte for byte.
 
 Every CIMD refusal at `/authorize` (URL, admission, fetch, validation,
 redirect mismatch, internal id, metadata changed) answers the **constant
@@ -770,3 +812,369 @@ re-reported:
 - L12 An origin edit inside the freshness window is not seen at the POST.
 - L13 `SECRET_KEY` rotation re-derives ids.
 - L14 A client whose every POST is malformed never reaches the gate's evidence (nor the AS).
+
+### `private_key_jwt` clients (#420)
+
+ChatGPT's connector presents `client_id=https://chatgpt.com/oauth/client.json`,
+whose document declares `token_endpoint_auth_method: private_key_jwt`,
+`token_endpoint_auth_signing_alg: RS256` and a same-origin `jwks_uri`. #357
+admitted only `none` documents, so every ChatGPT connection was refused
+`auth_method_unsupported` at `GET /authorize`. #420 admits the method for CIMD
+clients only. The formal requirements are in
+`openspec/specs/oauth-client-metadata-documents/`; the design, with its review
+rounds, is in `openspec/changes/archive/*-cimd-private-key-jwt/design.md`.
+`src/oauth/cimd.py` holds the document and JWKS rules;
+`src/oauth/client_assertion.py` holds assertion verification, the replay cache
+and the pre-phase.
+
+**The declared method is honoured, never downgraded.** ChatGPT's document
+also lists `none` in `token_endpoint_auth_methods_supported`. Reading that as
+permission to treat it as a public client would accept, unauthenticated, a
+client that asked to be authenticated by key. Honouring the declared
+`token_endpoint_auth_method` is the only reading under which the document's
+author decides how its client authenticates.
+
+**Document rules.** A `private_key_jwt` document must also:
+- carry a `jwks_uri` that passes `validate_client_id_url` unchanged (the URL
+  rules above), or it is `jwks_uri_invalid`;
+- have that `jwks_uri` **same origin** as the `client_id` URL: scheme,
+  canonical host and effective port (`jwks_uri_cross_origin`). The keys are
+  trusted on the same basis as the document, so they must come from the same
+  place (L14);
+- carry **no** inline `jwks` (`jwks_inline_refused`), even beside a valid
+  `jwks_uri`. One key source only (RFC 7591 §2);
+- if it names `token_endpoint_auth_signing_alg`, name `RS256`, `PS256` or
+  `ES256` (`signing_alg_unsupported`). That value then pins the algorithm;
+  absent, any of the three is accepted.
+
+**The JWKS at `/authorize`.** After the document validates, `GET` and `POST`
+both call `cimd.resolve_jwks`: `GET` so the user is never shown a consent that
+cannot complete, `POST` because it writes the snapshot. `POST` resolves it
+before the approve transaction opens, so no session is held across the fetch.
+Its admission chain mirrors the document's:
+
+> JWKS cache hit → join an in-progress fetch of the same `jwks_uri` (both
+> charged nothing) → the 30 s failure cooldown (the document's table, under a
+> key no URL can be, so a JWKS failure never arms the *document's* cooldown) →
+> **a second charge to the same per-address budget** → 1 in flight per slot →
+> 8 per process → `fetch_url_guarded` (no redirects, 10 s, 64 KiB, deny list,
+> pinned) → `validate_jwks`.
+
+**Why a second charge.** A cached document charges nothing. If the JWKS rode
+the document's charge, every cached-document `GET /authorize` would be a free
+outbound request to the client's origin, an amplifier any caller could drive.
+So each outbound request costs one unit. A ChatGPT consent spends at most 2 of
+the address's 10 per minute, and nothing once both are cached.
+
+The JWKS cache is a second LRU of 256 entries under the document cache's TTL
+rules, and it stores only validated snapshots. Every `JwksSnapshot` carries an
+immutable `fetched_at`: the moment its bytes left the origin. A cache hit
+returns that time, never the time of the hit. **`jwks_fetched_at` is always
+that origin time**, at an approval and at a refetch. Otherwise an approval
+served from a 23 h-old cache entry would restart the 24 h staleness clock, and
+a removed key could survive about 48 h (Codex spec R1-2).
+
+The JWKS refusals are `client_metadata.jwks_fetch_failed`, `jwks_fetch_timeout`,
+`jwks_http_status`, `jwks_too_large`, `jwks_content_encoded`,
+`jwks_ssrf_refused`, `jwks_not_json`, `jwks_invalid`, `jwks_private_key` and
+`jwks_no_usable_key`, plus the shared admission reasons `fetch_cooldown`,
+`fetch_budget_exhausted` and `fetch_busy`. All of them answer the constant
+`invalid_client` 400.
+
+**JWKS validation** (`cimd.validate_jwks`), in order:
+1. A JSON object whose `keys` is a list of 1–16 objects, or `jwks_invalid`.
+2. Any key carrying `d`, `p`, `q`, `dp`, `dq`, `qi`, `oth` or `k` refuses the
+   **whole set** (`jwks_private_key`). A publisher leaking private or
+   symmetric keys is misconfigured, and none of its keys should be trusted.
+   This is also what makes an `oct` key unreachable.
+3. These keys are **ignored**, not refused:
+   - `use` other than `sig`;
+   - `key_ops` without `verify`;
+   - `kty` other than `RSA`/`EC`, or EC other than `P-256`;
+   - an `alg` outside the three, or one that does not fit the key type;
+   - an RSA modulus under 2,048 or over 8,192 bits (computed from `n`; the
+     upper bound also bounds verification cost);
+   - an RSA exponent that is not an odd integer in 3…2³²;
+   - a `kid` that is not a 1–256-character string without control characters;
+   - a key that does not import as a public key in `joserfc`.
+4. Two usable keys sharing a `kid` refuse the set (`jwks_invalid`), because
+   ambiguous selection is not resolved by order. A set with no usable key is
+   `jwks_no_usable_key`.
+
+The snapshot is `{"keys": [...]}` holding only the usable keys, each reduced
+to its public members (`kty`, `kid`, `alg`, `n`/`e` or `crv`/`x`/`y`).
+Verification reads only the snapshot, so a later `joserfc` default cannot
+widen what it accepts.
+
+**The synthetic row and migration 038.** The pinned method is the existing
+`token_endpoint_auth_method` column, which already read `none` on every CIMD
+row. Reusing it means no second method column, no backfill, and no second
+answer to one question that could disagree with the first. There are four
+nullable columns: `jwks_uri`, `token_endpoint_auth_signing_alg`,
+`jwks_snapshot` (JSONB) and `jwks_fetched_at`. The database enforces the shape:
+- a `private_key_jwt` row is a CIMD row with no secret and with `jwks_uri`,
+  `jwks_snapshot` and `jwks_fetched_at` all set;
+- every other row has all four columns NULL;
+- the alg is NULL or one of the three.
+
+**A DCR row can never be `private_key_jwt`, and a `private_key_jwt` row
+without keys cannot be represented.** See
+[schema and migrations](schema-and-migrations.md#038-private_key_jwt-columns-on-oauth_clients-420).
+
+**The approve upsert** writes the method, `jwks_uri`, alg, snapshot and
+`jwks_fetched_at` (the snapshot's origin time) and refreshes them on conflict.
+A later approval therefore refreshes the snapshot and re-pins the `jwks_uri`.
+Three rules apply, each there because the obvious version was wrong:
+- **A `private_key_jwt` row never becomes `none`.** When the row exists, it is
+  read `FOR UPDATE` in the approve transaction. If it is `private_key_jwt` and
+  the re-resolved document now says `none`, the approve refuses
+  `client_metadata.auth_method_downgrade` and writes nothing. A refresh token
+  issued to a key-holding client must never become redeemable without the key.
+  The way out is the panel's Delete, which cascades that user's grants,
+  followed by a fresh consent (L10, owner-accepted). `none` →
+  `private_key_jwt` is allowed: it is the declared method taking effect, and
+  that row's existing families must then present assertions.
+- **The race guard.** Two *first* approvals of the same (URL, user) both find
+  no row to lock, so `FOR UPDATE` cannot serialise them. The
+  `ON CONFLICT DO UPDATE` therefore carries the same rule as its `WHERE`
+  clause (never `private_key_jwt` → `none`), judged against the row as
+  committed. An update the guard skips returns no row, and the approve rolls
+  back with the same `auth_method_downgrade` refusal. Adversarial Codex round 1
+  found the race, and a two-session real-Postgres test pins the fix. Do not
+  reduce it to the `FOR UPDATE` check alone.
+- **An approval never moves a stored snapshot backwards.** This case arises
+  when a refetch landed after the consent's JWKS was cached. If the stored row
+  has the same `jwks_uri` and a newer `jwks_fetched_at` than the approval's
+  snapshot, the stored snapshot and time are kept. The rule is evaluated in
+  the conflict update itself, against the row as it stands, not only on the
+  earlier read, so a racing approval cannot regress it either. Without it, an
+  approval served from a cache entry older than a refetch would re-admit a key
+  the refetch had removed.
+
+**Client authentication is one dispatcher**, `_client_auth_failure` in
+`routes.py`. All three call sites (`/token` for both grants, and `/revoke`)
+call it at the position `_client_authenticated` always held, on the row the
+**credential** resolved inside the main transaction:
+- **`private_key_jwt` row:** no `client_assertion` → `assertion_missing`. A
+  `client_secret`, with or without an assertion → `secret_presented` (RFC 6749
+  §2.3: one method per request). Otherwise `client_assertion.authenticate`
+  runs.
+- **`none` CIMD row:** `client_assertion` or `client_assertion_type` present →
+  `assertion_unexpected`. This is the one behaviour change for `none` CIMD
+  rows, and no known client sends either parameter. Otherwise the row
+  authenticates trivially, as before.
+- **DCR rows:** unchanged byte for byte. Assertion parameters are ignored
+  (L6), and a failure is still `authentication_failed`.
+
+**`authenticate`** runs these checks in order, each with its own sub:
+1. `client_assertion_type` must be exactly
+   `urn:ietf:params:oauth:client-assertion-type:jwt-bearer`
+   (`assertion_type_invalid`).
+2. The assertion must be ≤ 8,192 bytes of ASCII, a compact JWS of exactly
+   three non-empty segments, with a header that decodes to a JSON object
+   (`assertion_malformed`). JWE and the JSON serialisation are out.
+3. Header (`assertion_header_invalid`, `assertion_alg_invalid`):
+   - `crit`, `jku`, `jwk`, `x5u` or `x5c` present, or a `kid` that is not a
+     1–256-character string → `assertion_header_invalid`. These are refused,
+     not ignored: a key-bearing header is never a key source here, so its
+     presence means a confused client or an attack.
+   - `alg` must be `RS256`, `PS256` or `ES256`, and must equal the row's pin
+     when there is one (`assertion_alg_invalid`). So `none` and `HS*` cannot
+     be reached.
+   - `typ` is not checked.
+4. Key selection, from the row's `jwks_snapshot` only:
+   - with a `kid`, the key with that `kid` (`assertion_kid_unknown` when
+     absent);
+   - without one, the single key compatible with the alg
+     (`assertion_key_ambiguous` for zero or several, L3);
+   - the key's type must fit the alg (RS*/PS* → RSA, ES256 → EC P-256), and
+     its `alg`, when set, must equal the header's (`assertion_alg_invalid`).
+5. `joserfc.jwt.decode` runs with **exactly one key and one algorithm**, so the
+   library makes no selection of its own (`assertion_signature_invalid`). Our
+   code judges every claim below, not the library's registry defaults.
+6. `iss` and `sub` must be byte-equal to the **row's**
+   `client_id_metadata_url`, and so must a submitted `client_id`
+   (`assertion_claims_invalid`).
+7. `aud` must be a string, or an array of exactly one string
+   (`assertion_audience_invalid`). Its value must be the issuer
+   (`settings.base_url`) or `{issuer}/token`; at `/revoke`, `{issuer}/revoke`
+   is accepted too.
+   - The issuer is what rfc7523bis recommends.
+   - The token endpoint URL is what RFC 7523 §3 permits, what OIDC Core §9
+     recommends, and what most client libraries send (L12).
+   - Multi-valued arrays are refused, following rfc7523bis's
+     audience-injection hardening.
+8. Time, with `MAX_LIFETIME = 300` and `SKEW = 30`:
+   - `exp`, `iat` and `nbf` must be finite numbers, never booleans
+     (`assertion_claims_invalid`). `NaN` passes every comparison and `±inf`
+     breaks the arithmetic; adversarial Codex round 1 found this.
+   - `exp > now`, with **zero leeway** (`assertion_expired`).
+   - `exp − now ≤ 330`, and with `iat`, `exp − iat ≤ 300`
+     (`assertion_lifetime_exceeded`).
+   - `iat` and `nbf` ≤ now + 30 (`assertion_not_yet_valid`).
+9. `jti` must be a 1–256-character string (`assertion_claims_invalid`). It is
+   then consumed in the replay cache (`assertion_replayed`,
+   `assertion_replay_cache_full`).
+
+**The replay cache** is in-process (the `--workers 1` contract,
+[rate limits](rate-limits.md)). It holds 16,384 entries keyed by
+SHA-256(`iss` "\n" `jti`), each held until its `exp`, and purges expired
+entries before an insert.
+- **It is keyed per client URL, not per row.** An assertion spent at one
+  user's row cannot be spent again at another user's row for the same client.
+- **A full cache refuses; it never evicts a live entry.** Evicting one would
+  make its `jti` replayable (L2).
+- **Only an assertion that passed steps 1–8 is recorded.** Unauthenticated
+  garbage cannot fill the cache. Filling it takes about 50 validly signed
+  assertions a second, against a `/token` limit of 10/min per address.
+
+**The pre-phase** (`client_assertion.prephase`) is the only place the server
+refetches a JWKS, and it is the narrow revision of "`/token` never fetches".
+The handler awaits it **before** `async with async_session()`. It opens its
+own short sessions and holds none across the network hop. A real-Postgres test
+pins this: while the fetch is suspended, `pg_stat_activity` shows no
+`idle in transaction` and `pg_locks` shows no lock. A lock held across a 10 s
+fetch would be a stall any credential holder could cause.
+1. **Gate.** The request carries an assertion that parses (steps 1–3, without
+   the signature) and a credential: a `code`, a `refresh_token`, or a `token`
+   at `/revoke`.
+2. **Read and eligibility.** These run in a short read-only session that is
+   closed before any I/O. Egress is keyed on an **eligible credential**, not on
+   a `client_id` (Codex spec R1-1). All of these must hold:
+   - for a code: unspent, unexpired, a matching `redirect_uri`, and a
+     well-formed PKCE verifier whose S256 matches;
+   - for a refresh or revoke token: unrevoked, unexpired, and inside its
+     grant's absolute lifetime;
+   - a submitted `client_id` matches the row, and is never a `cimd_` id;
+   - the row is `private_key_jwt`;
+   - the unverified `iss` equals the row's URL;
+   - the assertion's alg equals the pin, when there is one.
+
+   A rotated-away token is ineligible, so **the #182 reuse branch never causes
+   a fetch**. These checks are **advisory**: they produce no response, record
+   or write. The main transaction re-runs every check under its locks, so
+   every existing response, #325's concealment and #326's refusal included, is
+   what it would be without the pre-phase.
+3. **Triggers.** There are two:
+   - **kid miss:** the assertion's `kid` is not in the snapshot;
+   - **stale:** `jwks_fetched_at` is older than `JWKS_MAX_AGE_SECONDS = 86400`.
+     That equals the JWKS cache ceiling, so no snapshot is trusted longer than
+     any cache entry could be.
+
+   One refetch serves both. The event says `kid_miss` when both hold.
+4. **Fetch.** The JWKS cache comes first. A hit is used for a kid miss only if
+   it holds the `kid`, and for staleness only if it is within 24 h and newer
+   than the row's time. Otherwise:
+   - a 60 s per-`jwks_uri` cooldown applies (`JWKS_REFETCH_COOLDOWN_SECONDS`,
+     1,024 entries, oldest replaced), armed at the end of every attempt,
+     success or failure;
+   - an in-progress refetch is joined;
+   - the global in-flight cap of 8 applies;
+   - the fetch is `cimd.fetch_jwks_guarded` (the `/authorize` fetch and
+     `validate_jwks`).
+
+   **There is no per-address charge.** The fetch needs a live credential for
+   that row and is bounded to one per `jwks_uri` per minute process-wide.
+   ChatGPT's token calls arrive from a shared egress pool, where an address
+   budget would either be irrelevant or let one user's traffic block another's
+   refresh. A busy cap is not an attempt, because nothing left the process, so
+   it arms no cooldown and emits nothing.
+5. **Write.** `UPDATE … SET jwks_snapshot, jwks_fetched_at WHERE client_id =
+   :row AND jwks_uri = :uri_read AND jwks_fetched_at < :t` runs in its own
+   short transaction, with `:t` the origin time. This is a compare-and-set: an
+   approval that re-pinned a different `jwks_uri` meanwhile is never
+   overwritten, and a snapshot never moves backwards.
+6. **Failure** writes nothing and does **not** advance `jwks_fetched_at`, so
+   the next request after the cooldown tries again. What happens next depends
+   on the trigger:
+   - stale only: the main phase verifies against the stored snapshot, so an
+     outage at the client's origin never breaks an exchange or a refresh (L4);
+   - kid miss: the main phase refuses `assertion_kid_unknown`.
+
+**A successful refetch is authoritative.** It replaces the snapshot, so an
+assertion whose `kid` the client has removed is refused `assertion_kid_unknown`
+(the event's outcome is `kid_still_absent`). Removing a compromised key is
+exactly what the stale trigger exists to honour.
+
+**The refetch runs while `OAUTH_CIMD_ENABLED=false`.** The switch stops the
+server accepting new CIMD clients and fetching documents named by
+unauthenticated callers. Existing CIMD grants keep refreshing (#357). The
+refetch fetches only a URL pinned on an approved row, for a credential holder.
+Disabling it would strand every `private_key_jwt` grant at the client's next
+key rotation and stop honouring key removal (L11). While the switch is off,
+the metadata stops advertising `private_key_jwt`.
+
+**`/revoke` without `client_id`.** For public clients, omitting it was a
+universal bypass, and it stays the constant 200 for them. A `private_key_jwt`
+caller may omit it. The assertion, verified against the credential-resolved
+row with `iss`/`sub` equal to its URL, identifies and authenticates it (Codex
+spec R1-3). With a live token:
+- no assertion → 401 `assertion_missing`;
+- malformed → 401 `assertion_malformed`;
+- wrong `iss`/`sub` → 401 `assertion_claims_invalid`;
+- valid → `{}` 200 and the family revoked.
+
+That 401 is L15.
+
+**Consequences, stated so they are not "fixed" later:**
+- **A replayed, invalid or missing assertion never revokes anything.** Every
+  assertion failure exits before any revocation write. The spent-code replay
+  branch is reached only *after* a successful assertion. The #182 reuse branch
+  never verifies, records or acts on one (L7).
+- **Concealment is preserved.**
+  - A spent code failing the assertion gets the unknown-code response.
+  - A live credential gets the same `invalid_client` 401 for every sub.
+  - `/revoke`'s `cimd_` and mismatch paths stay the constant 200.
+  - The sub appears only on the record.
+- **Cross-tenant.**
+  - The assertion is always verified against the row the credential
+    resolved, never a row looked up by URL.
+  - Its `iss` must equal that row's URL.
+  - Its `jti` is spent per client URL.
+
+  The assertion proves "this is ChatGPT". The code with its verifier, or the
+  refresh token, proves "this is user B's grant". No combination lets user A's
+  credential reach B's grant.
+
+**AS metadata**, only while `OAUTH_CIMD_ENABLED` is true:
+- `token_endpoint_auth_methods_supported` is
+  `["none","client_secret_post","private_key_jwt"]`;
+- `token_endpoint_auth_signing_alg_values_supported` is
+  `["RS256","PS256","ES256"]`.
+
+Disabled, the document is byte-identical to before. `/register` still refuses
+`private_key_jwt`, so the listing is true for CIMD clients only (L6). There are
+no revocation-endpoint auth fields (L13).
+
+**Logging.** No assertion, `kid`, `jti`, key, JWKS byte, `jwks_uri` or
+unverified `iss` is ever logged. The new reasons and the
+`oauth_client_jwks_refetched` event are in
+[security event logging](security-event-logging.md).
+
+**No new settings.** Every bound is a module constant:
+- in `cimd.py`: `JWKS_MAX_KEYS`, `RSA_MIN_BITS`, `RSA_MAX_BITS`,
+  `JWKS_CACHE_ENTRIES`;
+- in `client_assertion.py`: `ASSERTION_MAX_BYTES`, `MAX_LIFETIME`, `SKEW`,
+  `JTI_MAX_CHARS`, `REPLAY_CACHE_ENTRIES`, `JWKS_REFETCH_COOLDOWN_SECONDS`,
+  `JWKS_MAX_AGE_SECONDS`.
+
+The `OAUTH_CIMD_*` settings govern the `/authorize` JWKS fetch unchanged.
+
+**Accepted limitations (#420)**, recorded so they are not re-fixed when
+re-reported:
+- L1 The `jti` replay cache is per process and is lost on restart. An assertion captured before a restart can be replayed within its ≤ 330 s life, but only together with a valid code and verifier, or a refresh token.
+- L2 A full replay cache refuses valid assertions until entries expire. This is fail-closed by design.
+- L3 An assertion without `kid` is refused when the snapshot has more than one key compatible with its alg.
+- L4 A key the client removes stays usable through the stored snapshot for up to about 24 h after the last successful fetch, plus up to the 60 s cooldown. It stays usable for longer while the client's origin is unreachable or serves an invalid JWKS, because a failed stale refetch falls back to the stored snapshot (owner decision, 2026-11-07).
+- L5 Timing distinguishes a request that triggered a refetch.
+- L6 DCR clients cannot use `private_key_jwt` although the metadata lists it, and DCR clients that send assertion parameters have them ignored.
+- L7 A rotated-away refresh token of a `private_key_jwt` client revokes its family without client authentication (#182 unchanged). A holder of an old refresh token can end the grant but not use it. **Owner-accepted 2026-11-07.**
+- L8 The `jwks_uri` is pinned per row and changes only at an approval. A withdrawn document ends nothing.
+- L9 Only RS256, PS256 and ES256 are supported. No EdDSA, no `client_secret_jwt`, no mTLS.
+- L10 A `private_key_jwt` → `none` change in a client's document is refused at approval until the user deletes that client in the panel. **Owner-accepted 2026-11-07.**
+- L11 The kid-miss and stale refetches run while `OAUTH_CIMD_ENABLED=false`.
+- L12 The token-endpoint URL is accepted as `aud` besides the issuer, which keeps the residual audience-injection exposure of clients that build `aud` from a malicious AS's metadata.
+- L13 The metadata advertises no revocation-endpoint auth methods, as before.
+- L14 A compromise of the client's origin is a compromise of the client: the JWKS is trusted on the same basis as the document.
+- L15 At `/revoke`, a holder of a live `private_key_jwt` client's token who omits `client_id` and the assertion gets `invalid_client` 401 rather than the concealed 200. That tells them the token is live, which a bearer token's holder can learn at `/mcp` anyway.
+- L16 The pre-phase's eligibility checks run on an unlocked read. A credential that is spent, rotated or revoked concurrently can still cause one bounded refetch, which the cooldown caps. The main transaction decides the response.

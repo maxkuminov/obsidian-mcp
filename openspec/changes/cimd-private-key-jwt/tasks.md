@@ -196,16 +196,16 @@ Post-merge, the orchestrator greps for production callers of every new export. E
 
 ## 9. Docs (same PR, before merge)
 
-- [ ] 9.1 `docs/architecture/oauth-and-grants.md` §CIMD:
+- [x] 9.1 `docs/architecture/oauth-and-grants.md` §CIMD:
   - replace "`/token` never fetches" (the Detection paragraph and the consent-pin paragraph) with the revised invariant, D7's "The invariant, restated";
   - add a `private_key_jwt` subsection covering document rules, the JWKS fetch and charge, validation, the snapshot, the assertion rules, the replay cache, the pre-phase and the downgrade rule;
   - extend "The order of checks per endpoint" with D8's table;
   - append L1–L14 as this change's accepted limitations, marking L7 and L10 as owner-accepted 2026-11-07.
-- [ ] 9.2 `CLAUDE.md`: in the CIMD key-decision bullet, `private_key_jwt` for CIMD only, the same-origin `jwks_uri`, the snapshot plus refetch (kid miss or older than 24 h; a failed stale refetch falls back to the stored snapshot) with no lock across the hop, and "`/token` never fetches **the document**". Add the 038 migration and the new module to the bullet.
-- [ ] 9.3 `docs/architecture/security-event-logging.md`: add the new reasons on the three events and the `oauth_client_jwks_refetched` row.
-- [ ] 9.4 `docs/architecture/schema-and-migrations.md`: a 038 entry.
-- [ ] 9.5 `README.md`: in the client-compatibility section, ChatGPT connects through CIMD with `private_key_jwt`. Run the grep check for any stale "CIMD public clients only" or "`none` only" wording in README, DEPLOYMENT.md and `.env.example`. No new setting, so `.env.example` is unchanged.
-- [ ] 9.6 `requirements.txt`: the `joserfc` / Authlib comment no longer says "Optional browser OIDC". It states that `joserfc` is also used for CIMD client assertions.
+- [x] 9.2 `CLAUDE.md`: in the CIMD key-decision bullet, `private_key_jwt` for CIMD only, the same-origin `jwks_uri`, the snapshot plus refetch (kid miss or older than 24 h; a failed stale refetch falls back to the stored snapshot) with no lock across the hop, and "`/token` never fetches **the document**". Add the 038 migration and the new module to the bullet.
+- [x] 9.3 `docs/architecture/security-event-logging.md`: add the new reasons on the three events and the `oauth_client_jwks_refetched` row.
+- [x] 9.4 `docs/architecture/schema-and-migrations.md`: a 038 entry.
+- [x] 9.5 `README.md`: in the client-compatibility section, ChatGPT connects through CIMD with `private_key_jwt`. Run the grep check for any stale "CIMD public clients only" or "`none` only" wording in README, DEPLOYMENT.md and `.env.example`. No new setting, so `.env.example` is unchanged.
+- [x] 9.6 `requirements.txt`: the `joserfc` / Authlib comment no longer says "Optional browser OIDC". It states that `joserfc` is also used for CIMD client assertions.
 
 ## 10. Deploy and live end-to-end
 
