@@ -89,9 +89,9 @@ Post-merge, the orchestrator greps for production callers of every new export. E
 
 ## 4. Assertion verification and replay cache (Slice A)
 
-- [ ] 4.1 `authenticate`: D6 steps 1–9, in order, each with its sub-reason. Verify with `joserfc.jwt.decode` against **one** imported key and **one** algorithm. Claims are validated by our own code, not the library's registry defaults.
-- [ ] 4.2 The replay cache: 16,384 entries, keyed by SHA-256 of `iss` and `jti`, held until `exp`, purged before insert, refusing when full and never evicting a live entry. It is recorded only after steps 1–8 pass.
-- [ ] 4.3 `parse_unverified`, bounded by the same size limits and never raising. `prephase` implements D7, with both triggers (kid miss, and `jwks_fetched_at` older than `JWKS_MAX_AGE_SECONDS = 86400`) sharing one refetch:
+- [x] 4.1 `authenticate`: D6 steps 1–9, in order, each with its sub-reason. Verify with `joserfc.jwt.decode` against **one** imported key and **one** algorithm. Claims are validated by our own code, not the library's registry defaults.
+- [x] 4.2 The replay cache: 16,384 entries, keyed by SHA-256 of `iss` and `jti`, held until `exp`, purged before insert, refusing when full and never evicting a live entry. It is recorded only after steps 1–8 pass.
+- [x] 4.3 `parse_unverified`, bounded by the same size limits and never raising. `prephase` implements D7, with both triggers (kid miss, and `jwks_fetched_at` older than `JWKS_MAX_AGE_SECONDS = 86400`) sharing one refetch:
   - a credential-keyed read in a short session that is closed before I/O, then the D7 eligibility checks: code unspent and unexpired with redirect URI and PKCE verified; refresh or revoke token unrevoked, unexpired and in its lifetime; `client_id` matching when present. These are advisory only: no response, record or write;
   - the cache, then the cooldown (60 s per `jwks_uri`, 1,024 entries), then join, then the global cap, then `fetch_jwks_guarded`;
   - a CAS `UPDATE … WHERE client_id = :row AND jwks_uri = :uri AND jwks_fetched_at < :t` in its own short transaction;
@@ -99,7 +99,7 @@ Post-merge, the orchestrator greps for production callers of every new export. E
   - the JWKS cache records each entry's fetch time, and a stale-trigger cache hit counts only within 24 h;
   - one `oauth_client_jwks_refetched` emission per actual attempt;
   - it ignores `OAUTH_CIMD_ENABLED`.
-- [ ] 4.4 Unit tests:
+- [x] 4.4 Unit tests:
   - every sub-reason;
   - `kid` absent with one key and with two compatible keys;
   - each forbidden header;
