@@ -364,3 +364,6 @@ None. Owner decisions 2026-11-07:
   - MAJOR: concurrent first approvals could downgrade a `private_key_jwt` row to `none` (both read the absent row before either upserted). The conflict update is now guarded by the downgrade rule, and the newer-snapshot rule moved into it too; pinned by a two-session real-Postgres test.
   - MINOR: non-finite NumericDates (`NaN`, `±inf`, integers too large for a float) passed the type checks; each of `exp`, `iat`, `nbf` must now be finite, refused `assertion_claims_invalid`.
 - **openspec-verifier, round 1:** one blocking finding, fixed: a `/token` client-authentication refusal lacked `cimd_host` when the caller omitted `client_id`; it now falls back to the row's metadata URL, as `/revoke` does.
+- **Adversarial Codex, round 2 (verification only, 2026-11-07):** PASS. Fixed: the downgrade race, the finite NumericDates, and the verifier's `cimd_host` finding.
+  - **Declined NIT:** an integer NumericDate too large for a float (such as `nbf = -10**400`) is refused as `assertion_claims_invalid` rather than judged temporally. This is stricter, only the holder of the client's key can produce it, and it fails all three triage questions.
+  - No round 3: round 2 produced no new class of finding.
