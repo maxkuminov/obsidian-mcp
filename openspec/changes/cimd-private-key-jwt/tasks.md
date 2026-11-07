@@ -116,25 +116,25 @@ Post-merge, the orchestrator greps for production callers of every new export. E
 
 ## 5. Wiring (Slice R)
 
-- [ ] 5.1 Metadata (D9): the two additions only while enabled. Update `tests/test_oauth_cimd.py`'s metadata test and add the disabled-state exact-list assertion.
-- [ ] 5.2 `/authorize` GET and POST:
+- [x] 5.1 Metadata (D9): the two additions only while enabled. Update `tests/test_oauth_cimd.py`'s metadata test and add the disabled-state exact-list assertion.
+- [x] 5.2 `/authorize` GET and POST:
   - call `resolve_jwks` after the document for `private_key_jwt`;
   - the POST's upsert writes and refreshes the method, `jwks_uri`, alg, snapshot and `jwks_fetched_at`;
   - the `auth_method_downgrade` refusal sits under the existing `FOR UPDATE` read;
   - the consent template is unchanged.
-- [ ] 5.3 `_client_authenticated` becomes the D6 dispatcher, with one definition for all three call sites. It returns a closed result whose sub becomes the reason. The DCR path is byte-identical; a test runs the existing DCR suites unchanged.
-- [ ] 5.4 `/token`, both grants:
+- [x] 5.3 `_client_authenticated` becomes the D6 dispatcher, with one definition for all three call sites. It returns a closed result whose sub becomes the reason. The DCR path is byte-identical; a test runs the existing DCR suites unchanged.
+- [x] 5.4 `/token`, both grants:
   - `await client_assertion.prephase(...)` before `async with async_session()`;
   - the assertion is verified at the existing `_client_authenticated` position against the row read in the main transaction;
   - spent-code failures go through `_refuse_spent("assertion_<sub>")`;
   - live failures return the existing `invalid_client` 401 body;
   - the #182 reuse branch is untouched.
-- [ ] 5.5 `/revoke`:
+- [x] 5.5 `/revoke`:
   - the pre-phase after the `cimd_` and missing-token checks;
   - with `client_id` absent and a `private_key_jwt` row, skip the identity comparison and authenticate directly against the credential-resolved row (design D8, the exact response table);
   - assertion failure returns the existing 401 with `oauth_revoke_refused reason=assertion_<sub>`.
-- [ ] 5.6 Events: add the new reasons and the `oauth_client_jwks_refetched` event to the `security_events` catalogue and the `logging_setup` allow-list. The catalogue/call-site drift test stays green.
-- [ ] 5.7 Route tests (offline):
+- [x] 5.6 Events: add the new reasons and the `oauth_client_jwks_refetched` event to the `security_events` catalogue and the `logging_setup` allow-list. The catalogue/call-site drift test stays green.
+- [x] 5.7 Route tests (offline):
   - every D8 table row;
   - spent code + bad assertion is byte-identical (status, headers, body) to an unknown code;
   - live code + bad assertion is byte-identical to today's `authentication_failed` 401;
@@ -169,7 +169,7 @@ Post-merge, the orchestrator greps for production callers of every new export. E
 
 ## 6. Integration tests (real Postgres, `tests/integration/`)
 
-- [ ] 6.1 `test_oauth_cimd_pkjwt_pg.py`, the full ChatGPT flow on the fake origin:
+- [x] 6.1 `test_oauth_cimd_pkjwt_pg.py`, the full ChatGPT flow on the fake origin:
   - GET → POST approve → row shape;
   - code exchange with an assertion;
   - refresh with an assertion;
@@ -178,9 +178,9 @@ Post-merge, the orchestrator greps for production callers of every new export. E
   - revoke without `client_id`;
   - replayed spent code with a valid assertion revokes the family;
   - two users connect ChatGPT and each gets a separate row; user A's assertion `jti` is refused on B's refresh.
-- [ ] 6.2 No lock across the hop, for both triggers. While the fake JWKS fetch is suspended in the pre-phase, `pg_stat_activity` for the app's connections shows no `idle in transaction` and `pg_locks` shows no lock held by them.
-- [ ] 6.3 CAS. An approval re-pins `jwks_uri` during a suspended refetch, and the refetch's UPDATE affects 0 rows.
-- [ ] 6.4 Regression. The existing `test_oauth_cimd_pg.py`, `test_oauth_grants_pg.py` and `test_oauth_grant_lifetime_pg.py` pass unchanged.
+- [x] 6.2 No lock across the hop, for both triggers. While the fake JWKS fetch is suspended in the pre-phase, `pg_stat_activity` for the app's connections shows no `idle in transaction` and `pg_locks` shows no lock held by them.
+- [x] 6.3 CAS. An approval re-pins `jwks_uri` during a suspended refetch, and the refetch's UPDATE affects 0 rows.
+- [x] 6.4 Regression. The existing `test_oauth_cimd_pg.py`, `test_oauth_grants_pg.py` and `test_oauth_grant_lifetime_pg.py` pass unchanged.
 - [ ] 6.5 `make test-integration` is green (not concurrently with `make test-schema`).
 
 ## 7. Gates

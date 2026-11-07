@@ -652,7 +652,9 @@ async def test_kid_miss_refetches_once_and_writes_the_snapshot(harness):
     await run(refresh_form(unknown_kid_assertion()))
     assert harness.fetches == [JWKS_URI]
     assert harness.writes == [(harness.client.client_id, JWKS_URI, harness.served)]
-    assert harness.puts == [(JWKS_URI, harness.served)]
+    # `fetch_jwks_guarded` fills the cache with the origin's own directive;
+    # the pre-phase must not put a second time (seam fix, #420 Slice R).
+    assert harness.puts == []
     [(event, fields)] = harness.events
     assert event == "oauth_client_jwks_refetched"
     assert fields["trigger"] == "kid_miss" and fields["outcome"] == "updated"
@@ -783,19 +785,32 @@ async def test_concurrent_requests_join_one_flight(harness):
     assert len(harness.writes) == 10  # every joiner writes its own row (CAS)
 
 
-async def test_global_cap_busy_fetches_and_records_nothing(harness, monkeypatch):
-    monkeypatch.setattr(cimd, "_global_inflight", cimd.GLOBAL_IN_FLIGHT)
+async def test_global_cap_busy_records_nothing_and_arms_no_cooldown(harness):
+    # The cap itself is `cimd.fetch_jwks_guarded`'s (`fetch_busy`).
+    harness.fail = cimd.CimdRefusal("fetch_busy")
     await run(refresh_form(unknown_kid_assertion()))
-    assert harness.fetches == [] and harness.events == []
-    assert cimd._global_inflight == cimd.GLOBAL_IN_FLIGHT
+    assert harness.events == [] and harness.writes == []
+    # A busy cap is not an attempt: the next request may try at once.
+    harness.fail = None
+    await run(refresh_form(sign(RSA_B, jti="again")))
+    assert len(harness.fetches) == 2
+    assert harness.events[0][1]["outcome"] == "updated"
 
 
-async def test_global_slot_is_released_after_success_and_failure(harness):
-    await run(refresh_form(unknown_kid_assertion()))
-    assert cimd._global_inflight == 0
-    ca.reset_state_for_tests()
-    harness.fail = RuntimeError("x")
-    await run(refresh_form(sign(RSA_B, jti="z")))
+async def test_the_prephase_takes_no_global_slot_of_its_own(harness):
+    seen = []
+
+    async def fetch(uri):
+        seen.append(cimd._global_inflight)
+        return harness.served
+
+    ca_fetch = cimd.fetch_jwks_guarded
+    try:
+        cimd.fetch_jwks_guarded = fetch
+        await run(refresh_form(unknown_kid_assertion()))
+    finally:
+        cimd.fetch_jwks_guarded = ca_fetch
+    assert seen == [0]
     assert cimd._global_inflight == 0
 
 

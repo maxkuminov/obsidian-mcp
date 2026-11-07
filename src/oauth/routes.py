@@ -12,6 +12,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from sqlalchemy import func, select
+from sqlalchemy import null as sa_null
 from sqlalchemy import update as sa_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -20,7 +21,7 @@ from src.config import settings
 from src.database import async_session
 from src.limiter import limiter
 from src.models.db import OAuthClient, OAuthCode, OAuthToken
-from src.oauth import cimd
+from src.oauth import cimd, client_assertion
 from src.oauth import resource as oauth_resource
 from src.oauth.grants import (
     clamp_token_expiry,
@@ -379,6 +380,68 @@ def _client_authenticated(client, client_secret) -> bool:
     return auth_method == "none"
 
 
+#: The sub a DCR client's failed authentication has always carried.
+_DCR_AUTH_FAILED = "authentication_failed"
+
+
+def _client_auth_failure(client, form, *, endpoint: str, now) -> str | None:
+    """The D6 dispatcher (#420): `None` when the client authenticated, else
+    the closed sub that becomes the refusal's reason.
+
+    One definition for the three call sites (`/token` both grants, `/revoke`),
+    each of which calls it at the position `_client_authenticated` held, on the
+    row the **credential** resolved inside the main transaction:
+
+    * a `private_key_jwt` row → `client_assertion.authenticate` against that
+      row's URL, snapshot and pinned alg (it checks `assertion_missing`, then
+      `secret_presented`, then D6 1–9); the sub is one of
+      `client_assertion.SUBS`;
+    * a `none` CIMD row → `assertion_unexpected` when either assertion
+      parameter is present, otherwise authenticated, as before;
+    * every DCR row → `_client_authenticated`, byte for byte; assertion
+      parameters are ignored (L6), and a failure is `authentication_failed`.
+    """
+    auth_method = getattr(client, "token_endpoint_auth_method", "client_secret_post")
+    metadata_url = getattr(client, "client_id_metadata_url", None)
+    if auth_method == cimd.AUTH_METHOD_PRIVATE_KEY_JWT:
+        try:
+            client_assertion.authenticate(
+                form,
+                metadata_url=metadata_url,
+                snapshot=getattr(client, "jwks_snapshot", None),
+                pinned_alg=getattr(client, "token_endpoint_auth_signing_alg", None),
+                endpoint=endpoint,
+                now=now,
+            )
+        except client_assertion.AssertionRefusal as refusal:
+            return refusal.sub
+        return None
+    if metadata_url is not None and auth_method == cimd.AUTH_METHOD_NONE:
+        if (
+            form.get("client_assertion") is not None
+            or form.get("client_assertion_type") is not None
+        ):
+            return "assertion_unexpected"
+        return None
+    if _client_authenticated(client, form.get("client_secret")):
+        return None
+    return _DCR_AUTH_FAILED
+
+
+async def _assertion_prephase(form, request, *, credential_kind: str, credential) -> None:
+    """D7: the JWKS refetch pre-phase, run **before** the handler's main
+    session is opened. Advisory: it never decides a response and never
+    raises (`client_assertion.prephase`'s contract); a request without an
+    assertion returns before any I/O."""
+    await client_assertion.prephase(
+        form,
+        credential_kind=credential_kind,
+        credential=credential,
+        route=_route(request),
+        client_ip=security_events.client_ip(request),
+    )
+
+
 def _cross_user_client_error(
     request=None,
     *,
@@ -521,6 +584,14 @@ async def oauth_metadata():
     }
     if settings.oauth_cimd_enabled:
         metadata["client_id_metadata_document_supported"] = True
+        # #420 D9: `private_key_jwt` for CIMD clients only (`/register` still
+        # refuses it, L6). Disabled, the document is byte-identical to before.
+        metadata["token_endpoint_auth_methods_supported"] = [
+            "none", "client_secret_post", cimd.AUTH_METHOD_PRIVATE_KEY_JWT,
+        ]
+        metadata["token_endpoint_auth_signing_alg_values_supported"] = list(
+            cimd.SIGNING_ALGS
+        )
     return JSONResponse(metadata)
 
 
@@ -973,6 +1044,14 @@ async def _authorize_get_cimd(
             request, cimd.CimdRefusal("redirect_uri_mismatch", client_host), client_id,
             user_id=session_user_id,
         )
+    # #420 D2: a `private_key_jwt` client's JWKS is resolved here too, so the
+    # user is never shown a consent that cannot complete. Its own cache and a
+    # second per-address charge on a miss; every refusal is the constant one.
+    if projection.auth_method == cimd.AUTH_METHOD_PRIVATE_KEY_JWT:
+        try:
+            await cimd.resolve_jwks(projection, security_events.client_ip(request))
+        except cimd.CimdRefusal as refusal:
+            return _cimd_refused(request, refusal, client_id, user_id=session_user_id)
 
     # Prior approval comes only from (URL, authenticated user) (Codex R2-1).
     row_id = cimd.cimd_row_id(client_id, session_user_id)
@@ -1463,6 +1542,18 @@ async def _authorize_post_cimd(
             status_code=400,
         )
 
+    # #420 D2/D5: the POST writes the snapshot, so it resolves the JWKS too
+    # (normally a cache hit from the GET). Before the transaction: no session
+    # is open across a fetch.
+    snapshot = None
+    if projection.auth_method == cimd.AUTH_METHOD_PRIVATE_KEY_JWT:
+        try:
+            snapshot = await cimd.resolve_jwks(
+                projection, security_events.client_ip(request)
+            )
+        except cimd.CimdRefusal as refusal:
+            return _cimd_refused(request, refusal, client_id, user_id=session_user_id)
+
     row_id = cimd.cimd_row_id(client_id, session_user_id)
     code = secrets.token_hex(32)
     async with async_session() as session:
@@ -1471,12 +1562,65 @@ async def _authorize_post_cimd(
                 select(OAuthClient).where(OAuthClient.client_id == row_id).with_for_update()
             )
         ).scalar_one_or_none()
+        # #420 D5: a key-holding row never becomes `none`. Refused under the
+        # row lock, before anything is written (L10: the way out is the
+        # panel's Delete, then a fresh consent).
+        if (
+            existing is not None
+            and getattr(existing, "token_endpoint_auth_method", None)
+            == cimd.AUTH_METHOD_PRIVATE_KEY_JWT
+            and projection.auth_method != cimd.AUTH_METHOD_PRIVATE_KEY_JWT
+        ):
+            await session.rollback()
+            return _cimd_refused(
+                request, cimd.CimdRefusal("auth_method_downgrade", client_host),
+                client_id, user_id=session_user_id,
+            )
+        if snapshot is not None:
+            key_source = {
+                "token_endpoint_auth_method": cimd.AUTH_METHOD_PRIVATE_KEY_JWT,
+                "jwks_uri": projection.jwks_uri,
+                "token_endpoint_auth_signing_alg": projection.signing_alg,
+                "jwks_snapshot": snapshot.as_json(),
+                # The origin fetch time, carried through a cache hit — never
+                # now(), or a 23 h-old cache entry would restart the clock.
+                "jwks_fetched_at": snapshot.fetched_at,
+            }
+            stored_at = getattr(existing, "jwks_fetched_at", None)
+            if stored_at is not None and stored_at.tzinfo is None:
+                stored_at = stored_at.replace(tzinfo=timezone.utc)
+            if (
+                existing is not None
+                and getattr(existing, "jwks_uri", None) == projection.jwks_uri
+                and getattr(existing, "jwks_snapshot", None) is not None
+                and stored_at is not None
+                and stored_at > snapshot.fetched_at
+            ):
+                # A refetch already stored a newer set of the same URI: a
+                # snapshot never moves backwards (the D7 CAS rule).
+                key_source["jwks_snapshot"] = existing.jwks_snapshot
+                key_source["jwks_fetched_at"] = stored_at
+        else:
+            key_source = {
+                "token_endpoint_auth_method": cimd.AUTH_METHOD_NONE,
+                "jwks_uri": None,
+                "token_endpoint_auth_signing_alg": None,
+                # SQL NULL, not JSON `null`: a JSONB column binds None as the
+                # JSON value, which the 038 shape CHECK (rightly) refuses.
+                "jwks_snapshot": sa_null(),
+                "jwks_fetched_at": None,
+            }
         if existing is None:
             outcome = "created"
         elif (
             existing.client_name == projection.client_name
             and list(existing.redirect_uris or []) == list(projection.redirect_uris)
             and existing.scope == projection.scope
+            and getattr(existing, "token_endpoint_auth_method", None)
+            == key_source["token_endpoint_auth_method"]
+            and getattr(existing, "jwks_uri", None) == key_source["jwks_uri"]
+            and getattr(existing, "token_endpoint_auth_signing_alg", None)
+            == key_source["token_endpoint_auth_signing_alg"]
         ):
             outcome = "unchanged"
         else:
@@ -1486,13 +1630,13 @@ async def _authorize_post_cimd(
         upsert = pg_insert(OAuthClient).values(
             client_id=row_id,
             client_secret_hash=None,
-            token_endpoint_auth_method="none",
             client_name=projection.client_name,
             redirect_uris=list(projection.redirect_uris),
             scope=projection.scope,
             user_id=session_user_id,
             client_id_metadata_url=client_id,
             last_used_at=func.now(),
+            **key_source,
         )
         upsert = upsert.on_conflict_do_update(
             index_elements=[OAuthClient.client_id],
@@ -1501,6 +1645,14 @@ async def _authorize_post_cimd(
                 "redirect_uris": upsert.excluded.redirect_uris,
                 "scope": upsert.excluded.scope,
                 "last_used_at": func.now(),
+                # #420 D5: the key source is refreshed with the row; a
+                # `none` → `private_key_jwt` upgrade takes effect here.
+                "token_endpoint_auth_method": upsert.excluded.token_endpoint_auth_method,
+                "jwks_uri": upsert.excluded.jwks_uri,
+                "token_endpoint_auth_signing_alg":
+                    upsert.excluded.token_endpoint_auth_signing_alg,
+                "jwks_snapshot": upsert.excluded.jwks_snapshot,
+                "jwks_fetched_at": upsert.excluded.jwks_fetched_at,
             },
         ).returning(OAuthClient.client_id)
         await session.execute(upsert)
@@ -1580,7 +1732,6 @@ def _unknown_code_response() -> JSONResponse:
 async def _handle_auth_code(form, request=None):
     code = form.get("code")
     client_id = form.get("client_id")
-    client_secret = form.get("client_secret")
     code_verifier = form.get("code_verifier")
     redirect_uri = form.get("redirect_uri")
 
@@ -1596,6 +1747,11 @@ async def _handle_auth_code(form, request=None):
             submitted_client_id=submitted_client_id,
         )
         return JSONResponse({"error": "invalid_request"}, status_code=400)
+
+    # #420 D7: the JWKS refetch pre-phase, before the main session exists, so
+    # no lock is ever held across the hop. Advisory only: every check below
+    # runs as before, and the assertion is verified at the client step.
+    await _assertion_prephase(form, request, credential_kind="code", credential=code)
 
     async with async_session() as session:
         # Serialize against the single-user -> multi-user bootstrap before
@@ -1719,13 +1875,21 @@ async def _handle_auth_code(form, request=None):
             )
             return JSONResponse({"error": "invalid_client"}, status_code=401)
 
-        if not _client_authenticated(client, client_secret):
-            # The presented `client_secret` is never recorded, in any form.
+        # Client authentication (D6, #420): the dispatcher, on the row the
+        # code resolved, at exactly the position it always held. A spent code
+        # failing it — including any assertion failure — answers like an
+        # unknown code and revokes nothing; only a spent code whose fresh
+        # assertion verified can go on to the replay branch.
+        auth_failure = _client_auth_failure(
+            client, form, endpoint="token", now=_now()
+        )
+        if auth_failure is not None:
+            # The presented `client_secret` / assertion is never recorded.
             if spent:
-                return _refuse_spent("authentication_failed")
+                return _refuse_spent(auth_failure)
             _token_refused(
                 request,
-                "invalid_client.authentication_failed",
+                f"invalid_client.{auth_failure}",
                 client_id=client.client_id,
                 user_id=oauth_code.user_id,
             )
@@ -2073,7 +2237,6 @@ async def _replay_spent_code(session, oauth_code, request):
 async def _handle_refresh(form, request=None):
     refresh_token = form.get("refresh_token")
     client_id = form.get("client_id")
-    client_secret = form.get("client_secret")
 
     # Two provenances, kept apart deliberately (D15). `submitted_client_id` is
     # whatever the caller typed and may appear only under the `_submitted`
@@ -2094,6 +2257,13 @@ async def _handle_refresh(form, request=None):
             submitted_client_id=submitted_client_id,
         )
         return JSONResponse({"error": "invalid_request"}, status_code=400)
+
+    # #420 D7: the JWKS refetch pre-phase, before the main session exists. A
+    # rotated-away token is ineligible, so the #182 reuse branch below never
+    # causes a fetch and never sees a verified assertion.
+    await _assertion_prephase(
+        form, request, credential_kind="refresh_token", credential=refresh_token
+    )
 
     async with async_session() as session:
         try:
@@ -2371,10 +2541,16 @@ async def _handle_refresh(form, request=None):
                 )
                 return JSONResponse({"error": "invalid_client"}, status_code=401)
 
-            if not _client_authenticated(client, client_secret):
+            # Client authentication (D6, #420) at its unchanged position: after
+            # the reuse branch and the identity checks, before #326 and the
+            # rotation. A failed or replayed assertion revokes nothing.
+            auth_failure = _client_auth_failure(
+                client, form, endpoint="token", now=_now()
+            )
+            if auth_failure is not None:
                 _token_refused(
                     request,
-                    "invalid_client.authentication_failed",
+                    f"invalid_client.{auth_failure}",
                     client_id=client.client_id,
                     user_id=old_token.user_id,
                     grant_id=grant_id,
@@ -2633,7 +2809,6 @@ async def revoke_token(request: Request):
     form = await request.form()
     token = form.get("token")
     client_id = form.get("client_id")
-    client_secret = form.get("client_secret")
 
     # The synthetic CIMD id is never caller input (#357, D6): before the token
     # lookup, and still RFC 7009's constant 200 — the reason is log-only.
@@ -2646,6 +2821,9 @@ async def revoke_token(request: Request):
         _revoke_noop(request, "missing_token", client_id)
 
     if token:
+        # #420 D7/D8: the JWKS refetch pre-phase, after the `cimd_` and
+        # missing-token checks and before the session. Advisory only.
+        await _assertion_prephase(form, request, credential_kind="token", credential=token)
         token_hash = _hash(token)
         async with async_session() as session:
             result = await session.execute(
@@ -2689,24 +2867,44 @@ async def revoke_token(request: Request):
                 if client is None:
                     _revoke_noop(request, "unknown_client", client_id)
                     return JSONResponse({})
-                if not client_id or not _caller_matches_row(
-                    oauth_token.client_id,
-                    getattr(client, "client_id_metadata_url", None),
-                    client_id,
+                row_url = getattr(client, "client_id_metadata_url", None)
+                # #420 D8: a `private_key_jwt` caller may omit `client_id` —
+                # the assertion, verified against this credential-resolved
+                # row, identifies and authenticates it (its `iss`/`sub` must
+                # be this row's URL). Every other row keeps the hole closed:
+                # no `client_id` is the constant 200, as before.
+                key_authenticated = (
+                    not client_id
+                    and getattr(client, "token_endpoint_auth_method", None)
+                    == cimd.AUTH_METHOD_PRIVATE_KEY_JWT
+                )
+                if not key_authenticated and (
+                    not client_id
+                    or not _caller_matches_row(oauth_token.client_id, row_url, client_id)
                 ):
                     # Deliberately does **not** name the token's real owner or
                     # client: §2.2 hides that from the response, and a log an
                     # operator shares is not a reason to hand it back.
                     _revoke_noop(request, "client_mismatch", client_id)
                     return JSONResponse({})
-                if not _client_authenticated(client, client_secret):
+                auth_failure = _client_auth_failure(
+                    client, form, endpoint="revoke", now=_now()
+                )
+                if auth_failure is not None:
                     # The one case that is a real error rather than a no-op:
-                    # the right client was named and failed to authenticate.
-                    submitted = cimd.submitted_fields(client_id, resolved=True)
+                    # the right client was named (or, for a key-holding
+                    # client, presented) and failed to authenticate. A secret
+                    # client keeps `client_auth_failed`; an assertion failure
+                    # is its sub (#420 D10). Nothing is revoked.
+                    submitted = cimd.submitted_fields(client_id or row_url, resolved=True)
                     security_events.emit(
                         "oauth_revoke_refused",
                         subject=security_events.subject_for(request=request),
-                        reason="client_auth_failed",
+                        reason=(
+                            "client_auth_failed"
+                            if auth_failure == _DCR_AUTH_FAILED
+                            else auth_failure
+                        ),
                         client_id=oauth_token.client_id,
                         cimd_host=submitted.cimd_host,
                         cimd_ref=submitted.cimd_ref,
@@ -2741,11 +2939,14 @@ async def revoke_token(request: Request):
                 # No `actor_user_id`: `/revoke` authenticates as the *client*,
                 # not as a person, so there is no acting human to name. The
                 # panel's revoke handler emits the same event *with* one.
+                # A key-authenticated caller without `client_id` (#420 D8) is
+                # named by its row's URL, the same fields a submitted one gets.
+                revoked_by = cimd.submitted_fields(client_id or row_url, resolved=True)
                 security_events.emit(
                     "oauth_grant_revoked",
                     level=logging.INFO,
-                    cimd_host=_submitted_now().cimd_host,
-                    cimd_ref=_submitted_now().cimd_ref,
+                    cimd_host=revoked_by.cimd_host,
+                    cimd_ref=revoked_by.cimd_ref,
                     subject=security_events.subject_for(
                         user_id=oauth_token.user_id, request=request
                     ),

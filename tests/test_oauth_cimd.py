@@ -1006,10 +1006,32 @@ def test_metadata_advertises_both_values_claude_needs(client, monkeypatch):
     assert "none" in body["token_endpoint_auth_methods_supported"]
     assert body["authorization_response_iss_parameter_supported"] is True
     assert body["registration_endpoint"].endswith("/register")
+    # #420 D9: `private_key_jwt` and the three algs, only while enabled.
+    assert body["token_endpoint_auth_methods_supported"] == [
+        "none", "client_secret_post", "private_key_jwt",
+    ]
+    assert body["token_endpoint_auth_signing_alg_values_supported"] == [
+        "RS256", "PS256", "ES256",
+    ]
     monkeypatch.setattr(settings, "oauth_cimd_enabled", False)
     body = client.get("/.well-known/oauth-authorization-server").json()
     assert "client_id_metadata_document_supported" not in body
     assert body["registration_endpoint"].endswith("/register")
+    # Disabled, exactly the pre-#420 document.
+    base = settings.base_url
+    assert body == {
+        "issuer": base,
+        "authorization_endpoint": f"{base}/authorize",
+        "token_endpoint": f"{base}/token",
+        "registration_endpoint": f"{base}/register",
+        "revocation_endpoint": f"{base}/revoke",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none", "client_secret_post"],
+        "scopes_supported": ["read", "readwrite", "offline_access"],
+        "authorization_response_iss_parameter_supported": True,
+    }
 
 
 # ── RFC 8707 classification ────────────────────────────────────────────────

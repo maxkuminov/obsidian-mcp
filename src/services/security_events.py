@@ -205,6 +205,9 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
         {"cimd_host", "cimd_ref", "client_id", "user_id", "grant_id", "scope", "client_ip",
          "resource_class", "resource_host"}
     ),
+    # #420 adds `invalid_client.<sub>` (a live credential) and
+    # `invalid_grant.spent_code_<sub>` (a spent code), `<sub>` one of
+    # `client_assertion.SUBS`.
     "oauth_token_refused": frozenset(
         {
             "reason",
@@ -263,6 +266,8 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
         {"client_id", "client_id_submitted", "user_id", "client_ip",
          "cimd_host", "cimd_ref", "resource_class", "resource_host"}
     ),
+    # `client_metadata.<reason>`, `<reason>` one of `cimd.REASONS` — since
+    # #420 including the `jwks_*` subs and `auth_method_downgrade`.
     "oauth_authorize_refused": frozenset(
         {"reason", "client_id", "client_id_submitted", "user_id", "client_ip",
          "cimd_host", "cimd_ref", "resource_class", "resource_host"}
@@ -296,8 +301,19 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
     "oauth_resource_classified": frozenset(
         {"resource_class", "resource_host", "route"}
     ),
+    # `reason` is `client_auth_failed` (a secret client) or, since #420, one
+    # of `client_assertion.SUBS` (a `private_key_jwt` or `none` CIMD row).
     "oauth_revoke_refused": frozenset(
         {"reason", "client_id", "client_ip", "cimd_host", "cimd_ref"}
+    ),
+    # One per actual JWKS refetch attempt in the `/token` and `/revoke`
+    # pre-phase (#420 D7/D10); never for a cooldown skip, a join, a busy cap
+    # or a cache hit. INFO, WARNING on `failed`. `client_id` is the resolved
+    # row; `trigger` is `kid_miss` | `stale`; `outcome` is `updated` |
+    # `kid_still_absent` | `failed`; `reason` a `jwks_*` sub on `failed`.
+    # Never an assertion, `kid`, `jti`, key, `jwks_uri` or `https://` id.
+    "oauth_client_jwks_refetched": frozenset(
+        {"client_id", "cimd_host", "client_ip", "trigger", "outcome", "reason", "route"}
     ),
     # ── The request boundary (Slice A) ──
     "rate_limit_exceeded": frozenset(
