@@ -1,7 +1,7 @@
 ## 0. Pre-implementation
 
-- [ ] 0.1 Base check. The branch contains `alembic/versions/037_oidc_account_links.py`, and no `038_*` exists on `main` or in any open PR. Coordination issue #420 is open and references this change.
-- [ ] 0.2 Codex spec review of this proposal: read-only, `-m gpt-daybreak-blue-latest`, effort high, framed as a defensive PASS/FAIL review. "Wrong" here means three things: a client authenticates that should not; a working client breaks (DCR, `none` CIMD, existing refresh families); or a deliberately identical refusal becomes distinguishable. Fold the findings in, and record the round and any declined findings in design.md, before any code.
+- [x] 0.1 Base check. The branch contains `alembic/versions/037_oidc_account_links.py`, and no `038_*` exists on `main` or in any open PR. Coordination issue #420 is open and references this change.
+- [x] 0.2 Codex spec review of this proposal: read-only, `-m gpt-daybreak-blue-latest`, effort high, framed as a defensive PASS/FAIL review. "Wrong" here means three things: a client authenticates that should not; a working client breaks (DCR, `none` CIMD, existing refresh families); or a deliberately identical refusal becomes distinguishable. Fold the findings in, and record the round and any declined findings in design.md, before any code.
 
 ## 1. Slicing for implementation (independent Opus subagents)
 

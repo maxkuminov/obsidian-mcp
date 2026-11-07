@@ -350,3 +350,13 @@ None. Owner decisions 2026-11-07:
 - the stale-snapshot refetch (D7, L4) is in scope;
 - L7 (#182 unchanged) is accepted;
 - L10 (no `private_key_jwt` → `none` downgrade) is accepted.
+
+## Review record
+
+- **Codex spec review, round 1 (2026-11-07):** FAIL, 2 MAJOR and 2 MINOR, all accepted and folded in (commit 9577a8a):
+  - refetch egress gated on credential eligibility;
+  - `jwks_fetched_at` = the origin fetch time through cache hits;
+  - `/revoke` without `client_id` authenticates against the resolved row;
+  - Slice S owns `test_schema_check.py`.
+- **Round 2 (verification only):** PASS. One MINOR, accepted: the spec said "never reads the assertion" on the #182 path, where the advisory pre-phase does parse the unverified header and `iss`. The wording was narrowed to "never verified, recorded, or allowed to affect the reuse decision" (commit 0961386).
+- **Declined:** none.
