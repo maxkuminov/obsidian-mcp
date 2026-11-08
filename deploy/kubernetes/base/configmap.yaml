@@ -33,6 +33,7 @@ data:
   # TEI native provider (uncomment with the settings above):
   # EMBEDDING_PROVIDER: tei
   # TEI_URL: http://tei.embeddings.svc.cluster.local:80
+  # TEI_EMBEDDING_MODEL must equal the model_id reported by TEI's GET /info.
   # TEI_EMBEDDING_MODEL: BAAI/bge-m3
   # TEI_EMBED_BATCH_SIZE: "16"
   EMBEDDING_DIMENSIONS: "1024"

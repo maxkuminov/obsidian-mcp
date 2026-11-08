@@ -40,7 +40,7 @@ def test_ollama_default_no_key_required():
 
 
 def test_invalid_provider_value():
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError, match="tei"):
         Settings(embedding_provider="cohere", _env_file=None)
 
 

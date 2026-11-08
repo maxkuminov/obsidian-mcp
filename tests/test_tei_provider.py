@@ -118,6 +118,20 @@ async def test_a_5xx_is_retried_then_succeeds(tei, slept):
     assert slept == [1.0]
 
 
+async def test_every_embed_attempt_carries_the_60_s_request_timeout(tei, slept):
+    with respx.mock(base_url=URL) as mock:
+        answer_info(mock)
+        route = mock.post("/embed")
+        route.side_effect = [
+            Response(503, json={"error": "busy"}),
+            Response(200, json=[row()]),
+        ]
+        await TeiProvider().embed_one("hello", kind="query")
+
+    assert route.call_count == 2
+    assert [c.request.extensions["timeout"]["read"] for c in route.calls] == [60.0, 60.0]
+
+
 async def test_a_transport_error_is_retried(tei, slept):
     with respx.mock(base_url=URL) as mock:
         answer_info(mock)

@@ -11,7 +11,7 @@ What the code does around it today, read on 0227f73:
 
 ### Claims to confirm
 
-Nothing about TEI's server behaviour in this document has been run against a real server: the docs lookup for this proposal failed too (Context7 unavailable), so these come from reading #424 and from recollection of TEI's source. **Each is to confirm in task 7** and marked (TC) where used:
+When this proposal was written nothing here had been run against a real server (the docs lookup failed too), so these came from reading #424 and from recollection of TEI's source. Task 7 has since run them against `ghcr.io/huggingface/text-embeddings-inference:cpu-1.8` (version 1.8.3, sha 78502d8) with `sentence-transformers/all-MiniLM-L6-v2`; the outcomes are under "TC outcomes" below. Marked (TC) where used:
 
 - TC1. `GET /info` returns JSON with `model_id` and `max_client_batch_size` (field names and types).
 - TC2. `model_id` echoes the `--model-id` argument, including a local path.
@@ -21,6 +21,15 @@ Nothing about TEI's server behaviour in this document has been run against a rea
 - TC6. A healthy `/embed` answers a bare `[[...], ...]`.
 
 If TC3 is false, D4 is reopened before implementation continues. If TC1 is false, D1's field names change.
+
+### TC outcomes
+
+- TC1 confirmed: `/info` has string `model_id`, integer `max_client_batch_size`.
+- TC2 confirmed: `model_id` echoes `--model-id` for a Hub id and for a local snapshot path.
+- TC3 confirmed: `truncate: true` returned 200 with one vector at 13,500, 108,000 and 70,000 CJK characters; `truncate: false` returned 413 (`must have less than 256 tokens`). The only other refusal under `truncate: true` is the ~2 MB body limit (L7).
+- TC4 confirmed: 5 inputs at `--max-client-batch-size 4` returned 413 with `batch size 5 > maximum allowed batch size 4`.
+- TC5 partly: `/v1/embeddings` exists on 1.8.3; no version floor established, so the claim is removed from the README. Observed default `max_client_batch_size` is 32, not 96.
+- TC6 confirmed: bare array of arrays, one row per input.
 
 ## Goals / Non-Goals
 
@@ -95,6 +104,10 @@ The issue names 429/5xx. The code, like OpenAI's, also retries `httpx.HTTPError`
 - **L2. Verification is once per process.** A TEI server replaced with another model while this process runs is not noticed until restart. It is the same operator rule as the fingerprint's L1: a change of model needs the reset.
 - **L3. Same name, different weights** stays undetected (fingerprint L1). `model_sha` is not compared, because there is no stored value to compare it with.
 - **L4. `/info` is the server's own claim.** A hostile or misconfigured proxy can report anything. The check catches misconfiguration, not an adversary on the hop, which is the transport policy's job.
+- **L5. Out-of-range finite values.** A finite value above float32 range passes validation and fails at pgvector; only a broken server can produce it, and it fails loudly.
+- **L6. Fail-fast during a check.** Concurrent callers on an unverified process fail fast while one `/info` check runs.
+- **L7. Very large bodies.** A request body of about 2 MB or more is refused by TEI with 413 as an ordinary non-retried provider error; a default slice is about 32 KB, so only a very large operator-set `CHUNK_SIZE` reaches it.
+- **L8. Task 7.7 not run.** The end-to-end MCP tool exercise was not run because no TEI deployment exists; real-provider startup and embedding were exercised against a live TEI 1.8.3 instead, with `semantic_search`, `hybrid_search` and `find_related` not called.
 
 ## Migration Plan
 
@@ -102,4 +115,4 @@ Nothing to migrate: `tei` is unreleased. At archive, update the `embedding-provi
 
 ## Open Questions
 
-None blocking. TC1–TC6 are settled by task 7.
+None blocking. TC1–TC6 are settled by task 7 (TC outcomes above).

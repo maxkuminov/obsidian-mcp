@@ -1,7 +1,7 @@
 ## 0. Pre-implementation
 
 - [x] 0.1 Base check: the branch contains `tests/test_tei_provider.py` and merge 0227f73. Coordination issue #425 references this change.
-- [ ] 0.2 Codex spec review of this proposal (read-only, `-m gpt-daybreak-blue-latest`, effort high). "Wrong" here means an index filled from the wrong model, a late pgvector error, or a changed Ollama/OpenAI classification. Fold findings in before coding.
+- [x] 0.2 Codex spec review of this proposal (read-only, `-m gpt-daybreak-blue-latest`, effort high). "Wrong" here means an index filled from the wrong model, a late pgvector error, or a changed Ollama/OpenAI classification. Fold findings in before coding.
 
 ## 1. Provider contract and validation (`src/services/embeddings.py`)
 
@@ -29,7 +29,7 @@
 - [x] 4.2 Replace `test_the_token_limit_is_translated_and_not_retried` per 2.2.
 - [x] 4.3 Tests for the deadline: a hung slice ends by 90 s under a fake clock or patched timeout; a many-slice healthy note completes.
 - [x] 4.4 Transport tests: `TEI_URL` rejection and inactive-URL scenarios, TEI transport line, panel TEI check through the factory (extend the existing sweep to `TEI_URL` if it does not already cover it).
-- [ ] 4.5 `make test-integration` on the merged result; `python -m pytest tests`; `openspec validate native-tei-embeddings --strict`.
+- [x] 4.5 `make test-integration` on the merged result; `python -m pytest tests`; `openspec validate native-tei-embeddings --strict`.
 
 ## 5. Docs
 
@@ -43,8 +43,8 @@
 
 ## 6. Gates
 
-- [ ] 6.1 `openspec-verifier` against this change.
-- [ ] 6.2 Adversarial Codex pass (embedding path is a mandatory trigger). Two rounds by default, findings triaged per the workflow file, declined ones listed.
+- [x] 6.1 `openspec-verifier` against this change.
+- [x] 6.2 Adversarial Codex pass (embedding path is a mandatory trigger). Two rounds by default, findings triaged per the workflow file, declined ones listed.
 - [ ] 6.3 Search eval row: this change does not alter the chunking or Ollama/OpenAI path. Record in the PR why no eval was attached, or attach one if the implementation touched shared search code.
 
 ## 7. Verification against a real TEI server
@@ -55,4 +55,4 @@
 - [x] 7.4 Confirm TC4: a batch above `--max-client-batch-size` returns the expected status and body. Confirm TC6.
 - [x] 7.5 Confirm TC5 for the README claim.
 - [x] 7.6 Run the real provider end to end: startup verified, startup with a wrong `TEI_EMBEDDING_MODEL` exits non-zero, startup with TEI stopped serves and withholds embedding, then a late TEI start verifies.
-- [ ] 7.7 End-to-end MCP exercise on a test deployment: `semantic_search`, `hybrid_search`, `find_related`, with the tools called named in the report.
+- [ ] 7.7 End-to-end MCP exercise on a test deployment: `semantic_search`, `hybrid_search`, `find_related`, with the tools called named in the report. Not run: see design accepted limitation L8.
