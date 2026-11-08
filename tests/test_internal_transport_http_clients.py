@@ -172,6 +172,57 @@ async def test_ollama_does_not_follow_a_redirect(monkeypatch):
 
 
 @respx.mock
+async def test_tei_does_not_follow_a_redirect(monkeypatch):
+    _use_settings(
+        monkeypatch,
+        embedding_provider="tei",
+        tei_url="http://127.0.0.1:18080",
+        tei_embedding_model="m",
+        embedding_dimensions=1,
+    )
+    monkeypatch.setattr(embeddings, "_TEI_CLIENT", embeddings._SharedClient())
+    monkeypatch.setattr(
+        embeddings,
+        "_TEI_VERIFICATION",
+        embeddings._TeiVerification(verified=True),
+    )
+    respx.post("http://127.0.0.1:18080/embed").mock(
+        return_value=httpx.Response(
+            307, headers={"Location": "http://elsewhere.example/embed"}
+        )
+    )
+    target = respx.post("http://elsewhere.example/embed").mock(
+        return_value=httpx.Response(200, json=[[0.1]])
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        await embeddings.TeiProvider().embed_one("text", kind="query")
+    assert target.call_count == 0
+
+
+@respx.mock
+async def test_tei_info_does_not_follow_a_redirect(monkeypatch):
+    _use_settings(
+        monkeypatch,
+        embedding_provider="tei",
+        tei_url="http://127.0.0.1:18080",
+        tei_embedding_model="m",
+    )
+    monkeypatch.setattr(embeddings, "_TEI_CLIENT", embeddings._SharedClient())
+    monkeypatch.setattr(embeddings, "_TEI_VERIFICATION", embeddings._TeiVerification())
+    respx.get("http://127.0.0.1:18080/info").mock(
+        return_value=httpx.Response(
+            307, headers={"Location": "http://elsewhere.example/info"}
+        )
+    )
+    target = respx.get("http://elsewhere.example/info").mock(
+        return_value=httpx.Response(200, json={"model_id": "m"})
+    )
+    result = await embeddings.verify_tei_server()
+    assert result.status == "inconclusive"
+    assert target.call_count == 0
+
+
+@respx.mock
 async def test_openai_does_not_follow_a_redirect(monkeypatch):
     _use_settings(
         monkeypatch,

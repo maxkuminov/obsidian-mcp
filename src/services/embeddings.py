@@ -1,6 +1,8 @@
 import asyncio
 import enum
+import json
 import logging
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -1179,14 +1181,6 @@ _OPENAI_INPUT_LIMIT_CODES = frozenset(
 #: future Ollama error code has one obvious place to go.
 _OLLAMA_INPUT_LIMIT_CODES: frozenset[str] = frozenset()
 
-#: TEI answers `{"error": "...", "error_type": "Validation"}` with no
-#: machine-readable code for this fault. A batch above its client limit is a
-#: configuration/transport concern, not an input-too-large refusal, and its
-#: message names the batch size, so the phrase test must not translate it into
-#: `argument_too_long`. The token-limit message it sends for an oversized
-#: single input is caught by the phrase test below.
-_TEI_INPUT_LIMIT_CODES: frozenset[str] = frozenset()
-
 #: The message phrases that identify an input-limit rejection where the vendor
 #: sends no code to match on. Prose matching is the **fallback**, not the
 #: primary rule — a code is preferred wherever one is sent — and it is applied
@@ -1208,7 +1202,6 @@ _INPUT_LIMIT_PHRASES = re.compile(
     r"|context length"
     r"|context_length_exceeded"
     r"|maximum (?:input )?(?:number of )?tokens"
-    r"|less than \d+ tokens"
     r"|tokens per request"
     r"|too many tokens"
     r"|token limit"
@@ -1369,6 +1362,18 @@ _TEI_CLIENT = _SharedClient()
 OLLAMA_REQUEST_TIMEOUT_SECONDS = 30.0
 OPENAI_REQUEST_TIMEOUT_SECONDS = 60.0
 TEI_REQUEST_TIMEOUT_SECONDS = 60.0
+#: One TEI slice, attempts and backoff together (native-tei-embeddings D3). Not
+#: 60 s: a hung first attempt would use all of it and make retry unreachable.
+#: Per slice, never per batch, so a long healthy note is not cut off (#127 D5).
+TEI_SLICE_DEADLINE_SECONDS = 90.0
+#: The complete `GET /info` exchange, body included. An httpx `timeout=` bounds
+#: each phase, not the total, so only a wall-clock bound stops a trickling
+#: response from holding the lifespan.
+TEI_INFO_TIMEOUT_SECONDS = 5.0
+#: Between checks while the server is unverified, each call fails with no HTTP.
+TEI_RECHECK_INTERVAL_SECONDS = 30.0
+#: A value the server reports, before it is escaped for a log or an error.
+TEI_REPORTED_VALUE_MAX_CHARS = 200
 
 
 def _ollama_client() -> httpx.AsyncClient:
@@ -1631,82 +1636,243 @@ class OpenAIProvider:
         return out
 
 
+def _tei_reported(value: object) -> str:
+    """A value the TEI server chose, bounded then escaped: it goes into a log
+    line and into the failure text stored for a note."""
+    return json.dumps(str(value)[:TEI_REPORTED_VALUE_MAX_CHARS])
+
+
+@dataclass(frozen=True)
+class TeiServerCheck:
+    """One `/info` verdict: `ok`, `mismatch` (proven) or `inconclusive`."""
+
+    status: Literal["ok", "mismatch", "inconclusive"]
+    reason: str
+
+
+@dataclass
+class _TeiVerification:
+    """What this process knows about the server behind `TEI_URL`.
+
+    Module-level state rather than a lock: an `asyncio.Lock` binds to one loop
+    and the maintenance scripts run their own. `checked_at` is stamped before
+    the await, so a caller arriving during a check sees the interval as not
+    elapsed and fails fast instead of starting another check.
+    """
+
+    verified: bool = False
+    reason: str = "no /info check has completed"
+    checked_at: float | None = None
+    #: The verdict the last CRITICAL line described, so a verdict logs once.
+    logged_verdict: tuple[str, str] | None = None
+
+
+_TEI_VERIFICATION = _TeiVerification()
+
+
+async def _tei_info_exchange() -> httpx.Response:
+    return await _tei_client().get(
+        f"{settings.tei_url.rstrip('/')}/info",
+        timeout=TEI_INFO_TIMEOUT_SECONDS,
+    )
+
+
+def _judge_tei_info(response: httpx.Response) -> TeiServerCheck:
+    """The verdict on one answered `/info`. The rule (design D1): a mismatch
+    needs positive evidence, and so does a match; everything else is
+    inconclusive."""
+    if response.status_code != 200:
+        return TeiServerCheck(
+            "inconclusive", f"GET /info answered HTTP {response.status_code}"
+        )
+    try:
+        info = response.json()
+    except (ValueError, RecursionError):
+        return TeiServerCheck("inconclusive", "GET /info answered non-JSON")
+    if not isinstance(info, dict):
+        return TeiServerCheck("inconclusive", "GET /info answered a non-object")
+    reported_model = info.get("model_id")
+    if not isinstance(reported_model, str) or not reported_model:
+        return TeiServerCheck(
+            "inconclusive", "GET /info reported no usable model_id"
+        )
+    if reported_model != settings.tei_embedding_model:
+        return TeiServerCheck(
+            "mismatch",
+            "TEI_EMBEDDING_MODEL is "
+            f"{_tei_reported(settings.tei_embedding_model)} but the server "
+            f"reports model_id {_tei_reported(reported_model)}",
+        )
+    limit = info.get("max_client_batch_size")
+    if isinstance(limit, int) and not isinstance(limit, bool):
+        if limit < settings.tei_embed_batch_size:
+            return TeiServerCheck(
+                "mismatch",
+                f"TEI_EMBED_BATCH_SIZE is {settings.tei_embed_batch_size} but "
+                "the server reports max_client_batch_size "
+                f"{_tei_reported(limit)}",
+            )
+    else:
+        logger.warning(
+            "TEI /info reported no integer max_client_batch_size; "
+            "TEI_EMBED_BATCH_SIZE=%d is unchecked",
+            settings.tei_embed_batch_size,
+        )
+    return TeiServerCheck("ok", "server identity verified")
+
+
+async def verify_tei_server() -> TeiServerCheck:
+    """One `GET /info`, compared with the configuration (design D1).
+
+    Shared by the lifespan and the provider's gate. Records the verdict and
+    never raises for a provider fault: only the lifespan turns a `mismatch`
+    into an exit. One attempt, through the factory-built client, the whole
+    exchange inside a wall-clock bound.
+    """
+    state = _TEI_VERIFICATION
+    state.checked_at = time.monotonic()
+    try:
+        response = await asyncio.wait_for(
+            _tei_info_exchange(), timeout=TEI_INFO_TIMEOUT_SECONDS
+        )
+    except TimeoutError:
+        result = TeiServerCheck(
+            "inconclusive",
+            f"GET /info did not finish within {TEI_INFO_TIMEOUT_SECONDS:g} s",
+        )
+    except Exception as exc:
+        result = TeiServerCheck(
+            "inconclusive", f"GET /info failed: {type(exc).__name__}"
+        )
+    else:
+        result = _judge_tei_info(response)
+
+    state.reason = result.reason
+    if result.status == "ok":
+        state.verified = True
+        state.logged_verdict = None
+        logger.info("TEI server verified: %s", settings.tei_embedding_model)
+        return result
+
+    # Only a mismatch's text is part of its verdict: an inconclusive reason
+    # flips between refused, 503 and timeout while a server starts, and that
+    # must not be a CRITICAL line every 30 s.
+    verdict = (result.status, result.reason if result.status == "mismatch" else "")
+    if verdict != state.logged_verdict:
+        state.logged_verdict = verdict
+        if result.status == "mismatch":
+            logger.critical("TEI server identity mismatch: %s", result.reason)
+        else:
+            logger.critical(
+                "TEI server not verified, embedding is withheld until it is: %s",
+                result.reason,
+            )
+    return result
+
+
+async def _require_tei_verified() -> None:
+    """Raise unless `/info` has concluded that the server matches. No `/embed`
+    is sent before that, on any path that uses the provider."""
+    state = _TEI_VERIFICATION
+    if state.verified:
+        return
+    due = (
+        state.checked_at is None
+        or time.monotonic() - state.checked_at >= TEI_RECHECK_INTERVAL_SECONDS
+    )
+    if due:
+        await verify_tei_server()
+        if state.verified:
+            return
+    raise RuntimeError(f"TEI embedding withheld: {state.reason}")
+
+
+def _tei_number_ok(value: object) -> bool:
+    """A finite JSON number. `bool` is an `int` to Python and is not one here;
+    a JSON integer too large for a float must answer False, not raise."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except OverflowError:
+        return False
+
+
+def _parse_tei_vectors(
+    response: httpx.Response, expected: int
+) -> list[list[float]]:
+    """Every row of a 200, checked before any of it is used (design D2). The
+    failure names a row and a width, never input text."""
+    try:
+        vectors = response.json()
+    except (ValueError, RecursionError):
+        raise RuntimeError("TEI answered 200 with a non-JSON body") from None
+    if not isinstance(vectors, list) or len(vectors) != expected:
+        got = len(vectors) if isinstance(vectors, list) else "no"
+        raise RuntimeError(f"TEI returned {got} vectors for {expected} inputs")
+    width = settings.embedding_dimensions
+    for index, row in enumerate(vectors):
+        if not isinstance(row, list):
+            raise RuntimeError(f"TEI vector {index} is not a list")
+        if len(row) != width:
+            raise RuntimeError(
+                f"TEI vector {index} has width {len(row)}, expected {width}"
+            )
+        if not all(_tei_number_ok(element) for element in row):
+            raise RuntimeError(
+                f"TEI vector {index} holds a non-numeric or non-finite element"
+            )
+    return vectors
+
+
 class TeiProvider:
     """Hugging Face Text Embeddings Inference, native protocol.
 
-    TEI's `/embed` takes `{"inputs": [...], "truncate": bool}` and answers a
-    bare `[[float, ...], ...]`; it has no `model` field, so the served model
-    is configuration (`TEI_EMBEDDING_MODEL`) only. The server's default
-    `--max-client-batch-size` is 96 and a larger request is a 413, but the
-    client default is 16 so a full-size batch stays inside the 60 s timeout.
-    Retries match the OpenAI provider: 429/5xx with exponential backoff, three
-    attempts, while an input-limit rejection is translated once and never
-    retried.
+    `/embed` takes `{"inputs": [...], "truncate": true}` and answers a bare
+    `[[float, ...], ...]`. It has no `model` field, so nothing goes out until
+    `/info` has shown that the server serves `TEI_EMBEDDING_MODEL`.
+
+    `truncate: true` means an over-limit input is embedded from its leading
+    tokens rather than refused, so this provider never raises
+    `ProviderInputTooLarge`; the note is certified anyway (accepted, like
+    Ollama's truncation to the model context). The request timeout is per
+    attempt and `TEI_SLICE_DEADLINE_SECONDS` bounds one slice's attempts and
+    backoff together.
     """
 
     MAX_ATTEMPTS = 3
     BASE_DELAY = 1.0
 
     async def _post(self, inputs: list[str]) -> list[list[float]]:
-        url = f"{settings.tei_url.rstrip('/')}/embed"
-        payload = {"inputs": inputs, "truncate": True}
+        return await _post_with_retries(
+            _tei_client(),
+            f"{settings.tei_url.rstrip('/')}/embed",
+            label="TEI",
+            headers=None,
+            payload={"inputs": inputs, "truncate": True},
+            timeout=TEI_REQUEST_TIMEOUT_SECONDS,
+            max_attempts=self.MAX_ATTEMPTS,
+            base_delay=self.BASE_DELAY,
+            parse=lambda response: _parse_tei_vectors(response, len(inputs)),
+            input_limit=None,
+        )
 
-        last_exc: Exception | None = None
-        client = _tei_client()
-        for attempt in range(1, self.MAX_ATTEMPTS + 1):
-            try:
-                response = await client.post(
-                    url,
-                    json=payload,
-                    timeout=TEI_REQUEST_TIMEOUT_SECONDS,
-                )
-            except httpx.HTTPError as e:
-                last_exc = e
-                if attempt >= self.MAX_ATTEMPTS:
-                    raise
-                await asyncio.sleep(self.BASE_DELAY * (2 ** (attempt - 1)))
-                continue
-
-            status = response.status_code
-            if status == 200:
-                vectors = response.json()
-                if not isinstance(vectors, list) or len(vectors) != len(inputs):
-                    got = len(vectors) if isinstance(vectors, list) else "no"
-                    raise RuntimeError(
-                        f"TEI returned {got} vectors for {len(inputs)} inputs"
-                    )
-                return vectors
-
-            # An input-limit rejection fails identically on every attempt, so
-            # it is decided before the retry branch (the same ordering as the
-            # other providers).
-            reason = _input_limit_reason(
-                response, codes=_TEI_INPUT_LIMIT_CODES
+    async def _post_slice(self, inputs: list[str]) -> list[list[float]]:
+        try:
+            return await asyncio.wait_for(
+                self._post(inputs), timeout=TEI_SLICE_DEADLINE_SECONDS
             )
-            if reason is not None:
-                raise refusals.ProviderInputTooLarge(reason, provider="tei")
-
-            retryable = status == 429 or 500 <= status < 600
-            if retryable and attempt < self.MAX_ATTEMPTS:
-                logger.warning(
-                    "TEI embeddings %d on attempt %d/%d, retrying",
-                    status,
-                    attempt,
-                    self.MAX_ATTEMPTS,
-                )
-                await asyncio.sleep(self.BASE_DELAY * (2 ** (attempt - 1)))
-                continue
-
-            response.raise_for_status()
-            raise RuntimeError(f"Unexpected TEI response: {status}")
-
-        if last_exc:
-            raise last_exc
-        raise RuntimeError("TEI embeddings failed without an exception")
+        except TimeoutError:
+            # `str(TimeoutError())` is empty, and this text is what
+            # `EmbedNoteFailure` records for the note.
+            raise RuntimeError(
+                f"TEI slice exceeded the {TEI_SLICE_DEADLINE_SECONDS:g} s deadline"
+            ) from None
 
     async def embed_one(self, text: str, *, kind: EmbeddingKind) -> list[float]:
         # `/embed` has no input-type field; `kind` is accepted and ignored.
-        result = await self._post([text])
+        await _require_tei_verified()
+        result = await self._post_slice([text])
         return result[0]
 
     async def embed_batch(
@@ -1714,10 +1880,11 @@ class TeiProvider:
     ) -> list[list[float]]:
         if not texts:
             return []
+        await _require_tei_verified()
         size = settings.tei_embed_batch_size
         out: list[list[float]] = []
         for start in range(0, len(texts), size):
-            out.extend(await self._post(texts[start : start + size]))
+            out.extend(await self._post_slice(texts[start : start + size]))
         return out
 
 

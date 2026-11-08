@@ -373,6 +373,25 @@ def test_the_tei_provider_reports_its_own_url(monkeypatch, events, caplog):
         assert part in text, text
 
 
+def test_a_plaintext_tei_hop_reports_the_override_and_emits_the_event(
+    monkeypatch, events, caplog
+):
+    _use_settings(
+        monkeypatch,
+        embedding_provider="tei",
+        tei_url="http://tei:80",
+        embedding_allow_plaintext=True,
+    )
+    with caplog.at_level(logging.INFO):
+        ts.log_embedding_transport()
+    (line,) = _transport_lines(caplog, "Embedding transport:")
+    text = line.getMessage()
+    for part in ("provider=tei", "host=tei", "port=80", "plaintext_override=True"):
+        assert part in text, text
+    (record,) = _plaintext(events)
+    assert record.reason == "embedding" and record.outcome == "override"
+
+
 def test_the_line_never_carries_path_query_or_userinfo(monkeypatch, events, caplog):
     _use_settings(
         monkeypatch,

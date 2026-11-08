@@ -804,6 +804,23 @@ def test_the_inactive_provider_is_not_validated():
 
 
 @pytest_transport_defaults
+def test_an_inactive_tei_url_is_not_validated():
+    assert make(
+        embedding_provider="ollama",
+        ollama_url="http://127.0.0.1:11434",
+        tei_url="http://tei:80",
+    )
+
+
+@pytest_transport_defaults
+def test_a_plaintext_tei_url_names_the_setting_and_the_override():
+    with pytest.raises(ValueError) as info:
+        make(embedding_provider="tei", tei_url="http://tei:80")
+    assert "TEI_URL" in str(info.value)
+    assert "EMBEDDING_ALLOW_PLAINTEXT" in str(info.value)
+
+
+@pytest_transport_defaults
 def test_sandbox_mode_admits_the_default_without_the_override():
     assert make(mcp_sandbox_mode=True)
 
