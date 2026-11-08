@@ -1398,6 +1398,76 @@ async def close_provider_client() -> None:
     await _TEI_CLIENT.aclose()
 
 
+async def _post_with_retries(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    label: str,
+    headers: dict[str, str] | None,
+    payload: dict,
+    timeout: float,
+    max_attempts: int,
+    base_delay: float,
+    parse: Callable[[httpx.Response], list[list[float]]],
+    input_limit: Callable[[httpx.Response], Exception | None] | None,
+) -> list[list[float]]:
+    """POST `payload`, retrying 429/5xx and transport errors with exponential
+    backoff; the loop the OpenAI and TEI providers share.
+
+    `parse` handles a 200 and runs **outside** the transport-error `try`: what
+    it raises propagates after one request, so a provider's malformed answer is
+    never retried as if it were a network fault. `input_limit` returns the
+    exception to raise for an input the provider refuses, or `None`; pass
+    `None` instead of a callable for a provider with no such refusal.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = await client.post(
+                url, headers=headers, json=payload, timeout=timeout
+            )
+        except httpx.HTTPError as e:
+            last_exc = e
+            if attempt >= max_attempts:
+                raise
+            await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
+            continue
+
+        status = response.status_code
+        if status == 200:
+            return parse(response)
+
+        # Decided **before** `retryable`, deliberately: an input the provider
+        # will not accept fails identically on every attempt, so retrying it
+        # would turn one refusal into three provider round trips and three
+        # times the latency before the caller hears the one thing it can act
+        # on. No status in `_INPUT_LIMIT_STATUSES` is retryable today — this
+        # ordering is what keeps that true if one ever becomes so.
+        if input_limit is not None:
+            refusal = input_limit(response)
+            if refusal is not None:
+                raise refusal
+
+        retryable = status == 429 or 500 <= status < 600
+        if retryable and attempt < max_attempts:
+            logger.warning(
+                "%s embeddings %d on attempt %d/%d, retrying",
+                label,
+                status,
+                attempt,
+                max_attempts,
+            )
+            await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
+            continue
+
+        response.raise_for_status()
+        raise RuntimeError(f"Unexpected {label} response: {status}")
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"{label} embeddings failed without an exception")
+
+
 class OllamaProvider:
     """Default provider — POSTs to a self-hosted Ollama instance through the
     shared client, at most `OLLAMA_EMBED_BATCH_SIZE` inputs per `/api/embed`
@@ -1502,74 +1572,46 @@ class OpenAIProvider:
             "dimensions": settings.embedding_dimensions,
         }
 
-        last_exc: Exception | None = None
-        # The shared client (D14) outlives this call, so no `async with`.
-        client = _openai_client()
-        for attempt in range(1, self.MAX_ATTEMPTS + 1):
-            try:
-                response = await client.post(
-                    url,
-                    headers=headers,
-                    json=payload,
-                    timeout=OPENAI_REQUEST_TIMEOUT_SECONDS,
+        def parse(response: httpx.Response) -> list[list[float]]:
+            data = response.json()
+            rows = data.get("data") if isinstance(data, dict) else None
+            if isinstance(rows, list):
+                rows = sorted(rows, key=lambda r: r.get("index", -1))
+            # Per request, like Ollama's slice check: exactly one vector
+            # per input with indices exactly 0..n-1, or no vector of this
+            # response is used — a short, duplicated or gapped answer
+            # cannot be attributed to the right inputs.
+            if not isinstance(rows, list) or [
+                r.get("index") for r in rows
+            ] != list(range(len(inputs))):
+                got = len(rows) if isinstance(rows, list) else "no"
+                raise RuntimeError(
+                    f"OpenAI returned {got} vectors with indices not "
+                    f"exactly 0..{len(inputs) - 1} for {len(inputs)} inputs"
                 )
-            except httpx.HTTPError as e:
-                last_exc = e
-                if attempt >= self.MAX_ATTEMPTS:
-                    raise
-                await asyncio.sleep(self.BASE_DELAY * (2 ** (attempt - 1)))
-                continue
+            return [r["embedding"] for r in rows]
 
-            status = response.status_code
-            if status == 200:
-                data = response.json()
-                rows = data.get("data") if isinstance(data, dict) else None
-                if isinstance(rows, list):
-                    rows = sorted(rows, key=lambda r: r.get("index", -1))
-                # Per request, like Ollama's slice check: exactly one vector
-                # per input with indices exactly 0..n-1, or no vector of this
-                # response is used — a short, duplicated or gapped answer
-                # cannot be attributed to the right inputs.
-                if not isinstance(rows, list) or [
-                    r.get("index") for r in rows
-                ] != list(range(len(inputs))):
-                    got = len(rows) if isinstance(rows, list) else "no"
-                    raise RuntimeError(
-                        f"OpenAI returned {got} vectors with indices not "
-                        f"exactly 0..{len(inputs) - 1} for {len(inputs)} inputs"
-                    )
-                return [r["embedding"] for r in rows]
-
-            # Decided **before** `retryable`, deliberately: an input
-            # the provider will not accept fails identically on every
-            # attempt, so retrying it would turn one refusal into three
-            # provider round trips and three times the latency before the
-            # caller hears the one thing it can act on. No status in
-            # `_INPUT_LIMIT_STATUSES` is retryable today — this ordering is
-            # what keeps that true if one ever becomes so.
+        def input_limit(response: httpx.Response) -> Exception | None:
             reason = _input_limit_reason(
                 response, codes=_OPENAI_INPUT_LIMIT_CODES
             )
-            if reason is not None:
-                raise refusals.ProviderInputTooLarge(reason, provider="openai")
+            if reason is None:
+                return None
+            return refusals.ProviderInputTooLarge(reason, provider="openai")
 
-            retryable = status == 429 or 500 <= status < 600
-            if retryable and attempt < self.MAX_ATTEMPTS:
-                logger.warning(
-                    "OpenAI embeddings %d on attempt %d/%d, retrying",
-                    status,
-                    attempt,
-                    self.MAX_ATTEMPTS,
-                )
-                await asyncio.sleep(self.BASE_DELAY * (2 ** (attempt - 1)))
-                continue
-
-            response.raise_for_status()
-            raise RuntimeError(f"Unexpected OpenAI response: {status}")
-
-        if last_exc:
-            raise last_exc
-        raise RuntimeError("OpenAI embeddings failed without an exception")
+        # The shared client (D14) outlives this call, so no `async with`.
+        return await _post_with_retries(
+            _openai_client(),
+            url,
+            label="OpenAI",
+            headers=headers,
+            payload=payload,
+            timeout=OPENAI_REQUEST_TIMEOUT_SECONDS,
+            max_attempts=self.MAX_ATTEMPTS,
+            base_delay=self.BASE_DELAY,
+            parse=parse,
+            input_limit=input_limit,
+        )
 
     async def embed_one(self, text: str, *, kind: EmbeddingKind) -> list[float]:
         # The embeddings endpoint has no input-type field for these models;
