@@ -39,7 +39,7 @@
 - [x] 5.4 README, `.env.example`, `docs/deployment-kubernetes.md`: `TEI_EMBEDDING_MODEL` must equal the server's `/info` `model_id` exactly; `TEI_EMBED_BATCH_SIZE` above the server limit refuses startup. `.env.example` at the TEI model key states that no startup check detects replaced weights.
 - [x] 5.5 `docs/architecture/indexing-and-embeddings.md`: the `/info` check, gate, 90 s deadline, validation, truncation limitation, and the "model is reported in the fingerprint only" sentence corrected.
 - [x] 5.6 `CLAUDE.md` Key decisions: one bullet for the rule in design D1.
-- [ ] 5.7 At archive: `embedding-providers` Purpose line names TEI.
+- [x] 5.7 At archive: `embedding-providers` Purpose line names TEI.
 
 ## 6. Gates
 
