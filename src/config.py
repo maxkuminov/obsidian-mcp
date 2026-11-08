@@ -633,11 +633,12 @@ class Settings(BaseSettings):
     # the endpoint has only the native protocol.
     tei_url: str = "http://tei:80"
     tei_embedding_model: str = "BAAI/bge-m3"
-    # Inputs per native `/embed` request. TEI's `--max-client-batch-size`
-    # default is 96 and a larger request is a 413, but 96 full-size chunks
-    # can exceed the request timeout on a shared GPU (measured ~0.6 s per
-    # 512-token input, so ~60 s for 96). The default matches Ollama's safe
-    # 16; the limit stays available for a faster endpoint.
+    # Inputs per native `/embed` request. A request above the server's
+    # `--max-client-batch-size` is a 413, and a value above the limit `/info`
+    # reports refuses startup. Large full-size batches can exceed the request
+    # timeout on a shared GPU (measured ~0.6 s per 512-token input). The
+    # default matches Ollama's safe 16; the limit stays available for a
+    # faster endpoint.
     tei_embed_batch_size: int = Field(16, ge=1, le=256)
     # ── Embedding transport (#185) ─────────────────────────────────────────
     #

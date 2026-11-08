@@ -961,10 +961,25 @@ EMBEDDING_DIMENSIONS=1024
 TEI is the server of Hugging Face's `text-embeddings-inference` image. The
 `tei` provider uses its native `POST /embed` API, for servers that do not
 expose the OpenAI-compatible route. If your TEI build does serve
-`/v1/embeddings` (TEI 1.8 and later do), you can use the `openai` provider
+`/v1/embeddings`, you can use the `openai` provider
 instead with `OPENAI_BASE_URL=http://your-tei-host:80/v1` and any non-empty
-`OPENAI_API_KEY`. Both paths produce the same vectors. A change of provider
+`OPENAI_API_KEY`. A change of provider
 or model needs `make reset-embeddings`, exactly as for the other options.
+
+`TEI_EMBEDDING_MODEL` must equal the `model_id` your server reports at
+`GET /info`, exactly, including for a local path such as `/data/model`.
+The server checks this at startup: a different `model_id`, or a
+`TEI_EMBED_BATCH_SIZE` above the server's `max_client_batch_size`, refuses
+startup. If TEI is unreachable at startup the server still starts, and no
+vector is requested until a check passes (one re-check every 30 s), so
+semantic search and indexing fail per call during that window while keyword
+search, reads and writes keep working. The check compares the name only;
+replaced weights behind one name are not detected.
+
+The provider sends `truncate: true`, so a chunk or query longer than the
+model's limit is embedded from its leading tokens, the rest is not
+represented in the vector, and the note is still marked as embedded. Ollama
+truncates the same way; `CHUNK_SIZE` is the control.
 
 The embedding URL must be `https`, or `http` to a loopback host
 (`localhost`, `127.x`, `::1`). Plaintext `http` to any other host —
@@ -1659,8 +1674,8 @@ reason.
 | `OPENAI_API_KEY` | — | Required when provider is OpenAI |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Override for Azure, proxies, or any OpenAI-compatible embeddings server (including TEI's `/v1`). Same transport rule as `OLLAMA_URL` when this provider is active. |
 | `TEI_URL` | `http://tei:80` | TEI endpoint, used when the provider is `tei`. Same transport rule as `OLLAMA_URL`. |
-| `TEI_EMBEDDING_MODEL` | `BAAI/bge-m3` | The model the TEI server serves. Recorded in the fingerprint; a change needs `make reset-embeddings`. |
-| `TEI_EMBED_BATCH_SIZE` | `16` | Inputs per native `/embed` request (1–256). Keep at or below TEI's `--max-client-batch-size` (default 96); 96 full-size chunks can exceed the 60 s timeout on a shared GPU. |
+| `TEI_EMBEDDING_MODEL` | `BAAI/bge-m3` | Must equal the `model_id` the TEI server reports at `GET /info`, exactly (a different value refuses startup). Recorded in the fingerprint; a change needs `make reset-embeddings`. No startup check detects replaced weights behind the same name. |
+| `TEI_EMBED_BATCH_SIZE` | `16` | Inputs per native `/embed` request (1–256). A value above the server's `--max-client-batch-size` (32 on TEI 1.8.3 unless set) refuses startup; large full-size batches can exceed the 60 s timeout on a shared GPU. |
 | `EMBEDDING_ALLOW_PLAINTEXT` | `false` | Permit `http` to a non-loopback embedding host. Without it such a URL refuses to start. `.env.example` sets it `true` to match its `http://ollama:11434` default. |
 | `EMBEDDING_CA_FILE` | — | Trust anchor (PEM) for an `https` embedding endpoint behind an internal CA; replaces the default certifi bundle. Refused with an `http` URL. Embedding clients ignore `HTTP(S)_PROXY`, `SSL_CERT_*` and `.netrc`. |
 | `RERANK_URL` | — | Full URL of an optional reranker speaking the Jina-compatible `/v1/rerank` format (`llama-server --reranking`, vLLM, Infinity), e.g. `http://127.0.0.1:8081/v1/rerank`. Empty means no reranker: `rerank=true` answers `reranked: false (not_configured)`. **The endpoint receives the query and candidate note text.** Same transport rule as the embedding URL (`https`, loopback `http`, or `RERANK_ALLOW_PLAINTEXT`); a bad URL refuses to start, an unreachable reranker never does (it is probed at startup and re-probed in the background; `/health` reports `rerank`). Opt-in: on the reference vault it improves `semantic_search` and makes `hybrid_search` worse (see [Reranker reference setup](#reranker-reference-setup)); measure it with the harness on your own judgments, and a CPU reranker will time out at the default deadline. Since [#402](https://github.com/maxkuminov/obsidian-mcp/issues/402) it scores each note on up to four of its fetched chunks, sent with their heading path (`RERANK_MAX_DOCUMENTS`). See [Reranker reference setup](#reranker-reference-setup) and `DEPLOYMENT.md`, "Reranker (optional)". |

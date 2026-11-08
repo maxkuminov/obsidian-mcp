@@ -260,8 +260,8 @@ List-valued settings: `TRUSTED_PROXY_IPS`, `FTS_CONFIGS` and
 | `OLLAMA_KEEP_ALIVE` | `-1` | How long Ollama keeps the model loaded (`-1` = forever, or a Go duration). |
 | `OLLAMA_EMBED_BATCH_SIZE` | `16` | Chunks per `/api/embed` request (1 to 256). |
 | `TEI_URL` | `http://tei:80` | TEI endpoint for the native `/embed` API. Same transport rule as `OLLAMA_URL`. |
-| `TEI_EMBEDDING_MODEL` | `BAAI/bge-m3` | The model TEI serves. Recorded in the fingerprint; a change needs a reset. |
-| `TEI_EMBED_BATCH_SIZE` | `16` | Inputs per `/embed` request (1 to 256). Keep at or below TEI's `--max-client-batch-size` (default 96); 16 avoids the request timeout on a shared GPU. |
+| `TEI_EMBEDDING_MODEL` | `BAAI/bge-m3` | Must equal the `model_id` TEI reports at `GET /info`, exactly, including a local path; a different value refuses startup. Recorded in the fingerprint; a change needs a reset. |
+| `TEI_EMBED_BATCH_SIZE` | `16` | Inputs per `/embed` request (1 to 256). A value above TEI's `--max-client-batch-size` (32 on TEI 1.8.3 unless set) refuses startup; 16 avoids the request timeout on a shared GPU. |
 | `EMBEDDING_ALLOW_PLAINTEXT` | `false` | Acknowledge a plaintext `http://` embedding URL to a non-loopback host. |
 | `EMBEDDING_CA_FILE` | unset | PEM CA for an `https` embedding endpoint behind a private CA. Replaces the default bundle. |
 | `RERANK_URL` | unset | Optional Jina-compatible `/v1/rerank` endpoint (e.g. `llama-server --reranking`) for `rerank=true`. Receives query and note text. Same `https`/loopback rule; an unreachable reranker never blocks startup. See DEPLOYMENT.md, "Reranker (optional)". |
