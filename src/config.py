@@ -621,13 +621,28 @@ class Settings(BaseSettings):
     # docs/architecture/search.md.
     search_low_confidence_similarity: float = Field(0.0, ge=0.0, le=1.0, allow_inf_nan=False)
 
-    embedding_provider: Literal["ollama", "openai"] = "ollama"
+    embedding_provider: Literal["ollama", "openai", "tei"] = "ollama"
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1"
     openai_embedding_model: str = "text-embedding-3-small"
+    # Hugging Face Text Embeddings Inference (TEI) native API. TEI serves
+    # `POST /embed` with `{"inputs": [...], "truncate": true}` and answers a
+    # bare array of vectors. It takes no model field; the served model is
+    # fixed by the container's `--model-id`. Some TEI builds also expose
+    # `/v1/embeddings`; use the OpenAI provider for those, and this one when
+    # the endpoint has only the native protocol.
+    tei_url: str = "http://tei:80"
+    tei_embedding_model: str = "BAAI/bge-m3"
+    # Inputs per native `/embed` request. TEI's `--max-client-batch-size`
+    # default is 96 and a larger request is a 413, but 96 full-size chunks
+    # can exceed the request timeout on a shared GPU (measured ~0.6 s per
+    # 512-token input, so ~60 s for 96). The default matches Ollama's safe
+    # 16; the limit stays available for a faster endpoint.
+    tei_embed_batch_size: int = Field(16, ge=1, le=256)
     # ── Embedding transport (#185) ─────────────────────────────────────────
     #
-    # The **active** provider's URL (`OLLAMA_URL` or `OPENAI_BASE_URL`) must be
+    # The **active** provider's URL (`OLLAMA_URL`, `OPENAI_BASE_URL`, or
+    # `TEI_URL`) must be
     # `https`, or `http` to a literal loopback host — or `http` to anything
     # else only when this override is true. Default false (owner decision
     # 2026-09-22): an `http://` URL never becomes encrypted by itself, so the
@@ -1854,6 +1869,8 @@ class Settings(BaseSettings):
             return self
         if self.embedding_provider == "openai":
             setting, url = "OPENAI_BASE_URL", self.openai_base_url
+        elif self.embedding_provider == "tei":
+            setting, url = "TEI_URL", self.tei_url
         else:
             setting, url = "OLLAMA_URL", self.ollama_url
         endpoint = check_embedding_url_policy(

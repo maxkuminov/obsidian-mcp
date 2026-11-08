@@ -359,6 +359,20 @@ def test_https_without_a_ca_file_reports_certifi(monkeypatch, events, caplog):
     assert "verify=certifi" in line.getMessage()
 
 
+def test_the_tei_provider_reports_its_own_url(monkeypatch, events, caplog):
+    _use_settings(
+        monkeypatch,
+        embedding_provider="tei",
+        tei_url="https://tei.internal.example:8080",
+    )
+    with caplog.at_level(logging.INFO):
+        ts.log_embedding_transport()
+    (line,) = _transport_lines(caplog, "Embedding transport:")
+    text = line.getMessage()
+    for part in ("provider=tei", "host=tei.internal.example", "port=8080"):
+        assert part in text, text
+
+
 def test_the_line_never_carries_path_query_or_userinfo(monkeypatch, events, caplog):
     _use_settings(
         monkeypatch,

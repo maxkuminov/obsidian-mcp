@@ -700,6 +700,8 @@ def log_embedding_transport() -> None:
     provider = settings.embedding_provider
     if provider == "openai":
         setting, url = "OPENAI_BASE_URL", settings.openai_base_url
+    elif provider == "tei":
+        setting, url = "TEI_URL", settings.tei_url
     else:
         setting, url = "OLLAMA_URL", settings.ollama_url
     try:

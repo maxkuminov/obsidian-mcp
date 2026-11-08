@@ -38,7 +38,9 @@ consent page. [Connect a client](#4-connect-a-client) has the rest.
 
 Stack: Python 3.12, FastAPI, PostgreSQL with pgvector. Pluggable
 embeddings (Ollama — `bge-m3` by default, `qwen3-embedding:0.6b` in the
-reference deployment — or OpenAI `text-embedding-3-{small,large}`).
+reference deployment — OpenAI `text-embedding-3-{small,large}`, or
+Hugging Face TEI through its native `/embed` API or OpenAI-compatible
+`/v1/embeddings` route).
 
 ![Dashboard](https://raw.githubusercontent.com/maxkuminov/obsidian-mcp/main/screenshots/dashboard.png)
 
@@ -947,6 +949,23 @@ deployment runs; read [Embedding model choice](#embedding-model-choice)
 before the first index pass, because changing the model later means a
 full re-embed.
 
+Option C, Hugging Face Text Embeddings Inference (TEI, self-hosted):
+
+```env
+EMBEDDING_PROVIDER=tei
+TEI_URL=http://your-tei-host:80
+TEI_EMBEDDING_MODEL=BAAI/bge-m3
+EMBEDDING_DIMENSIONS=1024
+```
+
+TEI is the server of Hugging Face's `text-embeddings-inference` image. The
+`tei` provider uses its native `POST /embed` API, for servers that do not
+expose the OpenAI-compatible route. If your TEI build does serve
+`/v1/embeddings` (TEI 1.8 and later do), you can use the `openai` provider
+instead with `OPENAI_BASE_URL=http://your-tei-host:80/v1` and any non-empty
+`OPENAI_API_KEY`. Both paths produce the same vectors. A change of provider
+or model needs `make reset-embeddings`, exactly as for the other options.
+
 The embedding URL must be `https`, or `http` to a loopback host
 (`localhost`, `127.x`, `::1`). Plaintext `http` to any other host —
 another container such as `http://ollama:11434` included — refuses to
@@ -1329,7 +1348,8 @@ And across the internal-transport and panel-CSP release:
   `changeme` / `CHANGE_ME` is now refused, and the built-in default URL
   carries no password.
 - **Breaking: plaintext embedding endpoints must be acknowledged.** If
-  the active embedding URL (`OLLAMA_URL`, or `OPENAI_BASE_URL` with the
+  the active embedding URL (`OLLAMA_URL`, `TEI_URL` with the TEI provider, or
+  `OPENAI_BASE_URL` with the
   OpenAI provider) is `http://` to a non-loopback host — the
   `http://ollama:11434` default included — add
   `EMBEDDING_ALLOW_PLAINTEXT=true` to `.env` **before** deploying, or
@@ -1630,14 +1650,17 @@ reason.
 | `IMPORT_ALLOW_HTTP` | `false` | Let `import_from_url` fetch plain http. Off by default. |
 | `VAULT_ALLOW_NAMED_STAGING_FALLBACK` | `false` | Accept named staging on filesystems without `O_TMPFILE`. One flag, both write paths. See [System requirements](#system-requirements). |
 | `WRITE_PRECONDITION_REQUIRED` | `false` | Require `expected_hash` on supported destructive calls. Creation is exempt; enable after clients adopt read hashes. |
-| `EMBEDDING_PROVIDER` | `ollama` | `ollama` or `openai` |
+| `EMBEDDING_PROVIDER` | `ollama` | `ollama`, `openai`, or `tei` (TEI native `/embed`) |
 | `EMBEDDING_DIMENSIONS` | `1024` | pgvector column width |
 | `OLLAMA_URL` | `http://ollama:11434` | Used when provider is Ollama. Must be `https`, loopback `http`, or covered by `EMBEDDING_ALLOW_PLAINTEXT`. |
 | `EMBEDDING_MODEL` | `bge-m3` | Ollama model name. `bge-m3` stays the default and fully supported; the reference deployment runs `qwen3-embedding:0.6b` (also 1024-d) with the query instruction below, see [Embedding model choice](#embedding-model-choice). Changing it post-deploy requires `make reset-embeddings`; the server refuses to start until the stored vectors match. See [Switching providers or models](#switching-providers-or-models). |
 | `EMBEDDING_QUERY_INSTRUCTION` | empty | Prepended verbatim, with no separator, to every **search query** sent to the embedding provider, and never to a note. For instruction-tuned embedders such as Qwen3-Embedding, e.g. `"Instruct: Given a question, retrieve the notes that answer it\nQuery: "` (double quotes, so `.env` turns `\n` into a newline). Up to 1,000 characters; NUL and control characters other than newline and tab are refused. It is **not** in the stored embedding fingerprint, so changing it needs no reset and re-embeds nothing; changing the model still does. The default model is unchanged (bge-m3, which wants no instruction); the template above is the one the reference deployment runs with `qwen3-embedding:0.6b`. |
 | `OLLAMA_KEEP_ALIVE` | `-1` | How long Ollama keeps the model resident. `-1` pins it; a Go duration (`30m`) frees VRAM when idle. Ollama only. |
 | `OPENAI_API_KEY` | — | Required when provider is OpenAI |
-| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Override for Azure or proxies. Same transport rule as `OLLAMA_URL` when this provider is active. |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Override for Azure, proxies, or any OpenAI-compatible embeddings server (including TEI's `/v1`). Same transport rule as `OLLAMA_URL` when this provider is active. |
+| `TEI_URL` | `http://tei:80` | TEI endpoint, used when the provider is `tei`. Same transport rule as `OLLAMA_URL`. |
+| `TEI_EMBEDDING_MODEL` | `BAAI/bge-m3` | The model the TEI server serves. Recorded in the fingerprint; a change needs `make reset-embeddings`. |
+| `TEI_EMBED_BATCH_SIZE` | `16` | Inputs per native `/embed` request (1–256). Keep at or below TEI's `--max-client-batch-size` (default 96); 96 full-size chunks can exceed the 60 s timeout on a shared GPU. |
 | `EMBEDDING_ALLOW_PLAINTEXT` | `false` | Permit `http` to a non-loopback embedding host. Without it such a URL refuses to start. `.env.example` sets it `true` to match its `http://ollama:11434` default. |
 | `EMBEDDING_CA_FILE` | — | Trust anchor (PEM) for an `https` embedding endpoint behind an internal CA; replaces the default certifi bundle. Refused with an `http` URL. Embedding clients ignore `HTTP(S)_PROXY`, `SSL_CERT_*` and `.netrc`. |
 | `RERANK_URL` | — | Full URL of an optional reranker speaking the Jina-compatible `/v1/rerank` format (`llama-server --reranking`, vLLM, Infinity), e.g. `http://127.0.0.1:8081/v1/rerank`. Empty means no reranker: `rerank=true` answers `reranked: false (not_configured)`. **The endpoint receives the query and candidate note text.** Same transport rule as the embedding URL (`https`, loopback `http`, or `RERANK_ALLOW_PLAINTEXT`); a bad URL refuses to start, an unreachable reranker never does (it is probed at startup and re-probed in the background; `/health` reports `rerank`). Opt-in: on the reference vault it improves `semantic_search` and makes `hybrid_search` worse (see [Reranker reference setup](#reranker-reference-setup)); measure it with the harness on your own judgments, and a CPU reranker will time out at the default deadline. Since [#402](https://github.com/maxkuminov/obsidian-mcp/issues/402) it scores each note on up to four of its fetched chunks, sent with their heading path (`RERANK_MAX_DOCUMENTS`). See [Reranker reference setup](#reranker-reference-setup) and `DEPLOYMENT.md`, "Reranker (optional)". |
@@ -1778,7 +1801,8 @@ produced the stored vectors requires a full re-embed — not only a
 provider switch. That is every one of:
 
 - `EMBEDDING_PROVIDER`
-- `EMBEDDING_MODEL` (Ollama) or `OPENAI_EMBEDDING_MODEL` (OpenAI) —
+- `EMBEDDING_MODEL` (Ollama), `OPENAI_EMBEDDING_MODEL` (OpenAI), or
+  `TEI_EMBEDDING_MODEL` (TEI) —
   **including a swap between two models of the same dimension**, which
   the dimension guard cannot see
 - `EMBEDDING_DIMENSIONS`
@@ -1846,7 +1870,7 @@ resumes).
 
 > **The fingerprint records the configuration, not the model artifact.**
 > `bge-m3` is a mutable Ollama tag (so is `qwen3-embedding:0.6b`), so
-> `ollama pull` can replace the weights behind it, and `OLLAMA_URL` / `OPENAI_BASE_URL` are
+> `ollama pull` can replace the weights behind it, and `OLLAMA_URL` / `OPENAI_BASE_URL` / `TEI_URL` are
 > deliberately excluded from the fingerprint — repointing at another host
 > or proxy is usually an infrastructure move that serves the identical
 > artifact, and including it would demand a full re-embed for one.
@@ -2190,7 +2214,7 @@ adds a writer wait or drops a usage row because of its observed pressure.
                                        ┌────────────────────┐
                                        │  Embedding         │
                                        │  provider          │
-                                       │  (Ollama / OpenAI) │
+                                       │ (Ollama/OpenAI/TEI)│
                                        └────────────────────┘
 ```
 

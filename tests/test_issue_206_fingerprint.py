@@ -183,6 +183,17 @@ def test_the_inactive_providers_model_is_not_in_the_fingerprint(ollama, monkeypa
     assert embedding_fingerprint() == switched
 
 
+def test_a_tei_model_change_moves_the_embedding_fingerprint(ollama, monkeypatch):
+    monkeypatch.setattr(settings, "embedding_provider", "tei")
+    monkeypatch.setattr(settings, "tei_embedding_model", "BAAI/bge-m3")
+    before = embedding_fingerprint()
+    assert json.loads(before)["model"] == "BAAI/bge-m3"
+    monkeypatch.setattr(settings, "tei_embedding_model", "BAAI/bge-small-en-v1.5")
+    after = embedding_fingerprint()
+    assert json.loads(after)["model"] == "BAAI/bge-small-en-v1.5"
+    assert compare_fingerprint(before, after).fields == ("model",)
+
+
 @pytest.mark.parametrize(
     "attribute,value",
     [

@@ -376,8 +376,8 @@ to unwind — plaintext requests simply go back to being redirected.
 The app also opens two connections of its own: to PostgreSQL and to the
 embedding endpoint. Both are held to a transport policy at startup.
 
-**Upgrade note.** If the active embedding URL (`OLLAMA_URL`, or
-`OPENAI_BASE_URL` with the OpenAI provider) is `http://` to anything other
+**Upgrade note.** If the active embedding URL (`OLLAMA_URL`, `TEI_URL` with
+the TEI provider, or `OPENAI_BASE_URL` with the OpenAI provider) is `http://` to anything other
 than loopback — the `http://ollama:11434` default included — add this to
 `.env` **before** deploying, or the server refuses to start with a message
 naming it:

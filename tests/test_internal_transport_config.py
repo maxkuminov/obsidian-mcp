@@ -728,6 +728,7 @@ PARSER_CASES = [
 PROVIDERS = {
     "ollama": ("ollama_url", {}),
     "openai": ("openai_base_url", {"openai_api_key": "sk-test"}),
+    "tei": ("tei_url", {}),
 }
 
 
@@ -791,6 +792,14 @@ def test_the_inactive_provider_is_not_validated():
         openai_api_key="sk-test",
         openai_base_url="https://api.example.test/v1",
         ollama_url="http://ollama:11434",
+    )
+    # tei active, https: neither of the other two plaintext defaults is
+    # dialled, so neither is validated.
+    assert make(
+        embedding_provider="tei",
+        tei_url="https://tei.internal.example",
+        ollama_url="http://ollama:11434",
+        openai_base_url="http://gateway.example/v1",
     )
 
 

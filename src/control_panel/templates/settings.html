@@ -97,6 +97,11 @@
                     <span class="kv-k">API key</span>
                     <span class="kv-v mono u-font-size-12px">{{ provider.masked_key }}</span>
                 </div>
+                {% elif provider.name == "tei" %}
+                <div class="kv">
+                    <span class="kv-k">TEI URL</span>
+                    <span class="kv-v mono u-font-size-11px u-color-text-2">{{ provider.tei_url }}</span>
+                </div>
                 {% else %}
                 <div class="kv">
                     <span class="kv-k">Ollama URL</span>

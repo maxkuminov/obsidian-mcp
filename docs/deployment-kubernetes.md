@@ -81,7 +81,9 @@ in an overlay copied from `overlays/example/`.
   one route, by header,** plus an SSO / forward-auth provider for the panel.
   See [The front door](#the-front-door).
 - **An embedding endpoint.** OpenAI (or anything that speaks its embeddings API)
-  is the easy choice on a cluster without a GPU. Ollama works too.
+  is the easy choice on a cluster without a GPU. Ollama and Hugging Face TEI
+  work too; TEI can use either its native `/embed` API (`EMBEDDING_PROVIDER=tei`)
+  or its OpenAI-compatible `/v1/embeddings` route (`openai`).
 - `kubectl` 1.27+ (built-in kustomize with `components` and `labels`).
 
 ## Quick start
@@ -248,7 +250,7 @@ List-valued settings: `TRUSTED_PROXY_IPS`, `FTS_CONFIGS` and
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `EMBEDDING_PROVIDER` | `ollama` | `ollama` or `openai`. Switching after the first index needs `reset-embeddings` (below). |
+| `EMBEDDING_PROVIDER` | `ollama` | `ollama`, `openai`, or `tei` (Hugging Face Text Embeddings Inference native `/embed`). Switching after the first index needs `reset-embeddings` (below). |
 | `EMBEDDING_DIMENSIONS` | `1024` | Vector size. Must match the stored column. The server refuses to start on a mismatch. |
 | `OPENAI_API_KEY` | unset | **Secret.** Required for `openai`. |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Any OpenAI-compatible embeddings endpoint. |
@@ -257,6 +259,9 @@ List-valued settings: `TRUSTED_PROXY_IPS`, `FTS_CONFIGS` and
 | `EMBEDDING_MODEL` | `bge-m3` | Ollama model. A change needs a reset. |
 | `OLLAMA_KEEP_ALIVE` | `-1` | How long Ollama keeps the model loaded (`-1` = forever, or a Go duration). |
 | `OLLAMA_EMBED_BATCH_SIZE` | `16` | Chunks per `/api/embed` request (1 to 256). |
+| `TEI_URL` | `http://tei:80` | TEI endpoint for the native `/embed` API. Same transport rule as `OLLAMA_URL`. |
+| `TEI_EMBEDDING_MODEL` | `BAAI/bge-m3` | The model TEI serves. Recorded in the fingerprint; a change needs a reset. |
+| `TEI_EMBED_BATCH_SIZE` | `16` | Inputs per `/embed` request (1 to 256). Keep at or below TEI's `--max-client-batch-size` (default 96); 16 avoids the request timeout on a shared GPU. |
 | `EMBEDDING_ALLOW_PLAINTEXT` | `false` | Acknowledge a plaintext `http://` embedding URL to a non-loopback host. |
 | `EMBEDDING_CA_FILE` | unset | PEM CA for an `https` embedding endpoint behind a private CA. Replaces the default bundle. |
 | `RERANK_URL` | unset | Optional Jina-compatible `/v1/rerank` endpoint (e.g. `llama-server --reranking`) for `rerank=true`. Receives query and note text. Same `https`/loopback rule; an unreachable reranker never blocks startup. See DEPLOYMENT.md, "Reranker (optional)". |
