@@ -141,6 +141,15 @@ async def test_embed_note_sends_documents_and_semantic_search_sends_a_query(monk
     assert inputs[1][1] == "INSTR the query"
 
 
+async def test_the_startup_warm_up_makes_no_embedding_call_under_tei(monkeypatch):
+    from src import main
+
+    inputs = _recording_provider(monkeypatch)
+    monkeypatch.setattr(settings, "embedding_provider", "tei")
+    await main._warm_embedding_model()
+    assert inputs == []
+
+
 async def test_the_prewarm_and_the_startup_warm_up_embed_queries(monkeypatch):
     from src import main
     from src.services import indexer

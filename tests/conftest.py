@@ -75,6 +75,10 @@ SETTINGS_ENV_KEYS = (
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "OPENAI_EMBEDDING_MODEL",
+    # Hugging Face TEI native provider.
+    "TEI_URL",
+    "TEI_EMBEDDING_MODEL",
+    "TEI_EMBED_BATCH_SIZE",
     # Embedding transport (#185).
     "EMBEDDING_ALLOW_PLAINTEXT",
     "EMBEDDING_CA_FILE",

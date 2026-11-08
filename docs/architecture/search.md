@@ -1172,9 +1172,10 @@ the latency percentiles. The refusal names the argument, its length, the limit
 and the setting, and **never echoes the argument**.
 
 **Provider cost is not the reason.** #194's own verification withdrew the
-cost-amplification claim: Ollama truncates to the model context and OpenAI
-rejects input over its token limit, so an over-long query was never a way to
-spend the operator's money. The three real reasons are an unbounded argument
+cost-amplification claim: Ollama truncates to the model context, TEI truncates
+likewise (the provider sends `truncate: true`) and OpenAI rejects input over
+its token limit, so an over-long query was never a way to spend the
+operator's money. The three real reasons are an unbounded argument
 interpolated into a server-authored result string (the #149 discipline),
 `tsquery` parsing on the single event loop (the #204 class), and an OpenAI
 deployment turning an over-long query into a raw provider error where the

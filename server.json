@@ -46,12 +46,13 @@
         },
         {
           "name": "EMBEDDING_PROVIDER",
-          "description": "Embedding provider: `ollama` (self-hosted, default) or `openai` (bring your own key). Switching after deploy requires `make reset-embeddings`.",
+          "description": "Embedding provider: `ollama` (self-hosted, default), `openai` (bring your own key) or `tei` (Hugging Face Text Embeddings Inference, native /embed). Switching after deploy requires `make reset-embeddings`.",
           "isRequired": false,
           "default": "ollama",
           "choices": [
             "ollama",
-            "openai"
+            "openai",
+            "tei"
           ]
         },
         {
@@ -65,6 +66,24 @@
           "description": "OpenAI (or OpenAI-compatible) API key for text-embedding-3-* (required when EMBEDDING_PROVIDER=openai; the server refuses to start without it).",
           "isRequired": false,
           "isSecret": true
+        },
+        {
+          "name": "TEI_URL",
+          "description": "TEI endpoint (used when EMBEDDING_PROVIDER=tei). Must be https or loopback unless EMBEDDING_ALLOW_PLAINTEXT is set.",
+          "isRequired": false,
+          "default": "http://tei:80"
+        },
+        {
+          "name": "TEI_EMBEDDING_MODEL",
+          "description": "Must equal the model_id the TEI server reports at GET /info, exactly (a local path included); a different value refuses startup. A change needs `make reset-embeddings`.",
+          "isRequired": false,
+          "default": "BAAI/bge-m3"
+        },
+        {
+          "name": "TEI_EMBED_BATCH_SIZE",
+          "description": "Inputs per TEI /embed request (1-256). A value above the server's max_client_batch_size refuses startup.",
+          "isRequired": false,
+          "default": "16"
         }
       ]
     }

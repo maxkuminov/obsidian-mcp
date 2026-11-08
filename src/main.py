@@ -39,7 +39,7 @@ from src.services.index_state import (
     set_state,
     state_table_exists,
 )
-from src.services.embeddings import close_provider_client
+from src.services.embeddings import close_provider_client, verify_tei_server
 from src.services import rerank as rerank_service
 from src.services.indexer import run_indexer_loop
 from src.services.transport_security import (
@@ -671,6 +671,13 @@ async def lifespan(app: FastAPI):
         # database to read a fingerprint from and nothing it could verify.
         await _check_embedding_fingerprint()
         await _check_fts_fingerprint()
+        # After the fingerprint guards, so their more specific "run the reset"
+        # message wins. Exits only on a proven mismatch: an unreachable server
+        # is logged and embedding stays withheld in the provider (#425 D1).
+        if settings.embedding_provider == "tei":
+            tei_check = await verify_tei_server()
+            if tei_check.status == "mismatch":
+                sys.exit(1)
         # #344: a count, a WARNING, nothing else — see the function.
         await _warn_missing_keyword_excerpts()
         # #416 D13: one CRITICAL when password sign-in is off and no admin can

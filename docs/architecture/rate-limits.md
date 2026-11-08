@@ -294,9 +294,10 @@ exactly: the caller-facing **code** and the operator-facing **marker** answer
 different questions and are permitted to differ.
 
 Note what the cap is *not* for. #194's own verification **withdrew** the
-cost-amplification claim: Ollama truncates to the model context and OpenAI
-rejects over its token limit, so an over-long query was never a way to spend
-the operator's money. The reasons are an unbounded argument interpolated into a
+cost-amplification claim: Ollama truncates to the model context, TEI truncates
+likewise (the provider sends `truncate: true`) and OpenAI rejects over its
+token limit, so an over-long query was never a way to spend the operator's
+money. The reasons are an unbounded argument interpolated into a
 server-authored string (the #149 discipline), `tsquery` parsing on the single
 event loop (the #204 class), and — before L7 — an OpenAI deployment turning an
 over-long query into a raw provider error where the contract promises a typed

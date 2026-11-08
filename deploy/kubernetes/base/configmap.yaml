@@ -20,13 +20,22 @@ data:
   MULTI_USER_MODE: "false"
 
   # Embeddings. A typical cluster has no GPU, so the example uses OpenAI. For
-  # Ollama, set EMBEDDING_PROVIDER=ollama and OLLAMA_URL, and read "TLS to
+  # a self-hosted TEI server (Hugging Face Text Embeddings Inference), set
+  # EMBEDDING_PROVIDER=tei and TEI_URL to use its native /embed API, or keep
+  # EMBEDDING_PROVIDER=openai and point OPENAI_BASE_URL at <tei-url>/v1. For
+  # Ollama, set EMBEDDING_PROVIDER=ollama and OLLAMA_URL. Read "TLS to
   # Postgres and the embedding endpoint" in the guide first: a plaintext
   # http:// URL to a non-loopback host refuses to start unless
   # EMBEDDING_ALLOW_PLAINTEXT=true.
   EMBEDDING_PROVIDER: openai
   OPENAI_BASE_URL: https://api.openai.com/v1
   OPENAI_EMBEDDING_MODEL: text-embedding-3-small
+  # TEI native provider (uncomment with the settings above):
+  # EMBEDDING_PROVIDER: tei
+  # TEI_URL: http://tei.embeddings.svc.cluster.local:80
+  # TEI_EMBEDDING_MODEL must equal the model_id reported by TEI's GET /info.
+  # TEI_EMBEDDING_MODEL: BAAI/bge-m3
+  # TEI_EMBED_BATCH_SIZE: "16"
   EMBEDDING_DIMENSIONS: "1024"
 
   # Database TLS. The only place TLS for the database is set. Never put

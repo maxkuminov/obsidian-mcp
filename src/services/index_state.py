@@ -43,7 +43,7 @@ exactly one spelling per configuration — the property byte equality needs.
 
 ## What the fingerprint cannot see (accepted limitation L1)
 
-Endpoint identity — `OLLAMA_URL`, `OPENAI_BASE_URL` — is deliberately excluded.
+Endpoint identity — `OLLAMA_URL`, `OPENAI_BASE_URL`, `TEI_URL` — is deliberately excluded.
 Moving between hosts or proxies is an infrastructure change that usually serves
 the identical artifact, and including it would demand a full vault re-embed for
 one. The consequence is that **the fingerprint records the configuration, not
@@ -305,6 +305,8 @@ def active_embedding_model() -> str:
     """
     if settings.embedding_provider == "openai":
         return settings.openai_embedding_model
+    if settings.embedding_provider == "tei":
+        return settings.tei_embedding_model
     return settings.embedding_model
 
 

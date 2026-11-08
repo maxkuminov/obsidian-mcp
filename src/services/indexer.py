@@ -8089,8 +8089,8 @@ async def _prewarm_once() -> tuple[float | None, float | None]:
     embed_ms: float | None = None
     probe_ms: float | None = None
 
-    # Only local providers have warm state worth keeping. A remote API would
-    # just be billed once per tick for nothing.
+    # Only Ollama has warm state worth keeping. Any other provider would just
+    # get one query per tick for nothing.
     if settings.embedding_provider == "ollama":
         from src.services.embeddings import get_embedding
 

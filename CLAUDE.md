@@ -11,6 +11,8 @@ Self-hosted MCP server exposing an Obsidian vault (~2,577 markdown files) via se
   - `OllamaProvider` — bge-m3 by default, set `OLLAMA_URL` in `.env`
   - `OpenAIProvider` — `text-embedding-3-{small,large}` over httpx, supports
     Azure OpenAI / OpenAI-compatible base URLs
+  - `TeiProvider` — Hugging Face Text Embeddings Inference native `/embed`
+    API, set `TEI_URL` (use `openai` for TEI's `/v1/embeddings` route)
 - Jinja2 control panel; Chart.js vendored under
   `src/control_panel/static/vendor/`, no CDN, hand-written CSS, **nonce-based
   CSP** (`PANEL_CSP`) — see [control panel](docs/architecture/control-panel.md).
@@ -282,6 +284,14 @@ update it in the same change.** What stays here is the short list:
   OIDC_SUBJECT_USER_IDS" — change both together. See
   [native OIDC](docs/native-oidc.md) and
   [control panel](docs/architecture/control-panel.md).
+- **A TEI server must prove its identity before it gets a vector request**
+  (#425). `/embed` has no model field, so `verify_tei_server` compares `GET
+  /info` with `TEI_EMBEDDING_MODEL` (exact) and `TEI_EMBED_BATCH_SIZE`, in one
+  5 s `wait_for` (a phase timeout cannot bound a trickling body). The process
+  exits only on a proven mismatch; a vector is requested only after a match.
+  Unreachable or unusable answers serve with embedding withheld, re-checked at
+  most every 30 s (a late mismatch never exits). See
+  [indexing and embeddings](docs/architecture/indexing-and-embeddings.md).
 - **Unused dynamically registered OAuth clients expire** (#194).
   `oauth_clients.last_used_at` is stamped by consent approval, code exchange
   and refresh; migration 025 stamped every pre-existing row, so **NULL means

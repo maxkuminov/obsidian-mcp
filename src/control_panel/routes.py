@@ -2755,6 +2755,9 @@ async def settings_page(
         provider_card["model"] = settings.openai_embedding_model
         provider_card["base_url"] = settings.openai_base_url
         provider_card["masked_key"] = _mask_openai_key(settings.openai_api_key)
+    elif provider == "tei":
+        provider_card["model"] = settings.tei_embedding_model
+        provider_card["tei_url"] = settings.tei_url
     else:
         provider_card["model"] = settings.embedding_model
         provider_card["ollama_url"] = settings.ollama_url
@@ -2765,6 +2768,10 @@ async def settings_page(
         if provider == "ollama":
             async with embedding_http_client(5.0) as client:
                 r = await client.get(f"{settings.ollama_url}/api/tags")
+                provider_ok = r.status_code == 200
+        elif provider == "tei":
+            async with embedding_http_client(5.0) as client:
+                r = await client.get(f"{settings.tei_url.rstrip('/')}/health")
                 provider_ok = r.status_code == 200
         else:
             provider_ok = bool((settings.openai_api_key or "").strip())

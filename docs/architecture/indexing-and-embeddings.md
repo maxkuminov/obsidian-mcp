@@ -13,6 +13,18 @@
   batching: up to 96 inputs per `/v1/embeddings` POST, with sub-batching
   for larger lists. Retries 429/5xx with exponential backoff, max 3
   attempts.
+- `EMBEDDING_PROVIDER=tei` — Hugging Face Text Embeddings Inference, native
+  protocol. Uses `TEI_URL` and `TEI_EMBEDDING_MODEL`. `/embed` has no model
+  field, so the name is compared with the server's `GET /info` `model_id`
+  ("TEI server identity" below) and recorded in the fingerprint. Sends
+  `{"inputs": [...], "truncate": true}` to `/embed`, in slices of at most
+  `TEI_EMBED_BATCH_SIZE` (default 16; a client batch above the server's
+  `--max-client-batch-size`, 32 on TEI 1.8.3 unless set, is refused with 413).
+  The default matches Ollama's safe size because large full-size batches can
+  exceed the 60 s request timeout on a shared GPU. Retries 429/5xx and
+  transport errors with exponential backoff, max 3 attempts, under one 90 s
+  deadline per slice. Use this provider when the embedder exposes only
+  `/embed`; when it also serves `/v1/embeddings`, `openai` works as well.
 - `EMBEDDING_DIMENSIONS` (default 1024) controls both the pgvector column
   width and the `dimensions` param on OpenAI requests.
 - Reset workflow: `make reset-embeddings` (or **Settings → Danger zone →
@@ -67,7 +79,7 @@ client that talks to it is built one way. The code is
 
 **The scheme policy** applies to the **active** provider's URL only —
 `OLLAMA_URL` under `EMBEDDING_PROVIDER=ollama`, `OPENAI_BASE_URL` under
-`openai`. The inactive one is never dialled, so validating it would refuse a
+`openai`, `TEI_URL` under `tei`. The inactive one is never dialled, so validating it would refuse a
 deployment for a setting it does not use. In order:
 
 0. **The raw string is checked before any parser sees it.** Leading or trailing
@@ -121,7 +133,7 @@ booted "healthy" and failed every embedding. The file is refused with an
 checked in every mode, sandbox included.
 
 **One client factory**, `embedding_http_client(timeout)`, builds every HTTP
-client aimed at the embedding endpoint: both providers and the panel's Ollama
+client aimed at the embedding endpoint: every provider and the panel's Ollama
 reachability ping. It sets:
 
 - **`trust_env=False`.** httpx otherwise reads the environment for every
@@ -207,8 +219,9 @@ exemption. The client is:
 - **closed in the lifespan's shutdown** (`close_provider_client()`), after the
   indexer task has been cancelled and awaited and before `engine.dispose()`.
 - **given its timeout per request**: every `post(..., timeout=)` carries 30 s
-  for Ollama and 60 s for OpenAI (the values are unchanged; the client-level
-  timeout is the same number). Pool limits are httpx's defaults.
+  for Ollama and 60 s for OpenAI and TEI (the Ollama/OpenAI values are
+  unchanged; the client-level timeout is the same number). Pool limits are
+  httpx's defaults.
 
 **D15 — Ollama embeds through fixed-size `/api/embed` batches.** `embed_batch`
 splits the chunk list into consecutive slices of `OLLAMA_EMBED_BATCH_SIZE` and
@@ -216,10 +229,70 @@ sends each as one request with an `input` array, awaited under
 `asyncio.wait_for(..., 30.0)`. Every response must carry exactly
 `len(slice)` vectors, in input order, or the batch raises and no vector of it
 is used; `embed_note`'s whole-note cardinality check stays above it. The
-input-limit translation (#194) is unchanged. OpenAI keeps its native 96-input
-batching and its own retry contract; it is adapted to the shared client only.
+input-limit translation (#194) is unchanged. OpenAI keeps its 96-input
+batching and retry contract; native TEI uses `TEI_EMBED_BATCH_SIZE` (default
+16) and its own retry contract. Both are adapted to the shared client only.
 Why the size is fixed and there is still no aggregate deadline is the D5
 bullet under "Indexing decisions" below.
+
+### TEI server identity and the embedding gate (#425)
+
+The rule: **the process exits only on positive evidence of a mismatch, and a
+vector is requested only on positive evidence of a match.** `/embed` has no
+model field, so without this check a wrong server would fill the index with
+vectors from another model.
+
+`verify_tei_server()` makes one `GET /info` through the factory-built client,
+with the whole exchange inside a 5 s `asyncio.wait_for` (an httpx `timeout=`
+bounds each phase, so a trickling body would otherwise hold the lifespan).
+The lifespan calls it after the fingerprint guards, under `tei` only and
+below the sandbox short-circuit.
+
+| `/info` result | Startup | Embedding |
+| --- | --- | --- |
+| 200, `model_id` equal and batch within the limit | proceeds | allowed for the process lifetime |
+| 200, `model_id` differs (exact comparison) or `max_client_batch_size` < `TEI_EMBED_BATCH_SIZE` | one CRITICAL, `sys.exit(1)` | n/a |
+| transport error, the 5 s bound, non-200, non-object body, no usable `model_id` | one CRITICAL, keeps serving | withheld |
+
+An absent or non-integer `max_client_batch_size` passes with a WARNING: too
+large a batch fails loudly with a 413 and cannot produce wrong vectors. The
+gate lives in `TeiProvider`, so maintenance scripts that never run the
+lifespan are covered. While unverified each call fails as an ordinary
+provider failure carrying the last reason, with at most one re-check per
+30 s; concurrent callers see the stamped check time and fail fast rather
+than start another. A late mismatch fails every call and logs one CRITICAL
+per verdict change, and does **not** exit: a process serving reads and writes
+should not die from a sibling's rollout. A corrected server recovers without
+a restart. Once verified, a process does not check again (L2 in the change's
+design: a server replaced mid-process is not noticed until restart).
+
+**Do not exit on an unreachable server.** TEI is often a sibling that takes
+minutes to load a model; an exit becomes a crash loop that takes keyword
+search, reads and writes down too. Ollama and OpenAI do not exit either.
+**Do not proceed on one either.** Unreachable at startup and wrong a minute
+later is what one rollout restarting both pods looks like, which is why the
+check gates traffic instead of warning once as the reranker probe does.
+
+Every 200 is validated before any vector of it is used: a JSON list holding
+exactly one row per input, each row a list of `EMBEDDING_DIMENSIONS` finite
+numbers (a boolean is not a number; `NaN` and `Infinity` parse in Python and
+are refused here because pgvector would refuse them later). A malformed or
+non-JSON 200 is a `RuntimeError` naming the row and width, never input text,
+and is not retried. Each slice is bounded by `TEI_SLICE_DEADLINE_SECONDS`
+(90 s: one timed-out 60 s attempt, its backoff and a normal-speed retry); the
+bound is per slice, so D5's argument against aggregate deadlines is intact.
+
+**Over-limit chunks are truncated (owner decision).** With `truncate: true` the
+server embeds the leading tokens, the rest of that chunk is unsearchable by
+vector and the note is certified with no marker, the same terms as Ollama's
+truncation. So TEI raises no `ProviderInputTooLarge`: a 413 is an ordinary
+non-retried provider failure, and the phrase `less than \d+ tokens` is not in
+the shared list, because `max_tokens must be less than 4096 tokens` from an
+OpenAI gateway would otherwise tell an agent to shorten a query that was never
+the problem. Observed on TEI 1.8.3: `truncate: true` answers 200 past both the
+256-token and the 64,000-character validation; the only remaining refusal is
+the 2 MB body limit (`--payload-limit`), a separate `413 Failed to buffer the
+request body`, out of reach at any default chunk size.
 
 ### Chunk-vector reuse (#281, D16)
 
@@ -518,9 +591,9 @@ yields one chunk where #355 yielded none.
 
 ## Indexing decisions
 
-- Embeddings: pluggable provider, `EmbeddingProvider` Protocol with two
-  implementations (Ollama, OpenAI). Single `EMBEDDING_PROVIDER` env var
-  picks the backend; `get_provider()` is a cached singleton. Default is
+- Embeddings: pluggable provider, `EmbeddingProvider` Protocol with three
+  implementations (Ollama, OpenAI, native TEI). Single `EMBEDDING_PROVIDER`
+  env var picks the backend; `get_provider()` is a cached singleton. Default is
   Ollama bge-m3 at 1024 dim, 512 token windows inside heading-aware
   sections (#355), no overlap, each chunk embedded under a
   `Title > Heading` context prefix. Every call declares `kind="query"` or

@@ -184,6 +184,35 @@ def test_the_inactive_providers_model_is_not_in_the_fingerprint(ollama, monkeypa
 
 
 @pytest.mark.parametrize(
+    ("provider", "inactive_setting"),
+    [
+        ("ollama", "tei_embedding_model"),
+        ("openai", "tei_embedding_model"),
+        ("tei", "embedding_model"),
+        ("tei", "openai_embedding_model"),
+    ],
+)
+def test_an_inactive_model_setting_does_not_move_the_fingerprint(
+    ollama, monkeypatch, provider, inactive_setting
+):
+    monkeypatch.setattr(settings, "embedding_provider", provider)
+    before = embedding_fingerprint()
+    monkeypatch.setattr(settings, inactive_setting, "some-other-model")
+    assert embedding_fingerprint() == before
+
+
+def test_a_tei_model_change_moves_the_embedding_fingerprint(ollama, monkeypatch):
+    monkeypatch.setattr(settings, "embedding_provider", "tei")
+    monkeypatch.setattr(settings, "tei_embedding_model", "BAAI/bge-m3")
+    before = embedding_fingerprint()
+    assert json.loads(before)["model"] == "BAAI/bge-m3"
+    monkeypatch.setattr(settings, "tei_embedding_model", "BAAI/bge-small-en-v1.5")
+    after = embedding_fingerprint()
+    assert json.loads(after)["model"] == "BAAI/bge-small-en-v1.5"
+    assert compare_fingerprint(before, after).fields == ("model",)
+
+
+@pytest.mark.parametrize(
     "attribute,value",
     [
         ("ollama_url", "http://other-host:11434"),
