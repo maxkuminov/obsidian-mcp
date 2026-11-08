@@ -1179,6 +1179,14 @@ _OPENAI_INPUT_LIMIT_CODES = frozenset(
 #: future Ollama error code has one obvious place to go.
 _OLLAMA_INPUT_LIMIT_CODES: frozenset[str] = frozenset()
 
+#: TEI answers `{"error": "...", "error_type": "Validation"}` with no
+#: machine-readable code for this fault. A batch above its client limit is a
+#: configuration/transport concern, not an input-too-large refusal, and its
+#: message names the batch size, so the phrase test must not translate it into
+#: `argument_too_long`. The token-limit message it sends for an oversized
+#: single input is caught by the phrase test below.
+_TEI_INPUT_LIMIT_CODES: frozenset[str] = frozenset()
+
 #: The message phrases that identify an input-limit rejection where the vendor
 #: sends no code to match on. Prose matching is the **fallback**, not the
 #: primary rule — a code is preferred wherever one is sent — and it is applied
@@ -1200,6 +1208,7 @@ _INPUT_LIMIT_PHRASES = re.compile(
     r"|context length"
     r"|context_length_exceeded"
     r"|maximum (?:input )?(?:number of )?tokens"
+    r"|less than \d+ tokens"
     r"|tokens per request"
     r"|too many tokens"
     r"|token limit"
@@ -1353,11 +1362,13 @@ class _SharedClient:
 
 _OLLAMA_CLIENT = _SharedClient()
 _OPENAI_CLIENT = _SharedClient()
+_TEI_CLIENT = _SharedClient()
 
 #: Per-request bounds, passed on every `post(...)`. Unchanged values; the
 #: client-level timeout is the same number, so the two cannot disagree.
 OLLAMA_REQUEST_TIMEOUT_SECONDS = 30.0
 OPENAI_REQUEST_TIMEOUT_SECONDS = 60.0
+TEI_REQUEST_TIMEOUT_SECONDS = 60.0
 
 
 def _ollama_client() -> httpx.AsyncClient:
@@ -1372,12 +1383,19 @@ def _openai_client() -> httpx.AsyncClient:
     )
 
 
+def _tei_client() -> httpx.AsyncClient:
+    return _TEI_CLIENT.get(
+        lambda: embedding_http_client(TEI_REQUEST_TIMEOUT_SECONDS)
+    )
+
+
 async def close_provider_client() -> None:
     """Close every provider's shared client. Idempotent; the lifespan calls it
     at shutdown, after the indexer task has stopped and before the engine is
     disposed."""
     await _OLLAMA_CLIENT.aclose()
     await _OPENAI_CLIENT.aclose()
+    await _TEI_CLIENT.aclose()
 
 
 class OllamaProvider:
@@ -1571,11 +1589,103 @@ class OpenAIProvider:
         return out
 
 
+class TeiProvider:
+    """Hugging Face Text Embeddings Inference, native protocol.
+
+    TEI's `/embed` takes `{"inputs": [...], "truncate": bool}` and answers a
+    bare `[[float, ...], ...]`; it has no `model` field, so the served model
+    is configuration (`TEI_EMBEDDING_MODEL`) only. The server's default
+    `--max-client-batch-size` is 96 and a larger request is a 413, but the
+    client default is 16 so a full-size batch stays inside the 60 s timeout.
+    Retries match the OpenAI provider: 429/5xx with exponential backoff, three
+    attempts, while an input-limit rejection is translated once and never
+    retried.
+    """
+
+    MAX_ATTEMPTS = 3
+    BASE_DELAY = 1.0
+
+    async def _post(self, inputs: list[str]) -> list[list[float]]:
+        url = f"{settings.tei_url.rstrip('/')}/embed"
+        payload = {"inputs": inputs, "truncate": True}
+
+        last_exc: Exception | None = None
+        client = _tei_client()
+        for attempt in range(1, self.MAX_ATTEMPTS + 1):
+            try:
+                response = await client.post(
+                    url,
+                    json=payload,
+                    timeout=TEI_REQUEST_TIMEOUT_SECONDS,
+                )
+            except httpx.HTTPError as e:
+                last_exc = e
+                if attempt >= self.MAX_ATTEMPTS:
+                    raise
+                await asyncio.sleep(self.BASE_DELAY * (2 ** (attempt - 1)))
+                continue
+
+            status = response.status_code
+            if status == 200:
+                vectors = response.json()
+                if not isinstance(vectors, list) or len(vectors) != len(inputs):
+                    got = len(vectors) if isinstance(vectors, list) else "no"
+                    raise RuntimeError(
+                        f"TEI returned {got} vectors for {len(inputs)} inputs"
+                    )
+                return vectors
+
+            # An input-limit rejection fails identically on every attempt, so
+            # it is decided before the retry branch (the same ordering as the
+            # other providers).
+            reason = _input_limit_reason(
+                response, codes=_TEI_INPUT_LIMIT_CODES
+            )
+            if reason is not None:
+                raise refusals.ProviderInputTooLarge(reason, provider="tei")
+
+            retryable = status == 429 or 500 <= status < 600
+            if retryable and attempt < self.MAX_ATTEMPTS:
+                logger.warning(
+                    "TEI embeddings %d on attempt %d/%d, retrying",
+                    status,
+                    attempt,
+                    self.MAX_ATTEMPTS,
+                )
+                await asyncio.sleep(self.BASE_DELAY * (2 ** (attempt - 1)))
+                continue
+
+            response.raise_for_status()
+            raise RuntimeError(f"Unexpected TEI response: {status}")
+
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("TEI embeddings failed without an exception")
+
+    async def embed_one(self, text: str, *, kind: EmbeddingKind) -> list[float]:
+        # `/embed` has no input-type field; `kind` is accepted and ignored.
+        result = await self._post([text])
+        return result[0]
+
+    async def embed_batch(
+        self, texts: list[str], *, kind: EmbeddingKind
+    ) -> list[list[float]]:
+        if not texts:
+            return []
+        size = settings.tei_embed_batch_size
+        out: list[list[float]] = []
+        for start in range(0, len(texts), size):
+            out.extend(await self._post(texts[start : start + size]))
+        return out
+
+
 @lru_cache(maxsize=1)
 def get_provider() -> EmbeddingProvider:
     """Return a singleton provider instance based on `settings.embedding_provider`."""
     if settings.embedding_provider == "openai":
         return OpenAIProvider()
+    if settings.embedding_provider == "tei":
+        return TeiProvider()
     return OllamaProvider()
 
 
@@ -1717,7 +1827,7 @@ class NoteEmbedOutcome(enum.Enum):
     a note that cleaned to zero chunks *and was certified*, a provider
     exception the function swallowed, and a vector/chunk cardinality mismatch.
     `_embed_vault_pinned` then ran `outcome.embedded += 1` after all three, so a
-    total Ollama or OpenAI outage wrote an `indexer_runs` row reading
+    total embedding-provider outage wrote an `indexer_runs` row reading
     `notes_embedded = N, error = NULL` — byte for byte the record a healthy
     pass writes, with a *positive* count (#201).
     """

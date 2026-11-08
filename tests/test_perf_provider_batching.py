@@ -27,6 +27,7 @@ def _fresh_clients(monkeypatch):
     """Each test starts with no shared client, and leaves none behind."""
     monkeypatch.setattr(embeddings, "_OLLAMA_CLIENT", embeddings._SharedClient())
     monkeypatch.setattr(embeddings, "_OPENAI_CLIENT", embeddings._SharedClient())
+    monkeypatch.setattr(embeddings, "_TEI_CLIENT", embeddings._SharedClient())
 
 
 @pytest.fixture
@@ -257,21 +258,27 @@ async def test_a_closed_client_is_rebuilt(ollama, monkeypatch):
     await embeddings.close_provider_client()
 
 
-async def test_close_provider_client_closes_both_and_is_idempotent(ollama):
+async def test_close_provider_client_closes_all_three_and_is_idempotent(ollama):
     o = embeddings._ollama_client()
     oa = embeddings._openai_client()
+    tei = embeddings._tei_client()
     await embeddings.close_provider_client()
-    assert o.is_closed and oa.is_closed
+    assert o.is_closed and oa.is_closed and tei.is_closed
     await embeddings.close_provider_client()
 
 
 async def test_the_shared_instance_has_the_factorys_properties(ollama):
-    for client in (embeddings._ollama_client(), embeddings._openai_client()):
+    for client in (
+        embeddings._ollama_client(),
+        embeddings._openai_client(),
+        embeddings._tei_client(),
+    ):
         assert client.trust_env is False
         assert client.follow_redirects is False
         assert client._mounts == {}
     assert embeddings._ollama_client().timeout == httpx.Timeout(30.0)
     assert embeddings._openai_client().timeout == httpx.Timeout(60.0)
+    assert embeddings._tei_client().timeout == httpx.Timeout(60.0)
     await embeddings.close_provider_client()
 
 

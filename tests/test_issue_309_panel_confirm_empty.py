@@ -335,6 +335,35 @@ def test_settings_control_and_user_edit_control_render_for_admin(client_as, monk
     )
 
 
+def test_settings_page_shows_the_native_tei_provider(client_as, monkeypatch):
+    """A TEI deployment reports its own URL and probes `/health`, not an
+    Ollama endpoint it does not serve."""
+    probed: list[str] = []
+
+    class _Resp:
+        status_code = 200
+
+    class _Client:
+        async def get(self, url, *a, **k):
+            probed.append(url)
+            return _Resp()
+
+    @contextlib.asynccontextmanager
+    async def _offline_client(*_a, **_k):
+        yield _Client()
+
+    monkeypatch.setattr(panel_routes.settings, "embedding_provider", "tei")
+    monkeypatch.setattr(panel_routes.settings, "tei_url", "http://tei:80")
+    monkeypatch.setattr(panel_routes.settings, "tei_embedding_model", "BAAI/bge-m3")
+    monkeypatch.setattr(panel_routes, "embedding_http_client", _offline_client)
+
+    body = client_as(_user(1, admin=True), False).get("/admin/settings").text
+
+    assert "BAAI/bge-m3" in body
+    assert "http://tei:80" in body
+    assert probed == ["http://tei:80/health"]
+
+
 # ── redemption ──────────────────────────────────────────────────────────────
 
 

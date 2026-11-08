@@ -11,6 +11,8 @@ Self-hosted MCP server exposing an Obsidian vault (~2,577 markdown files) via se
   - `OllamaProvider` — bge-m3 by default, set `OLLAMA_URL` in `.env`
   - `OpenAIProvider` — `text-embedding-3-{small,large}` over httpx, supports
     Azure OpenAI / OpenAI-compatible base URLs
+  - `TeiProvider` — Hugging Face Text Embeddings Inference native `/embed`
+    API, set `TEI_URL` (use `openai` for TEI's `/v1/embeddings` route)
 - Jinja2 control panel; Chart.js vendored under
   `src/control_panel/static/vendor/`, no CDN, hand-written CSS, **nonce-based
   CSP** (`PANEL_CSP`) — see [control panel](docs/architecture/control-panel.md).

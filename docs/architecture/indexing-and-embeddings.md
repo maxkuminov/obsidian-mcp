@@ -13,6 +13,16 @@
   batching: up to 96 inputs per `/v1/embeddings` POST, with sub-batching
   for larger lists. Retries 429/5xx with exponential backoff, max 3
   attempts.
+- `EMBEDDING_PROVIDER=tei` — Hugging Face Text Embeddings Inference, native
+  protocol. Uses `TEI_URL` and `TEI_EMBEDDING_MODEL`; the model is reported
+  in the fingerprint only, because `/embed` has no model field. Sends
+  `{"inputs": [...], "truncate": true}` to `/embed`, in slices of at most
+  `TEI_EMBED_BATCH_SIZE` (default 16; TEI's `--max-client-batch-size` default
+  is 96, and a larger client batch is refused with 413). The default matches
+  Ollama's safe size because 96 full-size chunks can exceed the 60 s request
+  timeout on a shared GPU. Retries 429/5xx with exponential backoff, max 3
+  attempts. Use this provider when the embedder exposes only `/embed`;
+  when it also serves `/v1/embeddings`, `openai` works as well.
 - `EMBEDDING_DIMENSIONS` (default 1024) controls both the pgvector column
   width and the `dimensions` param on OpenAI requests.
 - Reset workflow: `make reset-embeddings` (or **Settings → Danger zone →
@@ -67,7 +77,7 @@ client that talks to it is built one way. The code is
 
 **The scheme policy** applies to the **active** provider's URL only —
 `OLLAMA_URL` under `EMBEDDING_PROVIDER=ollama`, `OPENAI_BASE_URL` under
-`openai`. The inactive one is never dialled, so validating it would refuse a
+`openai`, `TEI_URL` under `tei`. The inactive one is never dialled, so validating it would refuse a
 deployment for a setting it does not use. In order:
 
 0. **The raw string is checked before any parser sees it.** Leading or trailing
@@ -121,7 +131,7 @@ booted "healthy" and failed every embedding. The file is refused with an
 checked in every mode, sandbox included.
 
 **One client factory**, `embedding_http_client(timeout)`, builds every HTTP
-client aimed at the embedding endpoint: both providers and the panel's Ollama
+client aimed at the embedding endpoint: every provider and the panel's Ollama
 reachability ping. It sets:
 
 - **`trust_env=False`.** httpx otherwise reads the environment for every
@@ -207,8 +217,9 @@ exemption. The client is:
 - **closed in the lifespan's shutdown** (`close_provider_client()`), after the
   indexer task has been cancelled and awaited and before `engine.dispose()`.
 - **given its timeout per request**: every `post(..., timeout=)` carries 30 s
-  for Ollama and 60 s for OpenAI (the values are unchanged; the client-level
-  timeout is the same number). Pool limits are httpx's defaults.
+  for Ollama and 60 s for OpenAI and TEI (the Ollama/OpenAI values are
+  unchanged; the client-level timeout is the same number). Pool limits are
+  httpx's defaults.
 
 **D15 — Ollama embeds through fixed-size `/api/embed` batches.** `embed_batch`
 splits the chunk list into consecutive slices of `OLLAMA_EMBED_BATCH_SIZE` and
@@ -216,8 +227,9 @@ sends each as one request with an `input` array, awaited under
 `asyncio.wait_for(..., 30.0)`. Every response must carry exactly
 `len(slice)` vectors, in input order, or the batch raises and no vector of it
 is used; `embed_note`'s whole-note cardinality check stays above it. The
-input-limit translation (#194) is unchanged. OpenAI keeps its native 96-input
-batching and its own retry contract; it is adapted to the shared client only.
+input-limit translation (#194) is unchanged. OpenAI keeps its 96-input
+batching and retry contract; native TEI uses `TEI_EMBED_BATCH_SIZE` (default
+16) and its own retry contract. Both are adapted to the shared client only.
 Why the size is fixed and there is still no aggregate deadline is the D5
 bullet under "Indexing decisions" below.
 
@@ -518,9 +530,9 @@ yields one chunk where #355 yielded none.
 
 ## Indexing decisions
 
-- Embeddings: pluggable provider, `EmbeddingProvider` Protocol with two
-  implementations (Ollama, OpenAI). Single `EMBEDDING_PROVIDER` env var
-  picks the backend; `get_provider()` is a cached singleton. Default is
+- Embeddings: pluggable provider, `EmbeddingProvider` Protocol with three
+  implementations (Ollama, OpenAI, native TEI). Single `EMBEDDING_PROVIDER`
+  env var picks the backend; `get_provider()` is a cached singleton. Default is
   Ollama bge-m3 at 1024 dim, 512 token windows inside heading-aware
   sections (#355), no overlap, each chunk embedded under a
   `Title > Heading` context prefix. Every call declares `kind="query"` or

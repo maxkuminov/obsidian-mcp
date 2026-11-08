@@ -44,6 +44,31 @@ def test_invalid_provider_value():
         Settings(embedding_provider="cohere", _env_file=None)
 
 
+def test_tei_provider_needs_no_api_key():
+    s = Settings(
+        embedding_provider="tei",
+        tei_url="http://tei:80",
+        embedding_allow_plaintext=True,
+        secret_key="a-real-test-key",
+        _env_file=None,
+    )
+    assert s.embedding_provider == "tei"
+
+
+def test_tei_url_is_the_active_transport_target(monkeypatch):
+    """A plaintext TEI URL to a non-loopback host needs the override, exactly
+    like Ollama and OpenAI. The inactive URLs are never validated."""
+    monkeypatch.setenv("EMBEDDING_ALLOW_PLAINTEXT", "true")
+    with pytest.raises(ValidationError, match="TEI_URL"):
+        Settings(
+            embedding_provider="tei",
+            tei_url="http://tei.example",
+            embedding_allow_plaintext=False,
+            secret_key="a-real-test-key",
+            _env_file=None,
+        )
+
+
 def test_public_base_url_requires_https():
     with pytest.raises(ValidationError) as exc:
         Settings(base_url="http://mcp.example.com", _env_file=None)
