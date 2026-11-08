@@ -50,6 +50,34 @@ The system SHALL embed multiple chunks per indexer pass using the provider's bat
 - **WHEN** an Ollama request does not answer
 - **THEN** it SHALL fail after 30 s, with no longer deadline over the whole batch
 
+### Requirement: Retry on transient OpenAI errors
+
+When the OpenAI provider encounters an HTTP 429 or 5xx response or an `httpx.HTTPError` raised while sending the request, the system SHALL retry the request with exponential backoff of 1 s then 2 s, up to 3 attempts in total, before propagating the error. A retry after a 429 or 5xx SHALL be logged at WARNING level; a retry after a transport error SHALL NOT log. When the attempts are exhausted by transport errors, the exception from the last attempt SHALL propagate unchanged; when they are exhausted by a status, the `httpx.HTTPStatusError` for that response SHALL propagate. Any other non-200 status SHALL NOT be retried. A 200 response whose body is not JSON SHALL propagate `json.JSONDecodeError` after one request, with no retry.
+
+#### Scenario: Rate limit retry
+- **WHEN** OpenAI returns 429 on the first attempt and 200 on retry
+- **THEN** the embedding call returns the successful result and logs the retry at WARNING level
+
+#### Scenario: Persistent failure
+- **WHEN** OpenAI returns 5xx on three consecutive attempts
+- **THEN** the call raises an error that the indexer logs and skips, leaving `embedded_content_hash` unchanged so the chunk is retried on the next indexer pass
+
+#### Scenario: A transport error is retried
+- **WHEN** the first attempt raises `httpx.ConnectError` and the second is answered 200 with a valid body
+- **THEN** the call SHALL return the vectors after one 1 s backoff, having made two requests
+
+#### Scenario: Three transport errors exhaust the attempts
+- **WHEN** all three attempts raise an `httpx.HTTPError`
+- **THEN** the backoffs SHALL be 1 s then 2 s, three requests SHALL have been made, and the exception object from the third attempt SHALL propagate unchanged
+
+#### Scenario: A non-retryable status is sent once
+- **WHEN** OpenAI answers 400 with no input-limit code or phrase
+- **THEN** exactly one request SHALL be made and `httpx.HTTPStatusError` SHALL propagate
+
+#### Scenario: A non-JSON 200 is not retried
+- **WHEN** OpenAI answers 200 with an HTML body
+- **THEN** exactly one request SHALL be made, with no backoff, and `json.JSONDecodeError` SHALL propagate
+
 ### Requirement: Configurable embedding dimensions
 
 The system SHALL store note embeddings in a pgvector column whose width matches `EMBEDDING_DIMENSIONS`. The default value SHALL be 1024 to preserve existing 1024-dimensional bge-m3 embeddings. When the OpenAI provider is selected, the system SHALL pass the configured dimension count to the API via the `dimensions` request parameter (supported by `text-embedding-3-*` models).
@@ -175,9 +203,9 @@ The dimension check SHALL remain in place alongside the embedding fingerprint. I
 
 #### Scenario: The active provider's model is the one fingerprinted
 
-- **WHEN** the provider is one of the two supported backends and the other backend's model setting carries a different value
-- **THEN** the fingerprint SHALL name the active provider's model
-- **AND** changing only the inactive backend's model setting SHALL NOT cause a mismatch
+- **WHEN** the provider is any of `ollama`, `openai` and `tei`, and the model settings of the two inactive providers carry different values
+- **THEN** the fingerprint SHALL name the active provider's model and no other
+- **AND** changing either inactive provider's model setting SHALL NOT change the fingerprint or cause a mismatch
 
 #### Scenario: A changed endpoint alone does not refuse
 
@@ -213,7 +241,7 @@ Each embedding provider SHALL send its requests through one shared, connection-p
 - redirects not followed;
 - the configured CA context.
 
-No code path SHALL construct an `httpx` client for the embedding endpoint by any other means. The client SHALL be created lazily. It SHALL be rebuilt if the running event loop differs from the one it was created on. It SHALL be closed during application shutdown, after the indexer task has been cancelled. Per-request timeouts SHALL be passed on each request: 30 s for Ollama and 60 s for OpenAI and TEI.
+No code path SHALL construct an `httpx` client for the embedding endpoint by any other means. The client SHALL be created lazily. It SHALL be rebuilt if the running event loop differs from the one it was created on. It SHALL be closed during application shutdown, after the indexer task has been cancelled. Per-request timeouts SHALL be passed on each request: 30 s for Ollama, 60 s for OpenAI, and 60 s for each TEI `POST /embed` attempt. The 60 s TEI timeout SHALL NOT apply to `GET /info`, which SHALL be bounded by the 5 s wall-clock timeout of the TEI identity check.
 
 #### Scenario: Connections are reused
 - **WHEN** the indexer embeds several notes in one pass
@@ -295,7 +323,7 @@ A 200 response body from `/embed` MUST parse as JSON and MUST be a list in which
 - **THEN** the call SHALL return the keyword arm marked `semantic unavailable: provider_error`
 
 ### Requirement: The server MUST compare the TEI server's reported identity with its configuration at startup
-With `EMBEDDING_PROVIDER=tei`, outside `MCP_SANDBOX_MODE`, the lifespan MUST make one `GET {TEI_URL}/info` request, bounded by 5 s, after the stored-fingerprint guards. The server SHALL exit non-zero, with one CRITICAL log line naming the setting and both values, when the response is a 200 JSON object whose `model_id` differs from `TEI_EMBEDDING_MODEL` by exact string comparison, or whose integer `max_client_batch_size` is less than `TEI_EMBED_BATCH_SIZE`. When the check cannot be concluded, because of a transport error, a timeout, any non-200 status, a body that is not a JSON object, or a `model_id` that is absent or not a non-empty string, the server SHALL start, SHALL log one CRITICAL line stating that embedding is withheld until the server is verified, and SHALL NOT exit. When `model_id` matches and `max_client_batch_size` is absent or not an integer, the check SHALL pass with one WARNING. The server-reported value SHALL be bounded to 200 characters and escaped in the log. Under any other provider no request to `/info` SHALL be made.
+With `EMBEDDING_PROVIDER=tei`, outside `MCP_SANDBOX_MODE`, the lifespan MUST make one `GET {TEI_URL}/info` request after the stored-fingerprint guards, with the complete exchange, including reading the response body, bounded by an overall `asyncio` wall-clock timeout of 5 s. The server SHALL exit non-zero, with one CRITICAL log line naming the setting and both values, when the response is a 200 JSON object whose `model_id` differs from `TEI_EMBEDDING_MODEL` by exact string comparison, or whose integer `max_client_batch_size` is less than `TEI_EMBED_BATCH_SIZE`. When the check cannot be concluded, because of a transport error, a timeout including that wall-clock timeout, any non-200 status, a body that is not a JSON object, or a `model_id` that is absent or not a non-empty string, the server SHALL start, SHALL log one CRITICAL line stating that embedding is withheld until the server is verified, and SHALL NOT exit. When `model_id` matches and `max_client_batch_size` is absent or not an integer, the check SHALL pass with one WARNING. The server-reported value SHALL be bounded to 200 characters and escaped in the log. Under any other provider no request to `/info` SHALL be made.
 
 #### Scenario: A matching server
 - **WHEN** `/info` reports `model_id` equal to `TEI_EMBEDDING_MODEL` and `max_client_batch_size` 96 with `TEI_EMBED_BATCH_SIZE` 16
@@ -312,6 +340,10 @@ With `EMBEDDING_PROVIDER=tei`, outside `MCP_SANDBOX_MODE`, the lifespan MUST mak
 #### Scenario: An unreachable TEI does not stop the server
 - **WHEN** `GET /info` fails with a connection error at startup
 - **THEN** the server SHALL start and serve, with one CRITICAL line and no non-zero exit, and keyword search and the read and write tools SHALL be unaffected
+
+#### Scenario: A hung or trickling /info cannot hold startup
+- **WHEN** `GET /info` never answers, or sends its response slowly enough that no single read reaches the HTTP client's timeout
+- **THEN** the exchange SHALL be abandoned at the 5 s wall-clock bound, and startup SHALL continue in the inconclusive state with one CRITICAL line and no non-zero exit
 
 #### Scenario: A server that answers without a usable identity does not stop the server
 - **WHEN** `/info` answers 401, 404, a 3xx, or a 200 without a `model_id`
@@ -330,7 +362,7 @@ With `EMBEDDING_PROVIDER=tei`, outside `MCP_SANDBOX_MODE`, the lifespan MUST mak
 - **THEN** no request to `/info` SHALL be made and startup behaviour SHALL be unchanged
 
 ### Requirement: No TEI vector SHALL be requested until the TEI server has been verified
-`TeiProvider` SHALL send no `/embed` request until a `/info` check in this process has concluded that the server matches. While unverified, each embedding call SHALL run the same check, at most once per 30 s; between checks the call SHALL raise a provider failure without any HTTP request, carrying the last reason. A mismatch found after startup SHALL fail each call the same way, SHALL log one CRITICAL line when the verdict changes, and SHALL NOT exit the process. Once verified, a process SHALL NOT check again. This gate SHALL apply on every path that uses the provider, including maintenance scripts that do not run the lifespan.
+`TeiProvider` SHALL send no `/embed` request until a `/info` check in this process has concluded that the server matches. While unverified, each embedding call SHALL run the same check under the same 5 s wall-clock timeout, at most once per 30 s; between checks the call SHALL raise a provider failure without any HTTP request, carrying the last reason. A mismatch found after startup SHALL fail each call the same way, SHALL log one CRITICAL line when the verdict changes, and SHALL NOT exit the process. Once verified, a process SHALL NOT check again. This gate SHALL apply on every path that uses the provider, including maintenance scripts that do not run the lifespan.
 
 #### Scenario: TEI comes up after the application
 - **WHEN** `/info` failed at startup and later reports a matching model

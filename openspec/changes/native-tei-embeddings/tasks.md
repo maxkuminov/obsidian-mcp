@@ -5,10 +5,11 @@
 
 ## 1. Provider contract and validation (`src/services/embeddings.py`)
 
-- [ ] 1.1 Extract `_post_with_retries` per design D5. Convert `OpenAIProvider._post` to it with no change to log text, decision order or exceptions; existing OpenAI tests pass unmodified.
-- [ ] 1.2 Convert `TeiProvider._post` to the helper with no input-limit callable.
-- [ ] 1.3 Add `TEI_SLICE_DEADLINE_SECONDS = 90.0`. Wrap each slice and `embed_one` in `asyncio.wait_for`. Convert the timeout to a `RuntimeError` with a non-empty message naming the deadline.
-- [ ] 1.4 Validate every 200 per design D2, including a non-JSON body, non-list body, `bool`, non-finite values and an integer too large for a float.
+- [ ] 1.1 Before any refactor, add characterization tests of `OpenAIProvider` and see them pass on the unrefactored code: transport error then success (two requests, one 1 s backoff); three transport errors (three requests, 1 s then 2 s, the third exception object propagates); 429/5xx exhaustion raises `HTTPStatusError` after the same backoffs; a non-retryable 400 is one request; a non-JSON 200 is one request, no backoff, `json.JSONDecodeError`.
+- [ ] 1.2 Extract `_post_with_retries` per design D5. Convert `OpenAIProvider._post` to it with no change to log text, decision order or exceptions; the 1.1 tests and the existing OpenAI tests pass unmodified.
+- [ ] 1.3 Convert `TeiProvider._post` to the helper with no input-limit callable.
+- [ ] 1.4 Add `TEI_SLICE_DEADLINE_SECONDS = 90.0`. Wrap each slice and `embed_one` in `asyncio.wait_for`. Convert the timeout to a `RuntimeError` with a non-empty message naming the deadline.
+- [ ] 1.5 Validate every 200 per design D2, including a non-JSON body, non-list body, `bool`, non-finite values and an integer too large for a float.
 
 ## 2. Input-limit boundary
 
@@ -17,10 +18,10 @@
 
 ## 3. Server identity (`/info`)
 
-- [ ] 3.1 Implement `verify_tei_server()` and its module-level state per design D1, using `_tei_client()`, 5 s, one attempt, bounded and escaped reported values, CRITICAL only on a verdict change.
+- [ ] 3.1 Implement `verify_tei_server()` and its module-level state per design D1, using `_tei_client()`, one attempt, the whole exchange inside a 5 s `asyncio.wait_for`, bounded and escaped reported values, CRITICAL only on a verdict change.
 - [ ] 3.2 Gate `TeiProvider` calls on it, at most one check per 30 s. No `/embed` before verification.
 - [ ] 3.3 Call it from the lifespan after `_check_fts_fingerprint`, only under `tei`, below the sandbox short-circuit; `sys.exit(1)` on a proven mismatch only.
-- [ ] 3.4 Tests: every scenario of the two identity requirements, including a late start, late mismatch, recovery, the one-check-per-interval bound, and no `/info` under other providers or sandbox.
+- [ ] 3.4 Tests: every scenario of the two identity requirements, including a hung and a trickling `/info` abandoned at the wall-clock bound (startup continues inconclusive), a late start, late mismatch, recovery, the one-check-per-interval bound, and no `/info` under other providers or sandbox.
 
 ## 4. Test fixtures
 
