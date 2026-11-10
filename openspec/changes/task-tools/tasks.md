@@ -56,7 +56,7 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
   - docstring: the composition rule gains the write-time refresh exception (D10).
 - [x] 3.2 `src/services/indexer.py`:
   - `CURRENT_EXTRACTION_VERSION = 5`, with a "Version 5 adds task ids (#428)" paragraph;
-  - R2: `scan_started_at` from the database before the first file read of each attempt;
+  - R2: `scan_started_at` from the database before the first file read, once per pass invocation;
   - R3: task-dirty rows are ineligible for the stat shortcut and join the task stage's list;
   - R4: the keep-or-derive rule, setting `tasks_source_hash` and clearing `tasks_refreshed_at`;
   - insert the new columns.
@@ -84,7 +84,7 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
   - header line 1 (the #350 tokens plus `task ids pending: N tasks`, counting rows with a NULL `task_key`) and the query line (≤ 600);
   - an id rendered whenever `task_key` is populated, else `id pending`;
   - full rows with ids, brief rows (≤ 260 plus the path), context lines (`    ┆ `);
-  - the abbreviated row (structure ≤ 100, plus id ≤ 24);
+  - the abbreviated row (measured structure 86, plus the 29-character id token);
   - the agenda layout;
   - `response_cap_too_small`.
   
