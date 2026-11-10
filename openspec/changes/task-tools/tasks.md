@@ -131,14 +131,14 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
 
 ## 6. S6: panel Tasks card (wave 2)
 
-- [ ] 6.1 `src/control_panel/routes.py`:
+- [x] 6.1 `src/control_panel/routes.py`:
   - `POST /account/tasks` (multi-user, own row, `_require_account_route`);
   - `POST /admin/settings/tasks` (single-user, admin, NULL row);
   - context for the GET pages (effective values, timezone list).
   
   Both posts use CSRF, flash and a 303 redirect, and call `task_settings.save`.
-- [ ] 6.2 The card in `templates/account.html` (rendered only in multi-user mode) and `templates/settings.html` (rendered only in single-user mode). It uses `data-*` attributes, has no inline handler or style, and uses a `<datalist>` for timezones. Touch `panel.js` only if a control needs behaviour.
-- [ ] 6.3 `tests/test_panel_task_settings.py`: GET and POST in both modes, validation flashes with nothing saved, CSRF refused, 404 and admin gates, the CSP scan (no `on*=`, no `style=`, nonce on every `<script>`/`<style>`). Regenerate `tests/golden/oidc_off/page_account_*` deliberately and say so in the commit.
+- [x] 6.2 The card in `templates/account.html` (rendered only in multi-user mode) and `templates/settings.html` (rendered only in single-user mode). It uses `data-*` attributes, has no inline handler or style, and uses a `<datalist>` for timezones. Touch `panel.js` only if a control needs behaviour.
+- [x] 6.3 `tests/test_panel_task_settings.py`: GET and POST in both modes, validation flashes with nothing saved, CSRF refused, 404 and admin gates, the CSP scan (no `on*=`, no `style=`, nonce on every `<script>`/`<style>`). Regenerate `tests/golden/oidc_off/page_account_*` deliberately and say so in the commit.
 
 ## 7. S7: wiring and tool surface (wave 3, after S3–S5 merge)
 
