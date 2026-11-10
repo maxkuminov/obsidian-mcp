@@ -1358,8 +1358,9 @@ async def list_tasks(
 
     Each row: the raw marker, the path in backticks with `:line`, `— id <id>`,
     the dates, priority, tags, `under:` heading and `text:` last. In a path,
-    whitespace, `\\` and a backtick are shown as `\\`-escapes (`\\n`, `\\t`,
-    `\\uXXXX`, `\\\\`, `` \\` ``); the write tools take the unescaped path.
+    whitespace and a backtick are shown as `\\n`, `\\t`, `\\uXXXX`
+    (a backtick is `\\u0060`) and `\\` as `\\\\`; the write tools take the
+    unescaped path.
     `complete_task` and `update_task` take that id with the path; an id shaped
     `<key>.<i>of<n>` (identical lines) also needs `expected_hash`, the note's
     `content_hash` from `read_note`. `detail="brief"` prints one short line per
@@ -1672,7 +1673,7 @@ async def complete_task(
 
     Args:
         path: The note's vault-relative path, unescaped (a listing shows
-            whitespace, `\\` and backticks as `\\`-escapes).
+            `\\`-escapes).
         id: The task id from a `list_tasks` or `task_agenda` row.
         done_on: The completion date: `YYYY-MM-DD`, `today` (default),
             `yesterday`, `+Nd` or `-Nd`, in your task timezone.

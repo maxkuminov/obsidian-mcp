@@ -8624,16 +8624,16 @@ def _escape_task_path(path: str) -> str:
     a literal backslash is doubled, so the rendering is injective: `a\\nb.md`
     (backslash, n) and `a<LF>b.md` never look alike (Codex round 1).
 
-    A backtick is escaped too (`\\``, #428 Codex round 2): every task tool
-    prints the path inside a backtick-delimited field, and since #428 that
-    row is the handle the write tools act on, so a file name carrying a
-    backtick must never close the field and present a forged path, line or
-    id. Unescaping is `\\\\` → `\\`, `\\`` → `` ` ``, `\\n` / `\\r` / `\\t`,
-    `\\uXXXX` → that character; the result is the original path, which is
-    what the write tools take."""
+    A backtick is escaped too, as the generic `\\u0060` (#428 Codex round
+    2): every task tool prints the path inside a backtick-delimited field,
+    and since #428 that row is the handle the write tools act on, so NO
+    backtick character from a path may reach the output — not even an
+    escaped one a reader could skim past. Unescaping: a doubled backslash →
+    a backslash; `\\n` / `\\r` / `\\t`; `\\uXXXX` → that character. The
+    result is the original path, which is what the write tools take."""
     def _esc(m: re.Match) -> str:
         ch = m.group(0)
-        return {"\\": "\\\\", "`": "\\`", "\n": "\\n", "\r": "\\r", "\t": "\\t"}.get(
+        return {"\\": "\\\\", "\n": "\\n", "\r": "\\r", "\t": "\\t"}.get(
             ch, f"\\u{ord(ch):04x}"
         )
 
