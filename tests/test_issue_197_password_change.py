@@ -715,7 +715,14 @@ async def test_a_non_admin_reaches_the_account_page():
     _sid, request, _registry = await sh.sign_in(user)
     page = sh.browser_request(path="/admin/account", session=dict(request.session))
 
-    response = await panel_routes.account_page(page, user)
+    class _NoTaskSettingsRow:  # #428: the page also reads the Tasks card's row
+        async def execute(self, _stmt):
+            class _R:
+                def scalar_one_or_none(self):
+                    return None
+            return _R()
+
+    response = await panel_routes.account_page(page, user, _NoTaskSettingsRow())
 
     body = response.body.decode()
     assert response.status_code == 200
