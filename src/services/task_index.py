@@ -26,7 +26,10 @@ rejected in D10 as a second writer of the hottest code in the server).
    pass (a changed stat, or R3's read of a task-dirty row).
 4. Tasks are derived from **`published`**, held in memory, with
    `tasks.tasks_from_note_text` — never from the re-read, so a refresh can
-   never launder a concurrent writer's edit into "tool-refreshed" state.
+   never launder a concurrent writer's edit into "tool-refreshed" state. The
+   derivation runs off the loop **before** step 1, so neither the row lock nor
+   a pooled connection is held while it runs; its result (or its failure) is
+   applied only after 3a passes.
 5. The note's task rows are deleted and re-inserted with `tasks.note_task_row`,
    the mapping the pass uses, so the two writers agree column for column.
 6. `tasks_source_hash = canonical_note_hash(published)`,
@@ -179,6 +182,16 @@ async def refresh_note_tasks(
         source_hash = canonical_note_hash(published)
         if source_hash is None:
             return _lagged(LAG_NOT_UTF8)
+        # 4 (hoisted). Derive from the published bytes, off the loop and
+        # **before** the transaction: the derivation is a pure function of
+        # `published`, so it never holds the row lock or a pooled connection
+        # (a large note costs seconds, and the pass's R4 `FOR UPDATE` would
+        # wait on that lock). A failure is recorded under the lock below,
+        # exactly as before.
+        try:
+            derived = await asyncio.to_thread(tasks_from_note_text, published)
+        except Exception as exc:  # noqa: BLE001 - recorded as the pass records it
+            derived = exc
         from src import database
 
         async with database.async_session() as session:
@@ -191,6 +204,7 @@ async def refresh_note_tasks(
                     rel=rel,
                     published=published,
                     source_hash=source_hash,
+                    derived=derived,
                 )
             except _Outcome as outcome:
                 await session.rollback()
@@ -220,6 +234,7 @@ async def _refresh_locked(
     rel: str,
     published: bytes,
     source_hash: str,
+    derived,
 ) -> RefreshResult:
     # 1. The bounded wait, for this transaction only.
     await session.execute(
@@ -255,10 +270,10 @@ async def _refresh_locked(
     if current != published:
         raise _Outcome(_lagged(LAG_SUPERSEDED))
 
-    # 4. Derive from the published bytes, never from the re-read.
-    try:
-        extracted, truncated = await asyncio.to_thread(tasks_from_note_text, published)
-    except Exception as exc:  # noqa: BLE001 - recorded as the pass records it
+    # 4. The tasks derived (before the lock) from the published bytes, never
+    # from the re-read: `derived` is `(tasks, truncated)` or the exception.
+    if isinstance(derived, BaseException):
+        exc = derived
         await session.execute(delete(NoteTask).where(NoteTask.note_id == note_id))
         await _stamp(session, note_id, uid, source_hash, failed=True, truncated=None)
         logger.error(
@@ -267,6 +282,7 @@ async def _refresh_locked(
             type(exc).__name__,
         )
         return _lagged(LAG_DERIVATION_FAILED)
+    extracted, truncated = derived
 
     # 5. Delete and insert, as the pass does.
     await session.execute(delete(NoteTask).where(NoteTask.note_id == note_id))
