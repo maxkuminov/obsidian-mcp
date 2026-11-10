@@ -1,16 +1,16 @@
-"""`list_tasks` rendering, cursor and argument validation (#350, D6–D8).
+"""`list_tasks`: the #350 row helpers and the #428 tool wiring (offline).
 
-Offline. The renderer and the cursor are pure; the paging tests emulate the
-query's ordering and resume predicate in Python (`page`) so they can follow
-`next` to the end. The PostgreSQL side — the same predicate in SQL, the
-compact-cursor resolution, tenancy — is pinned in
-`tests/integration/test_list_tasks_pg.py`.
+The #350 row and header helpers stay in `tools.py`, where `task_render`
+builds on them; the page renderer, the version-2 cursor and the paging
+semantics moved to `task_query` / `task_render` and are pinned in
+`tests/test_task_render.py` and `tests/integration/test_task_query_pg.py`.
+This module pins the helpers, and the wiring of `list_tasks_impl`: every
+argument validated before any statement, a version-1 cursor refused
+(design D12, a deliberate one-time break), relative dates accepted, and the
+page read in one read-only snapshot.
 """
 import asyncio
-import base64
 import datetime
-import hashlib
-import json
 import os
 import tempfile
 
@@ -26,14 +26,11 @@ from src.mcp_server.tools import (  # noqa: E402
     LIST_TASKS_ABBREVIATED_STRUCTURE_MAX,
     LIST_TASKS_FOOTER_MAX,
     LIST_TASKS_HEADER_MAX,
-    _task_filters_digest,
     _task_owner_discriminator,
-    decode_task_cursor,
     encode_task_cursor,
     render_abbreviated_task_row,
     render_incomplete_notice,
     render_task_header,
-    render_task_results,
     render_task_row,
 )
 
@@ -60,58 +57,22 @@ def header_args(**kw):
 
 
 OWNER = _task_owner_discriminator(7)
-FILTERS = _task_filters_digest(None, "open", None, None, [])
+FILTERS = "0" * 16
 
 
-def render(rows, *, budget=40_000, more_rows=False, **kw):
-    return render_task_results(
-        rows, budget=budget, header_args=header_args(**kw),
-        cursor_args=dict(owner=OWNER, filters=FILTERS), more_rows=more_rows,
-    )
-
-
-def sort_key(r):
-    return (r["due"] or D.max, r["file_path"], r["line"])
-
-
-def page(all_rows, *, cursor=None, limit=100, budget=40_000, owner=OWNER,
-         filters=FILTERS):
-    """One call: the query's order, resume predicate and limit, in Python."""
-    rows = sorted(all_rows, key=sort_key)
-    if cursor:
-        b = decode_task_cursor(cursor, owner=owner, filters=filters)
-        if "h" in b:
-            hits = [r["file_path"] for r in rows
-                    if hashlib.sha256(r["file_path"].encode()).hexdigest()[:32] == b["h"]]
-            assert len(set(hits)) == 1, "compact cursor names a gone note"
-            b["p"] = hits[0]
-        key = (D.max if b["d"] == "infinity" else D.fromisoformat(b["d"]), b["p"], b["l"])
-        rows = [r for r in rows if sort_key(r) > key]
-    out = render_task_results(
-        rows[:limit], budget=budget, header_args=header_args(),
-        cursor_args=dict(owner=owner, filters=filters), more_rows=len(rows) > limit,
-    )
-    nxt = [ln for ln in out.splitlines() if ln.startswith("next: ")]
-    return out, (nxt[0][len("next: "):] if nxt else None)
-
-
-def follow(all_rows, **kw):
-    seen, pages, cursor = [], [], None
-    while True:
-        out, cursor = page(all_rows, cursor=cursor, **kw)
-        pages.append(out)
-        seen += [ln for ln in out.splitlines() if ln.startswith("- [")]
-        if cursor is None:
-            return seen, pages
-        assert len(pages) < 10_000
+def render(rows, *, more_rows=False, **kw):
+    """The #350 page shape from the kept helpers: header, rows, notice."""
+    args = header_args(**kw)
+    lines = [render_task_header(**args, shown=len(rows), more=more_rows)]
+    lines += [render_task_row(r) for r in rows]
+    notice = render_incomplete_notice(args["not_scanned"], args["failed"])
+    if notice:
+        lines.append(notice)
+    return "\n".join(lines)
 
 
 def task_lines(out):
     return [ln for ln in out.splitlines() if ln.startswith("- [")]
-
-
-def decode_raw(token):
-    return json.loads(base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)))
 
 
 # ── one line per task; a note cannot forge a row ───────────────────────────
@@ -187,7 +148,8 @@ def test_the_incomplete_notice():
 def test_echoes_are_cut_at_64():
     out = render([], folder="F" * 300, tags=["t" * 128] * 32, cut_tags=0)
     header = out.splitlines()[0]
-    assert "folder: " + "F" * 63 + "…" in header
+    assert "folder: " + tools._echo_path("F" * 300) in header
+    assert len(tools._echo_path("F" * 300)) == 64
     assert len(header) <= LIST_TASKS_HEADER_MAX
 
 
@@ -213,223 +175,7 @@ def test_the_fixed_bounds():
     assert LIST_TASKS_HEADER_MAX + LIST_TASKS_FOOTER_MAX + LIST_TASKS_ABBREVIATED_STRUCTURE_MAX <= 1000 - 200
 
 
-# ── the character budget ────────────────────────────────────────────────────
-
-
-def test_the_character_cap_stops_a_page_early():
-    rows = [row(path=f"n{i:03d}.md", text="x" * 900) for i in range(500)]
-    out, cursor = page(rows, limit=500, budget=40_000)
-    assert len(out) <= 40_000
-    assert "more: yes" in out.splitlines()[0]
-    shown = task_lines(out)
-    assert 0 < len(shown) < 500
-    last_path = f"n{len(shown) - 1:03d}.md"
-    assert decode_raw(cursor)["p"] == last_path
-    out2, _ = page(rows, limit=500, budget=40_000, cursor=cursor)
-    assert task_lines(out2)[0].startswith(f"- [ ] `n{len(shown):03d}.md`")
-
-
-def test_paging_reaches_every_row_once():
-    rows = [row(path=f"n{i % 21:02d}.md", line=i + 1,
-                due=None if i % 3 else D(2026, 1, 1) + datetime.timedelta(days=i % 40))
-            for i in range(1234)]
-    seen, pages = follow(rows, limit=100)
-    assert len(seen) == 1234 == len(set(seen))
-    assert len(pages) == 13
-
-
-def test_a_page_boundary_between_two_undated_tasks():
-    rows = [row(path="a.md", line=n) for n in (1, 2, 3)]
-    seen, pages = follow(rows, limit=1)
-    assert seen == [f"- [ ] `a.md`:{n} — text: t" for n in (1, 2, 3)]
-    assert len(pages) == 3 and "next:" not in pages[-1]
-    assert decode_raw(page(rows, limit=1)[1])["d"] == "infinity"
-
-
-# ── the cursor ──────────────────────────────────────────────────────────────
-
-
-def test_cursor_round_trip_and_shape():
-    token = encode_task_cursor(owner=OWNER, filters=FILTERS, due_key="2026-11-01",
-                               path="Projects/Alpha.md", line=42, compact=False)
-    assert decode_task_cursor(token, owner=OWNER, filters=FILTERS) == {
-        "d": "2026-11-01", "p": "Projects/Alpha.md", "l": 42,
-    }
-    raw = decode_raw(token)
-    assert set(raw) == {"v", "o", "f", "d", "p", "l"}
-    assert "=" not in token
-
-
-@pytest.mark.parametrize("mutate", [
-    lambda p: {**p, "v": 2},
-    lambda p: {**p, "d": None},
-    lambda p: {**p, "d": "2026-02-30"},
-    lambda p: {**p, "l": 0},
-    lambda p: {**p, "l": True},
-    lambda p: {**p, "l": "3"},
-    lambda p: {**p, "h": "0" * 32},             # both p and h
-    lambda p: {k: v for k, v in p.items() if k != "p"},  # neither
-    lambda p: {**p, "p": "x" * 1025},
-    lambda p: {**p, "id": 5},
-    lambda p: {**p, "p": "a\x00b.md"},          # NUL: never a stored path
-    lambda p: {**p, "p": "a\ud800b.md"},        # unpaired surrogate
-])
-def test_a_tampered_cursor_is_refused(mutate):
-    token = encode_task_cursor(owner=OWNER, filters=FILTERS, due_key="infinity",
-                               path="a.md", line=1, compact=False)
-    payload = mutate(decode_raw(token))
-    forged = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
-    with pytest.raises(tools._TaskCursorRefused):
-        decode_task_cursor(forged, owner=OWNER, filters=FILTERS)
-
-
-@pytest.mark.parametrize("token", ["", "!!!", "e30", "bm90IGpzb24", "W10"])
-def test_garbage_cursors_are_refused(token):
-    with pytest.raises(tools._TaskCursorRefused):
-        decode_task_cursor(token, owner=OWNER, filters=FILTERS)
-
-
-def test_a_cursor_with_another_filter_digest_is_refused():
-    token = encode_task_cursor(owner=OWNER, filters=FILTERS, due_key="infinity",
-                               path="a.md", line=1, compact=False)
-    done = _task_filters_digest(None, "done", None, None, [])
-    assert done != FILTERS
-    with pytest.raises(tools._TaskCursorRefused):
-        decode_task_cursor(token, owner=OWNER, filters=done)
-
-
-def test_a_cursor_with_another_owners_discriminator_is_refused():
-    token = encode_task_cursor(owner=OWNER, filters=FILTERS, due_key="infinity",
-                               path="a.md", line=1, compact=False)
-    for other in (_task_owner_discriminator(8), _task_owner_discriminator(None)):
-        assert other != OWNER
-        with pytest.raises(tools._TaskCursorRefused):
-            decode_task_cursor(token, owner=other, filters=FILTERS)
-
-
-def test_the_filter_digest_normalises():
-    assert _task_filters_digest(None, "open", None, None, ["b", "a"]) == \
-        _task_filters_digest("", "open", None, None, ["a", "b"])
-    assert _task_filters_digest("P/", "open", None, None, []) != FILTERS
-
-
-def test_the_compact_form_is_chosen_for_a_long_multibyte_path():
-    path = "語" * 1024
-    rows = [row(path=path, line=1), row(path=path, line=2)]
-    out, cursor = page(rows, limit=1)
-    assert len(cursor) <= 2048
-    raw = decode_raw(cursor)
-    assert "h" in raw and "p" not in raw
-    out2, cursor2 = page(rows, limit=1, cursor=cursor)
-    assert task_lines(out2)[0].endswith("— text: t") and f"`:{2}" in task_lines(out2)[0]
-    assert cursor2 is None
-
-
-def test_the_compact_form_is_chosen_at_the_minimum_cap():
-    rows = [row(path="p" * 600, line=n, text="x" * 50) for n in (1, 2)]
-    out, cursor = page(rows, limit=1, budget=1000)
-    assert len(out) <= 1000
-    assert "h" in decode_raw(cursor)
-
-
-def test_no_index_id_appears_in_a_cursor():
-    token = encode_task_cursor(owner=OWNER, filters=FILTERS, due_key="infinity",
-                               path="a.md", line=1, compact=True)
-    assert set(decode_raw(token)) == {"v", "o", "f", "d", "h", "l"}
-
-
 # ── status, dates and tags at the tool boundary ─────────────────────────────
-
-
-class _Result:
-    def __init__(self, rows=(), scalar=0, one=(0, 0)):
-        self._rows, self._scalar, self._one = list(rows), scalar, one
-
-    def scalar_one(self):
-        return self._scalar
-
-    def one(self):
-        return self._one
-
-    def all(self):
-        return self._rows
-
-    def scalars(self):
-        return self
-
-
-class _FakeSession:
-    """Records statements; answers every count with zero and the page with
-    nothing. Enough to show that validation runs before any statement."""
-
-    def __init__(self):
-        self.statements = []
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *_):
-        return False
-
-    async def execute(self, stmt, *_a, **_k):
-        self.statements.append(str(stmt))
-        return _Result()
-
-
-@pytest.fixture
-def fake_db(monkeypatch):
-    sessions = []
-
-    def factory():
-        s = _FakeSession()
-        sessions.append(s)
-        return s
-
-    monkeypatch.setattr(tools, "async_session", factory)
-    return sessions
-
-
-def call(**kw):
-    return asyncio.run(tools.list_tasks_impl.__wrapped__(**kw))
-
-
-@pytest.mark.parametrize("kw,bound", [
-    (dict(status="pending"), "status must be one of"),
-    (dict(due_by="tomorrow"), "due_by must be a YYYY-MM-DD"),
-    (dict(scheduled_by="2026-02-30"), "scheduled_by must be a YYYY-MM-DD"),
-    (dict(tags=["t"] * 33), "at most 32"),
-    (dict(tags=["a" * 129]), "1 to 128"),
-    (dict(tags=["#"]), "1 to 128"),
-    (dict(tags=[""]), "1 to 128"),
-    (dict(tags=[7]), "must be a string"),
-    (dict(cursor="garbage"), "does not belong to this query"),
-])
-def test_invalid_arguments_are_refused_before_any_query(fake_db, kw, bound):
-    out = call(**kw)
-    assert bound in out
-    assert out.rstrip().splitlines()[-1].startswith('MCP-REFUSAL {"code":"invalid_argument"')
-    assert fake_db == [], "no session may be opened for an invalid argument"
-
-
-def test_the_tags_argument_bounds(fake_db):
-    assert "invalid_argument" in call(tags=["t"] * 33)
-    assert "invalid_argument" in call(tags=["a" * 129])
-    assert "invalid_argument" in call(tags=["#"])
-    assert fake_db == []
-    out = call(tags=["#" + "a" * 128] + ["b" * 128] * 31)
-    assert "MCP-REFUSAL" not in out
-    assert "tasks with cut tags: 0" in out
-    assert len(fake_db) == 1
-
-
-def test_the_query_runs_in_one_read_only_snapshot(fake_db):
-    call(status="all", due_by="2026-10-29", folder="Projects/")
-    stmts = fake_db[0].statements
-    assert stmts[0] == "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
-    page_sql = stmts[-1]
-    assert "JOIN notes_metadata ON notes_metadata.id = note_tasks.note_id AND" in page_sql
-    assert "notes_metadata.user_id IS NULL" in page_sql
-    assert "ORDER BY coalesce(note_tasks.due" in page_sql
 
 
 def _filter(rows, status):
@@ -447,32 +193,6 @@ def test_status_mapping_in_rendering():
     assert cancelled == ["- [-] `n.md`:3 — text: c"]
     every = task_lines(render(_filter(rows, "all")))
     assert [ln[:5] for ln in every] == ["- [ ]", "- [/]", "- [-]", "- [x]"]
-
-
-def test_the_due_filter_is_inclusive(fake_db):
-    call(due_by="2026-10-29")
-    page_sql = fake_db[0].statements[-1]
-    assert "note_tasks.due <= " in page_sql
-
-
-# ── the zero-rows-fit regression (Codex spec round 1) ───────────────────────
-
-
-def test_a_first_row_that_cannot_fit_is_abbreviated_not_lost():
-    path = "p" * 1024
-    tags = [f"{i:02d}" + "t" * 126 for i in range(64)]
-    rows = [row(path=path, line=n, text="x" * 1000, tags=tags, heading_path="H",
-                due=D(2026, 1, n), priority="high") for n in range(1, 6)]
-    seen, pages = follow(rows, limit=100, budget=1000)
-    assert len(pages) == 5
-    for out in pages:
-        assert len(out) <= 1000, len(out)
-        lines = task_lines(out)
-        assert len(lines) == 1 and lines[0].endswith("— abbreviated")
-        assert "— path cut" in lines[0] and "— tags omitted" in lines[0]
-        assert "— due 2026-01-0" in lines[0] and "— priority high" in lines[0]
-        assert "text (cut): x" in lines[0]
-    assert len(seen) == 5 == len({ln.split("— due ")[1][:10] for ln in seen})
 
 
 def test_an_abbreviated_row_keeps_a_short_path_whole():
@@ -504,31 +224,144 @@ def test_path_escaping_is_injective():
     assert render_task_row(row(path="a\\u2028.md")) != render_task_row(row(path="a\u2028.md"))
 
 
-def test_the_worst_case_at_the_minimum_cap_keeps_40_of_path_and_text():
-    """Design D7 as corrected: header, closing notice, compact footer and an
-    abbreviated row keeping four dates and a priority still leave at least 40
-    characters each of path and text at `MAX_READ_RESPONSE_CHARS=1000`."""
-    big = 10**10 - 1
-    first = D(2026, 1, 1)
-    rows = [row(path="é" * 1024, line=big, text="x" * 1000, due=first, scheduled=first,
-                start=first, done_on=first, priority="highest",
-                tags=["t" * 128] * 64, tags_cut=True, heading_path="H" * 512),
-            row(path="é" * 1024, line=big + 1, text="y")]
-    out = render_task_results(
-        rows, budget=1000,
-        header_args=header_args(status="cancelled", folder="F" * 1024,
-                                due_by="2026-01-01", scheduled_by="2026-01-01",
-                                tags=["t" * 128] * 32, not_scanned=big, failed=big,
-                                capped=big, cut_tags=big),
-        cursor_args=dict(owner=OWNER, filters=FILTERS), more_rows=True,
-    )
-    assert len(out) <= 1000, len(out)
-    (line,) = task_lines(out)
-    assert line.endswith("— abbreviated") and "— tags cut" in line
-    for field in ("due 2026-01-01", "scheduled 2026-01-01", "start 2026-01-01",
-                  "done 2026-01-01", "priority highest"):
-        assert field in line
-    path_shown = line.split("`")[1]
-    text_shown = line.split("text (cut): ", 1)[1].rsplit(" — abbreviated", 1)[0]
-    assert len(path_shown) >= 40 and len(text_shown) >= 40, (len(path_shown), len(text_shown))
-    assert out.splitlines()[-1].startswith("next: ")
+# ── the #428 wiring of `list_tasks_impl` ────────────────────────────────────
+
+
+class _Result:
+    def __init__(self, rows=(), scalar=0, one=(0, 0)):
+        self._rows, self._scalar, self._one = list(rows), scalar, one
+
+    def scalar_one(self):
+        return self._scalar
+
+    def one(self):
+        return self._one
+
+    def all(self):
+        return self._rows
+
+    def scalars(self):
+        return self
+
+
+class _FakeSession:
+    """Records statements; answers every count with zero and the page with
+    nothing. Enough to show what runs, and in which order."""
+
+    def __init__(self):
+        self.statements = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return False
+
+    async def execute(self, stmt, *_a, **_k):
+        self.statements.append(str(stmt))
+        return _Result()
+
+    async def rollback(self):
+        return None
+
+
+#: 2026-11-10 12:00 UTC, so relative dates resolve deterministically.
+NOW = datetime.datetime(2026, 11, 10, 12, 0, tzinfo=datetime.timezone.utc)
+
+
+class _Sessions(list):
+    def __init__(self):
+        super().__init__()
+        self.settings_reads = []
+
+
+@pytest.fixture
+def fake_db(monkeypatch):
+    from src.services import task_settings as ts
+
+    sessions = _Sessions()
+
+    def factory():
+        s = _FakeSession()
+        sessions.append(s)
+        return s
+
+    async def effective(uid):
+        sessions.settings_reads.append(uid)
+        return ts.defaults()
+
+    monkeypatch.setattr(tools, "async_session", factory)
+    monkeypatch.setattr(tools, "_effective_task_settings", effective)
+    monkeypatch.setattr(tools, "_task_now", lambda: NOW)
+    return sessions
+
+
+def call(**kw):
+    return asyncio.run(tools.list_tasks_impl.__wrapped__(**kw))
+
+
+@pytest.mark.parametrize("kw,bound", [
+    (dict(status="pending"), "status"),
+    (dict(due_by="next week"), "due_by"),
+    (dict(scheduled_by="2026-02-30"), "scheduled_by"),
+    (dict(tags=["t"] * 33), "32"),
+    (dict(tags=["a" * 129]), "128"),
+    (dict(tags=["#"]), "tags"),
+    (dict(undated=True, due_by="today"), "undated"),
+    (dict(order_by="title"), "order_by"),
+    (dict(due_from="2026-11-12", due_by="2026-11-11"), "due_from"),
+])
+def test_invalid_arguments_are_refused_before_any_statement(monkeypatch, kw, bound):
+    """Validation runs against the caller's own settings (the zone decides
+    `today`), so the settings read is the one statement allowed before it."""
+    from src.services import task_settings as ts
+
+    sessions = []
+    reads = []
+
+    async def effective(uid):
+        reads.append(uid)
+        return ts.defaults()
+
+    monkeypatch.setattr(tools, "async_session", lambda: sessions.append(1) or _FakeSession())
+    monkeypatch.setattr(tools, "_effective_task_settings", effective)
+    out = call(**kw)
+    assert bound in out
+    assert out.rstrip().splitlines()[-1].startswith('MCP-REFUSAL {"code":"invalid_argument"')
+    assert sessions == [], "no query may run for an invalid argument"
+    assert reads == [None], "only the one settings read"
+
+
+def test_a_version_1_cursor_is_refused(fake_db):
+    """D12: the #350 cursor is refused once after deploy, `invalid_argument`
+    ("start without one")."""
+    v1 = encode_task_cursor(owner=_task_owner_discriminator(None), filters=FILTERS,
+                            due_key="infinity", path="a.md", line=1, compact=False)
+    out = call(cursor=v1)
+    assert out.rstrip().splitlines()[-1].startswith('MCP-REFUSAL {"code":"invalid_argument"')
+    assert "start" in out and "cursor" in out
+
+
+def test_relative_dates_are_accepted_and_echoed(fake_db):
+    out = call(due_from="tomorrow", due_by="+7d")
+    assert "MCP-REFUSAL" not in out
+    assert "2026-11-11" in out and "2026-11-17" in out
+    assert "timezone: UTC" in out
+
+
+def test_the_query_runs_in_one_read_only_snapshot(fake_db):
+    out = call(status="all", due_by="2026-10-29", folder="Projects/")
+    assert "MCP-REFUSAL" not in out and out.startswith("Tasks — status: all")
+    assert len(fake_db) == 1, "one session: the page and every count"
+    stmts = fake_db[0].statements
+    assert stmts[0] == "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+    page_sql = stmts[-1]
+    assert "JOIN notes_metadata ON notes_metadata.id = note_tasks.note_id AND" in page_sql
+    assert "notes_metadata.user_id IS NULL" in page_sql
+    assert "note_tasks.due <= " in page_sql
+
+
+def test_32_tags_of_128_are_accepted(fake_db):
+    out = call(tags=["#" + "a" * 128] + ["b" * 128] * 31)
+    assert "MCP-REFUSAL" not in out
+    assert "tasks with cut tags: 0" in out

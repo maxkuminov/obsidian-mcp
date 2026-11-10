@@ -222,6 +222,24 @@ def multi_user_vault(monkeypatch, tmp_path):
     monkeypatch.setattr(
         tools, "async_session", lambda: _MetadataSession(metadata)
     )
+    # The task tools (#428) read their settings, scan for duplicates and
+    # refresh the index around the same confirmed publication; those three
+    # database touches are stood in for like the note tools' metadata session,
+    # so the confirmation itself is what these tests exercise.
+    from src.services import task_index, task_settings, task_write
+
+    async def _task_defaults(_uid):
+        return task_settings.defaults()
+
+    async def _no_duplicates(*_a, **_k):
+        return [], [], False
+
+    async def _refreshed(**_k):
+        return task_index.RefreshResult(task_index.REFRESHED)
+
+    monkeypatch.setattr(tools, "_effective_task_settings", _task_defaults)
+    monkeypatch.setattr(task_write, "duplicate_scan", _no_duplicates)
+    monkeypatch.setattr(task_index, "refresh_note_tasks", _refreshed)
 
     logged: dict = {}
 
@@ -298,11 +316,23 @@ def seed(ctx) -> None:
     """The note and the file every refusal case must leave byte-identical."""
     (ctx.vault / "note.md").write_text("original body\n", encoding="utf-8")
     (ctx.vault / "picture.png").write_bytes(b"\x89PNG\r\n\x1a\npixels")
+    (ctx.vault / "tasks.md").write_text(TASKS_NOTE, encoding="utf-8")
+
+
+#: The note the task tools (#428) act on.
+TASKS_NOTE = "- [ ] water plants\n"
+
+
+def _task_id() -> str:
+    from src.services import task_line
+
+    return task_line.task_key("water plants")
 
 
 def untouched(ctx) -> None:
     """The former root is intact and nothing was created in the new one."""
     assert (ctx.vault / "note.md").read_text(encoding="utf-8") == "original body\n"
+    assert (ctx.vault / "tasks.md").read_text(encoding="utf-8") == TASKS_NOTE
     assert (ctx.vault / "picture.png").read_bytes() == b"\x89PNG\r\n\x1a\npixels"
     assert not (ctx.vault / ".trash").exists()
     assert sorted(p.name for p in ctx.other.iterdir()) == []
@@ -328,6 +358,12 @@ async def _call(ctx, name: str):
         return await tools.delete_note_impl("note.md", permanent=True)
     if name == "delete_file":
         return await tools.delete_file_impl("picture.png")
+    if name == "complete_task":
+        return await tools.complete_task_impl("tasks.md", _task_id())
+    if name == "update_task":
+        return await tools.update_task_impl("tasks.md", _task_id(), priority="high")
+    if name == "add_task":
+        return await tools.add_task_impl("tasks.md", "repot the fern")
     raise AssertionError(name)  # pragma: no cover
 
 
@@ -340,6 +376,9 @@ MUTATING_TOOLS = [
     "delete_note",
     "delete_note_permanent",
     "delete_file",
+    "complete_task",  # #428
+    "update_task",
+    "add_task",
 ]
 
 
@@ -1591,6 +1630,9 @@ def test_the_write_tool_detector_finds_the_tools_we_know_about():
         "delete_file",
         "import_from_url",
         "request_upload",
+        "complete_task",  # #428
+        "update_task",
+        "add_task",
     } <= found, found
     # A read-only mint shares `_mint_preflight` and must not be swept in.
     assert "request_download" not in found

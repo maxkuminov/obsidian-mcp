@@ -110,6 +110,17 @@ PRECONDITION_CODES = frozenset(
     }
 )
 
+#: The task-tool codes (#428, design D16). Body-only, like their siblings:
+#: each names a fact about the note's current bytes or the call's arguments,
+#: so none carries a retry interval or a bucket field.
+#: `response_cap_too_small` is a read refusal (`list_tasks` / `task_agenda`),
+#: nothing written by definition.
+TASK_CODES = frozenset({
+    "task_not_found", "task_ambiguous", "task_changed", "already_completed",
+    "task_cancelled", "task_malformed", "recurrence_unsupported",
+    "on_completion_unsupported", "duplicate_task", "response_cap_too_small",
+})
+
 # Body-only codes omit unrelated bucket fields. Existing gate codes retain
 # their historical wire shape, including argument_too_long at the provider.
 BODY_CODES = frozenset({
@@ -122,7 +133,7 @@ BODY_CODES = frozenset({
     "unsupported_filesystem", "io_failure", "index_not_ready",
     "transfer_unavailable", "credential_unusable", "fetch_refused",
     "transfer_busy", "transfer_timeout", "partial_completion", "publication_uncertain",
-})
+} | TASK_CODES)
 
 CODES = frozenset(
     {

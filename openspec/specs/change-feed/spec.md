@@ -2,7 +2,6 @@
 
 ## Purpose
 The durable, owner-scoped record of what changed in a vault (#351): the `note_events` log and its two writers (the MCP write tools, attributed at call time, and the index pass, unattributed `human/sync`), the per-scope sequence assigned under an advisory lock held to commit that makes an `ev:<seq>` cursor exact and private, suppression of a pass's duplicate of a tool's own event, the baseline `reset`, overflow and durable `gap` lines, retention with its watermark, the purges on provenance discard and permanent user deletion, and the `get_changes` tool's arguments, `by` semantics, rendering and disclosure rules.
-
 ## Requirements
 ### Requirement: Note changes SHALL be recorded in one durable, owner-scoped event table without foreign keys
 The system SHALL record note changes as rows of `note_events`, one row per event, each carrying the owner scope as a plain `user_id` column (NULL for single-user), a per-scope sequence number `seq`, `occurred_at`, a `kind` from `created`, `modified`, `moved`, `deleted` (note kinds) or `gap`, `reset` (meta kinds), the vault-relative `path` (the destination for a move, NULL for meta kinds), `from_path` for a move, the canonical `content_hash` the event leaves at `path` when known, and a `source` of `mcp` (written by a tool, attributed) or `index` (discovered by the index pass, unattributed), and a `reason` (`removed`, `not_indexable` or `quarantined`) on a `deleted` event and on a content event about bytes that cannot be indexed. `note_events`, `note_event_scopes` and `note_event_gaps` SHALL have no foreign key to `users` or to `notes_metadata`. An FK check on `users` taken after the pass's `notes_metadata` row locks would close the documented deadlock with permanent user deletion, and events must outlive their rows. An event SHALL be written only into the scope whose vault root its paths are relative to. The record of a deletion SHALL NOT depend on the deleted file's presence in `.trash/` or on the deleted note's `notes_metadata` row.
@@ -94,18 +93,45 @@ One function, `canonical_note_hash(data: bytes)` in `src/services/note_hash.py`,
 - **THEN** both the indexer and every tool event SHALL obtain it from `canonical_note_hash`
 
 ### Requirement: MCP write tools SHALL record attributed events for every markdown publication
-After a confirmed publication, the tool that performed it SHALL append an event with `source = 'mcp'`, the server-authored `tool` name, the caller's `actor_kind` and `actor_label` as written to `usage_logs`, and the caller's principal as `principal_kind` and `principal_ref` (`api_key` and the key's id, or `oauth` and the grant id). The events SHALL be:
-- `create_note` → `created`;
-- `edit_note` and `set_frontmatter` → `modified`;
-- `write_file`, `import_from_url` and `PUT /transfer/upload` on a `.md` path → `created` without an incumbent and `modified` with one;
-- `move_note` → `moved`, inside its metadata transaction, and one `modified` per backlink source whose rewrite it published;
-- `delete_note` → `deleted` with `reason = 'removed'`. (`delete_file` refuses every `.md` path and so never records an event.)
+After a confirmed publication, the tool that performed it SHALL append an event carrying:
 
-A transfer upload SHALL be attributed to the actor and principal that minted the capability, the same principal the write-bucket charge at redemption already uses (`transfer.minting_principal`). This reuses that rule rather than defining a second one. A publication the tool reports as `publication_uncertain` SHALL record no event.
+- `source = 'mcp'`;
+- the server-authored `tool` name;
+- the caller's `actor_kind` and `actor_label`, as written to `usage_logs`;
+- the caller's principal as `principal_kind` and `principal_ref` (`api_key` and the key's id, or `oauth` and the grant id).
+
+The events SHALL be:
+
+| Tool | Event |
+|---|---|
+| `create_note` | `created` |
+| `edit_note`, `set_frontmatter` | `modified` |
+| `complete_task`, `update_task`, `add_task` | `modified` (recorded after the write-time task refresh, whatever its result) |
+| `write_file`, `import_from_url`, `PUT /transfer/upload` on a `.md` path | `created` without an incumbent, `modified` with one |
+| `move_note` | `moved`, inside its metadata transaction, plus one `modified` per backlink source whose rewrite it published |
+| `delete_note` | `deleted` with `reason = 'removed'` |
+
+`delete_file` refuses every `.md` path, and so never records an event.
+
+A transfer upload SHALL be attributed to the actor and principal that minted the capability. That is the same principal the write-bucket charge at redemption already uses (`transfer.minting_principal`), so this reuses that rule rather than defining a second one.
+
+A publication the tool reports as `publication_uncertain` SHALL record no event. A dry run, a refusal and a call that changed no byte SHALL record no event.
 
 #### Scenario: An edit is attributed to the calling key
 - **WHEN** an API key named `laptop` (id 12) edits `A.md`
-- **THEN** an event `modified`, `path = 'A.md'`, `source = 'mcp'`, `tool = 'edit_note'`, `actor_kind = 'api_key'`, `actor_label = 'laptop'`, `principal_kind = 'api_key'`, `principal_ref = '12'` SHALL be recorded with `canonical_note_hash` of the bytes written
+- **THEN** an event SHALL be recorded with the `canonical_note_hash` of the bytes written and these fields:
+  - `modified`;
+  - `path = 'A.md'`;
+  - `source = 'mcp'`;
+  - `tool = 'edit_note'`;
+  - `actor_kind = 'api_key'`;
+  - `actor_label = 'laptop'`;
+  - `principal_kind = 'api_key'`;
+  - `principal_ref = '12'`.
+
+#### Scenario: A task completion is attributed to the caller
+- **WHEN** an OAuth grant completes a task in `Projects/Alpha.md`
+- **THEN** one `modified` event SHALL be recorded with `tool = 'complete_task'`, the grant as its principal and the canonical hash of the bytes written, after the write-time task refresh
 
 #### Scenario: A transfer upload is attributed to the minting principal
 - **WHEN** an OAuth grant mints an upload link for `Inbox/x.md` and a person redeems it
@@ -117,6 +143,10 @@ A transfer upload SHALL be attributed to the actor and principal that minted the
 
 #### Scenario: A non-markdown write records nothing
 - **WHEN** `write_file` writes `attachments/x.pdf`
+- **THEN** no event SHALL be recorded
+
+#### Scenario: A refused or dry-run task write records nothing
+- **WHEN** `update_task` is refused with `task_changed`, or `add_task` runs with `dry_run=true`
 - **THEN** no event SHALL be recorded
 
 ### Requirement: The index pass SHALL record only the changes it commits that no tool already recorded
@@ -282,3 +312,4 @@ Each event SHALL render as exactly one line beginning `- ev:<seq> <YYYY-MM-DDTHH
 #### Scenario: Metadata
 - **WHEN** a client lists tools
 - **THEN** `get_changes` SHALL carry that title and those four hints, and a description of at most 4,000 characters
+

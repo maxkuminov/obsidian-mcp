@@ -117,6 +117,12 @@
 
     </div>
 
+    {% if not multi_user_mode and tasks_card %}
+    {# #428: single-user mode's task settings (the NULL scope every MCP caller
+       uses). In multi-user mode each user edits their own on /account. #}
+    {% include "_task_settings_card.html" %}
+    {% endif %}
+
     <!-- Danger zone -->
     <div class="card anim-3 u-margin-top-24px u-border-color-danger-border">
         <div class="card-header u-border-bottom-color-danger-border-soft">

@@ -103,6 +103,10 @@
 
     </div>
 
+    {# #428: the signed-in user's own task settings. This page exists only in
+       multi-user mode; single-user mode shows the card on Settings. #}
+    {% if tasks_card %}{% include "_task_settings_card.html" %}{% endif %}
+
 </div>
 
 {% endblock %}

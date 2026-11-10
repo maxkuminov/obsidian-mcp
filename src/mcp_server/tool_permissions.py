@@ -44,6 +44,11 @@ WRITE_REQUIRED_TOOLS: frozenset[str] = frozenset(
         "delete_file",
         "import_from_url",
         "request_upload",
+        # #428: the three task write tools (12 names; a read-only grant
+        # lists 20 of 32).
+        "complete_task",
+        "update_task",
+        "add_task",
     }
 )
 

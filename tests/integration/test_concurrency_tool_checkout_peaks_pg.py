@@ -205,6 +205,13 @@ CALLS = [
     ('get_changes', 'get_changes_impl', lambda s: (('ev:0',), {})),  # #351
     ('hybrid_search', 'hybrid_search_impl', lambda s: (('quartzite',), {'limit': 5})),  # #354
     ('create_note', 'create_note_impl', lambda s: (('new.md', 'first\n'), {})),
+    # #428: the task tools, on the note `create_note` just wrote; each write
+    # takes the id the previous call's response returned.
+    ('add_task', 'add_task_impl', lambda s: (('new.md', 'water plants'), {})),
+    ('complete_task', 'complete_task_impl', lambda s: (('new.md', _task_id(s['add_task'])), {})),
+    ('update_task', 'update_task_impl',
+     lambda s: (('new.md', _task_id(s['complete_task'])), {'priority': 'high'})),
+    ('task_agenda', 'task_agenda_impl', lambda s: ((), {})),
     ('edit_note', 'edit_note_impl', lambda s: (('new.md', 'second\n'), {})),
     ('set_frontmatter', 'set_frontmatter_impl',
      lambda s: (('new.md',), {'updates': {'status': 'done'}})),
@@ -221,6 +228,13 @@ CALLS = [
     ('import_from_url', 'import_from_url_impl',
      lambda s: (('https://fixture.example/source', 'import.bin'), {})),
 ]
+
+
+def _task_id(response: str) -> str:
+    """The `id:` line of a task write's response (#428)."""
+    match = re.search(r"^id: (\S+)$", response, re.M)
+    assert match, response
+    return match.group(1)
 
 
 def test_the_call_table_covers_every_registered_tool():

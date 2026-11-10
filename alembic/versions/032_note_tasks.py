@@ -128,6 +128,49 @@ INDEXES = {
 NOTE_COLUMNS = {"tasks_truncated": TRUNCATED_MARKER, "tasks_failed": FAILED_MARKER}
 
 
+# Units a later revision adds to `note_tasks`, by kind and exact name, each
+# with the exact marker comment that revision writes. The complete comparison
+# below leaves out exactly these — a unit of one of these names *and* this
+# comment — because that revision verifies them; otherwise a stamp-back that
+# re-runs 032 over a head database would refuse them as foreign. Anything
+# else (another name, the right name with another comment, any other marker)
+# is compared and refused as before. On a database without these units
+# (every database 032 itself meets) nothing changes.
+#
+# **A future revision that adds a unit to `note_tasks` must extend these
+# lists on purpose**, with its literal names and markers; nothing is inferred
+# from a comment's shape. Byte identical to 039's literals (#428).
+_039_TASK_KEY = "task id key and occurrence (039_task_tools)"
+_039_RECURRENCE = "task recurrence rule (039_task_tools)"
+_039_DATES = "task created and cancelled dates (039_task_tools)"
+_039_CONTEXT = "task context lines (039_task_tools)"
+LATER_COLUMNS = {
+    "task_key": _039_TASK_KEY,
+    "key_ordinal": _039_TASK_KEY,
+    "key_count": _039_TASK_KEY,
+    "description_key": "task duplicate-detection key (039_task_tools)",
+    "text_fold": "case-folded task text (039_task_tools)",
+    "tag_prefixes": "hierarchical task tag prefixes (039_task_tools)",
+    "recurrence": _039_RECURRENCE,
+    "recurrence_cut": _039_RECURRENCE,
+    "created": _039_DATES,
+    "cancelled": _039_DATES,
+    "context": _039_CONTEXT,
+    "context_cut": _039_CONTEXT,
+}
+LATER_CONSTRAINTS = {
+    "ck_note_tasks_key_shape": "task id key shape (039_task_tools)",
+}
+LATER_INDEXES = {
+    "ix_note_tasks_tag_prefixes": "task tag-prefix filter index (039_task_tools)",
+    "ix_note_tasks_open_desc": "open-task duplicate lookup index (039_task_tools)",
+}
+
+
+def _later_revision_unit(allow_list: dict, name, comment) -> bool:
+    return comment is not None and allow_list.get(name) == comment
+
+
 def _quote(value: str) -> str:
     """A single-quoted SQL string literal (`COMMENT ON` takes no bind)."""
     return "'" + value.replace("'", "''") + "'"
@@ -156,12 +199,14 @@ def _columns(bind):
         (r[0], r[1], r[2])
         for r in bind.execute(
             sa.text(
-                "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull "
+                "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, "
+                "       col_description(a.attrelid, a.attnum) "
                 "FROM pg_attribute a WHERE a.attrelid = CAST(:q AS regclass) "
                 "  AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum"
             ),
             {"q": QUALIFIED},
         ).fetchall()
+        if not _later_revision_unit(LATER_COLUMNS, r[0], r[3])
     ]
 
 
@@ -204,17 +249,23 @@ def _primary_key(bind):
 def _other_constraints(bind):
     """Every CHECK, UNIQUE, EXCLUSION and FOREIGN KEY constraint on the table,
     resolved through `conrelid` — never by name (013's rule)."""
-    return bind.execute(
+    rows = bind.execute(
         sa.text(
             "SELECT c.conname, CAST(c.contype AS text) AS contype, "
             "       pg_get_constraintdef(c.oid) AS definition, c.convalidated, "
-            "       ic.relname AS index_name "
+            "       ic.relname AS index_name, "
+            "       obj_description(c.oid, 'pg_constraint') AS comment "
             "FROM pg_constraint c LEFT JOIN pg_class ic ON ic.oid = c.conindid "
             "WHERE c.conrelid = CAST(:q AS regclass) "
             "  AND c.contype IN ('c', 'u', 'x', 'f') ORDER BY c.conname"
         ),
         {"q": QUALIFIED},
     ).fetchall()
+    return [
+        r for r in rows
+        if not (r.contype == "c"
+                and _later_revision_unit(LATER_CONSTRAINTS, r.conname, r.comment))
+    ]
 
 
 def _index_definitions(bind) -> dict:
@@ -229,7 +280,8 @@ def _index_definitions(bind) -> dict:
             "                             AND a.attnum = CAST(k.attnum AS smallint)"
             "       ) AS columns, "
             "       i.indisunique, (i.indisvalid AND i.indisready) AS usable, "
-            "       (i.indpred IS NOT NULL OR i.indexprs IS NOT NULL) AS restricted "
+            "       (i.indpred IS NOT NULL OR i.indexprs IS NOT NULL) AS restricted, "
+            "       obj_description(ic.oid, 'pg_class') AS comment "
             "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
             "WHERE i.indrelid = CAST(:q AS regclass)"
         ),
@@ -238,6 +290,7 @@ def _index_definitions(bind) -> dict:
     return {
         r.name: (list(r.columns or []), r.indisunique, r.usable, r.restricted)
         for r in rows
+        if not _later_revision_unit(LATER_INDEXES, r.name, r.comment)
     }
 
 

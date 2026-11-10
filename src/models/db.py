@@ -4,6 +4,7 @@ from typing import ClassVar
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    CHAR,
     BigInteger,
     Boolean,
     CheckConstraint,
@@ -453,6 +454,33 @@ _BODY_EXCERPT_COLUMN_MARKER = "keyword excerpt (031_keyword_head_and_excerpt)"
 _NOTE_TASKS_TABLE_MARKER = "task rows derived per note (032_note_tasks)"
 _TASKS_TRUNCATED_COLUMN_MARKER = "task-extraction truncation marker (032_note_tasks)"
 _TASKS_FAILED_COLUMN_MARKER = "task-derivation failure marker (032_note_tasks)"
+# Migration 039's markers (#428, the task tools). Byte identical to the
+# migration's literals: the column and table markers are the comments
+# `alembic check` compares; the CHECK and index markers it cannot compare are
+# read by the migration and the schema gate.
+_TASK_KEY_COLUMN_MARKER = "task id key and occurrence (039_task_tools)"
+_TASK_DESCRIPTION_KEY_COLUMN_MARKER = "task duplicate-detection key (039_task_tools)"
+_TASK_TEXT_FOLD_COLUMN_MARKER = "case-folded task text (039_task_tools)"
+_TASK_TAG_PREFIXES_COLUMN_MARKER = "hierarchical task tag prefixes (039_task_tools)"
+_TASK_RECURRENCE_COLUMN_MARKER = "task recurrence rule (039_task_tools)"
+_TASK_DATES_COLUMN_MARKER = "task created and cancelled dates (039_task_tools)"
+_TASK_CONTEXT_COLUMN_MARKER = "task context lines (039_task_tools)"
+_TASKS_SOURCE_HASH_COLUMN_MARKER = (
+    "hash of the bytes the task rows describe (039_task_tools)"
+)
+_TASKS_REFRESHED_AT_COLUMN_MARKER = "task write-time refresh stamp (039_task_tools)"
+_TASK_SETTINGS_TABLE_MARKER = "task settings per owner scope (039_task_tools)"
+_TASK_KEY_SHAPE_CHECK_MARKER = "task id key shape (039_task_tools)"
+_TASK_TAG_PREFIXES_INDEX_MARKER = "task tag-prefix filter index (039_task_tools)"
+_TASK_OPEN_DESC_INDEX_MARKER = "open-task duplicate lookup index (039_task_tools)"
+# 039's CHECK over the task-id triple. Byte identical to the migration's
+# `KEY_SHAPE_PREDICATE`; alembic does not compare it, the schema gate does.
+_NOTE_TASK_KEY_SHAPE_CHECK_NAME = "ck_note_tasks_key_shape"
+_NOTE_TASK_KEY_SHAPE_PREDICATE = (
+    "(task_key IS NULL AND key_ordinal IS NULL AND key_count IS NULL) OR "
+    "(task_key IS NOT NULL AND key_ordinal IS NOT NULL AND key_count IS NOT NULL "
+    "AND key_ordinal >= 1 AND key_ordinal <= key_count)"
+)
 # Migration 033 (#351, the change feed). Byte identical to the migration's
 # literals, so `alembic check` compares them.
 _CONTENT_CHANGED_AT_COLUMN_MARKER = "content-change stamp (033_content_changed_at)"
@@ -676,6 +704,23 @@ class NoteMetadata(Base):
         server_default=text("false"),
         comment=_TASKS_FAILED_COLUMN_MARKER,
     )
+    # Which bytes this note's `note_tasks` rows describe (#428, migration 039,
+    # design D10): the canonical note hash (`note_hash.canonical_note_hash`)
+    # of the bytes they were derived from. Equal to `content_hash` when the
+    # pass derived them; different ("task-dirty") when a task tool published
+    # bytes after the row's scan and refreshed the rows from them. A task-dirty
+    # row is ineligible for the stat shortcut. NULL until a version-5
+    # derivation or a refresh writes it. Never written by anything but the
+    # task stage of the pass and `task_index.refresh_note_tasks`.
+    tasks_source_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, comment=_TASKS_SOURCE_HASH_COLUMN_MARKER
+    )
+    # When a task tool's write-time refresh last rewrote this note's task rows
+    # (`clock_timestamp()`); set NULL by every pass derivation. The pass keeps
+    # rows refreshed at or after its own scan start (D10 R4).
+    tasks_refreshed_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, comment=_TASKS_REFRESHED_AT_COLUMN_MARKER
+    )
     # Deferred with raise-on-load (#280, design D5). No read path renders the
     # tsvector: `keyword_search` uses it only server-side (`@@`, `ts_rank_cd`),
     # and every writer is SQL text or `insert().values`, which deferral does
@@ -889,6 +934,11 @@ class NoteTask(Base):
     both come from the note's row through the join, so a task row cannot
     outlive or precede its note and follows an id-preserving move unwritten.
     No relationship on `NoteMetadata` loads these.
+
+    Since #428 (migration 039) a task tool's write-time refresh is the second
+    writer of one note's rows, serialised with the pass by that note's
+    `notes_metadata` row lock; `notes_metadata.tasks_source_hash` records
+    which bytes the rows describe (design D10).
     """
 
     __tablename__ = "note_tasks"
@@ -917,9 +967,81 @@ class NoteTask(Base):
         Boolean, nullable=False, server_default=_sql_text("false")
     )
     heading_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # ── Migration 039 (#428, the task tools; design D1, D9, D11) ──────────
+    # All nullable (or defaulted) because rows written before the version-5
+    # pass have no value; the pass and the write-time refresh always write
+    # every one of them.
+    #
+    # The D1 id: a 12-hex key over the task's uncut text, and this task's
+    # 1-based rank among the note's tasks with the same key / their count.
+    # All three NULL or all set (`ck_note_tasks_key_shape`). A row with a NULL
+    # key renders `id pending`.
+    task_key: Mapped[str | None] = mapped_column(
+        CHAR(12), nullable=True, comment=_TASK_KEY_COLUMN_MARKER
+    )
+    key_ordinal: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment=_TASK_KEY_COLUMN_MARKER
+    )
+    key_count: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment=_TASK_KEY_COLUMN_MARKER
+    )
+    # D9 duplicate-detection key over the normalised description region.
+    description_key: Mapped[str | None] = mapped_column(
+        CHAR(16), nullable=True, comment=_TASK_DESCRIPTION_KEY_COLUMN_MARKER
+    )
+    # NFC + casefold of the stored (cut) `text`, folded in Python so
+    # `list_tasks(text=…)` matching is collation-independent.
+    text_fold: Mapped[str | None] = mapped_column(
+        Text, nullable=True, comment=_TASK_TEXT_FOLD_COLUMN_MARKER
+    )
+    # Every lower-cased `/`-segment prefix of every stored tag, deduplicated
+    # and **not capped** (≤ 64 tags × ≤ 64 segments, so lossless): the
+    # hierarchical `tags` / `exclude_tags` filters read only this.
+    tag_prefixes: Mapped[list[str] | None] = mapped_column(
+        ARRAY(String(128)), nullable=True, comment=_TASK_TAG_PREFIXES_COLUMN_MARKER
+    )
+    # The run's `🔁` value as written, cut at 256 (`recurrence_cut`).
+    recurrence: Mapped[str | None] = mapped_column(
+        String(256), nullable=True, comment=_TASK_RECURRENCE_COLUMN_MARKER
+    )
+    recurrence_cut: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=_sql_text("false"),
+        comment=_TASK_RECURRENCE_COLUMN_MARKER,
+    )
+    # `➕` and `❌`, under the #350 date rules.
+    created: Mapped[datetime.date | None] = mapped_column(
+        Date, nullable=True, comment=_TASK_DATES_COLUMN_MARKER
+    )
+    cancelled: Mapped[datetime.date | None] = mapped_column(
+        Date, nullable=True, comment=_TASK_DATES_COLUMN_MARKER
+    )
+    # The stored context run (≤ 8 lines, each ≤ 160 characters, joined by
+    # `\n`, ≤ 600 characters); `context_cut` when the cap bit.
+    context: Mapped[str | None] = mapped_column(
+        Text, nullable=True, comment=_TASK_CONTEXT_COLUMN_MARKER
+    )
+    context_cut: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=_sql_text("false"),
+        comment=_TASK_CONTEXT_COLUMN_MARKER,
+    )
 
     __table_args__ = (
         UniqueConstraint("note_id", "line", name="uq_note_tasks_note_id_line"),
+        # Migration 039. Alembic does not compare CHECK predicates; the schema
+        # gate asserts this one through `pg_constraint`.
+        CheckConstraint(
+            _NOTE_TASK_KEY_SHAPE_PREDICATE, name=_NOTE_TASK_KEY_SHAPE_CHECK_NAME
+        ),
+        Index("ix_note_tasks_tag_prefixes", "tag_prefixes", postgresql_using="gin"),
+        Index(
+            "ix_note_tasks_open_desc",
+            "description_key",
+            postgresql_where=_sql_text("state = 'open'"),
+        ),
         CheckConstraint(
             "state IN (" + ", ".join(f"'{v}'" for v in NOTE_TASK_STATES) + ")",
             name="ck_note_tasks_state",
@@ -931,6 +1053,54 @@ class NoteTask(Base):
         Index("ix_note_tasks_note", "note_id"),
         Index("ix_note_tasks_state_due", "state", "due"),
         {"comment": _NOTE_TASKS_TABLE_MARKER},
+    )
+
+
+class TaskSettings(Base):
+    """One owner scope's task settings (#428, migration 039, design D14).
+
+    At most one row per scope: `user_id` is the user, or NULL for the
+    single-user scope (`UNIQUE NULLS NOT DISTINCT`), and a user's row goes
+    with the user (`ON DELETE CASCADE`). A NULL field — and an absent row —
+    means "the environment default" (`Settings.tasks_*`); the merge is
+    `src.services.task_settings.effective`, the only reader, and `save` the
+    only writer. Durable for backups: it cannot be rebuilt from the vault.
+    No relationship on `User` loads it.
+    """
+
+    __tablename__ = "task_settings"
+    _TABLE_MARKER: ClassVar[str] = _TASK_SETTINGS_TABLE_MARKER
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True
+    )
+    # An IANA zone name, or NULL for `TASKS_DEFAULT_TIMEZONE`.
+    timezone: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Vault-relative folder prefixes, each ending in `/` (≤ 32).
+    excluded_folders: Mapped[list[str]] = mapped_column(
+        ARRAY(String(1024)), nullable=False, server_default=text("'{}'")
+    )
+    # Note tags, lower-case without `#` (≤ 32), matched hierarchically.
+    excluded_note_tags: Mapped[list[str]] = mapped_column(
+        ARRAY(String(128)), nullable=False, server_default=text("'{}'")
+    )
+    # The four plugin-mirroring write behaviours; NULL means the env default.
+    set_done_date: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    set_cancelled_date: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    set_created_date: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    next_recurrence_below: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            name="uq_task_settings_user_id",
+            postgresql_nulls_not_distinct=True,
+        ),
+        {"comment": _TASK_SETTINGS_TABLE_MARKER},
     )
 
 

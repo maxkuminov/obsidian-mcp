@@ -14,6 +14,9 @@ import _harness
 pytestmark = _harness.requires_pgvector
 
 DIM = 64
+# The current head (039 since #428). A downgrade 038 refuses rolls back the
+# whole run, 039's step included, so the version stays at head.
+HEAD_REVISION = "039"
 URL = "https://chatgpt.com/oauth/client.json"
 JWKS_URI = "https://chatgpt.com/oauth/jwks.json"
 SNAPSHOT = '{"keys": [{"kty": "RSA", "kid": "k1", "n": "AQAB", "e": "AQAB"}]}'
@@ -187,7 +190,7 @@ def test_upgrade_leaves_dcr_and_none_cimd_rows_unchanged_and_valid():
 
         _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
 
-        assert version(url) == "038"
+        assert version(url) == HEAD_REVISION
         assert rows(url) == before
         assert set(PKJWT_COLUMNS) <= columns(url)
         assert fetchval(
@@ -210,7 +213,7 @@ def test_rerun_reconciles_and_changes_nothing():
         _harness.run_alembic(url, "stamp", "037", dimensions=DIM)
         _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
 
-        assert version(url) == "038"
+        assert version(url) == HEAD_REVISION
         assert (checks(url), columns(url), rows(url)) == before
 
 
@@ -336,7 +339,7 @@ def test_downgrade_refuses_while_a_private_key_jwt_row_exists():
         assert "038 downgrade refused: 1 private_key_jwt client row(s)" in (
             result.stdout + result.stderr
         )
-        assert version(url) == "038"
+        assert version(url) == HEAD_REVISION
         assert (checks(url), columns(url)) == before
 
         sql(url, "DELETE FROM oauth_clients WHERE token_endpoint_auth_method = 'private_key_jwt'")
@@ -350,5 +353,5 @@ def test_downgrade_refuses_while_a_private_key_jwt_row_exists():
         assert rows(url) == legacy
 
         _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
-        assert version(url) == "038"
+        assert version(url) == HEAD_REVISION
         assert checks(url) == before[0]

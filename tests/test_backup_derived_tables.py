@@ -5,9 +5,9 @@ Six tables are a cache of the vault plus settings: the index pass rewrites
 `indexer_runs` is display history and `indexer_state`'s fingerprints are
 re-adopted at startup when absent. Their rows are the bulk of every dump, so
 `pg_dump` carries `--exclude-table-data` for each of them unless
-`BACKUP_FULL=1`. The other fifteen tables are durable — credentials, grants,
+`BACKUP_FULL=1`. The other sixteen tables are durable — credentials, grants,
 users, usage, quotas, `backups_log`, the concurrency evidence, the change
-feed — and must never
+feed, `task_settings` — and must never
 appear in an exclusion.
 
 Hermetic: the Makefile, the Kubernetes CronJob script and `src/models/db.py`
@@ -56,6 +56,10 @@ DURABLE = {
     "note_events",
     "note_event_scopes",
     "note_event_gaps",
+    # #428: each owner's task timezone, exclusions and write behaviours are
+    # typed into the panel by a person; nothing in the vault can rebuild them.
+    # (`note_tasks`, including 039's new columns, stays derived.)
+    "task_settings",
 }
 
 

@@ -59,7 +59,7 @@ from src.oauth.scope import (
     has_vault_scope,
     token_has_write,
 )
-from src.services import panel_csp, security_events, vault_overlap
+from src.services import panel_csp, security_events, task_settings, vault_overlap
 from src.services.index_state import (
     KEY_EMBEDDING_FINGERPRINT,
     acquire_generation_lock_unbounded,
@@ -588,10 +588,16 @@ def _refuse_password_change(
 async def account_page(
     request: Request,
     user=Depends(require_user_panel),
+    # After `user`, so a direct call `account_page(request, user)` still binds
+    # positionally as it did before #428.
+    session: AsyncSession = Depends(get_session),
 ):
-    """The signed-in user's own account page: who they are, and the form."""
+    """The signed-in user's own account page: who they are, the password form,
+    and (#428) the user's own Tasks settings card."""
     _require_account_route()
+    tasks_ctx = await _task_settings_context(session, user.id, "/admin/account/tasks")
     return templates.TemplateResponse(request, "account.html", _panel_context(request, user, {
+        **tasks_ctx,
         "active": "account",
         "min_password_length": MIN_PASSWORD_LENGTH,
         # #416 D11: a read-only status line, only while OIDC is enabled. No
@@ -777,6 +783,189 @@ async def change_password(
     # would be thrown away with it.
     flash(request, SUCCESS_MESSAGE)
     return RedirectResponse(ACCOUNT_PATH, status_code=303)
+
+
+# --- Tasks settings card (#428, design D14) --------------------------------
+#
+# One card, two homes. Multi-user mode: on `/account`, editing the signed-in
+# user's own `task_settings` row (`POST /account/tasks`). Single-user mode,
+# where `/account` 404s by design (#197 D23): on `/settings`, editing the
+# NULL-scope row the MCP callers there use (`POST /settings/tasks`, admin).
+# Neither route takes a user id from the request: the scope is the session's
+# own identity (multi-user) or NULL (single-user), so no form can address
+# another user's row. Validation and the upsert live in `task_settings.save`;
+# a route only owns the transaction, the flash and the 303.
+
+#: Where the single-user card's POST lands.
+TASKS_SETTINGS_PATH = "/admin/settings"
+
+#: Shown after a save that wrote the row.
+TASKS_SAVED_MESSAGE = "Task settings saved."
+
+#: The timezone `<datalist>`: suggestions only — the input accepts any IANA
+#: name `task_settings.save` accepts (`zoneinfo.available_timezones()`).
+#: A **fixed** list of long-standing canonical zones rather than the build's
+#: own `available_timezones()`, because that set is the union of the system
+#: zoneinfo and the `tzdata` wheel and so differs between hosts — and the
+#: account page is pinned byte for byte by `tests/golden/oidc_off/`.
+TASK_TIMEZONE_SUGGESTIONS: tuple[str, ...] = (
+    "UTC",
+    "Africa/Cairo", "Africa/Casablanca", "Africa/Johannesburg", "Africa/Lagos",
+    "Africa/Nairobi",
+    "America/Anchorage", "America/Argentina/Buenos_Aires", "America/Bogota",
+    "America/Caracas", "America/Chicago", "America/Denver", "America/Halifax",
+    "America/Havana", "America/Lima", "America/Los_Angeles", "America/Mexico_City",
+    "America/New_York", "America/Phoenix", "America/Santiago", "America/Sao_Paulo",
+    "America/St_Johns", "America/Toronto", "America/Vancouver",
+    "Asia/Almaty", "Asia/Bangkok", "Asia/Dhaka", "Asia/Dubai", "Asia/Ho_Chi_Minh",
+    "Asia/Hong_Kong", "Asia/Jakarta", "Asia/Jerusalem", "Asia/Karachi",
+    "Asia/Kathmandu", "Asia/Kolkata", "Asia/Manila", "Asia/Seoul", "Asia/Shanghai",
+    "Asia/Singapore", "Asia/Taipei", "Asia/Tashkent", "Asia/Tbilisi", "Asia/Tehran",
+    "Asia/Tokyo", "Asia/Yerevan",
+    "Atlantic/Azores", "Atlantic/Reykjavik",
+    "Australia/Adelaide", "Australia/Brisbane", "Australia/Darwin",
+    "Australia/Melbourne", "Australia/Perth", "Australia/Sydney",
+    "Europe/Amsterdam", "Europe/Athens", "Europe/Berlin", "Europe/Brussels",
+    "Europe/Bucharest", "Europe/Dublin", "Europe/Helsinki", "Europe/Istanbul",
+    "Europe/Kyiv", "Europe/Lisbon", "Europe/London", "Europe/Madrid",
+    "Europe/Moscow", "Europe/Oslo", "Europe/Paris", "Europe/Prague", "Europe/Rome",
+    "Europe/Stockholm", "Europe/Vienna", "Europe/Warsaw", "Europe/Zurich",
+    "Pacific/Auckland", "Pacific/Honolulu",
+)
+
+#: The four write behaviours, in `task_settings.BOOLEAN_FIELDS` order:
+#: `(field, label, help)`. The label is what the setting does; the help names
+#: when it applies. The Tasks plugin's own setting of the same meaning is named
+#: in the help so a plugin user can match them, without the card assuming the
+#: plugin is in use.
+_TASK_FLAG_COPY: dict[str, tuple[str, str]] = {
+    "set_done_date": (
+        "Add a done date when a task is completed",
+        "Writes ✅ YYYY-MM-DD on the task when an agent marks it done. "
+        "(The Tasks plugin calls this “Set done date on every completed task”.)",
+    ),
+    "set_cancelled_date": (
+        "Add a cancelled date when a task is cancelled",
+        "Writes ❌ YYYY-MM-DD on the task when an agent cancels it. "
+        "(Tasks plugin: “Set cancelled date on every cancelled task”.)",
+    ),
+    "set_created_date": (
+        "Add a created date to new tasks",
+        "Writes ➕ YYYY-MM-DD on a task an agent adds, and on the next occurrence "
+        "of a recurring task. (Tasks plugin: “Set created date on every added task”.)",
+    ),
+    "next_recurrence_below": (
+        "Put the next occurrence of a recurring task below it",
+        "When a recurring task is completed, its next occurrence is inserted on "
+        "the line below the completed one instead of above it. "
+        "(Tasks plugin: “Next recurrence appears on the line below”.)",
+    ),
+}
+
+
+async def _task_settings_context(session: AsyncSession, uid: int | None, action: str) -> dict:
+    """The card's template context: stored values, defaults, effective values.
+
+    `stored` tells an explicit choice from an inherited default, which the
+    four three-way selects and the "server default" notes need; `effective`
+    is what the task tools will use (including a stored zone this build cannot
+    load, which falls back to UTC — shown, not hidden).
+    """
+    row = await task_settings.stored(session, uid)
+    effective = await task_settings.effective(session, uid)
+    defaults = task_settings.defaults()
+    flags = []
+    for field in task_settings.BOOLEAN_FIELDS:
+        label, help_text = _TASK_FLAG_COPY[field]
+        stored_value = getattr(row, field) if row is not None else None
+        flags.append({
+            "name": field,
+            "label": label,
+            "help": help_text,
+            # "default" | "on" | "off" — the select's current option.
+            "choice": "default" if stored_value is None else ("on" if stored_value else "off"),
+            "default": bool(getattr(defaults, field)),
+            "effective": bool(getattr(effective, field)),
+        })
+    return {
+        "tasks_card": {
+            "action": action,
+            "timezone": (row.timezone if row is not None else None) or "",
+            "default_timezone": defaults.timezone,
+            "effective_timezone": effective.timezone,
+            "timezone_fallback": effective.timezone_fallback,
+            "timezone_suggestions": TASK_TIMEZONE_SUGGESTIONS,
+            "excluded_folders": "\n".join(effective.excluded_folders),
+            "excluded_note_tags": "\n".join(effective.excluded_note_tags),
+            "max_entries": task_settings.TASK_SETTINGS_MAX_ENTRIES,
+            "flags": flags,
+        },
+    }
+
+
+async def _save_task_settings(
+    request: Request,
+    session: AsyncSession,
+    uid: int | None,
+    redirect_to: str,
+) -> RedirectResponse:
+    """Validate and save the card's form for scope `uid`, flash, 303.
+
+    Only the card's own field names are passed on, so an extra form field (a
+    `user_id`, say) never reaches the service. A refused save rolls back with
+    nothing written and flashes every problem; the redirected GET then shows
+    the values still stored.
+    """
+    form = await request.form()
+    payload: dict[str, Any] = {}
+    for name in ("timezone", "excluded_folders", "excluded_note_tags",
+                 *task_settings.BOOLEAN_FIELDS):
+        if name in form:
+            value = form.get(name)
+            payload[name] = value if isinstance(value, str) else ""
+    errors = await task_settings.save(session, uid, payload)
+    if errors:
+        await session.rollback()
+        flash(request, "Task settings not saved. " + " ".join(errors), ERR)
+        return RedirectResponse(redirect_to, status_code=303)
+    await session.commit()
+    flash(request, TASKS_SAVED_MESSAGE)
+    return RedirectResponse(redirect_to, status_code=303)
+
+
+@router.post("/account/tasks")
+async def save_account_task_settings(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    user=Depends(require_user_panel),
+):
+    """Save the signed-in user's own task settings (multi-user mode, #428).
+
+    404 in single-user mode, like every `/account` route. The scope is the
+    session user's id — never a request value.
+    """
+    _require_account_route()
+    uid = getattr(user, "id", None)
+    if not isinstance(uid, int):  # pragma: no cover - multi-user is always a User
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    return await _save_task_settings(request, session, uid, ACCOUNT_PATH)
+
+
+@router.post("/settings/tasks")
+async def save_single_user_task_settings(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    user=Depends(require_admin_panel),
+):
+    """Save the NULL-scope task settings (single-user mode, admin, #428).
+
+    404 in multi-user mode: there, the NULL-scope row is read by nobody and
+    each user edits their own row on `/account`; a route that wrote it would
+    be a control with no effect.
+    """
+    if settings.multi_user_mode:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    return await _save_task_settings(request, session, None, TASKS_SETTINGS_PATH)
 
 
 # --- Dashboard ------------------------------------------------------------
@@ -2790,6 +2979,12 @@ async def settings_page(
         "provider_ok": provider_ok,
         "provider": provider_card,
         "vault_path": settings.vault_path,
+        # #428: the Tasks card lives here only in single-user mode (the NULL
+        # scope); in multi-user mode each user edits their own on /account.
+        **(
+            await _task_settings_context(session, None, "/admin/settings/tasks")
+            if not settings.multi_user_mode else {}
+        ),
     }))
 
 

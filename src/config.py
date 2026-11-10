@@ -144,6 +144,59 @@ TASK_TAG_MAX_CHARS = 128
 TASK_MAX_TAGS = 64
 LIST_TASKS_MAX_TAG_ARGS = 32
 
+# The task tools (#428). Constants, not settings: each is part of a stated
+# contract (design D9, D10, D12), and none is an operator's tuning knob.
+#
+# - `TASK_REFRESH_LOCK_WAIT_MS`: the write-time task refresh's `lock_timeout`
+#   on the note's `notes_metadata` row. Past it the write stands and the
+#   response says `index: may lag (lock_timeout)` (D10).
+# - `TASK_SIMILAR_SCAN_MAX`: candidate rows `add_task`'s similar-task scan
+#   reads before it stops and says so (D9).
+# - `TASK_CONTEXT_MAX_LINES`: continuation lines stored and rendered as a
+#   task's context; placement never uses this cap (D8, D12).
+TASK_REFRESH_LOCK_WAIT_MS = 2_000
+TASK_SIMILAR_SCAN_MAX = 2_000
+TASK_CONTEXT_MAX_LINES = 8
+
+
+#: Names `zoneinfo.available_timezones()` can pick up from a host's OS zone
+#: directory that are not portable IANA zones: `localtime` is whatever the
+#: host is set to, `Factory` is a placeholder, `posixrules` a tzcode
+#: internal, and `posix/` / `right/` are alternative trees. A task setting must
+#: mean the same thing on every host, so these are refused everywhere.
+HOST_ONLY_ZONE_NAMES = frozenset({"localtime", "Factory", "posixrules"})
+_HOST_ONLY_ZONE_PREFIXES = ("posix/", "right/")
+
+
+def is_portable_zone_name(name: str) -> bool:
+    """True for a name that is neither a host-only pseudo-zone nor under one
+    of the alternative trees. Membership in the available set is separate."""
+    return name not in HOST_ONLY_ZONE_NAMES and not name.startswith(_HOST_ONLY_ZONE_PREFIXES)
+
+
+def _validate_timezone_name(value: str, *, variable: str) -> str:
+    """A zone name this build can load, or a ValueError naming `variable`.
+
+    Membership in `zoneinfo.available_timezones()` first — `ZoneInfo` alone
+    would also accept a file-system path that is not an IANA key — then a
+    load, so a listed but unreadable zone is refused too.
+    """
+    import zoneinfo
+
+    name = value.strip() if isinstance(value, str) else value
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"{variable} must name an IANA timezone, e.g. UTC or Europe/Berlin")
+    try:
+        if not is_portable_zone_name(name) or name not in zoneinfo.available_timezones():
+            raise KeyError(name)
+        zoneinfo.ZoneInfo(name)
+    except (KeyError, ValueError, OSError, zoneinfo.ZoneInfoNotFoundError):
+        raise ValueError(
+            f"{variable}={name!r} is not a timezone available to this build. "
+            "Use an IANA name such as UTC, Europe/Berlin or America/New_York."
+        ) from None
+    return name
+
 # Chunks embedded and stored for a single note. Unbounded, the arithmetic is
 # `MAX_NOTE_BYTES` (10 MiB) ÷ `CHUNK_SIZE` (512 tokens, ~4 characters each) ≈
 # 5,120 chunks for one legal note, each of them one sequential, 30 s-bounded
@@ -795,6 +848,34 @@ class Settings(BaseSettings):
     # Default **false**, so enabling this change is a no-op for every existing
     # client. Env: WRITE_PRECONDITION_REQUIRED.
     write_precondition_required: bool = False
+
+    # ── Task tools defaults (#428, design D14) ─────────────────────────────
+    #
+    # The values a scope's `task_settings` row falls back to, field by field,
+    # when the row (or the field) is NULL — which is every scope until someone
+    # saves the panel's Tasks card. The four booleans mirror the Obsidian
+    # Tasks plugin's own defaults, so with nothing configured the task tools
+    # write what the plugin would.
+    #
+    # `TASKS_DEFAULT_TIMEZONE` resolves "today" and relative dates. Validated
+    # here, so an unknown name refuses startup naming the variable (and refuses
+    # the migration init container too, which imports these settings: the same
+    # image carries the same zone data, so a name it refuses the app would
+    # refuse as well). `tzdata` is pinned in requirements.txt.
+    tasks_default_timezone: str = "UTC"
+    # "Set done date on every completed task" (✅ <date>).
+    tasks_set_done_date: bool = True
+    # "Set cancelled date on every cancelled task" (❌ <date>).
+    tasks_set_cancelled_date: bool = True
+    # "Set created date on every added task" (➕ <date>).
+    tasks_set_created_date: bool = False
+    # "Next recurrence appears on the line below".
+    tasks_next_recurrence_below: bool = False
+
+    @field_validator("tasks_default_timezone", mode="before")
+    @classmethod
+    def _validate_tasks_default_timezone(cls, v):
+        return _validate_timezone_name(v, variable="TASKS_DEFAULT_TIMEZONE")
 
     # Cap on how much note/file text a single read_note / read_file call may
     # return to the model. The byte caps above stop the server from reading a

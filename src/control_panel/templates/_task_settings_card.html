@@ -1,0 +1,101 @@
+{#
+  The Tasks settings card (#428, design D14), included by `account.html`
+  (multi-user mode: the signed-in user's own row) and `settings.html`
+  (single-user mode: the NULL-scope row). Context: `tasks_card`, built by
+  `routes._task_settings_context`; the form posts to `tasks_card.action`.
+
+  CSP (#195, #289): no inline handler, no `style=`, no `javascript:` URL, no
+  script — every control is a plain form field, so nothing here needs
+  `panel.js`. Classes are the panel's existing components and generated
+  utilities only.
+
+  The four write behaviours are three-way selects, not checkboxes: "server
+  default" (stored NULL, follows the environment) must stay expressible, and
+  `task_settings.save` reads the literal "default" as exactly that.
+#}
+<div class="card anim-3 u-margin-top-24px">
+    <div class="card-header">
+        <span class="card-title">Tasks</span>
+    </div>
+    <div class="card-body">
+        <div class="u-color-text-3 u-font-size-12px u-margin-bottom-14px">
+            How the task tools read and write checkbox tasks
+            (<code>- [ ] …</code>) in {% if multi_user_mode %}your{% else %}the{% endif %} notes.
+            These settings apply to {% if multi_user_mode %}your account only{% else %}every MCP caller of this server{% endif %}.
+        </div>
+        <form method="POST" action="{{ tasks_card.action }}">
+            {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
+
+            <div class="field">
+                <label class="field-label" for="task-timezone">Timezone</label>
+                <input type="text" name="timezone" id="task-timezone" class="field-input mono"
+                       list="task-timezone-names" maxlength="64" autocomplete="off" spellcheck="false"
+                       value="{{ tasks_card.timezone }}"
+                       placeholder="{{ tasks_card.default_timezone }} (server default)">
+                <datalist id="task-timezone-names">
+                    {% for name in tasks_card.timezone_suggestions %}<option value="{{ name }}"></option>
+                    {% endfor %}
+                </datalist>
+                <div class="u-font-size-11px u-color-text-3 u-margin-top-6px">
+                    What “today” means for task dates: relative dates such as
+                    <code>today</code> or <code>+3d</code>, and the date written when a task
+                    is completed, cancelled or added. Any IANA timezone name
+                    (for example <code>Europe/Berlin</code>); leave blank to use the server
+                    default, <code>{{ tasks_card.default_timezone }}</code>.
+                    In use now: <code>{{ tasks_card.effective_timezone }}</code>.
+                </div>
+                {% if tasks_card.timezone_fallback %}
+                <div class="alert alert-warning u-margin-top-8px u-font-size-12px">
+                    The stored timezone cannot be loaded by this server, so the task
+                    tools use UTC until it is changed.
+                </div>
+                {% endif %}
+            </div>
+
+            <div class="field">
+                <label class="field-label" for="task-excluded-folders">Excluded folders</label>
+                <textarea name="excluded_folders" id="task-excluded-folders" rows="4"
+                          class="field-input mono" spellcheck="false"
+                          placeholder="Archive/">{{ tasks_card.excluded_folders }}</textarea>
+                <div class="u-font-size-11px u-color-text-3 u-margin-top-6px">
+                    One folder per line, relative to the vault root. Tasks in these folders
+                    (and their subfolders) are left out of task listings by default;
+                    callers can still ask for everything. At most {{ tasks_card.max_entries }}.
+                </div>
+            </div>
+
+            <div class="field">
+                <label class="field-label" for="task-excluded-tags">Excluded note tags</label>
+                <textarea name="excluded_note_tags" id="task-excluded-tags" rows="4"
+                          class="field-input mono" spellcheck="false"
+                          placeholder="template">{{ tasks_card.excluded_note_tags }}</textarea>
+                <div class="u-font-size-11px u-color-text-3 u-margin-top-6px">
+                    One tag per line, with or without <code>#</code>. Tasks in notes carrying
+                    one of these tags, or a nested tag below it (<code>ticket/ops</code> under
+                    <code>ticket</code>), are left out of task listings by default; callers can
+                    still ask for everything. At most {{ tasks_card.max_entries }}.
+                </div>
+            </div>
+
+            {% for flag in tasks_card.flags %}
+            <div class="field">
+                <label class="field-label" for="task-flag-{{ flag.name }}">{{ flag.label }}</label>
+                <select name="{{ flag.name }}" id="task-flag-{{ flag.name }}" class="field-select">
+                    <option value="default"{% if flag.choice == "default" %} selected{% endif %}>Server default ({% if flag.default %}on{% else %}off{% endif %})</option>
+                    <option value="on"{% if flag.choice == "on" %} selected{% endif %}>On</option>
+                    <option value="off"{% if flag.choice == "off" %} selected{% endif %}>Off</option>
+                </select>
+                <div class="u-font-size-11px u-color-text-3 u-margin-top-6px">
+                    {{ flag.help }}
+                    In use now: {% if flag.effective %}on{% else %}off{% endif %}
+                    ({% if flag.choice == "default" %}server default{% else %}overridden here{% endif %}).
+                </div>
+            </div>
+            {% endfor %}
+
+            <div class="u-display-flex u-gap-10px u-margin-top-18px">
+                <button type="submit" class="btn btn-primary">Save task settings</button>
+            </div>
+        </form>
+    </div>
+</div>

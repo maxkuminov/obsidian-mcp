@@ -2,7 +2,6 @@
 
 ## Purpose
 How the index-backed read tools select and order notes: the one shared `folder` / `tags` / `frontmatter` filter helper, the filters each search and listing tool accepts, the total owner-scoping rule that keeps an ownerless caller from reading a named user's rows, and (#351) the `since` / `until` / `order_by` / `cursor` window on `get_recent` and `list_notes` with its UTC bound parser and owner-bound keyset cursor.
-
 ## Requirements
 ### Requirement: Shared filter helper
 
@@ -135,9 +134,19 @@ Calls that include the new `tags` or `frontmatter` parameters SHALL record them 
 
 ### Requirement: Read-path owner scoping is total
 
-The shared filter helper SHALL treat `user_id=None` as a scoping value, not as the absence of one: it SHALL append `notes_metadata.user_id IS NULL` when `user_id` is None and `notes_metadata.user_id = :uid` when it is an integer. Every index-backed read tool — `keyword_search`, `semantic_search`, `list_notes`, `get_recent`, `get_tags`, `get_backlinks`, `get_links`, `get_neighborhood`, `find_related`, `find_orphans`, `list_tasks`, and `get_changes` (over `note_events.user_id`) — SHALL scope its owner predicate by this same total mapping, so a caller with no user identifier can never read rows owned by a named user.
+The shared filter helper SHALL treat `user_id=None` as a scoping value, not as the absence of one: it SHALL append `notes_metadata.user_id IS NULL` when `user_id` is None, and `notes_metadata.user_id = :uid` when it is an integer.
 
-For the graph tools the mapping SHALL be closed over joins: any query that resolves `note_links.source_note_id` or `target_note_id` to a `notes_metadata` row SHALL require that row to be inside the caller's owned set as part of the join condition (not as a post-filter that would drop dangling-link rows), `list_tasks` SHALL resolve `note_tasks.note_id` to its `notes_metadata` row under the same mapping as part of the join, and neighborhood and orphan computations SHALL NOT let an edge whose other endpoint is outside the owned set influence membership, distance, or orphan status.
+Every index-backed read SHALL scope its owner predicate by this same total mapping, so a caller with no user identifier can never read rows owned by a named user. That covers these tools and lookups:
+
+- `keyword_search`, `semantic_search`, `list_notes`, `get_recent` and `get_tags`;
+- `get_backlinks`, `get_links`, `get_neighborhood`, `find_related` and `find_orphans`;
+- `list_tasks` and `task_agenda`;
+- `get_changes` (over `note_events.user_id`);
+- the index lookups of the task write tools: `add_task`'s duplicate and similarity scans, and the write-time task refresh's row lookup.
+
+**Joins.** For the graph tools the mapping SHALL be closed over joins: any query that resolves `note_links.source_note_id` or `target_note_id` to a `notes_metadata` row SHALL require that row to be inside the caller's owned set as part of the join condition, not as a post-filter that would drop dangling-link rows. `list_tasks`, `task_agenda` and the task write tools' index lookups SHALL resolve `note_tasks.note_id` to its `notes_metadata` row under the same mapping, as part of the join.
+
+**Graph membership.** Neighborhood and orphan computations SHALL NOT let an edge whose other endpoint is outside the owned set influence membership, distance or orphan status.
 
 #### Scenario: Ownerless read on a mixed database returns only NULL-owned rows
 
@@ -170,6 +179,11 @@ For the graph tools the mapping SHALL be closed over joins: any query that resol
 
 - **WHEN** a named user's notes hold open tasks and `list_tasks` runs with no user identifier
 - **THEN** none of those tasks, paths or headings SHALL appear in the result, and neither SHALL they be counted in its header
+
+#### Scenario: task_agenda and add_task stay in their owner scope
+
+- **WHEN** user 8's notes hold overdue tasks and a task identical to one user 7 adds, and user 7 calls `task_agenda` and `add_task`
+- **THEN** no user-8 task SHALL appear in the agenda, in its counts, in a `duplicate_task` refusal or in the similar-task list
 
 #### Scenario: get_changes on a mixed database
 
@@ -242,3 +256,4 @@ When a call uses any of `since`, `until`, `order_by` or `cursor`, returns `limit
 #### Scenario: Cursor bound to its filters
 - **WHEN** an agent passes a cursor from a `folder="Projects/"` listing to a call with `folder="Cards/"`
 - **THEN** the call SHALL be refused with `invalid_argument`
+

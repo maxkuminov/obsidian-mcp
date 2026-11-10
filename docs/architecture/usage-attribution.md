@@ -804,6 +804,36 @@ writes NULL on every log row and every note, and `usage_logs.user_id` is
 than vanishing. That is the honest reading — those rows *are* now unattributed
 — and it is the same treatment the ownerless indexer passes get.
 
+## What the task tools log (#428)
+
+The task tools log through the same `_tracked` named-parameter list and the
+#310 renderer as every other tool. **Ids and flags, never task text.**
+
+| Tool | Logged arguments | Result-side keys |
+| --- | --- | --- |
+| `complete_task` | `path`, `id`, `done_on`, `dry_run`, `expected_hash` (as presence: `true` / `false`) | `task_refresh`, `task_write_attempts` |
+| `update_task` | `path`, `id`, `status`, `clear`, `dry_run`, `expected_hash` (presence) | `fields` (the **names** of the fields set), `task_refresh`, `task_write_attempts` |
+| `add_task` | `path`, `section`, `dry_run`, `allow_duplicate` | `similar_count`, `task_refresh`, `task_write_attempts` |
+| `task_agenda` | `date`, `days`, `folder`, `tags`, `exclude_tags`, `scope` | |
+| `list_tasks` | the #350 arguments plus every new one, `text` included | |
+
+- **Never logged**: the `text`, `append_context` and `context` of a write
+  tool, and any field value `update_task` sets (the due date, the rule
+  text): only the field names. A task's description is note content.
+- `list_tasks(text=…)` **is** logged, like `keyword_search`'s `query`: it is
+  the caller's search terms, not note content, cut at 200 characters as
+  every top-level string is.
+- `task_refresh` is `refreshed`, `lagged:<code>` (`lock_timeout`,
+  `root_changed`, `not_indexed`, `superseded`, `not_utf8`,
+  `derivation_failed`, `error`) or `skipped` (a dry run or a no-change call:
+  nothing was published). A lag is **not an error marker**: the write
+  stands, and the response said `index: may lag (<code>)`.
+- `task_write_attempts` appears only when the in-call conflict retry ran (2
+  or 3); `similar_count` is the number of similar open tasks `add_task`
+  listed.
+- Attribution, actor columns and change-feed principals are exactly
+  `edit_note`'s, with `tool` set to the task tool's name.
+
 ## The change feed's actor columns (#351)
 
 `note_events` carries its own denormalised attribution, written by the tool

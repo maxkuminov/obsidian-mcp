@@ -11,7 +11,9 @@ from src.mcp_server.auth import current_permission
 from src.mcp_server.read_result import ReadNoteResult
 from src.mcp_server.tool_permissions import visible
 from src.mcp_server.tools import (
+    add_task_impl,
     check_upload_impl,
+    complete_task_impl,
     create_note_impl,
     delete_file_impl,
     delete_note_impl,
@@ -38,6 +40,8 @@ from src.mcp_server.tools import (
     search_notes_impl,
     semantic_search_impl,
     set_frontmatter_impl,
+    task_agenda_impl,
+    update_task_impl,
     write_file_impl,
 )
 
@@ -109,11 +113,12 @@ def _origin_patterns(origins) -> list[str]:
 #
 # The classification, pinned by `tests/test_issue_343_tool_metadata.py`
 # against the code rather than a list:
-#   read-only   = the eighteen tools that neither change vault bytes nor mint a
-#                 capability (idempotent, closed-world)
+#   read-only   = the nineteen tools that neither change vault bytes nor mint
+#                 a capability (idempotent, closed-world)
 #   destructive = the write-bucket set (`_tracked(write_class=True)`) minus
-#                 `create_note` (no-clobber, additive) plus `request_upload`
-#                 (its `overwrite=True` capability overwrites on redemption)
+#                 `create_note` (no-clobber, additive) and `add_task` (inserts
+#                 one line, removes no byte; #428) plus `request_upload` (its
+#                 `overwrite=True` capability overwrites on redemption)
 #   open-world  = `import_from_url` only
 # A `.trash/` undo path does not make a delete non-destructive, and the hints
 # are per tool, not per call: `edit_note(dry_run=True)` is still "destructive".
@@ -162,9 +167,11 @@ SERVER_INSTRUCTIONS = (
     "link graph is `get_backlinks`, `get_links`, `get_neighborhood`, "
     "`find_related` and `find_orphans`. Deletes are soft (`.trash/`) unless "
     "`permanent=true`. Calls are rate-limited per credential; a rate refusal "
-    "says when to retry and spends no daily quota. `list_tasks` lists checkbox "
-    "tasks across the vault from the index; Tasks-plugin query blocks are text "
-    "it does not evaluate."
+    "says when to retry and spends no daily quota. `list_tasks` and "
+    "`task_agenda` list checkbox tasks from the index (Tasks-plugin query "
+    "blocks are text they do not evaluate); `complete_task` and `update_task` "
+    "change one task, named by its note `path` plus the task id a listing "
+    "prints, and `add_task` inserts one."
 )
 
 
@@ -1323,57 +1330,94 @@ async def list_tasks(
     tags: list[str] | None = None,
     limit: int = 100,
     cursor: str | None = None,
+    due_from: str | None = None,
+    scheduled_from: str | None = None,
+    done_from: str | None = None,
+    done_by: str | None = None,
+    undated: bool | None = None,
+    has_due: bool | None = None,
+    text: str | None = None,
+    priority: list[str] | None = None,
+    recurring: bool | None = None,
+    exclude_tags: list[str] | None = None,
+    path: str | None = None,
+    order_by: str = "due",
+    detail: str = "full",
+    context: bool = False,
+    scope: str = "default",
 ) -> str:
     """List checkbox tasks (`- [ ] …`) across the vault in one call, from the index — no note is read.
 
-    Reads the index, refreshed each pass (default every 300 s): a just-edited
-    note may show its previous tasks until the next pass. Tasks-plugin and
-    Dataview query blocks are fenced text and are not evaluated; only the
-    checkbox lines themselves are tasks. A checkbox inside a fenced code block
-    or inline code is not a task.
+    For a dated overview (overdue, due today, scheduled, upcoming) use
+    `task_agenda`; use `list_tasks` to filter, search and page. Plain
+    checkboxes work; Tasks-plugin emoji fields (📅 due, ⏳ scheduled, 🛫 start,
+    ✅ done, 🔁 recurrence, priority) are optional and read when present. Query
+    blocks are text and are not evaluated; a checkbox in code is not a task.
+    The index follows each pass (default every 300 s); task writes refresh it
+    at once.
 
-    Status: `[ ]`, `[/]` (in progress) and any other marker are `open`; `[x]`
-    and `[X]` are `done`; `[-]` is `cancelled` — excluded from `open`,
-    included in `all`. Each line shows the raw marker.
+    Each row: the raw marker, the path in backticks with `:line`, `— id <id>`,
+    the dates, priority, tags, `under:` heading and `text:` last. In a path,
+    whitespace and a backtick are shown as `\\n`, `\\t`, `\\uXXXX`
+    (a backtick is `\\u0060`) and `\\` as `\\\\`; the write tools take the
+    unescaped path.
+    `complete_task` and `update_task` take that id with the path; an id shaped
+    `<key>.<i>of<n>` (identical lines) also needs `expected_hash`, the note's
+    `content_hash` from `read_note`. `detail="brief"` prints one short line per
+    task; `context=true` adds the indented lines under each task (`┆`).
 
-    Ordering: due date ascending, undated tasks last, then path, then line.
-    When more rows match than fit, the header says `more: yes` and the
-    response ends with `next: <cursor>`; pass it back as `cursor` with the same
-    filters to continue. A cursor from other filters or another owner is
-    refused (`invalid_argument`); so is a compact cursor whose note has since
-    gone — start again without one.
+    Status: `[ ]`, `[/]` and other markers are `open`; `[x]`/`[X]` are `done`;
+    `[-]` is `cancelled` (only in `cancelled` and `all`). Dates accept
+    `YYYY-MM-DD`, `today`, `tomorrow`, `yesterday`, `+Nd` or `-Nd`, resolved in
+    your task timezone (the query line states it and each resolved date).
+    `*_from` / `*_by` are inclusive and exclude tasks without that date.
 
-    Each task is one line: the marker, the path in backticks with `:line`, then any of due,
-    scheduled, start and done dates, priority, the task's own `#tags`, the
-    heading path (`under:`), and `text:` last, as written (Tasks-plugin
-    emoji included). Text past 1,000 characters is cut and labelled; a task
-    whose tags were capped (64 kept) says `tags cut`. A first row too long for
-    the response is shown abbreviated rather than skipped.
-
-    The header always states `not yet scanned for tasks` (notes the index has
-    not re-derived yet, e.g. right after an upgrade), `tasks could not be
-    indexed` and `over the task cap` (5,000 per note), each even when zero, and
-    with `tags` the count of tasks whose tags were cut. When either of the
-    first two is non-zero the list is incomplete and the response says so —
-    "no tasks" then does not mean none exist.
+    The header always states what the index could not show — notes not yet
+    scanned, tasks that could not be indexed, notes over the 5,000-task cap,
+    ids pending — and, under `scope="default"`, how many tasks your excluded
+    folders and note tags removed, so "no tasks" does not mean none exist.
+    When more rows match, the header says `more: yes` and the response ends
+    `next: <cursor>`: pass it back with the same arguments. A cursor from other
+    arguments, an older server version, or a relative-date query continued
+    after midnight is refused (`invalid_argument`): start again without one.
+    `response_cap_too_small`: the response cap cannot hold one row.
 
     Args:
         folder: Only notes under this path prefix (e.g. "Projects/").
         status: `open` (default), `done`, `cancelled` or `all`.
-        due_by: `YYYY-MM-DD`; only tasks due on or before this date. Tasks
-            with no due date are excluded when it is given.
-        scheduled_by: `YYYY-MM-DD`; only tasks scheduled on or before this
-            date. Tasks with no scheduled date are excluded when it is given.
-        tags: Only tasks carrying every one of these inline tags on the task
-            line itself (a leading `#` is optional; note-level tags are not
-            consulted). At most 32, each 1–128 characters.
-        limit: Maximum tasks per page (1–500, default 100). The response size
-            cap can end a page sooner; `next` then continues it.
+        due_by: Due on or before this date.
+        scheduled_by: Scheduled on or before this date.
+        tags: Tasks carrying every one of these tags on the task line, matched
+            by `/` segment and case-insensitively (`a` matches `#a` and `#A/b`,
+            not `#ab`). At most 32, a leading `#` optional.
+        limit: Tasks per page, 1–500 (default 100).
         cursor: The `next` value from the previous page of the same query.
+        due_from: Due on or after this date.
+        scheduled_from: Scheduled on or after this date.
+        done_from: Done on or after this date.
+        done_by: Done on or before this date.
+        undated: true — neither a due nor a scheduled date; false — at least one.
+        has_due: true — with a due date; false — without.
+        text: 1–256 characters, at most 8 words; every word must occur in the
+            task's text, case-insensitively.
+        priority: Any of `highest`, `high`, `medium`, `none`, `low`, `lowest`.
+        recurring: true — with a 🔁 rule; false — without.
+        exclude_tags: Drop tasks carrying any of these tags (matched as `tags`).
+        path: Exactly this note.
+        order_by: `due` (default, undated last), `priority`, `scheduled`,
+            `done` (newest first) or `path`.
+        detail: `full` (default) or `brief`.
+        context: true to include each task's indented context lines.
+        scope: `default` applies your task settings' excluded folders and note
+            tags; `all` ignores them.
     """
     return await list_tasks_impl(
         folder=folder, status=status, due_by=due_by, scheduled_by=scheduled_by,
-        tags=tags, limit=limit, cursor=cursor,
+        tags=tags, limit=limit, cursor=cursor, due_from=due_from,
+        scheduled_from=scheduled_from, done_from=done_from, done_by=done_by,
+        undated=undated, has_due=has_due, text=text, priority=priority,
+        recurring=recurring, exclude_tags=exclude_tags, path=path,
+        order_by=order_by, detail=detail, context=context, scope=scope,
     )
 
 
@@ -1504,6 +1548,318 @@ async def hybrid_search(
     return await hybrid_search_impl(
         query, limit=limit, folder=folder, tags=tags, frontmatter=frontmatter,
         rerank=rerank,
+    )
+
+
+# The task tools of #428, registered after every other tool in this order
+# (design D15), so the first 28 entries of `tools/list` keep their order; the
+# four are appended to `tests/fixtures/tools_list_schema_additions.json`.
+@mcp.tool(title="Task agenda", annotations=_READ_ONLY)
+async def task_agenda(
+    date: str = "today",
+    days: int = 7,
+    folder: str | None = None,
+    tags: list[str] | None = None,
+    exclude_tags: list[str] | None = None,
+    scope: str = "default",
+) -> str:
+    """A dated overview of open tasks in one call, from the index: overdue, due today, scheduled and now due, and upcoming.
+
+    Use `list_tasks` to filter, search or page through tasks in general; use
+    `task_agenda` for "what is due". Plain checkboxes work; only tasks with a
+    Tasks-plugin date (📅 due, ⏳ scheduled) can be dated, and the emoji fields
+    are otherwise optional.
+
+    Sections, each counted and disjoint — every open task due on or before
+    `date + days`, or scheduled on or before `date`, is in exactly one:
+    - overdue: due before `date`;
+    - due today: due on `date`;
+    - scheduled and now due: scheduled on or before `date` with no due date,
+      or with a due date after the window;
+    - upcoming: due in the `days` days after `date`, grouped by due date.
+
+    Rows are brief: marker, id, the path in backticks with `:line` (escaped
+    as in `list_tasks`; pass it unescaped), dates,
+    priority, tags and description. `complete_task` and `update_task` take
+    that id with the path. A section shows at most 25 rows (overdue, due
+    today), 15 (each scheduled part) or 50 (upcoming); one with more ends
+    `continue: list_tasks(…)` — the exact `list_tasks` arguments, dates
+    resolved, with a `cursor` when rows were shown — to be called with this
+    call's folder, tags, exclude_tags and scope.
+
+    The header states the timezone and date used, `days`, the scope,
+    `excluded by scope: N`, and what the index could not show (notes not yet
+    scanned, tasks that could not be indexed, notes over the task cap, ids
+    pending), so an empty section does not mean no tasks exist. Invalid
+    arguments are refused `invalid_argument`; `response_cap_too_small` means
+    the deployment's response cap is under 2,800 characters.
+
+    Args:
+        date: The day to report on: `YYYY-MM-DD`, `today` (default),
+            `tomorrow`, `yesterday`, `+Nd` or `-Nd`, in your task timezone.
+        days: The upcoming window in days, 1–31 (default 7).
+        folder: Only notes under this path prefix (e.g. "Projects/").
+        tags: Only tasks carrying every one of these tags, matched by `/`
+            segment and case-insensitively. At most 32.
+        exclude_tags: Drop tasks carrying any of these tags.
+        scope: `default` applies your task settings' excluded folders and note
+            tags; `all` ignores them.
+    """
+    return await task_agenda_impl(
+        date=date, days=days, folder=folder, tags=tags,
+        exclude_tags=exclude_tags, scope=scope,
+    )
+
+
+@mcp.tool(title="Complete task", annotations=_DESTRUCTIVE)
+async def complete_task(
+    path: str,
+    id: str,
+    done_on: str | None = None,
+    dry_run: bool = False,
+    expected_hash: str | None = None,
+) -> str:
+    """Mark one task done — `[x]` and `✅ <date>` — and, for a recurring task, write its next occurrence in the same edit. Requires write permission (a `readwrite` API key or OAuth scope).
+
+    Arguments: `path` and `id` (both from a listing), `done_on`, `dry_run` and
+    the `expected_hash` precondition.
+    Every refusal the server raises ends with one machine-readable
+    `MCP-REFUSAL {"code":…}` line and writes nothing; an undeclared or
+    mistyped argument is rejected by protocol validation before the tool runs
+    and carries no such line.
+
+    The id, from a `list_tasks` or `task_agenda` row, is re-checked against
+    the note's current text, never a line number, so the call changes only
+    the line it names or
+    refuses. A task's id changes whenever its line changes; the response
+    returns the new one. An id shaped `<key>.<i>of<n>` names one of several
+    identical lines and is accepted only with `expected_hash`, the note's
+    `content_hash` from `read_note`; without it the call is refused
+    `precondition_required`.
+
+    Plain checkboxes work; Tasks-plugin emoji fields are optional. Any open
+    marker (`[ ]`, `[/]`, `[>]`…) becomes `[x]`. Whether `✅` is added, where
+    a next occurrence goes (above the task, or below its indented lines) and
+    whether it gets `➕ <today>` follow your task settings, which default to
+    the Tasks plugin's. Recurrence rules supported: every day / N days /
+    weekday / week / N weeks / week on <weekdays> / <weekdays> / month /
+    N months / month on the <Nth> / month on the last / year / N years /
+    <month> on the <Nth>, each optionally `when done`. Any other rule refuses
+    the whole completion: a recurring task is never completed without its
+    next occurrence.
+
+    `dry_run=true` returns the diff and the new line(s) and writes nothing.
+    `expected_hash` is optional otherwise and binds the whole note (refused
+    `stale_precondition` if it changed). Without it, a change made by someone
+    else during the call is retried from a fresh read, at most 3 attempts,
+    then refused `concurrent_write`.
+
+    The response gives the new line and id, the next occurrence's line,
+    position and id, `content_hash`, the timezone and dates resolved, and
+    `index: refreshed` (listings already show the change) or
+    `index: may lag (<reason>)` (the write stands; the next index pass
+    catches up).
+
+    Codes: `task_not_found` (the line changed since the listing: list again),
+    `task_ambiguous` (lists the suffixed ids), `task_changed`,
+    `precondition_required`, `stale_precondition`, `malformed_precondition`,
+    `concurrent_write`,
+    `already_completed`, `task_cancelled` (reopen it with
+    `update_task(status="open")` first), `recurrence_unsupported`,
+    `on_completion_unsupported` (`🏁 delete`), `task_malformed` (fix the line
+    with `edit_note`), `content_unsafe` (a malformed frontmatter block: the
+    refusal names the repair), `size_limit`, `invalid_argument`, `not_found`,
+    `permission_denied`.
+
+    Args:
+        path: The note's vault-relative path, unescaped (a listing shows
+            `\\`-escapes).
+        id: The task id from a `list_tasks` or `task_agenda` row.
+        done_on: The completion date: `YYYY-MM-DD`, `today` (default),
+            `yesterday`, `+Nd` or `-Nd`, in your task timezone.
+        dry_run: Preview the change without writing.
+        expected_hash: The note's `content_hash` from `read_note`; required
+            with a suffixed id.
+    """
+    return await complete_task_impl(
+        path, id, done_on=done_on, dry_run=dry_run, expected_hash=expected_hash
+    )
+
+
+@mcp.tool(title="Update task", annotations=_DESTRUCTIVE)
+async def update_task(
+    path: str,
+    id: str,
+    due: str | None = None,
+    scheduled: str | None = None,
+    start: str | None = None,
+    priority: str | None = None,
+    add_tags: list[str] | None = None,
+    remove_tags: list[str] | None = None,
+    recurrence: str | None = None,
+    status: str | None = None,
+    text: str | None = None,
+    append_context: str | None = None,
+    clear: list[str] | None = None,
+    dry_run: bool = False,
+    expected_hash: str | None = None,
+) -> str:
+    """Change one task's dates, priority, tags, recurrence, status, description or context, in place. Requires write permission (a `readwrite` API key or OAuth scope).
+
+    Arguments: `path` and `id` (both from a listing); the changes `due`,
+    `scheduled`, `start`, `priority`, `add_tags`, `remove_tags`, `recurrence`,
+    `status`, `text`, `append_context` and `clear`; `dry_run` and the
+    `expected_hash` precondition.
+    Every refusal the server raises ends with one machine-readable
+    `MCP-REFUSAL {"code":…}` line and writes nothing; an undeclared or
+    mistyped argument is rejected by protocol validation before the tool runs
+    and carries no such line.
+
+    The id, from a `list_tasks` or `task_agenda` row, is re-checked against
+    the note's current text, never a line number, so the call changes only
+    the line it names or refuses. A task's id changes whenever its line
+    changes; the response returns the new one. An id shaped `<key>.<i>of<n>`
+    names one of several identical lines and is accepted only with
+    `expected_hash`, the note's `content_hash` from `read_note`; without it
+    the call is refused `precondition_required`. To complete a task use
+    `complete_task`.
+
+    Only the named fields change: a value is replaced where it stands, an
+    added field goes into the trailing emoji fields, and every other
+    character of the line and the note is kept. Plain checkboxes work;
+    Tasks-plugin fields are added as you set them. `text` replaces the
+    description's words and keeps its tags; only `remove_tags` removes a tag
+    (whole tags, case-insensitive). `status`: `open` (`[ ]`) or `in_progress`
+    (`[/]`) drop `✅`/`❌`; `cancelled` (`[-]`) adds `❌ <today>` per your task
+    settings and never writes a next occurrence. `append_context` adds one
+    indented `- <text>` line after everything already under the task.
+
+    `dry_run=true` returns the diff and the new line(s) and writes nothing.
+    `expected_hash` is optional otherwise and binds the whole note (refused
+    `stale_precondition` if it changed). Without it, a change made by someone
+    else during the call is retried from a fresh read, at most 3 attempts,
+    then refused `concurrent_write`. A call that would change nothing answers
+    `No changes`. The response names the fields changed and gives the new
+    line and id, `content_hash`, the timezone and dates resolved, and
+    `index: refreshed` or `index: may lag (<reason>)` (the write stands).
+
+    Codes: `task_not_found` (the line changed since the listing: list again),
+    `task_ambiguous`, `task_changed`, `precondition_required`,
+    `stale_precondition`, `malformed_precondition`, `concurrent_write`,
+    `recurrence_unsupported`, `task_malformed` (fix the line with
+    `edit_note`), `content_unsafe` (a malformed frontmatter block: the
+    refusal names the repair), `size_limit`, `invalid_argument` (also
+    `status="done"`), `not_found`, `permission_denied`.
+
+    Args:
+        path: The note's vault-relative path, unescaped (a listing shows
+            `\\`-escapes).
+        id: The task id from a `list_tasks` or `task_agenda` row.
+        due: New due date (📅), a date form as above.
+        scheduled: New scheduled date (⏳), same forms.
+        start: New start date (🛫), same forms.
+        priority: `highest`, `high`, `medium`, `low` or `lowest`.
+        add_tags: Tags to add (at most 32).
+        remove_tags: Tags to remove.
+        recurrence: A 🔁 rule from the grammar `complete_task` lists.
+        status: `open`, `in_progress` or `cancelled`.
+        text: The new description: one line, 1–1,000 characters, no emoji.
+        append_context: One line of context to add under the task.
+        clear: Fields to remove: any of `due`, `scheduled`, `start`,
+            `priority`, `recurrence`.
+        dry_run: Preview the change without writing.
+        expected_hash: `content_hash` from `read_note`; needed for a suffixed id.
+    """
+    return await update_task_impl(
+        path, id, due=due, scheduled=scheduled, start=start, priority=priority,
+        add_tags=add_tags, remove_tags=remove_tags, recurrence=recurrence,
+        status=status, text=text, append_context=append_context, clear=clear,
+        dry_run=dry_run, expected_hash=expected_hash,
+    )
+
+
+@mcp.tool(title="Add task", annotations=_ADDITIVE)
+async def add_task(
+    path: str,
+    text: str,
+    section: str | None = None,
+    due: str | None = None,
+    scheduled: str | None = None,
+    start: str | None = None,
+    priority: str | None = None,
+    tags: list[str] | None = None,
+    recurrence: str | None = None,
+    context: str | None = None,
+    allow_duplicate: bool = False,
+    dry_run: bool = False,
+    expected_hash: str | None = None,
+) -> str:
+    """Insert one new task line (`- [ ] <text>`) into an existing note, next to its task list. Requires write permission (a `readwrite` API key or OAuth scope).
+
+    Arguments: `path`, `text`, `section`; the fields `due`, `scheduled`,
+    `start`, `priority`, `tags`, `recurrence`; `context`, `allow_duplicate`,
+    `dry_run` and the optional `expected_hash` precondition.
+    Every refusal the server raises ends with one machine-readable
+    `MCP-REFUSAL {"code":…}` line and writes nothing; an undeclared or
+    mistyped argument is rejected by protocol validation before the tool runs
+    and carries no such line.
+
+    The note must exist; this tool never creates one (use `create_note`).
+    The line is placed after the last top-level task of the region — the
+    `section` heading's body, or the whole note — and after everything
+    indented under that task, copying its list marker and quote prefix; with
+    no task there it goes after the region's last line, and in an empty
+    section right under the heading. Nothing else in the note changes.
+
+    Plain checkboxes work; Tasks-plugin fields are written only for the
+    arguments you give, in the plugin's order: `#tags`, priority, 🔁 rule,
+    ➕ created (per your task settings), 🛫 start, ⏳ scheduled, 📅 due.
+    `context` adds one indented `- <text>` line under the new task.
+
+    An open task with the same description (case, spacing and Unicode form
+    ignored; tags count) in this note, or elsewhere in your default scope, is
+    refused `duplicate_task`, naming up to 5 matches; `allow_duplicate=true`
+    adds it anyway. Up to 5 similar open tasks are listed in the response and
+    the dry run, and never block. The response gives the new line and its id
+    (for `complete_task` / `update_task`), `content_hash`, the timezone and
+    dates resolved, and `index: refreshed` or `index: may lag (<reason>)`
+    (the write stands).
+
+    `dry_run=true` returns the diff, the new line(s) and the similar tasks,
+    and writes nothing. `expected_hash` is optional, even where the deployment
+    requires preconditions (adding a line removes nothing); when given it
+    binds the whole note (refused `stale_precondition` if it changed).
+    Without it, a change made by someone else during the call is retried from
+    a fresh read, at most 3 attempts, then refused `concurrent_write`.
+
+    Codes: `duplicate_task`, `not_found`, `selector_unresolved` (no such section),
+    `content_unsafe` (a malformed frontmatter block or an unclosed indented
+    fence: the refusal names the repair), `recurrence_unsupported`,
+    `stale_precondition`, `concurrent_write`, `task_malformed`, `size_limit`,
+    `invalid_argument`, `permission_denied`.
+
+    Args:
+        path: The existing note's vault-relative path.
+        text: The task description: one line, 1–1,000 characters, no field
+            emoji (pass dates and the rest as arguments).
+        section: A heading, as `edit_note` addresses one (`Parent/Child`, or a
+            `#N` ordinal); omit for the whole note.
+        due: Due date (📅): `YYYY-MM-DD`, `today`, `tomorrow`, `yesterday`,
+            `+Nd` or `-Nd`, in your task timezone.
+        scheduled: Scheduled date (⏳), same forms.
+        start: Start date (🛫), same forms.
+        priority: `highest`, `high`, `medium`, `low` or `lowest`.
+        tags: Tags for the task, e.g. ["errand"] (at most 32).
+        recurrence: A 🔁 rule from the grammar `complete_task` lists.
+        context: One line of context under the task.
+        allow_duplicate: Add even if an identical open task exists.
+        dry_run: Preview the change without writing.
+        expected_hash: Optional; the note's `content_hash` from `read_note`.
+    """
+    return await add_task_impl(
+        path, text, section=section, due=due, scheduled=scheduled, start=start,
+        priority=priority, tags=tags, recurrence=recurrence, context=context,
+        allow_duplicate=allow_duplicate, dry_run=dry_run, expected_hash=expected_hash,
     )
 
 

@@ -30,6 +30,7 @@ from src.mcp_server.auth import current_permission
 from src.models.db import NoteEmbedding, NoteLink, NoteMetadata, NoteTask, User
 from src.services import embeddings as embeddings_service
 from src.services import indexer, indexer_health
+from src.services import task_line
 from src.services import vault as vault_service
 from src.services.search import full_text_search
 import _harness
@@ -210,6 +211,9 @@ async def assert_isolated(sessionmaker, bad: str, *, others: dict[str, list[str]
     row = await note(sessionmaker, bad)
     assert row is not None, "the note keeps its row"
     assert row.tasks_failed is True
+    # #428: the failure mark describes those bytes, so the note is not
+    # re-read every pass (as before, it is retried when its content changes).
+    assert row.tasks_source_hash == row.content_hash
     assert await tasks_of(sessionmaker, bad) == []
     assert indexer.quarantined_paths(None) == []
     assert indexer.quarantine_count() == 0
@@ -241,7 +245,16 @@ async def test_frontmatter_lines_count_and_fields_land(sessionmaker, vault):
         6, datetime.date(2026, 11, 1), "high", ["work"], "open",
     )
     row = await note(sessionmaker, "f.md")
-    assert row.extraction_version == indexer.CURRENT_EXTRACTION_VERSION == 4
+    assert row.extraction_version == indexer.CURRENT_EXTRACTION_VERSION == 5
+    # #428: the pass records which bytes the rows describe, and every
+    # version-5 column is written.
+    assert row.tasks_source_hash == row.content_hash
+    assert row.tasks_refreshed_at is None
+    assert (t.task_key, t.key_ordinal, t.key_count) == (
+        task_line.task_key("ship 📅 2026-11-01 ⏫ #work"), 1, 1,
+    )
+    assert t.tag_prefixes == ["work"] and t.text_fold == "ship 📅 2026-11-01 ⏫ #work"
+    assert t.description_key is not None and t.context is None
 
 
 async def test_deleting_a_note_removes_its_tasks(sessionmaker, vault):
@@ -292,7 +305,7 @@ async def test_an_unlistable_directory_keeps_its_tasks(sessionmaker, vault):
         assert await tasks_of(sessionmaker, "sub/a.md") == ["protected"]
 
 
-async def test_the_v3_to_v4_backfill_stamps_4_and_re_embeds_nothing(
+async def test_the_v3_backfill_stamps_the_current_version_and_re_embeds_nothing(
     sessionmaker, vault, monkeypatch
 ):
     write(vault, "old.md", "body\n- [ ] backfilled\n[[x]]\n")
@@ -314,7 +327,7 @@ async def test_the_v3_to_v4_backfill_stamps_4_and_re_embeds_nothing(
     await indexer.index_vault()
     await indexer.embed_vault()
     after = await note(sessionmaker, "old.md")
-    assert after.extraction_version == 4
+    assert after.extraction_version == indexer.CURRENT_EXTRACTION_VERSION == 5
     assert after.embedded_content_hash == before.embedded_content_hash == after.content_hash
     assert await tasks_of(sessionmaker, "old.md") == ["backfilled"]
     assert "not yet scanned for tasks: 0 notes" in await tools.list_tasks_impl()

@@ -164,7 +164,7 @@ vanished from the page, so the operator saw a blank space that read as success.
   `readwrite` for a client not registered for it *and* clamps what it writes,
   and `_handle_refresh` re-clamps on every rotation — otherwise a scope raised
   above the registration survives forever (#67).
-- **A `read` grant lists 19 tools, not 28** (#358). `tools/list` omits the nine
+- **A `read` grant lists 20 tools, not 32** (#358; 19 of 28 before #428). `tools/list` omits the twelve
   write-required tools (`tool_permissions.WRITE_REQUIRED_TOOLS`) for an OAuth
   grant without `readwrite` — the preselected consent choice, so the common
   case. The list is decided per request from `token_has_write`, the same

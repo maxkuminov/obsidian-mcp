@@ -384,9 +384,10 @@ BACKUP_RETAIN_MIN ?= 7
 # and `alembic_version`, so a restore followed by `alembic check` is clean and
 # the first pass after it rebuilds the rows from the vault. `BACKUP_FULL=1`
 # dumps everything (a weekly cron line, if restore time matters more than
-# dump size). The other twelve tables are durable — users, credentials, OAuth
+# dump size). Every other table is durable — users, credentials, OAuth
 # grants, transfer tokens, sessions, usage, quotas, backups_log, the
-# concurrency evidence — and are always dumped. The same list is written out
+# concurrency evidence, the change feed, task_settings (#428) — and is always
+# dumped. The same list is written out
 # in deploy/kubernetes/components/db-backup/configmap.yaml, and
 # tests/test_backup_derived_tables.py pins both against src/models/db.py.
 BACKUP_DERIVED_TABLES := notes_metadata note_embeddings note_links note_tasks indexer_runs indexer_state

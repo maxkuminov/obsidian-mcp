@@ -7,7 +7,9 @@
 #     are a cache of the vault that the indexer rebuilds after a restore,
 #     and their rows are the bulk of every dump. BACKUP_FULL=1 dumps them
 #     too (a second, weekly CronJob if restore time matters). Keep the list
-#     equal to BACKUP_DERIVED_TABLES in the Makefile (#348).
+#     equal to BACKUP_DERIVED_TABLES in the Makefile (#348). Every other
+#     table (task_settings included, #428) is durable and dumped with its
+#     rows.
 #   * A dump that fails `gzip -t`, or lacks pg_dump's end-of-dump trailer
 #     (empty or truncated), is deleted and the Job fails.
 #   * Prune dumps older than BACKUP_RETAIN_DAYS, but always keep the newest

@@ -36,9 +36,9 @@ worst case (not read-only, destructive, open-world), which is how a
 
 | shape | readOnly | destructive | idempotent | openWorld | tools |
 | --- | --- | --- | --- | --- | --- |
-| `_READ_ONLY` | true | false | true | false | `keyword_search`, `semantic_search`, `read_note`, `list_notes`, `get_tags`, `get_recent`, `get_vault_guide`, `read_file`, `list_files`, `get_backlinks`, `get_links`, `get_neighborhood`, `find_related`, `find_orphans`, `check_upload`, `list_tasks` (#350), `get_changes` (#351), `hybrid_search` (#354) |
-| `_ADDITIVE` | false | false | false | false | `create_note` (no-clobber), `request_download` (mints a capability, destroys nothing) |
-| `_DESTRUCTIVE` | false | true | false | false | `edit_note`, `move_note`, `delete_note`, `set_frontmatter`, `write_file`, `delete_file`, `request_upload` |
+| `_READ_ONLY` | true | false | true | false | `keyword_search`, `semantic_search`, `read_note`, `list_notes`, `get_tags`, `get_recent`, `get_vault_guide`, `read_file`, `list_files`, `get_backlinks`, `get_links`, `get_neighborhood`, `find_related`, `find_orphans`, `check_upload`, `list_tasks` (#350), `get_changes` (#351), `hybrid_search` (#354), `task_agenda` (#428) |
+| `_ADDITIVE` | false | false | false | false | `create_note` (no-clobber), `request_download` (mints a capability, destroys nothing), `add_task` (#428: inserts one line, removes no byte) |
+| `_DESTRUCTIVE` | false | true | false | false | `edit_note`, `move_note`, `delete_note`, `set_frontmatter`, `write_file`, `delete_file`, `request_upload`, `complete_task` and `update_task` (#428) |
 | `_DESTRUCTIVE_OPEN_WORLD` | false | true | false | true | `import_from_url` |
 
 **Annotations are hints; `_tracked` enforces.** Nothing server-side reads them.
@@ -50,11 +50,12 @@ destructive ones prompting) and nothing else. The MCP spec tells clients to
 treat annotations as untrusted unless the server is trusted.
 
 **The classification is derived, not listed.** With `W` the write-bucket set
-(`_tracked(write_class=True)`, eight tools, equal to the `write` class of
-`concurrency.TOOL_CLASSES`):
+(`_tracked(write_class=True)`, eleven tools since #428, equal to the `write`
+class of `concurrency.TOOL_CLASSES`):
 
-- destructive = `(W − {create_note}) ∪ {request_upload}` — `create_note` only
-  ever adds a file; `request_upload(overwrite=True)` mints a capability that
+- destructive = `(W − {create_note, add_task}) ∪ {request_upload}` —
+  `create_note` only ever adds a file, and `add_task` (#428) only ever inserts
+  a line (its plan is verified to change no pre-existing line); `request_upload(overwrite=True)` mints a capability that
   overwrites an existing file when a person redeems it, and the tool call is
   what authorises that (owner decision, 2026-10-28);
 - not read-only = `W ∪ {request_upload, request_download}`;
@@ -139,9 +140,9 @@ returning only the tools the caller's granted scopes permit".
 
 | Request | `tools/list` |
 | --- | --- |
-| OAuth grant whose scope lacks `readwrite` | **19** — the full list minus the nine write-required tools |
-| OAuth grant with `readwrite`, API key (`read` or `readwrite`) | 28, byte-identical to before |
-| `MCP_SANDBOX_MODE`, stdio, in-process (no principal) | 28 |
+| OAuth grant whose scope lacks `readwrite` | **20** — the full list minus the twelve write-required tools (19 before #428) |
+| OAuth grant with `readwrite`, API key (`read` or `readwrite`) | 32 (28 before #428), byte-identical to `tools_list_full_v2.json` |
+| `MCP_SANDBOX_MODE`, stdio, in-process (no principal) | 32 |
 | No credential | never reaches the handler: the middleware answers 401 |
 
 Read-only **API keys** keep the full list by owner decision (2026-10-31): a
@@ -149,9 +150,10 @@ key's permission is set and shown by its owner in the panel, and keeping it
 full leaves every script and registry byte-identical (L1).
 
 **One registry, two consumers.** `WRITE_REQUIRED_TOOLS` in
-`src/mcp_server/tool_permissions.py` is a `frozenset` literal: `create_note`,
-`edit_note`, `move_note`, `delete_note`, `set_frontmatter`, `write_file`,
-`delete_file`, `import_from_url`, `request_upload`. It drives
+`src/mcp_server/tool_permissions.py` is a `frozenset` literal of twelve names:
+`create_note`, `edit_note`, `move_note`, `delete_note`, `set_frontmatter`,
+`write_file`, `delete_file`, `import_from_url`, `request_upload`, and since
+#428 `complete_task`, `update_task`, `add_task`. It drives
 
 - **the gate**: `_tracked` calls `_require_write()` for a member at the *body
   boundary* — after every admission gate (rate buckets, vault root, argument
@@ -170,7 +172,7 @@ review showed that was metadata enforcement never consumed, agreeing with the
 refusals only because a test said so. The registry is the enforcement source
 now, and it must equal the write bucket plus `request_upload` (whose write
 charge is taken at `PUT /transfer/upload` redemption) and the destructive set
-plus `create_note`. `check_upload` and `request_download` stay listed: neither
+plus `create_note` and `add_task`. `check_upload` and `request_download` stay listed: neither
 refuses a read-only caller.
 
 **The one behaviour difference at call time (L5).** `write_file` and
@@ -194,7 +196,7 @@ with no `nextCursor`, and a `cursor` is ignored.
 
 **The 1.30 tool cache.** The SDK keeps one process-wide `_tool_cache`, which a
 plain-list `tools/list` result clears and refills — so after a filtered list it
-holds 19 entries. Every cache miss refreshes under the *calling* request's
+holds 20 entries. Every cache miss refreshes under the *calling* request's
 credential, so a `readwrite` call still finds and output-validates its tool; a
 read-only call of a hidden tool after a filtered list logs the SDK's "not
 listed, no validation will be performed" WARNING and skips output validation
@@ -209,11 +211,15 @@ No setting.
 
 **Fixtures.** `tests/fixtures/tools_list_full_v1.json` is the complete
 pre-change `tools/list` result for an API key — every field of all 28 tools —
-captured over HTTP before the code changed; the full list is asserted
+captured over HTTP before the code changed. It is the 1.0 freeze fixture and is
+kept as that record. Since #428 the byte-identity oracle is
+`tests/fixtures/tools_list_full_v2.json` (32 tools): the full list is asserted
 byte-identical to it (canonical JSON) for a `read` key, a `readwrite` key and a
-`readwrite` grant. It is also the 1.0 freeze fixture: a change that alters the
-published surface regenerates it deliberately and says so in its spec.
-`tests/fixtures/tools_list_readonly_oauth.json` pins the 19 names in order.
+`readwrite` grant, and a test derives v1 from v2 — v2 minus the four task
+tools equals v1 except for `list_tasks`'s description and its added optional
+properties. A change that alters the published surface regenerates the oracle
+deliberately and says so in its spec.
+`tests/fixtures/tools_list_readonly_oauth.json` pins the 20 names in order.
 `tests/test_issue_358_scoped_tools_list.py` also races, through one barrier,
 a read-only list, an API-key list, a `readwrite` list and two hidden-tool calls
 (50 rounds per cache ordering, plus an injected suspension), each checked
@@ -446,7 +452,7 @@ So `open_mutable(rel, user_id)` is now the entry point for every mutation. It ru
 - **an adversary who can write to the destination directory itself** can still win the `renameat` race on an overwrite publish. Say it plainly: that adversary can also just edit the note directly, so it is outside the threat #59 addresses — redirection through an *ancestor* or the *root*, where the attacker never had access to the destination at all. The no-clobber publish has no such window (nothing it stages is ever named), unless `VAULT_ALLOW_NAMED_STAGING_FALLBACK` is set, which is the operator's declared decision to take it back.
 - **creating a missing directory has no beneath-root form** (#87, D22). The *lookup* window is gone: `vault_fs.open_dir_beneath` is one `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)`, so there is no interval between components for an ancestor rename to exploit. But `mkdirat` has no such form, and no syscall creates a directory *and* proves the path it created it under stayed beneath a root. So creation is still one component at a time — carrying **no** descriptor across a creation: each `mkdirat` goes through a fresh beneath-root lookup of the prefix that already exists, dropped at once, and the descriptor the caller finally gets comes from a fresh lookup of the whole path performed *after* the creation. What a race can still cost is at most one **empty** directory per component, **per creation descent**, in a place the winner already controls — never a file, never file content, never something a tool reports success about. The bound is per descent and one call can have more than one: an upload walks its destination twice with creation enabled (a cheap up-front walk so a bad path costs one syscall rather than a whole body, and the authoritative walk inside the publish gate), a note write once. **Do not try to clean it up** — an `rmdir` by a name the caller chose is the same delete-the-substitute hazard `_discard_temp` and `soft_delete` refuse.
 - **a lookup proves containment when it resolves, not afterwards** (#87, D26). `RESOLVE_BENEATH` proves the path stayed beneath the root *during that resolution* and says nothing about the future — it cannot: the descriptor it returns keeps naming the same directory however that directory's pathname is later renamed, which is the entire reason #59 anchors to a descriptor rather than a name. So between the final lookup and the publish — the transfer gate's destination walk to its `linkat`/`renameat`, a note tool's `open_mutable` to its publish — a process that can rename a vault ancestor can move the resolved directory out of the vault, and the call publishes into it, wherever it now is, and reports success. Nothing was *redirected*: the bytes went to the directory the caller named, which somebody else moved. Excluding it would need an operation the kernel does not offer, and re-verifying by walking `..` upward from the descriptor is check-then-act one level up — the class of bug #59 exists to remove. **Retained, not introduced**: the per-component walk had this interval too, underneath the larger window it did not close.
-- a **read-modify-write overwrite** (`edit_note`, `set_frontmatter`, and `move_note`'s link rewrites) is optimistic, not linearizable: `expected=` compares the current bytes immediately before the rename and a writer landing inside that window is still overwritten — the same guarantee level as the transfer fingerprint check, declared rather than implied. **`expected=` is server-internal and its window is the tool's own read→rename interval, not the caller's.** The bytes it compares are the ones this call read, so it structurally cannot see a change that landed between the *caller's* `read_note` and its write. That second window is what the caller-visible **`expected_hash` precondition** closes (#205) — see "Write preconditions" below. The two are a **pair**: neither subsumes the other, neither is removed, and a matching `expected_hash` does **not** exempt a call from the `expected=` compare. Any wording that lets an agent read `File changed while editing` as covering its own read→edit round trip is still a bug in the docstring; so is any wording that lets it read `expected_hash` as covering the publish.
+- a **read-modify-write overwrite** (`edit_note`, `set_frontmatter`, `move_note`'s link rewrites, and since #428 `complete_task`, `update_task` and `add_task`, which publish through the same `write_file_at(expected=…)`) is optimistic, not linearizable: `expected=` compares the current bytes immediately before the rename and a writer landing inside that window is still overwritten — the same guarantee level as the transfer fingerprint check, declared rather than implied. **`expected=` is server-internal and its window is the tool's own read→rename interval, not the caller's.** The bytes it compares are the ones this call read, so it structurally cannot see a change that landed between the *caller's* `read_note` and its write. That second window is what the caller-visible **`expected_hash` precondition** closes (#205) — see "Write preconditions" below. The two are a **pair**: neither subsumes the other, neither is removed, and a matching `expected_hash` does **not** exempt a call from the `expected=` compare. Any wording that lets an agent read `File changed while editing` as covering its own read→edit round trip is still a bug in the docstring; so is any wording that lets it read `expected_hash` as covering the publish.
 - **An unguarded `write_file(overwrite=True)` remains an unconditional replace** when required mode is off. Supplying `expected_hash` adds the caller-to-call check and passes the observed bytes to the same final comparison the note tools use. `request_upload(overwrite=True)` separately binds the incumbent's fingerprint at mint time.
 - The **no-clobber** publish (`create_note`, `write_file` by default) has no window at all (`link()` is kernel-atomic), and neither does the soft delete or `move_note`'s own publication (one `renameat2(RENAME_NOREPLACE)`).
 
@@ -885,6 +891,10 @@ nested in a callout is listed; and a date signifier anywhere on the line counts
 here is an extraction-version bump, like the fence and link grammars.
 
 ### `list_tasks`: rendering and the cursor (#350)
+
+The arguments, the id token, cursor version 2 and the bounds #428 added are in
+"[Task tools (#428)](#task-tools-428)"; what follows is the #350 baseline they
+extend.
 
 - **What it reads**: `note_tasks` (migration 032), joined to `notes_metadata`
   for the path and the owner, never a file; see "Task extraction (#350)" in
@@ -1547,3 +1557,459 @@ scope's `last_seq` and the input cursor; a cursor above `last_seq` is refused
 `history_truncated: true` when the cursor is below `pruned_through_seq`, or a
 date `since` is at or before `pruned_at` (conservative). `created` means
 first seen at this path (L3); edits outside MCP are `human/sync` (L2).
+
+## Task tools (#428)
+
+Five tools work on markdown checkbox tasks: `list_tasks` (extended) and
+`task_agenda` read the `note_tasks` index; `complete_task`, `update_task` and
+`add_task` change one task line. Plain `- [ ]` checkboxes are complete tasks;
+the Tasks-plugin emoji fields are optional and are read and written in the
+plugin's format. The modules: `src/services/task_line.py` (the line anatomy
+and the minimal editor, pure), `task_recurrence.py` (the closed grammar,
+pure), `task_dates.py` (relative dates, pure), `task_write.py` (planning,
+verification, the duplicate scan), `task_query.py` (listing and agenda SQL),
+`task_settings.py`, and `task_index.py` (the write-time refresh, described in
+[indexing and embeddings](indexing-and-embeddings.md#the-write-time-task-refresh-428));
+`src/mcp_server/task_render.py` renders. The full record is the `task-tools`
+change under `openspec/`. What follows must not be silently reversed.
+
+### The task id: a key over the uncut text, plus an ordinal suffix
+
+`task_key = sha256(b"omcp-task-v1\x00" + full_text.encode("utf-8")).hexdigest()[:12]`,
+where `full_text` is exactly what the extractor reads as the task's text:
+everything after `]` and the following spaces or tabs, right-stripped, **not
+cut at 1,000 characters**. The status marker, indentation, list marker and
+blockquote prefix are excluded. Within one note, `key_count` is the number of
+tasks sharing a key and `key_ordinal` this task's rank among them in document
+order. The id is `<key>` when the count is 1, else `<key>.<i>of<n>`
+(`^[0-9a-f]{12}(\.[1-9][0-9]{0,3}of[1-9][0-9]{0,3})?$`, at most 23
+characters); `<key>.1of1` is accepted and means `<key>`. The extractor stores
+all three (`note_tasks.task_key`, `key_ordinal`, `key_count`), so an id works
+for text past the stored cut and the listing needs no window query.
+
+- **The status is excluded**, so a retried `complete_task` on a task whose
+  text did not change (done date off) answers `already_completed` rather than
+  `task_not_found`. With the done date on, the text changes and the retry is
+  `task_not_found`. Neither can complete twice.
+- **Fields are included.** An id over the description alone would give two
+  lines that differ only in their due date one key, and every date edit would
+  move which of them is "first".
+- **Why `path` + id**, not an index lookup or an opaque token: the id is
+  verifiable against the bytes with no server state, and the path scopes
+  collisions to one note, where 48 bits is ample and a collision only behaves
+  like a duplicate. A token encoding a note id would leak a database-global
+  identifier (the #350 round-2 lesson) and still could not prove the bytes are
+  unchanged; a line number from the index may be stale.
+- **Nothing is ever written into a note to identify a task.** Every write
+  changes the line's text and so its id; the response returns the new one, and
+  an id from an older listing answers `task_not_found` (L3).
+
+### Resolution is bound to the bytes being replaced
+
+Every write follows one order, and the order is the design:
+`_require_write` → argument validation (the id grammar included) →
+`expected_hash` syntax → `open_mutable` → `read_bytes_at` under the cap → the
+`_precondition_error` ladder → UTF-8 decode → `tasks_from_note_text` (the one
+definition the pass and the refresh also use; a truncated extraction is
+`size_limit`, because the 5,000-task cap would make a count unverifiable) →
+match the id → plan and verify (off the loop) → `_note_size_error` →
+`dry_run` → `_confirmed_publication(… write_file_at(target, new,
+expected=existing_bytes, …))` → refresh → change-feed event → response.
+
+**No line number from the index or from an earlier read is trusted.** The plan
+is computed from `existing_bytes`, and the rename is refused when the file no
+longer holds those bytes (`concurrent_write`), so the bytes the id was
+re-derived from are exactly the bytes replaced. A concurrent change elsewhere
+in the note causes a refusal, never a lost edit. With `n` tasks in the current
+bytes carrying the id's key:
+
+| Id | `n` | Outcome |
+| --- | --- | --- |
+| suffixed, no `expected_hash` | any | `precondition_required`, before any read, in **every** mode |
+| any | 0 | `task_not_found` |
+| bare | 1 | resolves |
+| bare | > 1 | `task_ambiguous`, listing the suffixed ids and their lines |
+| suffixed `.<i>of<m>`, matching hash | `m ≠ n` | `task_changed` (unreachable while the hash matches; a belt) |
+| suffixed `.<i>of<m>`, matching hash | `m = n` | the `i`-th |
+
+**A suffixed id always needs `expected_hash`** (Codex spec review r1 #2). Two
+identical lines can swap places, or one can be replaced, with the count
+unchanged, and the ordinal would then silently name the other occurrence.
+Bound to the whole-note hash the caller read, the ordinal is relative to
+exactly those bytes. Listings do not print a hash: the index's `content_hash`
+(canonical: newline-translated, NUL-stripped) is not the write ladder's
+raw-byte `sha256:` token and differs for every CRLF note, so a caller acting
+on a suffixed id calls `read_note` first (L18).
+
+**Required mode** (`WRITE_PRECONDITION_REQUIRED=true`, owner decision
+2026-11-10). For `complete_task` and `update_task` with a **bare** id, the
+`(path, id)` pair satisfies the requirement. It is a content precondition on
+the exact line replaced, re-derived from the bytes the rename is bound to, and
+every other byte comes from the current file, so the stale-base overwrite the
+mode exists to stop cannot happen. `add_task` removes no byte and is exempt. A
+supplied hash is still compared (`stale_precondition`). Requiring a hash for
+every task write was rejected: listings carry no file hash, so every write
+would need a `read_note` for no safety gain.
+
+**The conflict retry.** When publication reports an in-call conflict **and the
+caller supplied no `expected_hash`**, the tool repeats everything from the read
+(re-read, re-resolve, re-plan, re-verify, publish), at most **3 attempts** in
+total (`TASK_WRITE_MAX_ATTEMPTS`), carrying nothing between attempts, then
+refuses `concurrent_write` (L19). An agent closing three tasks of one note in
+parallel is the ordinary case. With a hash there is no retry: the caller bound
+a version, so a changed file is `stale_precondition` on the next read, and
+suffixed ids always carry one. All attempts run inside one `_tracked` call
+(the gates are passed once), and each takes its own `_confirmed_publication`.
+Two parallel completions of the same task give one success and one
+`already_completed` or `task_not_found`.
+
+**The retry narrows nothing about the publish window.** The task tools publish
+through the same `write_file_at(expected=existing_bytes)` as `edit_note`, so
+the declared read-modify-write residual above ("optimistic, not
+linearizable") applies to them unchanged: a writer landing between the
+`expected=` comparison and the rename is still overwritten. The retry only
+handles a conflict that comparison *did* see. This is the owner-declared
+residual of the shared publish path, not a new one, and a reviewer
+re-reporting it as a task-tool blocker is re-reporting that residual.
+
+### Minimal one-line edits, and why the plugin's rebuild is not copied
+
+The Tasks plugin re-serialises the whole line on every edit: fixed field
+order, tags moved in front of the fields, rule text canonicalised
+(`every weekend` becomes `every week`, which changes its meaning). The server
+does none of that (supervisor ruling 1). "As the plugin would write it" means
+semantically (the same dates, the same fields kept or dropped), never the same
+bytes. A whole-line rebuild would reformat the user's line and make every
+write a diff an agent cannot audit.
+
+`task_line.py` parses the line as the plugin does (R§1.4 of the change's
+plugin reference): a trailing block link, then up to 21 end-anchored field and
+tag matches, form the **run**; what remains is the **description region**.
+Operations are byte-exact outside the touched spans:
+
+- a changed value replaces only its characters, keeping the signifier as
+  written (`📆`, `🗓`, `⌛`, VS16) and its spacing;
+- a removed field takes exactly one adjacent space with it;
+- an added field goes into the run in the plugin's canonical order when the
+  run is in that order, else at its end, always before a block link and the
+  trailing whitespace;
+- a tag is added at the end of the description region, and removed wherever
+  it occurs, whole-tag and case-insensitively;
+- a replaced description re-appends every tag of the old description that the
+  new text dropped. Tags are conserved: only `remove_tags` removes one.
+
+Prefix, gap, untouched tokens and their order, trailing whitespace (a hard
+break) and the line terminator are preserved; a CRLF or lone-CR note is
+untouched outside the edited content.
+
+Refused `task_malformed` with nothing written, rather than picking a copy:
+inline code inside the run; a field family the call touches that occurs twice
+on the line; a touched family that occurs once but in the description region,
+where the plugin would not read it and the extractor would; a non-calendar
+date in a changed field, or in any date field of a recurring completion.
+Picking one copy (the extractor's last-wins or the plugin's leftmost) would
+silently diverge from one of the two readers (L2).
+
+### Every plan is verified before publication
+
+A plan is a list of line-span replacements and insertions, never a
+regenerated note. Before `dry_run` or publication, `task_write.verify`
+asserts that:
+
+- every line other than the target is unchanged (content and terminator), and
+  every insertion is a whole line at a line boundary;
+- the target and any new line re-extract, through both the extractor and
+  `task_line.parse`, with exactly the intended status, dates, priority, tags
+  and recurrence, and are byte-identical to the original outside the intended
+  tokens;
+- every other task extracts identically (shifted only by the inserted lines),
+  and no task appears or disappears beyond the declared ones;
+- **no pre-existing line changes its owning task**, ownership being the
+  uncapped continuation block below;
+- the tag set is conserved;
+- the frontmatter, every heading and every existing line's code mask are
+  unchanged, and no inserted line lies inside code.
+
+A note containing NUL is refused, and a result over the per-note task cap is
+`size_limit`. A failed assertion is `task_malformed`. This is the last line of
+defence and the strongest safety property here, pinned by a property test
+over a corpus.
+
+Before planning, every planner refuses `content_unsafe` (detail
+`frontmatter_defect`, with `edit_note`'s prose) when line 1 is `---` and no
+closing `---` follows or the YAML between is invalid: the same diagnosis
+`edit_note(section=…)` uses. A note whose line 1 is a `---` thematic break
+with no closer therefore cannot have its tasks written (L24).
+`add_task(section=…)` also refuses an unmatched indented fence
+(`unmatched_fence`).
+
+**Caller text cannot smuggle structure.** A description (`text`) and a context
+line must be one line of 1–1,000 characters after stripping, with no field
+signifier, no `^block` suffix and no CR, LF, U+0085, U+2028 or U+2029.
+Neither may hold an odd number of `%%`, an unpaired or nested `<!--` / `-->`,
+or a run of three or more backticks or tildes. A context line also may not
+begin with a list marker, a checkbox, a `#` heading marker or `>`. Each is
+`invalid_argument`.
+
+### Recurrence: a closed grammar, and nothing completes without its successor
+
+`task_recurrence.py` uses the standard library only (`datetime`,
+`calendar`). The plugin computes dates with rrule 2.8.1 (JavaScript), which no
+Python port reproduces exactly, so the grammar is closed over **text
+shapes**: an unrecognised rule is refused `recurrence_unsupported` and never
+handed to a general parser (supervisor ruling 3). `N` is 2–999 with no
+leading zero, names are full English, matching is ASCII case-insensitive, and
+a trailing ` when done` anchors on the completion date.
+
+| Shape | Next date after anchor `A` |
+| --- | --- |
+| `every day` / `every N days` | `A + 1` / `A + N` days |
+| `every weekday` | first Monday–Friday after `A` |
+| `every week` / `every N weeks` | `A + 7` / `A + 7N` days |
+| `every week on D[, D…]` / `every D[, D…]` | first date after `A` on one of the weekdays |
+| `every month` / `every N months` | `A` + N months, a missing day clamped to the month's last (2021-10-31 → 11-30 → 12-30) |
+| `every month on the K` (`1st` … `31st`, correct suffix) | first date after `A` with day K; months without K are skipped |
+| `every month on the last` | the last day of `A`'s month if after `A`, else of the next month |
+| `every year` / `every N years` | the same month and day; `A` = February 29 is refused |
+| `every M on the K` (K valid for M in every year) | first date after `A` that is M-K |
+
+Refused until a golden table generated with rrule 2.8.1 admits them (owner
+decision 2026-11-10, L7): `every N weeks on D…`, `every month on the last D`,
+`the Kth D`, `the Kth last D`, `every N months on the …`, `every M and M on the
+K and K`, `every weekend` (lossy), abbreviations, `every 1 day`, `for N
+times`, `until`, and anything else. The reference date is due, else
+scheduled, else start; the other two keep their whole-day offset from it.
+Missed occurrences are not skipped (L8, mirrored on purpose). A task with no
+date still gets its next line, with no dates.
+
+**Nothing is completed without its next occurrence.** A rule outside the
+grammar, a yearly rule on February 29, or a non-calendar reference date
+(where the plugin would silently drop the rule and end the series) refuses the
+whole completion with nothing written. The agent may clear the rule with
+`update_task(clear=["recurrence"])` and then complete. `🏁 delete` is refused
+`on_completion_unsupported`: the server never deletes a line implicitly.
+
+The next line is a copy of the original line's **pre-completion bytes** with
+`[ ]`, the shifted dates replaced in place, `✅`, `❌`, `🆔`, `⛔` and a trailing
+`^block` removed, and `➕` set to today when `set_created_date` is on, else
+removed. It is not canonicalised. With `next_recurrence_below` off (the
+plugin's default) it goes above the completed line. With it on, it goes after
+the completed task's **whole continuation block**, so the completed task keeps
+its children; the plugin writes the two lines adjacently and hands the
+children to the new occurrence (L17). Its terminator is the original line's
+own; a last line without one takes the note's first terminator, else `\n`,
+and an insertion at the end of a file with no final terminator keeps it
+without one.
+
+### `add_task`: placement and the uncapped continuation block
+
+The line is `- [ ] <text>` followed by the given fields in the plugin's
+canonical order (`#tags`, priority, `🔁`, `➕`, `🛫`, `⏳`, `📅`); the rule must be
+in the grammar. The region is the `section` body (resolved by `edit_note`'s
+selector, inheriting its refusals) or the whole body after the frontmatter.
+The anchor is the region's last task line at indentation 0 after its
+blockquote prefix (tab = 4).
+
+- With an anchor, the line goes directly after the anchor's continuation block
+  and copies its blockquote prefix and bullet. An ordered `N.` gives `N+1.`;
+  later items are not renumbered and zero padding is not kept (L10, L25).
+- With no anchor, it goes after the region's last non-blank line.
+- In an empty region, it goes directly after the heading (or at body start).
+
+It is never placed "at end of file" unless the region is the file, and the
+tool never creates a note.
+
+**The continuation block** is every following line that belongs to the task in
+Markdown: a deeper blockquote, or the same blockquote prefix with greater
+indentation, crossing blank lines while a later non-blank line still belongs.
+**It is uncapped** (Codex spec review r1 #1, a BLOCKER): placement,
+`append_context` and below-placed recurrence all scan it in full, so a ninth
+continuation line can never be reparented. The 8-line / 600-character cap
+applies only to the context that is stored and rendered (L15). A context line
+copies the leading text of the task's first shallowest child item when there
+is one, else the task's own lead plus a tab (when the task or the note nests
+with tabs) or four spaces, and goes after the whole block.
+
+### Duplicates are refused, similar tasks are listed
+
+The description key is SHA-256 over the description region (fields and block
+link removed, tags kept), NFC, `casefold()`, whitespace runs collapsed. An
+open task with the same key **in the target note's current bytes** (always,
+whatever the scope) or **in the index under the caller's default scope** is
+`duplicate_task`, naming up to 5 matches, unless `allow_duplicate=true`. The
+index side reflects the caller's own earlier task writes through the refresh;
+a duplicate written by a generic tool since the last pass can be missed
+(L14).
+
+Similar tasks never block. The up to 8 longest terms of 2 or more code points
+(not all digits) select candidates by `strpos` on `text_fold` in the default
+scope, at most `TASK_SIMILAR_SCAN_MAX` (2,000) rows; a stopped scan says so. A
+candidate is similar when the Jaccard index of the term sets is ≥ 0.5, or when
+one set contains the other and the smaller holds at least 2 terms; the top 5
+are listed in the response and the dry run. `pg_trgm` was rejected: it is not
+installed, an extension would need the init scripts, and trigram similarity
+misbehaves on short multilingual text.
+
+### Every printed path goes through one escaper
+
+Every note path the task tools print — `list_tasks` full and brief rows,
+`task_agenda` rows, `add_task`'s similar-tasks list, refusal listings
+(`task_ambiguous`, `duplicate_task`) and the write responses — goes through
+one helper, `_escape_task_path` in `src/mcp_server/tools.py`. Whitespace
+other than U+0020 is shown as an escape (`\n`, `\r`, `\t`, `\uXXXX`), a
+literal backslash is doubled, and a **backtick is escaped too** (as `\u0060`), so
+the rendering is injective and stays on one line. **The backtick rule is
+load-bearing.** The path sits in a backtick-delimited field, and a file name
+can contain backticks (a web-clipped title is enough); printed raw, one could
+close the field and forge a second path, line or id inside one row. Since
+#428 a row is the handle the write tools act on, so a forged row is a write
+aimed at another task. Found by the cross-family review. The write tools take
+the **original** path as it is on disk, never the escaped display form: a
+caller undoes the escapes when a row shows any.
+
+### Refusal codes
+
+New, in `refusals.TASK_CODES` (body-only, no retry interval): `task_not_found`,
+`task_ambiguous`, `task_changed`, `already_completed`, `task_cancelled`
+(reopen with `update_task(status="open")` first), `task_malformed`,
+`recurrence_unsupported`, `on_completion_unsupported`, `duplicate_task`, and
+`response_cap_too_small` (a read refusal of `list_tasks` and `task_agenda`).
+Reused: `precondition_required` (a suffixed id without a hash, every mode),
+`content_unsafe` (`frontmatter_defect`, `unmatched_fence`), `invalid_argument`
+(also `update_task(status="done")`), `selector_unresolved`, `size_limit`,
+`stale_precondition`, `malformed_precondition`, `precondition_unavailable`,
+`concurrent_write` (after the retry budget), `io_failure`, `not_found`,
+`validation_failed`, `permission_denied`, and the gate refusals.
+`complete_task` and `update_task` can answer `content_unsafe` (a defective
+frontmatter block) and `malformed_precondition` too. Every refusal writes
+nothing, but the payloads differ: only the task-specific codes
+(`refusals.TASK_CODES`) carry the explicit `nothing_written` marker; the
+generic codes reused from `edit_note` (`not_found`, `validation_failed`,
+`size_limit`, `io_failure`, and `content_unsafe` with its detail) keep their
+existing payloads unchanged, and the precondition codes keep theirs. A
+call that would change nothing answers `No changes for <path>`: nothing is
+published, and there is no event and no refresh. A success states the new
+line and id, a next occurrence's line, position and id, `content_hash`, the
+timezone and resolved dates when a relative date or "today" was used, and
+`index: refreshed` or `index: may lag (<code>)`.
+
+### `list_tasks`: the new arguments, scope and cursor version 2
+
+Every #350 argument keeps its name, position and default. The new ones are
+optional: `due_from`, `scheduled_from`, `done_from`, `done_by`, `undated`,
+`has_due`, `text`, `priority`, `recurring`, `exclude_tags`, `path`,
+`order_by` (`due` | `priority` | `scheduled` | `done` | `path`), `detail`
+(`full` | `brief`), `context` and `scope` (`default` | `all`).
+
+- **Dates** accept `YYYY-MM-DD`, `today`, `tomorrow`, `yesterday`, `+Nd` and
+  `-Nd` (N ≤ 3,660), resolved by `task_dates.resolve` in the caller's
+  effective timezone against **one clock read per call**. Bounds are
+  inclusive and exclude tasks without that date; `from > by` is
+  `invalid_argument`. A configured zone missing from this build falls back to
+  UTC, and the query line says `timezone: UTC (configured zone unavailable)`;
+  never a refusal.
+- **`text`** (1–256 characters, at most 8 terms) matches each NFC-casefolded
+  term by `strpos` on `note_tasks.text_fold`, which is folded in Python at
+  extraction. That is collation-independent, unlike `ILIKE` or `lower()`,
+  whose folding depends on the database ctype. With it, the header counts
+  `tasks with cut text` (L13).
+- **Tags, amended** (supervisor ruling 5). An argument and every stored tag
+  are normalised the same way (lower-cased, `/` runs collapsed, a trailing
+  `/` stripped). `tags` is `tag_prefixes @> ARRAY[…]` and `exclude_tags`
+  `NOT (tag_prefixes && ARRAY[…])`. Matching is by `/` segment and
+  case-insensitive: `waiting-for` matches `#Waiting-For/x`, never
+  `#waiting-forever`. The plugin's substring match (`#home` matches
+  `#homework`) is rejected. Every row that matched under #350 still matches.
+  A normalised value must match `[a-z][a-z0-9_/-]*`, so a value outside the
+  tag grammar (`2024`, `a.b`, a non-ASCII tag), which under #350 returned an
+  empty page, is now `invalid_argument`; the `tags:` echo is the normalised,
+  lower-cased value. A path containing a backtick is now shown with the
+  backtick escaped (as `\u0060`, see "Every printed path goes through one
+  escaper"); #350 printed it raw.
+  `tag_prefixes` is uncapped and lossless (at most 64 prefixes per tag and
+  4,096 per task, by construction), so a filter can never disagree with the
+  stored tags.
+- **Scope.** `default` drops tasks whose note lies under an excluded folder,
+  or whose note tags (a leading `#` stripped) match an excluded note tag by the
+  same segment rule; `all` drops nothing. It applies to `path` and `folder`
+  too. The query line always states the scope and `excluded by scope: N
+  tasks`, so exclusion is never silent; with no settings saved, nothing
+  changes.
+- **Rows.** `full` inserts ` — id <id>` after `path:line` (` — id pending` for
+  a row whose `task_key` is still NULL). `brief` is one row of at most 260
+  characters plus the escaped path, which is never cut because the write tools
+  need it exactly. `context=true` appends each stored context line as
+  `    ┆ <line>` (no context line can begin `- [`), plus
+  `    ┆ (context cut)` when cut.
+- **Header.** Line 1 is #350's, plus `task ids pending: N tasks`. Line 2, the
+  query line (≤ 600 characters; the timezone and resolved dates are never
+  cut), appears whenever a new argument is given, a relative date was
+  resolved, or the scope excluded something.
+- **Cursor version 2**: `{"v":2,"o","f","ob","k":[…],"p"|"h","l"}`, with the
+  #350 owner discriminator, compact form, 2,048-character cap and checks. `f`
+  digests every normalised filter **with its dates resolved**, the scope and
+  the effective exclusion lists, so a settings change, or a relative-date
+  query continued after midnight, refuses the cursor (L4). A version-1 cursor
+  is refused `invalid_argument`, once, after the upgrade. `order_by="done"`
+  runs newest first, with the resume predicate expanded for the mixed
+  direction.
+- **During the version-5 backfill** only `text` and `recurring` read new
+  columns. On rows with a NULL `task_key` they fall back (`lower(text)`; the
+  `🔁` signifier anywhere on the line), and the response carries an
+  `Incomplete list: … approximate until the next index pass.` notice of at most
+  120 characters. Every other filter reads version-4 columns and is exact.
+
+**Bounds, as measured** (S4 audit; synthetic worst case: every count 10
+digits, a 10-digit line, a 23-character id, a 1,024-character folder echo, 32
+tags of 128 characters):
+
+- With no query line, a row always renders, abbreviated if necessary, down to
+  the 1,000-character minimum cap, and the response never exceeds the cap.
+  `response_cap_too_small` is returned only when no abbreviated row fits at
+  all, and an empty result is never refused.
+- The text keeps 40 characters. In the extreme case at B = 1,000 the path
+  share can fall to 9 characters, because the id token costs 29 (L22); 40 + 40
+  needs 1,031.
+- With the query line, a row always renders from 1,531 (guaranteed at 1,600);
+  40 + 40 needs 1,608, or 1,641 with the incomplete-list notice.
+- Header line 1 ≤ 480; the query line ≤ 600 (measured 591, the four free-text
+  echoes shrinking from 32 to 24 characters when needed). The abbreviated
+  row's fixed structure measured 86 characters, plus 29 for the id token and
+  18 for `— context omitted`.
+
+### `task_agenda`
+
+`task_agenda(date="today", days=7, folder?, tags?, exclude_tags?,
+scope="default")`, `days` 1–31. Every section is `state='open'`, owner- and
+scope-scoped, and read from one `REPEATABLE READ, READ ONLY` snapshot. The
+sections are disjoint by construction:
+
+| Section | Predicate | Cap |
+| --- | --- | --- |
+| overdue | `due ≤ D−1` | 25 |
+| due today | `due = D` | 25 |
+| scheduled and now due, no due date | `scheduled ≤ D ∧ due IS NULL` | 15 |
+| scheduled and now due, due later | `scheduled ≤ D ∧ due ≥ D+days+1` | 15 |
+| upcoming, grouped by date | `D+1 ≤ due ≤ D+days` | 50 |
+
+Every open task due on or before `D+days`, or scheduled on or before `D`, is
+in exactly one. Rows are brief, and every section header states its total. A
+capped section ends with the exact `list_tasks` arguments that continue it
+(dates resolved, `has_due=false` where needed, which is why `has_due` exists)
+and a cursor minted **only from a row actually shown**; a section that showed
+no row gives the arguments without a cursor, which continue from its first row
+(Codex spec review r1 #5). Below a 2,800-character response cap it refuses
+`response_cap_too_small`. Class `scan`, annotations `_READ_ONLY`.
+
+### Metadata and visibility
+
+The four new tools are registered after `hybrid_search`, in the order
+`task_agenda`, `complete_task`, `update_task`, `add_task`, so the first 28
+entries keep their order. The counts: 32 tools; 19 read-only (`task_agenda`
+added); 12 names in `WRITE_REQUIRED_TOOLS`; 11 in the write bucket; a
+read-only grant lists 20; `CLASS_MAPPING_VERSION` 6. `complete_task` and
+`update_task` are `_DESTRUCTIVE`, `add_task` is `_ADDITIVE`, and the
+destructive rule is `(W − {create_note, add_task}) ∪ {request_upload}`. Each
+description is at most 4,000 characters and leads with its contract.
+`SERVER_INSTRUCTIONS` keeps its 512-character lead byte-identical and names
+the five tools in one sentence, within the 2,000-character cap.
