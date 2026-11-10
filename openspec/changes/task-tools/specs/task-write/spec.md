@@ -82,6 +82,7 @@ A task write SHALL replace only the token spans its call names, according to the
 - **Adding a field** inserts one space, the plugin's write signifier, one space and the value into the trailing field run. It goes before the first existing field of higher canonical rank when the run is in the canonical order (id, dependsOn, priority, recurrence, onCompletion, created, start, scheduled, due, cancelled, done). Otherwise it goes at the end of the run. In both cases it goes before a trailing `^block` link and before trailing whitespace.
 - **Adding a tag** places it at the end of the description region.
 - **Removing a tag** removes whole-tag, case-insensitive matches only.
+- **Replacing the description** replaces its words only. Every tag of the old description region that does not occur in the new text is re-appended at the end of the new description region, in its original order and spelling. A tag present in the new text is not duplicated. `[[links]]` are ordinary description text and are replaced with it. Only `remove_tags` removes a tag.
 
 The trailing field run SHALL be identified as the Tasks plugin parses it: block link first, then repeated end-anchored field and trailing-tag matches.
 
@@ -119,7 +120,8 @@ Before any dry-run diff or publication, every plan SHALL be verified, and a fail
 2. the target and any inserted line re-extract as tasks with exactly the intended status and fields;
 3. every other task of the note re-extracts identically, with lines after an insertion shifted by the inserted count;
 4. no undeclared task appears;
-5. no pre-existing line changes its owning task. A line's owning task is the nearest preceding task whose continuation block contains it.
+5. no pre-existing line changes its owning task. A line's owning task is the nearest preceding task whose continuation block contains it;
+6. the target's tag set, compared whole-tag and case-insensitively, equals the set before, plus the tags added, minus the tags removed.
 
 A task's **continuation block** is every following line that has a greater blockquote depth, or the same blockquote prefix and a greater indentation width (a tab counts as 4). Blank lines are crossed while a later line still belongs. The block has no line or character cap.
 
@@ -242,7 +244,7 @@ The next-occurrence line SHALL be the completed task's original line, before com
 
 Every other byte SHALL be kept: prefix, field order, rule text, tags, priority, `🏁 keep` and trailing whitespace.
 
-**Placement.** The line SHALL be placed immediately above the completed line when the effective `next_recurrence_below` is false. When that setting is true, it SHALL be placed after the completed task's full continuation block, so no line changes its owning task. It SHALL use the original line's terminator, or the note's first terminator when the original is the last line and has none, else LF. A file without a final terminator SHALL still have none.
+**Placement.** The line SHALL be placed immediately above the completed line when the effective `next_recurrence_below` is false. When that setting is true, it SHALL be placed after the completed task's full continuation block, so no line changes its owning task. In both placements it SHALL use the original task line's own terminator, or, when that line has none, the note's first terminator, else LF. A file without a final terminator SHALL still have none.
 
 #### Scenario: The plugin's dropped fields are dropped
 - **WHEN** `- [ ] Rent 🆔 r1 ⛔ a2 🔁 every month ➕ 2026-01-01 📅 2026-11-01 ✅ 2026-10-01 ^b1` is completed on 2026-11-02, with `set_created_date` false and defaults otherwise
@@ -252,6 +254,10 @@ Every other byte SHALL be kept: prefix, field order, rule text, tags, priority, 
 #### Scenario: Below, at end of file without a newline
 - **WHEN** the completed task is the last line of a file with no final newline, and `next_recurrence_below` is true
 - **THEN** the file SHALL end with the completed line, one terminator, and the next line, with no final terminator
+
+#### Scenario: The terminator follows the original line in a mixed note
+- **WHEN** a recurring task whose line ends in CRLF, in a note whose other lines end in LF and whose last context line under the task ends in LF, is completed with `next_recurrence_below` true, and again with it false
+- **THEN** in both cases the next-occurrence line SHALL end in CRLF, and every other terminator SHALL be unchanged
 
 #### Scenario: Below keeps the completed task's children
 - **WHEN** a recurring task followed by three indented context lines is completed with `next_recurrence_below` true
@@ -271,7 +277,7 @@ Every other byte SHALL be kept: prefix, field order, rule text, tags, priority, 
 - **Recurrence.** It SHALL set the recurrence rule, which must be accepted by the closed grammar or be refused with `recurrence_unsupported`.
 - **Clearing.** It SHALL clear any of `due`, `scheduled`, `start`, `priority` and `recurrence` named in `clear`.
 - **Status.** It SHALL change the status to `open` (`[ ]`, removing `✅` and `❌`), `in_progress` (`[/]`, removing `✅` and `❌`) or `cancelled` (`[-]`, removing `✅`, and adding `❌ <today>` when the effective `set_cancelled_date` is true and none exists).
-- **Description.** It SHALL replace the description region with `text`, which must be a single line of 1–1,000 characters, contain no field signifier, `^block` suffix, line break or line-separator character, and not change how the line parses.
+- **Description.** It SHALL replace the words of the description region with `text`, keeping every tag of the old description region (re-appended in original order when `text` does not contain it). The new `text` which must be a single line of 1–1,000 characters, contain no field signifier, `^block` suffix, line break or line-separator character, and not change how the line parses.
 - **Context.** It SHALL append one context line under the task (`append_context`, the same text rules), after the task's full, uncapped continuation block.
 
 The following SHALL be refused with `invalid_argument`, writing nothing:
@@ -293,6 +299,22 @@ Cancelling SHALL write no next occurrence. A call that changes no byte SHALL ans
 #### Scenario: Asking update_task to complete is refused
 - **WHEN** `update_task(status="done")` is called
 - **THEN** it SHALL be refused with `invalid_argument` naming `complete_task`
+
+#### Scenario: Replacing the description keeps a trailing tag
+- **WHEN** `update_task(text="Pay landlord")` names `- [ ] Pay rent #finance 📅 2026-12-01`
+- **THEN** the line SHALL become `- [ ] Pay landlord #finance 📅 2026-12-01`
+
+#### Scenario: Replacing the description keeps a tag from its middle
+- **WHEN** `update_task(text="Call the agent")` names `- [ ] Call #bob about the [[Lease]] 📅 2026-12-01`
+- **THEN** the line SHALL become `- [ ] Call the agent #bob 📅 2026-12-01`, and the `[[Lease]]` link SHALL be gone with the replaced words
+
+#### Scenario: A tag already in the new text is not duplicated
+- **WHEN** `update_task(text="Ping #Bob about keys")` names `- [ ] Call #bob about the lease`
+- **THEN** the line SHALL become `- [ ] Ping #Bob about keys`
+
+#### Scenario: Text combined with remove_tags
+- **WHEN** `update_task(text="Pay landlord", remove_tags=["finance"])` names `- [ ] Pay rent #finance #home 📅 2026-12-01`
+- **THEN** the line SHALL become `- [ ] Pay landlord #home 📅 2026-12-01`
 
 #### Scenario: Removing a tag is not hierarchical
 - **WHEN** `update_task(remove_tags=["waiting-for"])` names `- [ ] Chase #waiting-for/bob`

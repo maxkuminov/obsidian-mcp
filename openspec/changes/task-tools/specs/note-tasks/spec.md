@@ -14,8 +14,8 @@ For each task, the extractor SHALL parse each of the following dates, written as
 It SHALL also parse:
 
 - **Priority**: 🔺 highest, ⏫ high, 🔼 medium, 🔽 low, ⏬ lowest, with an optional U+FE0F.
-- **Inline tags** (the shared inline-tag rule). A tag longer than 128 characters SHALL NOT be stored. The first 64 distinct remaining tags in document order SHALL be stored in document order. The row's `tags_cut` SHALL be true exactly when any tag on the line was not stored for either reason, or when the tag-prefix array below was capped.
-- **Tag prefixes**: each stored tag, lower-cased, with every `/`-segment prefix, deduplicated and capped at 256 entries.
+- **Inline tags** (the shared inline-tag rule). A tag longer than 128 characters SHALL NOT be stored. The first 64 distinct remaining tags in document order SHALL be stored in document order. The row's `tags_cut` SHALL be true exactly when any tag on the line was not stored for either reason.
+- **Tag prefixes**: each stored tag, lower-cased, with every `/`-segment prefix, deduplicated and never capped. It is bounded by construction at 4,096 entries, and holds every prefix of every stored tag.
 - **Recurrence rule**: the value of a `🔁` field in the line's trailing field run, identified as the Tasks plugin parses it, cut at 256 characters with `recurrence_cut`.
 - **Description key**: the 16-hex normalised-description key of the `task-write` capability.
 - **Folded text**: the stored text with Unicode case folding applied.
@@ -39,6 +39,10 @@ Dates and priority SHALL be read from the masked text of the line, so a signifie
 #### Scenario: Tag prefixes support hierarchical matching
 - **WHEN** a task carries `#Waiting-For/Chase`
 - **THEN** its stored tags SHALL be `Waiting-For/Chase`, and its tag prefixes SHALL be `waiting-for` and `waiting-for/chase`
+
+#### Scenario: Tag prefixes are lossless at the bound
+- **WHEN** a task carries 64 distinct tags of 128 characters, each made of 64 one-character `/`-segments
+- **THEN** its tag prefixes SHALL hold all 4,096 prefixes, `tags_cut` SHALL be false, and `list_tasks(tags=[<any stored tag>])` and `list_tasks(exclude_tags=[<its first segment>])` SHALL agree with the stored tags
 
 #### Scenario: Context lines are captured
 - **WHEN** `- [ ] Call bank` is followed by `    - ref 1234`, `    more notes`, a blank line and `- [ ] next`

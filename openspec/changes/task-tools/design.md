@@ -188,6 +188,10 @@ The run is a sequence of tokens with their exact spans: fields, tags and the blo
   - be a single line, 1–1,000 characters, stripped;
   - contain no field signifier, no `^block` suffix and no line-break or format character (CR, LF, U+0085, U+2028, U+2029);
   - not make the line re-parse differently (D5).
+
+  **Tags survive a description replacement** (Codex r2 #1). `text` replaces the *words* of the description. Tags are a separately controlled field. Trailing tags are run tokens under the plugin's parse, so they are untouched anyway. Every tag token that was in the old description region and does not occur in the new text (whole tag, case-insensitive, unmasked) is re-appended at the end of the new description region, in its original order, each as `" #" + tag` spelled exactly as before. A tag the caller typed inside the new text stays where it was typed and is not duplicated. `[[links]]` and all other description text are ordinary words, and are replaced with the description.
+
+  When one call combines `text` with tag changes, the order is: replace the description (with re-append), then `remove_tags`, then `add_tags`. Only `remove_tags` removes a tag.
 - **Status.** Replace the one status character inside `box`.
 
 **Preserved byte for byte:** `prefix` (indentation, list marker, blockquote prefix), `gap`, every untouched token, the order of the run, the rule text unless changed, `tail_ws` (so the hard break survives) and the line terminator.
@@ -203,6 +207,7 @@ A plan is a list of `(old line span → new text)` replacements and insertions, 
 3. Every other task of the note extracts identically: same `full_text`, status and line. Lines after an insertion shift by exactly the number of inserted lines.
 4. No new task appears except the declared ones. This catches a context line or description that would create a checkbox or a heading.
 5. **No pre-existing line changes its owning task** (Codex r1 #1). A line's owning task is the nearest preceding task line whose **continuation block** contains it, where the continuation block is defined in D8: uncapped, crossing blank lines. Every line of the old note keeps its owner in the new note, except the declared new lines, which are owned as planned.
+6. **Tags are conserved** (Codex r2 #1). The target's tag set after the write (whole tags, case-insensitive) equals the set before, plus `add_tags`, minus `remove_tags`.
 
 A failed assertion is `task_malformed`, with nothing written. This is the last line of defence and the strongest safety property here. It is pinned by a property test over a corpus.
 
@@ -285,7 +290,10 @@ Everything else is identical: prefix, order, rule text, tags, priority, `🏁 ke
 
 - **`next_recurrence_below = false`** (the plugin default, R§2e): `next + T + completed`, replacing the original line's content. The completed task's continuation block stays directly under it, and no line changes owner.
 - **`next_recurrence_below = true`:** the next line goes **after the completed task's full continuation block** (D8, uncapped), so the completed task keeps its own children and no line changes owner (D5 check 5). This deliberately differs from the plugin, which writes the two lines adjacently and so hands the children to the new occurrence (L17). With no continuation block the result is the plugin's `completed + T + next`.
-- **Terminators.** `T` is the terminator of the line the new line follows (or precedes, for "above"). If that line has none (the last line), `T` is the note's first terminator, otherwise `\n`. A final line without a terminator stays without one.
+- **Terminators, one rule for both placements** (Codex r2 #3). `T` is the **original task line's own terminator**. If that line has none (it is the last line), `T` is the note's first terminator, otherwise `\n`.
+  - "Above" writes `next + T` before the line.
+  - "Below" writes `T + next` when the insertion point is the end of a file without a final terminator, so the file still has none, and `next + T` otherwise.
+  - In a mixed CRLF/LF note, a CRLF task line yields a CRLF next line wherever it is placed.
 
 ### D8. `add_task`: canonical serialisation, a precise placement rule, and context lines
 
@@ -438,7 +446,7 @@ The pass already holds the row lock of every note whose tasks it rewrites (D-con
 
 **Columns are nullable** because existing rows have no value until the version-5 pass re-derives them. Pass and refresh always write all of them. `ck_note_tasks_key_shape` keeps the triple coherent. The models mirror this byte for byte, so `alembic check` stays clean. Partial and GIN indexes are declared with `postgresql_where` / `postgresql_using`.
 
-**`tag_prefixes`.** For each stored tag, lower-cased (the tag grammar is ASCII), every `/`-segment prefix: `waiting-for/Chase` gives `waiting-for` and `waiting-for/chase`. The array is deduplicated and capped at 256 entries. If the cap bites, `tags_cut` is set.
+**`tag_prefixes`.** For each stored tag, lower-cased (the tag grammar is ASCII), every `/`-segment prefix: `waiting-for/Chase` gives `waiting-for` and `waiting-for/chase`. The array is deduplicated and **not capped** (Codex r2 #2). It is bounded by construction: at most 64 stored tags, each at most 128 characters and so at most 64 segments, which gives at most 4,096 entries. It is therefore lossless for every stored tag, and `tags` / `exclude_tags` can never disagree with the stored `tags`. `tags_cut` keeps exactly its #350 meaning: a tag dropped from the stored list (over 128 characters, or past the 64th).
 
 **Version 5.** The extraction gains the D1 key, ordinal and count, the D9 description key, `text_fold`, `tag_prefixes`, the run-based `recurrence` (plugin rule, R§1.4), `created`, `cancelled` and `context`.
 
@@ -887,7 +895,15 @@ Then run the full offline suite, `make test-integration`, `make test-schema` and
 5. **MAJOR, accepted.** A zero-row agenda section had no cursor source. It now gives its arguments without a cursor, and cursors come only from shown rows (D13).
 6. **MINOR, accepted.** Ids render whenever `task_key` is populated, and the pending count is per row (D11).
 
-**Supervisor additions.**
+**Codex spec review, round 2 (2026-11-10).** All six round-1 items were verified, and additions A and B were accepted. The verdict was FAIL on three new findings, all accepted:
+
+1. **MAJOR.** `update_task(text=…)` could erase tags. Tags in the old description now survive by re-append, and D5 check 6 conserves the tag set.
+2. **MAJOR, implausible input but cheaper to fix.** The 256-entry `tag_prefixes` cap could make tag filters disagree with the stored tags. The cap is removed; the array is bounded by construction at 4,096 entries.
+3. **MINOR.** The next-occurrence terminator rule differed between placements. One rule now applies: the original task line's terminator.
+
+Round 3 is verification only, per the review budget.
+
+**Supervisor additions** (round 1).
 
 - **A.** With `next_recurrence_below`, the next line goes after the completed task's full continuation block (D7, L17).
 - **B.** A bounded internal retry, at most 3 attempts with full re-resolution, on an in-call conflict when no `expected_hash` was supplied (D2).

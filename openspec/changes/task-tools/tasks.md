@@ -22,6 +22,7 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
 - [ ] 1.4 `tests/test_task_line.py`, `tests/test_task_recurrence.py` and `tests/test_task_dates.py`:
   - every case in the design §Test plan "Unit, pure";
   - the R§2b/2c table;
+  - `tag_prefixes` at the bound: 64 tags of 64 segments give 4,096 prefixes, uncapped;
   - every tier-2 text refused;
   - the CRLF, lone CR, hard break, VS16 and variant-signifier cases;
   - the property test "bytes outside the declared spans are identical".
@@ -122,6 +123,8 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
   - `add_task` placement cases 1–3 (ordered and callout anchors);
   - context-line insertion;
   - every D4(a)–(d) refusal;
+  - `text` replacement keeping tags (trailing tag, a mid-description tag with a `[[link]]` replaced, a tag already in the new text, `text` with `remove_tags`), with D5 check 6 catching an injected tag loss;
+  - the next-occurrence terminator in a mixed CRLF/LF note for both placements;
   - 9- and 10-line continuation blocks (a blank line inside, a deeper child task) for `add_task`, `append_context` and below placement, with D5 check 5 catching an injected reparenting;
   - D5 verification catching an injected corruption.
 - [ ] 5.4 `tests/integration/test_task_duplicates_pg.py` (container `omcp-tt-s5` / 55455): exact duplicate in scope and in the target note, similar listed, the scan bound, tenancy.
