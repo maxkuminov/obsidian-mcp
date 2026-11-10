@@ -523,6 +523,9 @@ def _locate(text: str, id: str, hash_supplied: bool):
     view = _view(text)
     if isinstance(view, TaskWriteRefusal):
         return view
+    bad = _frontmatter_refusal(text)
+    if bad is not None:
+        return bad
     got = _extract(text)
     if isinstance(got, TaskWriteRefusal):
         return got
@@ -579,21 +582,121 @@ def _compose(text: str, spans: Sequence[Span]) -> str:
     return "".join(out)
 
 
-def _context_line(task_line: str, text: str) -> str:
-    """D8: ``bq_prefix + indent + unit + "- " + text``."""
-    m = re.match(r"(?:[ \t]*+>)*+", task_line)
-    bq_end = m.end()
-    lead_end = re.match(r"[ \t]*+", task_line[bq_end:]).end() + bq_end
-    indent = task_line[bq_end:lead_end]
-    unit = "\t" if "\t" in indent else "    "
-    return task_line[:lead_end] + unit + "- " + text
+_LEAD_RE = re.compile(r"(?:[ \t]*+>)*+[ \t]*+")
+_LIST_ITEM_RE = re.compile(r"(?:[ \t]*+>)*+[ \t]*+(?:[-*+]|[0-9]{1,9}[.)])(?:[ \t]|$)")
+
+
+def _note_nests_with_tabs(view: _NoteView) -> bool:
+    """Whether the note's nested list items (indentation width > 0 after the
+    blockquote prefix) are indented with tabs."""
+    for i in range(view.body_first, len(view.lines)):
+        masked = view.masked_line(i)
+        if not _LIST_ITEM_RE.match(masked):
+            continue
+        line = view.content(i)
+        bq_end = _BQ_RE.match(line).end()
+        indent = line[bq_end:_LEAD_RE.match(line).end()]
+        if "\t" in indent:
+            return True
+    return False
+
+
+def _context_line(view: _NoteView, i: int | None, task_line: str, text: str) -> str:
+    """D8 (as amended by the S5 audit): the context line under task line
+    ``i`` (None for a task this plan adds, which has no children).
+
+    * The task has direct child list items in its continuation block: the
+      first shallowest one's exact leading text (blockquote prefix and
+      indentation) is copied, so the new bullet is their sibling and owned by
+      the task.
+    * Otherwise: the task's own leading text plus one unit — a tab when the
+      task's indentation or the note's nested list items use tabs, else four
+      spaces.
+
+    Inserted after the full continuation block; D5 check 5 proves the owner.
+    """
+    if i is not None:
+        contents = view.contents()
+        depth = _shape(task_line)[0]
+        best = None
+        for j in range(i + 1, continuation_block(contents, i)):
+            if not _LIST_ITEM_RE.match(view.masked_line(j)):
+                continue
+            shape = _shape(contents[j])
+            if shape[0] != depth:
+                continue
+            if best is None or shape[1] < best[0]:
+                best = (shape[1], j)
+        if best is not None:
+            line = contents[best[1]]
+            return line[:_LEAD_RE.match(line).end()] + "- " + text
+    lead_end = _LEAD_RE.match(task_line).end()
+    bq_end = _BQ_RE.match(task_line).end()
+    tabbed = "\t" in task_line[bq_end:lead_end] or _note_nests_with_tabs(view)
+    return task_line[:lead_end] + ("\t" if tabbed else "    ") + "- " + text
+
+
+_CONTEXT_STRUCTURE_RE = re.compile(r"[ \t]*(?:[-*+](?:[ \t]|$)|[0-9]{1,9}[.)](?:[ \t]|$)|\[.\]|#{1,6}(?:[ \t]|$)|>)")
+_FENCE_RUN_RE = re.compile(r"`{3,}|~{3,}")
+
+
+def _structure_refusal(text: str, *, context: bool, what: str) -> TaskWriteRefusal | None:
+    """Caller text that would smuggle structure into the note (S5 audit
+    item 4), for a description (`add_task` / `update_task` ``text``) and a
+    context line (`append_context`, `add_task(context=…)`): an odd number of
+    ``%%`` (an Obsidian comment left open), an HTML comment opener without
+    its closer on the same text (or a closer without an opener), a run of
+    three or more backticks or tildes (a fence); and, for a context line,
+    text that begins with a list marker, a checkbox, a heading marker or
+    ``>``. The one check every entry point uses."""
+    problem = None
+    if text.count("%%") % 2:
+        problem = "an unbalanced %% comment marker"
+    elif _FENCE_RUN_RE.search(text):
+        problem = "a run of three or more backticks or tildes"
+    else:
+        depth = 0
+        pos = 0
+        while True:
+            o, c = text.find("<!--", pos), text.find("-->", pos)
+            if o < 0 and c < 0:
+                break
+            if o >= 0 and (c < 0 or o < c):
+                if depth:
+                    problem = "a nested HTML comment opener"
+                    break
+                depth, pos = 1, o + 4
+            else:
+                if not depth:
+                    problem = "an HTML comment closer without its opener"
+                    break
+                depth, pos = 0, c + 3
+        if problem is None and depth:
+            problem = "an HTML comment opener without its closer"
+    if problem is None and context and _CONTEXT_STRUCTURE_RE.match(text):
+        problem = "text that begins with a list marker, checkbox, heading marker or '>'"
+    if problem is None:
+        return None
+    return _refuse("invalid_argument", f"{what} contains {problem}; nothing was written")
 
 
 def _validate_context(text) -> str | TaskWriteRefusal:
     got = tl_mod.validate_description(text)
     if isinstance(got, TaskLineRefusal):
         return _refuse("invalid_argument", "context: " + got.reason)
-    return got
+    bad = _structure_refusal(got, context=True, what="context")
+    return bad if bad is not None else got
+
+
+def _frontmatter_refusal(text: str) -> TaskWriteRefusal | None:
+    """S5 audit item 1: a task write never touches a note whose frontmatter
+    the server cannot delimit. The exact diagnosis `edit_note(section=…)`
+    refuses on (`parse_frontmatter_diagnose(...).defect`)."""
+    _fm, _body, diagnosis = parse_frontmatter_diagnose(text)
+    if diagnosis.defect is not None:
+        return _refuse("content_unsafe", "the note has a malformed frontmatter block",
+                       detail=("frontmatter_defect", diagnosis))
+    return None
 
 
 def _typed_tags(text: str) -> tuple[str, ...]:
@@ -776,6 +879,12 @@ def plan_update(note_text: str, args: UpdateArgs, settings, today: datetime.date
     for tags in (args.add_tags, args.remove_tags):
         if len(tags) > tl_mod.MAX_NEW_TASK_TAGS:
             return _refuse("invalid_argument", f"at most {tl_mod.MAX_NEW_TASK_TAGS} tags")
+    if args.text is not None:
+        desc = tl_mod.validate_description(args.text)
+        if isinstance(desc, str):
+            bad = _structure_refusal(desc, context=False, what="text")
+            if bad is not None:
+                return bad
     context = None
     if args.append_context is not None:
         context = _validate_context(args.append_context)
@@ -826,7 +935,7 @@ def plan_update(note_text: str, args: UpdateArgs, settings, today: datetime.date
     spans = _line_spans(view, i, edit) if edit.changed else []
     inserted: list[Inserted] = []
     if context is not None:
-        line = _context_line(tl.line, context)
+        line = _context_line(view, i, tl.line, context)
         end = continuation_block(view.contents(), i)
         spans.append(_insertion(view, end - 1, [line], view.term_for(end - 1)))
         inserted.append(Inserted("context", line, None, ("old", target.line)))
@@ -887,6 +996,11 @@ def plan_add(note_text: str, args: AddArgs, settings, today: datetime.date) -> P
             return _refuse("invalid_argument", f"invalid tag {tag!r}")
     if args.priority is not None and args.priority not in tl_mod.PRIORITY_SYMBOLS:
         return _refuse("invalid_argument", "priority must be highest, high, medium, low or lowest")
+    desc = tl_mod.validate_description(args.text)
+    if isinstance(desc, str):
+        bad = _structure_refusal(desc, context=False, what="text")
+        if bad is not None:
+            return bad
     context = None
     if args.context is not None:
         context = _validate_context(args.context)
@@ -896,6 +1010,9 @@ def plan_add(note_text: str, args: AddArgs, settings, today: datetime.date) -> P
     view = _view(note_text)
     if isinstance(view, TaskWriteRefusal):
         return view
+    bad = _frontmatter_refusal(note_text)
+    if bad is not None:
+        return bad
     got = _extract(note_text)
     if isinstance(got, TaskWriteRefusal):
         return got
@@ -964,7 +1081,7 @@ def plan_add(note_text: str, args: AddArgs, settings, today: datetime.date) -> P
     new_lines = [line]
     inserted = [Inserted("task", line, Expect(" ", _expect_new(args, created, line), frozenset(t.lower() for t in new_tl.tags)), owner)]
     if context is not None:
-        cl = _context_line(line, context)
+        cl = _context_line(view, None, line, context)
         new_lines.append(cl)
         inserted.append(Inserted("context", cl, None, ("new", 0)))
     term = view.term_for(after) if after is not None else view.term_for(view.body_first - 1 if view.body_first > 0 else None)
@@ -1137,23 +1254,185 @@ def _line_map(old: str, plan: Plan):
     return old_to_new, ins_new
 
 
-def _target_expect(old_tl, intent: Intent) -> tuple[str, dict[str, object], frozenset[str]]:
-    """The target's expected status, run tokens per family and tags, derived
-    from the old line and the call's intent."""
+@dataclass(frozen=True)
+class _LineSpec:
+    """What a derived line must be relative to its ORIGINAL line: the status,
+    per family ``("same",)`` / ``("set", value_text)`` / ``("absent",)``,
+    whether the block link goes, the tags whose tokens may differ, the
+    expected tag set, and — for a replaced description — the exact composed
+    description the new text must start with."""
+
+    status: str
+    families: Mapping[str, tuple]
+    remove_block: bool
+    touched_tags: frozenset[str]
+    tags: frozenset[str]
+    description: str | None
+
+
+def _tag_spans(text: str, masked: str, lo: int, hi: int, tags: set[str]) -> list[tuple[int, int]]:
+    return [(m.start, m.end) for m in tl_mod._tag_matches(text, masked, lo, hi) if m.tag.lower() in tags]
+
+
+def _drop(text: str, spans: list[tuple[int, int]], lo: int, hi: int,
+          marks: Sequence[tuple[int, int]] = ()) -> str:
+    """``text[lo:hi]`` with each span removed together with ONE adjacent
+    separating space or tab — the preceding one, else the following one,
+    never one another removal took (the D4 removal rule) — and each ``marks``
+    span (a value changed in place) replaced by one marker character, so its
+    position stays pinned."""
+    claimed: set[int] = set()
+    cuts = []
+    for start, end in sorted(set(spans)):
+        if start - 1 >= lo and text[start - 1] in " \t" and (start - 1) not in claimed:
+            start -= 1
+        elif end < hi and text[end] in " \t" and end not in claimed:
+            end += 1
+        claimed.update(range(start, end))
+        cuts.append((start, end, ""))
+    cuts += [(a, b, "\x00") for a, b in marks]
+    out, pos = [], lo
+    for start, end, repl in sorted(cuts):
+        out.append(text[pos:max(pos, start)])
+        out.append(repl)
+        pos = max(pos, end)
+    out.append(text[pos:hi])
+    return "".join(out)
+
+
+def _skeleton(tl, lo: int, spec: _LineSpec) -> str:
+    """The line's text from ``lo`` with every token the spec may change
+    removed (touched families, touched tags, a dropped block link). Two lines
+    whose skeletons are equal differ only in those tokens."""
+    in_place = {f for f, w in spec.families.items() if w[0] == "set" and len(w) > 2 and w[2]}
+    touched = {f for f, w in spec.families.items() if w[0] != "same"} - in_place
+    spans = [(t.start, t.end) for t in tl.tokens if t.kind == "field" and t.family in touched and t.start >= lo]
+    marks = [(t.value_start, t.value_end) for t in tl.tokens
+             if t.kind == "field" and t.family in in_place and t.start >= lo]
+    if spec.remove_block and tl.block is not None:
+        spans.append((tl.block.start, tl.block.end))
+    spans += _tag_spans(tl.line, tl.masked, lo, tl.text_end, set(spec.touched_tags))
+    return _drop(tl.line, spans, lo, tl.text_end, marks)
+
+
+def _target_spec(old_tl, intent: Intent) -> _LineSpec:
     status = intent.status if intent.status is not None else old_tl.status
-    tokens: dict[str, object] = {}
+    fams: dict[str, tuple] = {}
     for fam in tl_mod.CANONICAL_ORDER:
         if fam in intent.set_fields:
-            tokens[fam] = ("set", intent.set_fields[fam])
+            # A value changed in place keeps its token's position.
+            fams[fam] = ("set", intent.set_fields[fam], bool(old_tl.run_fields(fam)))
         elif fam in intent.remove_fields:
-            tokens[fam] = ("absent",)
+            fams[fam] = ("absent",)
         else:
-            tokens[fam] = ("same",)
-    tags = {t.lower() for t in old_tl.tags}
-    tags |= {t.lower() for t in intent.typed_tags}
-    tags -= {t.lower() for t in intent.remove_tags}
-    tags |= {t.lower() for t in intent.add_tags}
-    return status, tokens, frozenset(tags)
+            fams[fam] = ("same",)
+    add = {t.lower() for t in intent.add_tags}
+    remove = {t.lower() for t in intent.remove_tags}
+    tags = {t.lower() for t in old_tl.tags} | {t.lower() for t in intent.typed_tags}
+    tags = (tags - remove) | add
+    comp = None
+    if intent.description is not None:
+        # The composition, derived here independently of the planner: the
+        # caller's text, then every tag of the old description region the
+        # text lacks (original order and spelling), then `remove_tags`, then
+        # the `add_tags` present nowhere else on the line.
+        comp = intent.description
+        present = {t.lower() for t in _typed_tags(comp)}
+        for tag in _typed_tags(old_tl.line[old_tl.text_start:old_tl.description_end]):
+            if tag.lower() not in present:
+                present.add(tag.lower())
+                comp += " #" + tag
+        if remove:
+            cm = mask_code(comp, context=BODY)
+            comp = _drop(comp, _tag_spans(comp, cm, 0, len(comp), remove), 0, len(comp))
+        rest = {m.tag.lower() for m in tl_mod._tag_matches(
+            old_tl.line, old_tl.masked, old_tl.description_end, old_tl.text_end)} - remove
+        have = {t.lower() for t in _typed_tags(comp)} | rest
+        for t in intent.add_tags:
+            if t.lower() not in have:
+                have.add(t.lower())
+                comp += " #" + t
+    return _LineSpec(status, fams, False, frozenset(add | remove), frozenset(tags), comp)
+
+
+def _next_spec(old_tl, expect: Expect) -> _LineSpec:
+    """The next occurrence against the ORIGINAL line (D7): only the status,
+    the shifted dates, ``➕`` and the dropped families may differ."""
+    fams: dict[str, tuple] = {f: ("same",) for f in tl_mod.CANONICAL_ORDER}
+    for fam in (DUE, SCHEDULED, START, CREATED):
+        v = expect.fields.get(fam)
+        fams[fam] = ("set", v, bool(old_tl.run_fields(fam))) if v is not None else ("absent",)
+    for fam in (DONE, CANCELLED, ID, DEPENDS_ON):
+        fams[fam] = ("absent",)
+    return _LineSpec(" ", fams, True, frozenset(), frozenset(t.lower() for t in old_tl.tags), None)
+
+
+_EXTRACTED_ATTR = {DUE: "due", SCHEDULED: "scheduled", START: "start", DONE: "done_on",
+                   CREATED: "created", CANCELLED: "cancelled", PRIORITY: "priority", RECURRENCE: "recurrence"}
+
+
+def _reading(task, family: str):
+    v = getattr(task, _EXTRACTED_ATTR[family], None)
+    if isinstance(v, datetime.date):
+        return v.isoformat()
+    return v.strip() if isinstance(v, str) and family == RECURRENCE else v
+
+
+def _check_derived_line(old_tl, old_task, new_tl, new_task, spec: _LineSpec, what: str) -> str | None:
+    """A target or next-occurrence line against its ORIGINAL line: prefix,
+    gap and trailing whitespace byte-identical; the description identical,
+    or exactly the expected composition with nothing after it; every token
+    the spec does not touch byte-identical and in order (equal skeletons);
+    touched families exactly as intended; untouched families read by the
+    extractor exactly as they read before; the tag set as expected."""
+    if new_tl is None or new_task is None:
+        return f"the {what} line would not be a task"
+    if new_tl.status != spec.status or new_task.status_char != spec.status:
+        return f"the {what} line would not have the intended status"
+    if new_tl.prefix != old_tl.prefix or new_tl.gap != old_tl.gap or new_tl.tail_ws != old_tl.tail_ws:
+        return f"the {what} line's prefix, gap or trailing whitespace would change"
+    if spec.description is not None:
+        start = new_tl.text_start
+        end = start + len(spec.description)
+        if new_tl.line[start:end] != spec.description or (end < new_tl.text_end and new_tl.line[end] not in " \t"):
+            return f"the {what} line's description would not be exactly the replacement text"
+        old_lo, new_lo = old_tl.description_end, end
+    else:
+        old_lo, new_lo = old_tl.text_start, new_tl.text_start
+    if _skeleton(old_tl, old_lo, spec) != _skeleton(new_tl, new_lo, spec):
+        return f"the {what} line would change outside the fields the call names"
+    for fam, want in spec.families.items():
+        found = new_tl.run_fields(fam)
+        if want[0] == "same":
+            if new_tl.family_count(fam) != old_tl.family_count(fam):
+                return f"the {what} line's untouched {fam} field would change"
+        elif want[0] == "absent":
+            if found or new_tl.family_count(fam):
+                return f"the {what} line would carry an unintended {fam} field"
+        else:
+            want_v = want[1].strip() if fam == RECURRENCE else want[1]
+            if len(found) != 1 or new_tl.family_count(fam) != 1 or _value_text(new_tl, fam) != want_v:
+                return f"the {what} line's {fam} field would not re-extract as intended"
+    for fam in _EXTRACTED_ATTR:
+        want = spec.families[fam]
+        got = _reading(new_task, fam)
+        if want[0] == "same":
+            ok = got == _reading(old_task, fam)
+        elif want[0] == "absent":
+            ok = got is None
+        else:
+            ok = got == (want[1].strip() if fam == RECURRENCE else want[1])
+        if not ok:
+            return f"the {what} line's {fam} would not be extracted as intended"
+    if {t.lower() for t in new_tl.tags} != set(spec.tags):
+        return f"the {what} line's tags would not be conserved"
+    if not new_task.tags_cut and {t.lower() for t in (new_task.tags or [])} != set(spec.tags):
+        return f"the {what} line's extracted tags would not be conserved"
+    block_old = old_tl.block.value if old_tl.block else None
+    block_new = new_tl.block.value if new_tl.block else None
+    if block_new != (None if spec.remove_block else block_old):
+        return f"the {what} line's block link would change"
+    return None
 
 
 def _extracted_value(task, family: str):
@@ -1282,67 +1561,32 @@ def verify(old: str, new: str, plan: Plan) -> TaskWriteRefusal | None:
             if getattr(t, name) != getattr(u, name):
                 return _fail(f"another task's {name} would change")
 
-    # 2 and 6. the target.
+    # 2, 6 and the byte-level pin. The target, against its old line.
     if target is not None:
         if target not in old_by:
             return _fail("the declared target is not a task")
         old_tl = ov.parse(target)
-        new_tl = nv.parse(old_to_new[target])
-        new_task = new_by.get(old_to_new[target])
-        if old_tl is None or new_tl is None or new_task is None:
-            return _fail("the target would not stay a task")
-        intent = plan.intent or Intent()
-        status, tokens, tags = _target_expect(old_tl, intent)
-        if new_tl.status != status or new_task.status_char != status:
-            return _fail("the target would not have the intended status")
-        if new_tl.prefix != old_tl.prefix or new_tl.tail_ws != old_tl.tail_ws:
-            return _fail("the target's prefix or trailing whitespace would change")
-        for fam, want in tokens.items():
-            old_vals = [old_tl.line[x.start:x.end] for x in old_tl.run_fields(fam)]
-            new_found = new_tl.run_fields(fam)
-            if want[0] == "same":
-                if [new_tl.line[x.start:x.end] for x in new_found] != old_vals or new_tl.family_count(fam) != old_tl.family_count(fam):
-                    return _fail(f"the target's untouched {fam} field would change")
-            elif want[0] == "absent":
-                if new_found or new_tl.family_count(fam):
-                    return _fail(f"the target's {fam} field would survive its removal")
-            else:
-                got = _value_text(new_tl, fam)
-                want_v = want[1].strip() if fam == RECURRENCE else want[1]
-                if len(new_found) != 1 or new_tl.family_count(fam) != 1 or got != want_v:
-                    return _fail(f"the target's {fam} field would not re-extract as intended")
-        for fam in (DUE, SCHEDULED, START, DONE):
-            want = tokens[fam]
-            if want[0] == "same":
-                ok = _extracted_value(new_task, fam) == _extracted_value(old_by[target], fam)
-            elif want[0] == "absent":
-                ok = _extracted_value(new_task, fam) is None
-            else:
-                ok = _extracted_value(new_task, fam) == want[1]
-            if not ok:
-                return _fail(f"the target's {fam} date would not be extracted as intended")
-        want = tokens[PRIORITY]
-        if want[0] == "same" and new_task.priority != old_by[target].priority:
-            return _fail("the target's priority would change")
-        if want[0] == "absent" and new_task.priority is not None:
-            return _fail("the target's priority would survive its removal")
-        if want[0] == "set" and new_task.priority != want[1]:
-            return _fail("the target's priority would not be extracted as intended")
-        if {t.lower() for t in new_tl.tags} != set(tags):
-            return _fail("the target's tags would not be conserved")
-        if not new_task.tags_cut and {t.lower() for t in (new_task.tags or [])} != set(tags):
-            return _fail("the target's extracted tags would not be conserved")
-        if intent.description is not None:
-            if not new_tl.line[new_tl.text_start:].startswith(intent.description):
-                return _fail("the target's description would not be the replacement text")
-        elif not intent.add_tags and not intent.remove_tags and new_tl.description != old_tl.description:
-            return _fail("the target's description would change")
-        if (old_tl.block.value if old_tl.block else None) != (new_tl.block.value if new_tl.block else None):
-            return _fail("the target's block link would change")
+        if old_tl is None:
+            return _fail("the declared target is not a task")
+        spec = _target_spec(old_tl, plan.intent or Intent())
+        problem = _check_derived_line(
+            old_tl, old_by[target], nv.parse(old_to_new[target]), new_by.get(old_to_new[target]), spec, "target")
+        if problem is not None:
+            return _fail(problem)
 
     # 2. declared inserted tasks; context lines.
     for idx, decl in zip(ins_new, plan.inserted):
-        if decl.kind in ("next", "task"):
+        if decl.kind == "next":
+            if target is None or decl.expect is None:
+                return _fail("a next occurrence needs its completed task")
+            old_tl = ov.parse(target)
+            problem = _check_derived_line(
+                old_tl, old_by[target], nv.parse(idx), new_by.get(idx), _next_spec(old_tl, decl.expect), "next")
+            if problem is not None:
+                return _fail(problem)
+        elif decl.kind == "task":
+            if decl.expect is None:
+                return _fail("an added task has no expectation")
             problem = _check_new_task(nv.parse(idx), new_by.get(idx), decl.expect, decl.kind)
             if problem is not None:
                 return _fail(problem)
