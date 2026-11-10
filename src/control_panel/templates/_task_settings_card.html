@@ -26,6 +26,66 @@
         <form method="POST" action="{{ tasks_card.action }}">
             {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
 
+            {# #434: the task rule. Every control is always visible, so no
+               show/hide script is needed; each input is labelled with the
+               rule that uses it. #}
+            <div class="field">
+                <label class="field-label" for="task-rule">Which checkboxes are tasks</label>
+                <div class="u-font-size-11px u-color-text-3 u-margin-bottom-14px">
+                    Agents list, check off and add tasks in your notes. A task is a
+                    Markdown checkbox (<code>- [ ] …</code>). If you also use checkboxes
+                    for checklists, steps or reference cards, choose which ones count as
+                    tasks. “Task details” are the optional emoji fields of the Obsidian
+                    Tasks plugin, which you can type without it: 📅 due, ⏳ scheduled,
+                    🛫 start, ➕ created, ✅ done, ❌ cancelled, 🔺⏫🔼🔽⏬ priority,
+                    🔁 repeat. The global filter is the Tasks plugin’s “Global task
+                    filter”: if you set one there, set the same text here. Agents can
+                    always ask for every checkbox.
+                </div>
+                <select name="task_rule" id="task-rule" class="field-select">
+                    <option value="default"{% if tasks_card.rule_choice == "default" %} selected{% endif %}>Server default ({{ tasks_card.default_rule_words }})</option>
+                    <option value="all"{% if tasks_card.rule_choice == "all" %} selected{% endif %}>Every checkbox is a task</option>
+                    <option value="fields"{% if tasks_card.rule_choice == "fields" %} selected{% endif %}>Only checkboxes with task details or a task tag</option>
+                    <option value="filter"{% if tasks_card.rule_choice == "filter" %} selected{% endif %}>Only checkboxes that contain the global filter text</option>
+                </select>
+                <div class="u-font-size-11px u-color-text-3 u-margin-top-6px">
+                    In use now: {{ tasks_card.effective_rule_words }}
+                    ({% if tasks_card.rule_inherited %}server default{% else %}set here{% endif %}).
+                </div>
+                {% if tasks_card.rule_unusable %}
+                <div class="alert alert-warning u-margin-top-8px u-font-size-12px">
+                    The configured rule cannot be applied ({{ tasks_card.rule_unusable }}),
+                    so every checkbox is treated as a task until it is changed.
+                </div>
+                {% endif %}
+            </div>
+
+            <div class="field">
+                <label class="field-label" for="task-rule-tags">Task tags (used by “task details or a task tag”)</label>
+                <textarea name="task_tags" id="task-rule-tags" rows="3"
+                          class="field-input mono" spellcheck="false"
+                          placeholder="waiting-for">{{ tasks_card.task_tags }}</textarea>
+                <div class="u-font-size-11px u-color-text-3 u-margin-top-6px">
+                    One tag per line, with or without <code>#</code>. A checkbox carrying one
+                    of these tags, or a nested tag below it (<code>waiting-for/bob</code> under
+                    <code>waiting-for</code>), counts as a task even without task details.
+                    Leave empty to count task details only. At most {{ tasks_card.task_tags_max }}.
+                </div>
+            </div>
+
+            <div class="field">
+                <label class="field-label" for="task-global-filter">Global filter text (used by “global filter”)</label>
+                <input type="text" name="global_filter" id="task-global-filter" class="field-input mono"
+                       maxlength="{{ tasks_card.filter_max }}" autocomplete="off" spellcheck="false"
+                       value="{{ tasks_card.global_filter }}" placeholder="#task">
+                <div class="u-font-size-11px u-color-text-3 u-margin-top-6px">
+                    A checkbox counts as a task when its text contains this exactly
+                    (capital letters matter). Tasks that agents add get it at the start.
+                    For example <code>#task</code> or <code>TODO</code>; at most
+                    {{ tasks_card.filter_max }} characters on one line.
+                </div>
+            </div>
+
             <div class="field">
                 <label class="field-label" for="task-timezone">Timezone</label>
                 <input type="text" name="timezone" id="task-timezone" class="field-input mono"
