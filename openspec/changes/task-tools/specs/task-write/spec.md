@@ -121,7 +121,7 @@ Before any dry-run diff or publication, every plan SHALL be verified, and a fail
 3. every other task of the note re-extracts identically, with lines after an insertion shifted by the inserted count;
 4. no undeclared task appears;
 5. no pre-existing line changes its owning task. A line's owning task is the nearest preceding task whose continuation block contains it;
-6. the target's tag set, compared whole-tag and case-insensitively, equals the set before, plus the tags added, minus the tags removed.
+6. the target's tag set, compared whole-tag and case-insensitively, equals the set before, plus the tags added (through `add_tags`, or typed by the caller inside a replacement `text`), minus the tags removed through `remove_tags`.
 
 A task's **continuation block** is every following line that has a greater blockquote depth, or the same blockquote prefix and a greater indentation width (a tab counts as 4). Blank lines are crossed while a later line still belongs. The block has no line or character cap.
 

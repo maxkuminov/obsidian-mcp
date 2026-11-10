@@ -59,7 +59,7 @@ The source is `references/tasks-plugin-reference.md` in this change: Tasks 8.6.0
 - **Ordinal.** Within one note's extracted task list (document order, the same 5,000 cap), `key_count` is the number of tasks with that key and `key_ordinal` is this task's 1-based rank among them.
 - **Rendered id.**
   - `<key>` when `key_count = 1`, otherwise `<key>.<ordinal>of<count>`.
-  - Grammar `^[0-9a-f]{12}(\.[1-9][0-9]{0,3}of[1-9][0-9]{0,3})?$`, at most 22 characters.
+  - Grammar `^[0-9a-f]{12}(\.[1-9][0-9]{0,3}of[1-9][0-9]{0,3})?$`, at most 23 characters (`<12 hex>.9999of9999`). Any rendering bound that reserves room for an id uses 23.
   - The write tools accept both forms. `<key>.1of1` is equivalent to `<key>`.
 - **Stored.** `note_tasks.task_key char(12)`, `key_ordinal int` and `key_count int` are written by the extractor (D11), so an id works for text beyond the 1,000-character cut and the listing needs no window query.
 - **A suffixed id names an occurrence, not a line** (Codex r1 #2). Two identical lines can swap places, or one can be replaced, with the count unchanged, and the ordinal then silently names the other occurrence. A write with a suffixed id is therefore accepted only together with a whole-note `expected_hash` that matches the current bytes (D2/D3), in every deployment mode. The ordinal is then relative to exactly the bytes the caller read.
@@ -207,7 +207,7 @@ A plan is a list of `(old line span → new text)` replacements and insertions, 
 3. Every other task of the note extracts identically: same `full_text`, status and line. Lines after an insertion shift by exactly the number of inserted lines.
 4. No new task appears except the declared ones. This catches a context line or description that would create a checkbox or a heading.
 5. **No pre-existing line changes its owning task** (Codex r1 #1). A line's owning task is the nearest preceding task line whose **continuation block** contains it, where the continuation block is defined in D8: uncapped, crossing blank lines. Every line of the old note keeps its owner in the new note, except the declared new lines, which are owned as planned.
-6. **Tags are conserved** (Codex r2 #1). The target's tag set after the write (whole tags, case-insensitive) equals the set before, plus `add_tags`, minus `remove_tags`.
+6. **Tags are conserved** (Codex r2 #1). The target's tag set after the write (whole tags, case-insensitive) equals the set before, plus `add_tags`, plus any tag the caller typed inside a replacement `text` (the caller wrote it, so it is a named change), minus `remove_tags`. No tag is ever lost unless `remove_tags` names it.
 
 A failed assertion is `task_malformed`, with nothing written. This is the last line of defence and the strongest safety property here. It is pinned by a property test over a corpus.
 

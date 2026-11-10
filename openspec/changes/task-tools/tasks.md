@@ -6,7 +6,7 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
 
 ## 1. S1: pure modules (wave 1, no database)
 
-- [ ] 1.1 `src/services/task_line.py`. Implement and unit-test against every R§1.4 example:
+- [x] 1.1 `src/services/task_line.py`. Implement and unit-test against every R§1.4 example:
   - `parse(line) -> TaskLine`: prefix, box, gap, description span, run tokens with spans, block link, `tail_ws`;
   - the D4 operations, as pure functions returning `(new_line, spans)` or a `TaskLineRefusal(code="task_malformed", reason)`;
   - `description_region(text)`;
@@ -14,12 +14,12 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
   - `task_key(full_text)` (D1);
   - `description_key(norm)` (D9);
   - `render_id(key, ordinal, count)` and `parse_id(s)`.
-- [ ] 1.2 `src/services/task_recurrence.py`, D7:
+- [x] 1.2 `src/services/task_recurrence.py`, D7:
   - `parse_rule(text) -> Rule | Unsupported`, tier 1 only;
   - `next_occurrence(rule, *, due, scheduled, start, done_on) -> Shift | Unsupported`, using stdlib `datetime` and `calendar` only;
   - a docstring listing tier 1, tier 2 and the R§ citations.
-- [ ] 1.3 `src/services/task_dates.py`: `resolve(value, tz, *, now=None) -> date | invalid` (D12 forms, N ≤ 3660) and `today(tz, *, now=None)`. The clock is injectable.
-- [ ] 1.4 `tests/test_task_line.py`, `tests/test_task_recurrence.py` and `tests/test_task_dates.py`:
+- [x] 1.3 `src/services/task_dates.py`: `resolve(value, tz, *, now=None) -> date | invalid` (D12 forms, N ≤ 3660) and `today(tz, *, now=None)`. The clock is injectable.
+- [x] 1.4 `tests/test_task_line.py`, `tests/test_task_recurrence.py` and `tests/test_task_dates.py`:
   - every case in the design §Test plan "Unit, pure";
   - the R§2b/2c table;
   - `tag_prefixes` normalisation (slash runs collapsed, trailing `/` stripped, the same on filter values), plus the largest buildable case: 64 distinct 127-character tags of a 3-character first segment and 62 one-character segments give 4,032 prefixes, uncapped;
