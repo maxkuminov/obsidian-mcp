@@ -49,12 +49,12 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
 
 ## 3. S3: extractor version 5, indexer guard, write-time refresh (wave 2)
 
-- [ ] 3.1 `src/services/tasks.py`:
+- [x] 3.1 `src/services/tasks.py`:
   - `ExtractedTask` gains `task_key`, `key_ordinal`, `key_count`, `description_key`, `text_fold`, `tag_prefixes`, `recurrence`, `recurrence_cut`, `created`, `cancelled`, `context` and `context_cut` (the `note-tasks` delta, using `task_line` for the run, the key and the description);
   - add `tasks_from_note_text(raw) -> (tasks, truncated)`, the one shared function (frontmatter split + offset + extraction);
   - add `TASK_IDS_SINCE_EXTRACTION_VERSION = 5`;
   - docstring: the composition rule gains the write-time refresh exception (D10).
-- [ ] 3.2 `src/services/indexer.py`:
+- [x] 3.2 `src/services/indexer.py`:
   - `CURRENT_EXTRACTION_VERSION = 5`, with a "Version 5 adds task ids (#428)" paragraph;
   - R2: `scan_started_at` from the database before the first file read of each attempt;
   - R3: task-dirty rows are ineligible for the stat shortcut and join the task stage's list;
@@ -62,9 +62,9 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
   - insert the new columns.
   
   `src/services/embeddings.py`: `clean_at_version` gains `5: clean_for_embedding`.
-- [ ] 3.3 `src/services/task_index.py`: `refresh_note_tasks(*, uid, root, target, rel, published: bytes) -> RefreshResult(status, code)`, exactly R1 including step 3a (re-read through the anchored `target` under the row lock; on a mismatch write nothing and return `superseded`). Its own session, `SET LOCAL lock_timeout`, root re-check, `FOR UPDATE` on the owner-scoped row, delete and insert, the hash and timestamp. It never raises to the caller, and takes no generation lock.
-- [ ] 3.4 Unit: `tests/test_note_tasks_extractor.py` gains the version-5 columns, the context rule and the run-based recurrence. Add an AST guard that `task_index` never calls `acquire_generation_lock*`.
-- [ ] 3.5 Integration (`tests/integration/test_task_refresh_pg.py`, container `omcp-tt-s3` / 55453):
+- [x] 3.3 `src/services/task_index.py`: `refresh_note_tasks(*, uid, root, target, rel, published: bytes) -> RefreshResult(status, code)`, exactly R1 including step 3a (re-read through the anchored `target` under the row lock; on a mismatch write nothing and return `superseded`). Its own session, `SET LOCAL lock_timeout`, root re-check, `FOR UPDATE` on the owner-scoped row, delete and insert, the hash and timestamp. It never raises to the caller, and takes no generation lock.
+- [x] 3.4 Unit: `tests/test_note_tasks_extractor.py` gains the version-5 columns, the context rule and the run-based recurrence. Add an AST guard that `task_index` never calls `acquire_generation_lock*`.
+- [x] 3.5 Integration (`tests/integration/test_task_refresh_pg.py`, container `omcp-tt-s3` / 55453):
   - the version 4 → 5 backfill (no `embedded_content_hash` cleared);
   - every D10 interleaving converging within two passes;
   - a task-dirty row with an unchanged stat re-read;

@@ -160,7 +160,8 @@ def test_a_missing_body_or_id_is_a_skip():
 def test_the_extraction_version_carries_task_extraction():
     from src.services.tasks import TASKS_SINCE_EXTRACTION_VERSION
 
-    assert indexer.CURRENT_EXTRACTION_VERSION == 4 == TASKS_SINCE_EXTRACTION_VERSION
+    assert indexer.CURRENT_EXTRACTION_VERSION == 5
+    assert TASKS_SINCE_EXTRACTION_VERSION == 4
 
 
 @pytest.mark.parametrize("body", [

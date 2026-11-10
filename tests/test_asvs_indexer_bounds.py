@@ -407,7 +407,7 @@ _CORPUS = [
 
 def test_the_extraction_version_is_four():
     # 3 → 4 for task extraction (#350); see `test_note_tasks_extractor.py`.
-    assert indexer.CURRENT_EXTRACTION_VERSION == 4
+    assert indexer.CURRENT_EXTRACTION_VERSION == 5
 
 
 def test_version_two_cleans_identically_to_version_one():
