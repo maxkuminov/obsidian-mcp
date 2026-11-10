@@ -12,8 +12,8 @@ and refreshes the task rows (D2 steps 5–16).
 * A plan is a list of `Span`s over the ORIGINAL text — never a regenerated
   note. Every byte outside the spans is the original byte (D4, D5).
 * Every planner re-derives the tasks from the text it is handed, with the one
-  shared extraction function (`_tasks_from_note_text`, see the adapter
-  below), and carries nothing from one call to the next: the wiring's
+  shared extraction function (`tasks.tasks_from_note_text`, over the
+  canonical text; `_NoteView` reads the same partition and mask), and carries nothing from one call to the next: the wiring's
   retry-on-conflict loop (D2, up to 3 attempts) simply calls again on the
   fresh bytes.
 * A refusal (`TaskWriteRefusal`) writes nothing. When in doubt the planner
@@ -46,7 +46,6 @@ import datetime
 import functools
 import re
 import unicodedata
-from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
@@ -72,11 +71,8 @@ from src.services.task_line import (
     TaskLineRefusal,
 )
 from src.services.task_recurrence import Rule, Unsupported, next_occurrence, parse_rule
-from src.services.tasks import (
-    STATE_OPEN,
-    extract_tasks_bounded,
-    frontmatter_line_offset,
-)
+from src.services import tasks as tasks_mod
+from src.services.tasks import STATE_OPEN
 from src.services.vault import (
     _ATX_HEADING_RE,
     _resolve_section_index,
@@ -86,82 +82,10 @@ from src.services.vault import (
     parse_frontmatter_diagnose,
 )
 
-# ── the shared extraction (adapter) ──────────────────────────────────────────
-
-
-@dataclass(frozen=True)
-class _AdaptedTask:
-    """`tasks.ExtractedTask`'s fields plus the D1 identity triple.
-
-    The shape `tasks.tasks_from_note_text` returns once S3 merges (its
-    `ExtractedTask` gains these three fields and more). This module reads
-    only: ``line``, ``status_char``, ``state``, ``text``, ``text_cut``,
-    ``due``, ``scheduled``, ``start``, ``done_on``, ``priority``, ``tags``,
-    ``tags_cut``, ``heading_path``, ``task_key``, ``key_ordinal``,
-    ``key_count``.
-    """
-
-    line: int
-    status_char: str
-    state: str
-    text: str
-    text_cut: bool
-    due: datetime.date | None
-    scheduled: datetime.date | None
-    start: datetime.date | None
-    done_on: datetime.date | None
-    priority: str | None
-    tags: list[str] | None
-    tags_cut: bool
-    heading_path: str | None
-    task_key: str
-    key_ordinal: int
-    key_count: int
+# ── the shared extraction ──────────────────────────────────────────
 
 
 _LINE_BREAK_RE = re.compile(r"\r\n|\n|\r")
-
-
-def _tasks_from_note_text(raw: str) -> tuple[list, bool]:
-    """The tasks of a whole note text and whether the per-note cap bit.
-
-    TODO(#428): replace with tasks.tasks_from_note_text once S3 merges.
-
-    Contract (identical to the shared function's): ``raw`` is the whole
-    decoded note (frontmatter included, any terminators, NUL-free). The body
-    is split exactly as the index pass splits it (`parse_frontmatter`, then
-    `frontmatter_line_offset`), extracted with `extract_tasks_bounded`, so
-    ``line`` is the 1-based line of the whole file. Each task carries
-    ``task_key`` over its UNCUT text (D1) and ``key_ordinal`` / ``key_count``
-    counted in document order over the (capped) list. Returns
-    ``(tasks, truncated)``.
-    """
-    _fm, body = parse_frontmatter(raw)
-    offset = frontmatter_line_offset(raw, body)
-    extracted, truncated = extract_tasks_bounded(body, line_offset=offset)
-    masked = mask_code(body, context=BODY)
-    starts = [0]
-    ends = []
-    for m in _LINE_BREAK_RE.finditer(body):
-        ends.append(m.start())
-        starts.append(m.end())
-    ends.append(len(body))
-    keys = []
-    for t in extracted:
-        i = t.line - offset - 1
-        s, e = starts[i], ends[i]
-        parsed = tl_mod.parse(body[s:e], masked=masked[s:e])
-        if parsed is None:  # the parser and the extractor disagree: a bug
-            raise ValueError("task_write: extractor and task_line disagree on a task line")
-        keys.append(tl_mod.task_key(parsed.full_text))
-    counts = Counter(keys)
-    seen: Counter = Counter()
-    out = []
-    for t, k in zip(extracted, keys):
-        seen[k] += 1
-        values = {f.name: getattr(t, f.name) for f in dataclasses.fields(t)}
-        out.append(_AdaptedTask(**values, task_key=k, key_ordinal=seen[k], key_count=counts[k]))
-    return out, truncated
 
 
 # ── data ─────────────────────────────────────────────────────────────────────
@@ -359,9 +283,19 @@ class _Line:
 
 class _NoteView:
     """A whole note split under the universal-newline rule, with the body
-    partition and code mask the extractor uses."""
+    partition and code mask the extractor uses.
+
+    The partition and the mask are derived from the CANONICAL text — the
+    one `tasks.tasks_from_note_text` extracts from (every terminator → LF;
+    NUL notes are refused before a view is built) — so the planner and the
+    extractor read the same lines the same way. Canonicalisation rewrites
+    only terminators, so line ``i``'s content and length are identical in
+    both texts and positions map line by line; edits are spans over the
+    ORIGINAL text, whose terminators are untouched."""
 
     def __init__(self, text: str) -> None:
+        if "\x00" in text:
+            raise ValueError("task_write: the note contains NUL")
         self.text = text
         lines: list[_Line] = []
         pos = 0
@@ -370,18 +304,30 @@ class _NoteView:
             pos = m.end()
         lines.append(_Line(pos, len(text), ""))
         self.lines = lines
-        _fm, body = parse_frontmatter(text)
-        if len(body) > len(text) or not text.endswith(body):
+        canon = "\n".join(text[ln.start : ln.end] for ln in lines)
+        if canon != tasks_mod._canonical_text(text):
+            raise ValueError("task_write: canonical text does not map line for line")
+        canon_starts = []
+        p = 0
+        for ln in lines:
+            canon_starts.append(p)
+            p += ln.end - ln.start + 1
+        self._canon_starts = canon_starts
+        _fm, body = parse_frontmatter(canon)
+        if len(body) > len(canon) or not canon.endswith(body):
             raise ValueError("task_write: the body is not a suffix of the note")
-        self.body = body
-        self.body_offset = len(text) - len(body)
-        self.body_first = len(_LINE_BREAK_RE.findall(text[: self.body_offset]))
-        if body == "" and self.body_offset == len(text) and self.lines[-1].start != len(text):
+        offset = len(canon) - len(body)
+        self.body_first = canon[:offset].count("\n")
+        if body == "" and offset == len(canon) and canon_starts[-1] != len(canon):
             # A frontmatter block that ends the file without a terminator:
             # the body is empty and has no line of its own.
             self.body_first = len(lines)
-        elif self.lines[self.body_first].start != self.body_offset:
+            self.body_offset = len(text)
+        elif canon_starts[self.body_first] != offset:
             raise ValueError("task_write: the body does not start at a line start")
+        else:
+            self.body_offset = lines[self.body_first].start
+        self._canon_body_offset = offset
         self.masked = mask_code(body, context=BODY)
         if len(self.masked) != len(body):
             raise ValueError("task_write: masking changed the length")
@@ -398,7 +344,8 @@ class _NoteView:
         ln = self.lines[i]
         if i < self.body_first:
             return self.content(i)
-        return self.masked[ln.start - self.body_offset : ln.end - self.body_offset]
+        start = self._canon_starts[i] - self._canon_body_offset
+        return self.masked[start : start + ln.end - ln.start]
 
     def parse(self, i: int):
         return tl_mod.parse(self.content(i), masked=self.masked_line(i))
@@ -429,10 +376,10 @@ def _extract(text: str) -> tuple[tuple, bool] | TaskWriteRefusal:
 
 @functools.lru_cache(maxsize=8)
 def _extract_cached(text: str) -> tuple[tuple, bool]:
-    """`_tasks_from_note_text`, memoised on the exact text. The function is
+    """`tasks.tasks_from_note_text` (the one shared extraction), memoised on the exact text. The function is
     pure, so this only saves the repeated extractions of one call (plan,
     verify, ids); it carries no decision between calls."""
-    tasks, truncated = _tasks_from_note_text(text)
+    tasks, truncated = tasks_mod.tasks_from_note_text(text)
     return tuple(tasks), truncated
 
 
@@ -1439,7 +1386,7 @@ def verify(old: str, new: str, plan: Plan) -> TaskWriteRefusal | None:
 
 def _heading_lines(v: _NoteView) -> list[tuple[int, int, str]]:
     out = []
-    starts = [ln.start - v.body_offset for ln in v.lines]
+    starts = [c - v._canon_body_offset for c in v._canon_starts]
     for m in _ATX_HEADING_RE.finditer(v.masked):
         k = bisect.bisect_right(starts, m.start()) - 1
         out.append((k, len(m.group(1)), m.group(2).strip()))
