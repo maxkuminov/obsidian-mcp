@@ -1663,7 +1663,11 @@ async def duplicate_scan(session, uid, settings, norm: str, terms: Sequence[str]
     from src.models.db import NoteMetadata, NoteTask
 
     key = tl_mod.description_key(norm)
-    owner = NoteMetadata.user_id.is_(None) if uid is None else NoteMetadata.user_id == uid
+    # The one owner mapping (`tools._note_owner_predicate`, the predicate
+    # `list_tasks` joins under), imported at call time like `task_query` does.
+    from src.mcp_server import tools as _tools
+
+    owner = _tools._note_owner_predicate(uid)
     from src.services.task_query import scope_clause
 
     # The listing's own default-scope predicate (D12/D14): a note `list_tasks`

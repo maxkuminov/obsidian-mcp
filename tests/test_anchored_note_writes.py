@@ -55,6 +55,23 @@ def vault(monkeypatch, tmp_path):
 
     monkeypatch.setattr(vault_service.settings, "vault_path", str(tmp_path))
     monkeypatch.setattr(tools, "_log_usage", noop)
+    # The task tools (#428) also read their settings, scan for duplicates and
+    # refresh the index; stand those database touches in so the anchoring is
+    # what these tests exercise.
+    from src.services import task_index, task_settings, task_write
+
+    async def task_defaults(_uid):
+        return task_settings.defaults()
+
+    async def no_duplicates(*_a, **_k):
+        return [], [], False
+
+    async def refreshed(**_k):
+        return task_index.RefreshResult(task_index.REFRESHED)
+
+    monkeypatch.setattr(tools, "_effective_task_settings", task_defaults)
+    monkeypatch.setattr(task_write, "duplicate_scan", no_duplicates)
+    monkeypatch.setattr(task_index, "refresh_note_tasks", refreshed)
     vault_fs.reset_filesystem_probe_cache()
     token = current_permission.set("readwrite")
     yield tmp_path
@@ -129,6 +146,9 @@ def _twin_directories(root: Path) -> tuple[Path, Path]:
                 "Real/note.md", updates={"status": "done"}
             ),
             id="set_frontmatter",
+        ),
+        pytest.param(
+            lambda: tools.add_task_impl("Real/note.md", "after"), id="add_task"
         ),
     ],
 )
@@ -432,6 +452,13 @@ needs_proc = pytest.mark.skipif(
         ),
         pytest.param(
             lambda i: tools.delete_note_impl(f"n{i}.md"), id="delete_note"
+        ),
+        pytest.param(
+            lambda i: tools.add_task_impl("kept.md", f"task {i}"), id="add_task"
+        ),
+        pytest.param(
+            lambda i: tools.complete_task_impl("kept.md", "0123456789ab"),
+            id="complete_task_refused",
         ),
         pytest.param(
             lambda i: tools.write_file_impl(
@@ -783,6 +810,21 @@ async def test_a_source_replaced_mid_move_is_relocated_intact(vault, monkeypatch
             lambda: tools.move_note_impl("gone.md", "there.md"),
             "Source note not found",
             id="move_note",
+        ),
+        pytest.param(
+            lambda: tools.complete_task_impl("gone.md", "0123456789ab"),
+            "Note not found",
+            id="complete_task",
+        ),
+        pytest.param(
+            lambda: tools.update_task_impl("gone.md", "0123456789ab", due="today"),
+            "Note not found",
+            id="update_task",
+        ),
+        pytest.param(
+            lambda: tools.add_task_impl("gone.md", "x"),
+            "use create_note",
+            id="add_task",
         ),
     ],
 )

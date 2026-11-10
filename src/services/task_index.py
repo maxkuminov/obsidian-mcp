@@ -133,8 +133,12 @@ def _lagged(code: str) -> RefreshResult:
 
 
 def _owner(uid: int | None):
-    """The total owner mapping (`_note_owner_predicate`): None is IS NULL."""
-    return NoteMetadata.user_id.is_(None) if uid is None else NoteMetadata.user_id == uid
+    """The total owner mapping: None is IS NULL. The ONE implementation,
+    `tools._note_owner_predicate` (imported at call time, as `task_query`
+    does: `tools` imports this module), so tenancy has a single definition."""
+    from src.mcp_server import tools
+
+    return tools._note_owner_predicate(uid)
 
 
 def _is_lock_not_available(exc: BaseException) -> bool:

@@ -249,9 +249,12 @@ def _header_line1(page: TaskPage, *, shown: int, more: bool, line_max: int) -> s
         # counts, a 64-character folder echo): the folder echo gives way so
         # the #350 line bound holds; it stays labelled cut (`…`).
         over = len(line) - line_max
-        shown_folder = _t()._one_line(n.folder)
-        keep = max(min(len(shown_folder), _legacy_echo_max()) - 1 - over, 1)
-        line = build(shown_folder[:keep] + "…")
+        keep = max(min(len(n.folder), _legacy_echo_max()) - 1 - over, 1)
+        line = build(n.folder[:keep] + "…")
+        while len(line) > line_max and keep > 1:
+            # An escaped character is wider than one: shrink until it fits.
+            keep -= 1
+            line = build(n.folder[:keep] + "…")
     return line
 
 
@@ -272,7 +275,7 @@ def _names_part(label: str, names: tuple[str, ...], room: int) -> str:
         return base
     shown: list[str] = []
     for i, name in enumerate(names):
-        candidate = shown + [_cut(tools._escape_task_path(name), QUERY_ECHO_MAX)]
+        candidate = shown + [tools._echo_path(name, QUERY_ECHO_MAX)]
         rest = len(names) - len(candidate)
         part = f"{base} [{', '.join(candidate)}{f' +{rest} more' if rest else ''}]"
         if len(part) > room:
@@ -325,7 +328,7 @@ def _query_line(page: TaskPage, *, line_max: int = QUERY_LINE_MAX,
             parts.append(
                 f"exclude_tags: {_cut(' '.join('#' + t for t in n.exclude_tags), echo_max)}")
         if n.path is not None:
-            parts.append(f"path: {_cut(tools._escape_task_path(n.path), echo_max)}")
+            parts.append(f"path: {tools._echo_path(n.path, echo_max)}")
         parts.append(f"scope: {ex.scope}")
         parts.append(f"excluded by scope: {ex.excluded} tasks")
         return parts
@@ -518,7 +521,7 @@ def render_agenda_header(page: AgendaPage) -> str:
     parts = [f"Agenda — {_tz_part(page.timezone, page.timezone_unavailable)}",
              f"date: {date}", f"days: {page.days}"]
     if page.folder:
-        parts.append(f"folder: {_cut(tools._one_line(page.folder), QUERY_ECHO_MAX)}")
+        parts.append(f"folder: {tools._echo_path(page.folder, QUERY_ECHO_MAX)}")
     if page.tags:
         parts.append(f"tags: {_cut(' '.join('#' + t for t in page.tags), QUERY_ECHO_MAX)}")
     if page.exclude_tags:
