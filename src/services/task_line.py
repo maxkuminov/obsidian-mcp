@@ -396,21 +396,107 @@ class LineChanges:
 # ── parsing ──────────────────────────────────────────────────────────────────
 
 
-def _whitespace_start(text: str, pos: int, floor: int) -> int:
-    while pos > floor and text[pos - 1].isspace():
-        pos -= 1
-    return pos
+# ── the linear end-anchored matcher ──────────────────────────────────────────
+#
+# Every plugin pattern is ``prefix + value + '$'`` where everything after the
+# prefix (the signifier and its optional U+FE0F, or the tag's ``#``, or the
+# block link's `` ^``) is drawn from a small alphabet that never contains the
+# prefix characters. So the only place a match ending at ``end`` can start is
+# immediately before the maximal run of that alphabet ending at ``end``: the
+# leftmost match a ``re.search`` from the start would find is that one
+# candidate. Runs are found on the reversed text with a forward ``match``
+# (C speed), and cached per alphabet while ``end`` stays inside the run, so
+# a pass looks only at the suffix it is about to consume and the whole parse
+# is linear in the text (#428; the old rescan from the start of the text on
+# each of up to 21 passes took ~25 s on a 10 MiB line).
+
+_WS_RUN = re.compile(r"\s*")
+_WS_CHAR = re.compile(r"\s")
+_ALPHABETS = {
+    "date": re.compile(r"[ 0-9-]*"),
+    "recurrence": re.compile(r"[a-zA-Z0-9, !]*"),
+    "on_completion": re.compile(r"[ a-zA-Z]*"),
+    "id": re.compile(r"[ a-zA-Z0-9_-]*"),
+    "depends_on": re.compile(r"[ ,a-zA-Z0-9_-]*"),
+    "tag": re.compile(r"[^ !@#$%^&*(),.?\":{}|<>]*"),
+    "block": re.compile(r"[a-zA-Z0-9-]*"),
+}
+_FAMILY_ALPHABET = {
+    DONE: "date", CANCELLED: "date", DUE: "date", SCHEDULED: "date", START: "date",
+    CREATED: "date", RECURRENCE: "recurrence", ON_COMPLETION: "on_completion",
+    ID: "id", DEPENDS_ON: "depends_on",
+}
+
+
+class _Backward:
+    """Backward runs over one text, via its reversal, cached per alphabet."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.rev = text[::-1]
+        self.n = len(text)
+        self.cache: dict[str, tuple[int, int]] = {}
+
+    def run_start(self, name: str, pattern: re.Pattern, end: int) -> int:
+        """Start of the maximal run of ``pattern``'s alphabet ending at ``end``."""
+        cached = self.cache.get(name)
+        if cached is not None and cached[0] <= end <= cached[1]:
+            return cached[0]
+        start = self.n - pattern.match(self.rev, self.n - end).end()
+        self.cache[name] = (start, end)
+        return start
+
+    def rstrip_end(self, end: int) -> int:
+        """``len(text[:end].rstrip())``."""
+        return self.run_start("ws", _WS_RUN, end)
+
+    def whitespace_start(self, pos: int, floor: int) -> int:
+        return max(self.run_start("ws", _WS_RUN, pos), min(floor, pos))
+
+    def match(self, family: str, pattern: re.Pattern, end: int):
+        """The leftmost match of ``pattern`` ending exactly at ``end``, or
+        None — the same match ``pattern.search(text, 0, end)`` returns."""
+        text = self.text
+        if end <= 0:
+            return None
+        if family == PRIORITY:
+            candidates = (end - 1, end - 2)
+        elif family == "#tag":
+            s = self.run_start("tag", _ALPHABETS["tag"], end)
+            if s == end or s < 1 or text[s - 1] != "#":
+                return None
+            if s - 1 > 0 and _WS_CHAR.match(text, s - 2) is None:
+                return None
+            return pattern.match(text, max(s - 2, 0), end) if s - 1 > 0 else pattern.match(text, 0, end)
+        else:
+            s = self.run_start(_FAMILY_ALPHABET[family], _ALPHABETS[_FAMILY_ALPHABET[family]], end)
+            candidates = (s - 1, s - 2)
+        for pos in candidates:
+            if pos < 0:
+                continue
+            m = pattern.match(text, pos, end)
+            if m is not None:
+                return m
+        return None
+
+    def block_link(self, end: int):
+        s = self.run_start("block", _ALPHABETS["block"], end)
+        if s == end or s < 2 or self.text[s - 1] != "^" or self.text[s - 2] != " ":
+            return None
+        return _BLOCK_LINK_RE.match(self.text, s - 2, end)
 
 
 def parse_run(text: str, *, offset: int = 0, floor: int | None = None) -> RunParse:
     """The plugin's backward parse of ``text`` (R§1.4), tokens in document
     order. ``offset`` shifts every reported span (so a caller can parse a
     slice of a line); ``floor`` bounds ``sep_start`` (defaults to ``offset``).
+    Linear in ``len(text)`` (see `_Backward`).
     """
     floor = offset if floor is None else floor
-    end = len(text.rstrip())
+    back = _Backward(text)
+    end = back.rstrip_end(len(text))
     block = None
-    m = _BLOCK_LINK_RE.search(text, 0, end)
+    m = back.block_link(end)
     if m is not None:
         b_start = m.start("val")
         block = Token(
@@ -418,15 +504,15 @@ def parse_run(text: str, *, offset: int = 0, floor: int | None = None) -> RunPar
             start=offset + b_start, end=offset + m.end(),
             value_start=offset + b_start, value_end=offset + m.end(),
             value=m.group("val"), symbol="^",
-            sep_start=offset + _whitespace_start(text, b_start, floor - offset),
+            sep_start=offset + back.whitespace_start(b_start, floor - offset),
         )
-        end = len(text[: m.start()].rstrip())
+        end = back.rstrip_end(m.start())
 
     found: list[Token] = []
     for _ in range(_MAX_PASSES):
         matched = False
         for family, pattern in _PLUGIN_PATTERNS:
-            m = pattern.search(text, 0, end)
+            m = back.match(family, pattern, end)
             if m is None:
                 continue
             matched = True
@@ -453,13 +539,13 @@ def parse_run(text: str, *, offset: int = 0, floor: int | None = None) -> RunPar
                     value_start=v_start, value_end=v_end, value=value,
                     symbol=text[start:symbol_end], sep_start=start,
                 ))
-            end = len(text[: m.start()].rstrip())
+            end = back.rstrip_end(m.start())
         if not matched:
             break
 
     tokens = []
     for t in sorted(found, key=lambda t: t.start):
-        sep = _whitespace_start(text, t.start, floor - offset)
+        sep = back.whitespace_start(t.start, floor - offset)
         tokens.append(Token(
             kind=t.kind, family=t.family,
             start=offset + t.start, end=offset + t.end,
