@@ -903,11 +903,11 @@ async def _task_settings_context(session: AsyncSession, uid: int | None, action:
             # (stored NULL is "default"); the tags and filter inputs show what
             # is stored on this card (kept even while another rule is chosen);
             # "in use now" is the effective rule and where it comes from.
-            "rule_choice": (row.task_rule if row is not None and row.task_rule else "default"),
+            "rule_choice": getattr(row, "task_rule", None) or "default",
             "default_rule_words": task_rule.describe(
                 defaults.task_rule, defaults.task_tags, defaults.global_filter),
-            "task_tags": "\n".join(row.task_tags or ()) if row is not None else "",
-            "global_filter": (row.global_filter or "") if row is not None else "",
+            "task_tags": "\n".join(getattr(row, "task_tags", None) or ()),
+            "global_filter": getattr(row, "global_filter", None) or "",
             "effective_rule_words": task_rule.describe(
                 effective.task_rule, effective.task_tags, effective.global_filter),
             "rule_inherited": effective.task_rule_inherited,

@@ -93,6 +93,12 @@ RULE_LINE_FILTER_MAX = 284
 #: `test_rule_line_min_budget` / `test_rule_line_full_budget`.
 LIST_WITH_RULE_MIN_BUDGET = LIST_WITH_QUERY_MIN_BUDGET + RULE_LINE_MAX + 1
 LIST_WITH_RULE_FULL_BUDGET = LIST_WITH_QUERY_FULL_BUDGET + RULE_LINE_MAX + 1
+#: Measured by rendering that synthetic worst case (ten-digit counts, every
+#: echo at its widest, the worst `fields` rule line with 32 task tags and the
+#: approximate token): the smallest caps at which the row renders, and at
+#: which it keeps 40 + 40. The guarantees above stay the stated figures.
+LIST_WITH_RULE_MIN_MEASURED = 1878
+LIST_WITH_RULE_FULL_MEASURED = 1955
 #: #434 D5: the agenda with its rule line is refused below this.
 AGENDA_WITH_RULE_MIN_BUDGET = AGENDA_MIN_BUDGET + RULE_LINE_MAX + 1
 RULE_SCOPE_ALL = 'pass scope="all" to list every checkbox'

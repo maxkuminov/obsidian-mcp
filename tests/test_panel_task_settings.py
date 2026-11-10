@@ -474,3 +474,124 @@ def test_timezone_suggestions_are_fixed_unique_and_available():
     assert [n for n in names if n not in available] == []
     for name in names:  # every suggestion is one `save` would accept
         assert task_settings.normalise_timezone(name) == (name, None)
+
+
+# ── the task rule block (#434, D10) ─────────────────────────────────────────
+
+
+def test_the_rule_block_shows_the_server_default_and_its_controls(harness, monkeypatch):
+    monkeypatch.setattr(settings, "tasks_rule", "fields")
+    monkeypatch.setattr(settings, "tasks_rule_tags", ["someday"])
+    monkeypatch.setattr(settings, "tasks_global_filter", "")
+    client, _store, _db = harness("multi")
+    body = client.get("/admin/account").text
+    card = _card(body)
+    assert "Which checkboxes are tasks" in card
+    assert _selected(body, "task_rule") == "default"
+    assert ("Server default (only checkboxes with task details or a task tag, task tags: "
+            "#someday)") in card
+    for words in ("Every checkbox is a task", "Only checkboxes with task details or a task tag",
+                  "Only checkboxes that contain the global filter text"):
+        assert words in card
+    assert 'name="task_tags"' in card and 'name="global_filter"' in card
+    assert 'maxlength="64"' in card and 'placeholder="#task"' in card
+    assert "In use now: only checkboxes with task details or a task tag, task tags: " \
+        "#someday\n                    (server default)." in card
+    # The help text is for people without the plugin.
+    for phrase in ("A task is a\n                    Markdown checkbox", "Global task\n",
+                   "Agents can\n                    always ask for every checkbox"):
+        assert phrase in card, phrase
+
+
+def test_the_card_shows_the_rule_set_here(harness):
+    client, store, _db = harness("multi")
+    store.seed(7, task_rule="fields", task_tags=["someday"], global_filter=None)
+    body = client.get("/admin/account").text
+    card = _card(body)
+    assert _selected(body, "task_rule") == "fields"
+    assert ">someday</textarea>" in card
+    assert "In use now: only checkboxes with task details or a task tag, task tags: " \
+        "#someday\n                    (set here)." in card
+
+
+def test_the_card_states_an_unusable_stored_rule(harness):
+    client, store, _db = harness("multi")
+    store.seed(7, task_rule="filter", task_tags=[], global_filter=None)
+    card = _card(client.get("/admin/account").text)
+    assert "cannot be applied (filter rule without filter text)" in card
+    assert "In use now: every checkbox is a task" in card
+
+
+def test_a_rule_save_passes_the_three_fields_through(harness):
+    client, store, db = harness("multi")
+    token = _csrf(client.get("/admin/account").text)
+    response = client.post(ACCOUNT_POST, data=_form(
+        token, task_rule="filter", task_tags="#Someday\nwaiting-for", global_filter=" #task ",
+        user_id="99",
+    ), follow_redirects=False)
+    assert response.status_code == 303 and set(store.rows) == {7}
+    row = store.rows[7]
+    assert (row.task_rule, row.task_tags, row.global_filter) == (
+        "filter", ["someday", "waiting-for"], "#task")
+    assert db.commits == 1
+
+
+def test_absent_rule_fields_reach_the_service_as_absent(harness, monkeypatch):
+    """The route passes only the card's names that were posted: a client
+    posting part of the card leaves the rule unchanged (the service's
+    absent-key rule, `rule_unchanged`)."""
+    client, store, _db = harness("multi")
+    seen = {}
+
+    async def save(session, uid, form):
+        seen.update(form)
+        values, errors = task_settings.validate(form)
+        assert values.rule_unchanged == frozenset(task_settings.RULE_FIELDS)
+        return errors
+
+    monkeypatch.setattr(task_settings, "save", save)
+    token = _csrf(client.get("/admin/account").text)
+    client.post(ACCOUNT_POST, data={"csrf_token": token, "timezone": "UTC",
+                                    "user_id": "99"}, follow_redirects=False)
+    assert set(seen) == {"timezone"}
+
+
+@pytest.mark.parametrize("fields, message", [
+    ({"task_rule": "any"}, "Unrecognised value for the task rule."),
+    ({"task_tags": "waiting-for/"}, "is not a tag"),
+    ({"task_tags": "\n".join(f"t{i}" for i in range(33))}, "At most 32 task tags"),
+    ({"global_filter": "%%"}, "Obsidian comment marker"),
+    ({"global_filter": "&lt;!-- x --&gt;"}, "HTML comment marker"),
+    ({"global_filter": "x" * 65}, "longer than 64"),
+    ({"global_filter": "[t]"}, "checkbox"),
+])
+@pytest.mark.parametrize("mode", ["multi", "single"])
+def test_a_refused_rule_save_flashes_and_stores_nothing(harness, mode, fields, message):
+    client, store, db = harness(mode)
+    scope = 7 if mode == "multi" else None
+    store.seed(scope, task_rule="fields", task_tags=["keep"], global_filter=None)
+    before = vars(store.rows[scope]).copy()
+    if fields.get("global_filter", "").startswith("&lt;"):
+        fields = {"global_filter": "<!-- x -->"}
+    token = _csrf(client.get(_page(mode)).text)
+    client.post(_post_path(mode), data=_form(token, **fields), follow_redirects=False)
+    assert vars(store.rows[scope]) == before
+    assert db.commits == 0 and db.rollbacks == 1
+    page = client.get(_page(mode)).text
+    assert "Task settings not saved." in page and message in page
+
+
+@pytest.mark.parametrize("mode", ["multi", "single"])
+def test_the_filter_needs_text_refusal_is_flashed(harness, mode, monkeypatch):
+    client, _store, db = harness(mode)
+
+    async def save(session, uid, form):
+        return [task_settings.task_rule.FILTER_NEEDS_TEXT]
+
+    monkeypatch.setattr(task_settings, "save", save)
+    token = _csrf(client.get(_page(mode)).text)
+    client.post(_post_path(mode), data=_form(token, task_rule="filter", global_filter=""),
+                follow_redirects=False)
+    assert db.rollbacks == 1 and db.commits == 0
+    page = client.get(_page(mode)).text
+    assert "needs a global filter text" in page
