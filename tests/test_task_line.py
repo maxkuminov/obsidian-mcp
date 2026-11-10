@@ -414,7 +414,28 @@ def test_removing_a_tag_is_not_hierarchical():
 def test_remove_tag_everywhere_case_insensitively():
     assert edit("- [ ] #Home call #bob, then #HOME 📅 2026-01-01 #home", remove_tags=("home",)) == \
         "- [ ] call #bob, then 📅 2026-01-01"
-    assert edit("- [ ] call #bob, then go", remove_tags=("bob",)) == "- [ ] call, then go"
+    assert edit("- [ ] call #bob then go", remove_tags=("bob",)) == "- [ ] call then go"
+
+
+@pytest.mark.parametrize(
+    "line, tag",
+    [("- [ ] x #foo.bar y", "foo"), ("- [ ] #q'x", "q"), ("- [ ] call #bob, then go", "bob"),
+     ("- [ ] a #t b #t.x", "t")],
+)
+def test_an_attached_tag_is_refused_not_cut(line, tag):
+    # Audit item 3: only a delimited #tag token is removed; never a partial cut.
+    r = refused(line, remove_tags=(tag,))
+    assert "attached" in r.reason
+    # With a description replacement the attached occurrence is replaced
+    # with the old words, so the tag simply goes.
+    result = apply_changes(p(line), LineChanges(remove_tags=(tag,), description="new words"))
+    assert isinstance(result, LineEdit), result
+    assert tag not in {t.lower() for t in p(result.line).tags}
+
+
+def test_removing_a_tag_the_task_does_not_carry_stays_a_no_op():
+    result = apply_changes(p("- [ ] x #foo.bar y"), LineChanges(remove_tags=("other",)))
+    assert isinstance(result, LineEdit) and not result.changed
 
 
 def test_a_tag_in_code_is_not_removed():
@@ -532,6 +553,78 @@ def test_serialisation_markers_and_tags():
     assert isinstance(T.serialize_new_task("c", marker="x "), TaskLineRefusal)
 
 
+def test_serialisation_enforces_tier_one_rules_and_the_tag_cap():
+    # Audit item 5: D8's rule and tag-count checks live in the serialiser too.
+    for rule in ("every weekend", "every 2 weeks on Monday", "every day!", "nonsense"):
+        r = T.serialize_new_task("c", recurrence=rule)
+        assert isinstance(r, TaskLineRefusal) and r.code == "recurrence_unsupported", rule
+    assert T.serialize_new_task("c", recurrence="every day when done") == "- [ ] c 🔁 every day when done"
+    many = [f"t{i}" for i in range(33)]
+    r = T.serialize_new_task("c", tags=many)
+    assert isinstance(r, TaskLineRefusal) and r.code == "invalid_argument"
+    assert isinstance(T.serialize_new_task("c", tags=many[:32]), str)
+
+
+# ── audit regressions: spacing around insertions (items 2, 4) and clean
+#    re-append (item 6) ─────────────────────────────────────────────────────
+
+
+def test_every_inserted_token_is_separated_when_everything_between_is_removed():
+    assert edit("- [ ] 🔁 every week", remove_fields=fs("recurrence"), set_fields={"due": D(2026, 1, 1)},
+                add_tags=("t",)) == "- [ ] #t 📅 2026-01-01"
+    assert edit("- [ ] 📅 2026-01-01", remove_fields=fs("due"), set_fields={"done": D(2026, 1, 1)},
+                description="hello") == "- [ ] hello ✅ 2026-01-01"
+    assert edit("- [ ] 📅 2026-01-01 ^b", remove_fields=fs("due"), set_fields={"done": D(2026, 1, 1)},
+                add_tags=("t",)) == "- [ ] #t ✅ 2026-01-01 ^b"
+
+
+def test_a_first_run_token_removal_does_not_block_a_placement():
+    assert edit("- [ ] ⏫ 📅 2026-01-01", remove_fields=fs("priority"),
+                set_fields={"scheduled": D(2025, 12, 1)}) == "- [ ] ⏳ 2025-12-01 📅 2026-01-01"
+    assert edit("- [ ] x ⏫ 📅 2026-01-01", remove_fields=fs("priority"),
+                set_fields={"scheduled": D(2025, 12, 1)}) == "- [ ] x ⏳ 2025-12-01 📅 2026-01-01"
+    assert edit("- [ ] ⏫ 🛫 2025-01-01 📅 2026-01-01", remove_fields=fs("priority", "start"),
+                set_fields={"scheduled": D(2025, 12, 1)}) == "- [ ] ⏳ 2025-12-01 📅 2026-01-01"
+
+
+def test_a_preserved_tag_is_reappended_clean():
+    assert edit("- [ ] x [[n #a]] 📅 2026-01-01", description="y") == "- [ ] y #a 📅 2026-01-01"
+    assert edit("- [ ] x #Ab's 📅 2026-01-01 #ok", description="y") == "- [ ] y #Ab 📅 2026-01-01 #ok"
+
+
+def _inserted_tokens_are_separated(result):
+    out = []
+    for e in result.edits:
+        if e.start == e.end and e.text.strip():
+            out.append(e)
+    return out
+
+
+def test_property_insertions_are_always_space_separated():
+    rng = random.Random(4281)
+    checked = 0
+    for _ in range(3000):
+        line, _clean = _random_line(rng)
+        tl = parse(line)
+        changes = _random_changes(rng, tl)
+        result = apply_changes(tl, changes)
+        if not isinstance(result, LineEdit):
+            continue
+        # Locate each insertion in the new line and check both neighbours.
+        shift = 0
+        for e in result.edits:
+            pos = e.start + shift
+            if e.start == e.end and e.text.strip():
+                core = e.text.strip(" ")
+                at = pos + (len(e.text) - len(e.text.lstrip(" ")))
+                before = result.line[at - 1] if at > 0 else " "
+                after = result.line[at + len(core)] if at + len(core) < len(result.line) else " "
+                assert before.isspace() and after.isspace(), (line, changes, result.line)
+                checked += 1
+            shift += len(e.text) - (e.end - e.start)
+    assert checked > 500
+
+
 # ── identity (D1) and normalisation (D9, D11) ────────────────────────────────
 
 
@@ -594,22 +687,34 @@ def test_fold_text():
 def test_tag_prefixes():
     assert T.tag_prefixes(["Waiting-For/Chase"]) == ["waiting-for", "waiting-for/chase"]
     assert T.tag_prefixes(["a/b", "A/c", "a"]) == ["a", "a/b", "a/c"]
-    assert T.tag_prefixes(["a//b"]) == ["a", "a//b"]
+    assert T.tag_prefixes(["a//b"]) == ["a", "a/b"]
 
 
-def test_tag_prefixes_are_lossless_at_the_bound():
-    # 64 distinct tags, each 64 one-character segments: 4,096 prefixes, uncapped.
-    letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+def test_empty_segments_are_normalised_identically_on_both_sides():
+    # note-tasks scenario "Empty segments are normalised identically on both sides".
+    stored = T.tag_prefixes(["Waiting-For//Chase/"])
+    assert stored == ["waiting-for", "waiting-for/chase"]
+    # Filter values go through the same normaliser and are found.
+    for value in ("waiting-for//chase", "waiting-for", "Waiting-For/Chase"):
+        assert T.normalise_tag(value) in stored
+    assert T.normalise_tag("a///b//") == "a/b"
+    assert T.tag_prefixes(["a/", "A"]) == ["a"]
+
+
+def test_tag_prefixes_are_lossless_at_the_largest_buildable_case():
+    # tasks.md 1.4: 64 distinct 127-character tags of a 3-character first
+    # segment and 62 one-character segments give 4,032 prefixes, uncapped.
+    letters = "abcdefghijklmnopqrstuvwxyz"
     tags = []
     for i in range(64):
-        head = letters[i % 26] + letters[(i // 26) % 26].upper()
-        segs = [head] + [letters[(i + j) % 26] for j in range(63)]
-        tags.append("/".join(segs))
-    assert len(set(t.lower() for t in tags)) == 64
+        head = "t" + letters[i // 26] + letters[i % 26]
+        tags.append("/".join([head] + [letters[(i + j) % 26] for j in range(62)]))
+    assert all(len(t) == 127 and T.valid_tag(t) for t in tags)
+    assert len(set(tags)) == 64
     prefixes = T.tag_prefixes(tags)
-    assert len(prefixes) == 64 * 64 == 4096
+    assert len(prefixes) == 64 * 63 == 4032
     for tag in tags:
-        assert tag.lower() in prefixes
+        assert tag in prefixes
 
 
 # ── purity ──────────────────────────────────────────────────────────────────
@@ -628,7 +733,8 @@ def _imports(module):
 
 def test_task_line_is_pure():
     assert _imports(T) <= {"__future__", "datetime", "hashlib", "re", "unicodedata",
-                           "collections.abc", "dataclasses", "src.services.links"}
+                           "collections.abc", "dataclasses", "src.services.links",
+                           "src.services.task_recurrence"}
     assert not any(name.startswith("src.config") for name in _imports(links))
 
 
@@ -677,7 +783,8 @@ def _random_line(rng):
         run.insert(rng.randint(0, len(run)), "#" + rng.choice(["t1", "Tag/x", "home"]))
     words = [rng.choice(WORDS) for _ in range(rng.randint(1, 4))]
     if clean:
-        words = [w for w in words if "`" not in w] or ["task"]
+        # No code and no attached tag ("#bob," cannot be removed cleanly).
+        words = [w for w in words if "`" not in w and w != "#bob,"] or ["task"]
     text = " ".join(words + run)
     if rng.random() < 0.3:
         text += " ^" + rng.choice(["b1", "blk-2"])

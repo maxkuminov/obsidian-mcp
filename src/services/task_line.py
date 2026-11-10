@@ -84,6 +84,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
 from src.services.links import BODY, mask_code
+from src.services.task_recurrence import Rule, parse_rule
 
 # ── constants ────────────────────────────────────────────────────────────────
 
@@ -157,6 +158,9 @@ TAG_GRAMMAR_RE = re.compile(r"[A-Za-z][A-Za-z0-9_/-]*")
 
 TASK_MALFORMED = "task_malformed"
 INVALID_ARGUMENT = "invalid_argument"
+RECURRENCE_UNSUPPORTED = "recurrence_unsupported"
+#: D8: at most 32 tags on a new task.
+MAX_NEW_TASK_TAGS = 32
 
 # The extractor's checkbox grammar (`tasks._CHECKBOX_RE`), copied rather than
 # imported (it is private there); `tests/test_task_line.py` pins agreement.
@@ -357,7 +361,8 @@ class LineEdit:
 @dataclass(frozen=True)
 class TaskLineRefusal:
     """An expected refusal: nothing may be written. ``code`` is
-    ``task_malformed`` (the line cannot be edited unambiguously) or
+    ``task_malformed`` (the line cannot be edited unambiguously),
+    ``recurrence_unsupported`` (`serialize_new_task` with a non-tier-1 rule) or
     ``invalid_argument`` (the requested value is not acceptable)."""
 
     code: str
@@ -602,19 +607,28 @@ def fold_text(text: str) -> str:
     return unicodedata.normalize("NFC", text).casefold()
 
 
+_SLASH_RUN_RE = re.compile(r"/{2,}")
+
+
+def normalise_tag(tag: str) -> str:
+    """D11/D12: lower-case, collapse every run of ``/`` to one, strip a
+    trailing ``/``. Stored tag prefixes and the ``tags`` / ``exclude_tags``
+    filter values go through this one function, so both sides agree."""
+    return _SLASH_RUN_RE.sub("/", tag.lower()).rstrip("/")
+
+
 def tag_prefixes(tags: Iterable[str]) -> list[str]:
-    """D11: every stored tag lower-cased with each ``/``-segment prefix,
-    deduplicated in first-seen order and never capped. An intermediate
-    prefix ending in ``/`` (from an empty segment) is skipped; the whole tag
-    is always kept."""
+    """D11: for each stored tag, the normalised tag (`normalise_tag`) cut
+    immediately before each ``/``, plus the whole normalised tag;
+    deduplicated in first-seen order and never capped."""
     out: list[str] = []
     seen: set[str] = set()
     for tag in tags:
-        low = tag.lower()
-        parts = low.split("/")
-        candidates = ["/".join(parts[:i]) for i in range(1, len(parts))]
-        candidates = [c for c in candidates if c and not c.endswith("/")]
-        candidates.append(low)
+        norm = normalise_tag(tag)
+        if not norm:
+            continue
+        candidates = [norm[:i] for i, ch in enumerate(norm) if ch == "/"]
+        candidates.append(norm)
         for c in candidates:
             if c not in seen:
                 seen.add(c)
@@ -786,29 +800,54 @@ def _field_insertion_point(tl: TaskLine, family: str) -> int:
     return max(t.end for t in tl.tokens)
 
 
-def _description_with_tags(old_desc: str, new_text: str, remove: list[str], add: list[str], run_tags_after: set[str]) -> str:
-    """D4 description replacement with tag re-append, then the tag removals
-    and additions that fall in the description, as one string."""
+_UNDELIMITED_TAG = "the tag {tag!r} is attached to other characters and cannot be removed cleanly"
+
+
+def _removable_tag_spans(
+    text: str, masked: str, start: int, end: int, removing: set[str],
+    skip: list[tuple[int, int]] = (),  # type: ignore[assignment]
+) -> list[tuple[int, int]] | TaskLineRefusal:
+    """The ``#tag`` spans to remove for the named tags. A tag is removed
+    only where its token is delimited: preceded by the start or whitespace
+    (the grammar guarantees it) and followed by whitespace or the end of
+    ``[start, end)``. A named tag with any undelimited occurrence is refused
+    — never a partial cut."""
+    spans = []
+    for m in _tag_matches(text, masked, start, end):
+        if m.tag.lower() not in removing:
+            continue
+        if any(s <= m.start < e for s, e in skip):
+            continue  # inside a token that is being replaced whole
+        if m.end < end and not text[m.end].isspace():
+            return TaskLineRefusal(TASK_MALFORMED, _UNDELIMITED_TAG.format(tag=m.tag))
+        spans.append((m.start, m.end))
+    return spans
+
+
+def _description_with_tags(old_desc: str, new_text: str, remove: list[str], add: list[str], run_tags_after: set[str], extra_tags: list[str]) -> str | TaskLineRefusal:
+    """D4 description replacement with tag re-append (each tag as a clean
+    ``" #" + tag`` token, exactly as the extractor's grammar reads it), then
+    the tag removals and additions that fall in the description, as one
+    string. ``extra_tags`` are tags of run tokens that carried attached
+    characters and are being replaced with the description."""
     old_mask = mask_code(old_desc, context=BODY)
     new_mask = mask_code(new_text, context=BODY)
     present = {m.tag.lower() for m in _tag_matches(new_text, new_mask, 0, len(new_text))}
     result = new_text
-    for m in _tag_matches(old_desc, old_mask, 0, len(old_desc)):
-        tag = m.tag
+    for tag in [m.tag for m in _tag_matches(old_desc, old_mask, 0, len(old_desc))] + extra_tags:
         if tag.lower() not in present:
             present.add(tag.lower())
             result += " #" + tag
     return _string_tag_ops(result, remove, add, run_tags_after)
 
 
-def _string_tag_ops(text: str, remove: list[str], add: list[str], run_tags_after: set[str]) -> str:
+def _string_tag_ops(text: str, remove: list[str], add: list[str], run_tags_after: set[str]) -> str | TaskLineRefusal:
     removing = {t.lower() for t in remove}
     if removing:
         masked = mask_code(text, context=BODY)
-        spans = []
-        for m in _tag_matches(text, masked, 0, len(text)):
-            if m.tag.lower() in removing:
-                spans.append((m.start, m.end))
+        spans = _removable_tag_spans(text, masked, 0, len(text), removing)
+        if isinstance(spans, TaskLineRefusal):
+            return spans
         edits = []
         claimed: set[int] = set()
         for start, end in spans:
@@ -916,11 +955,31 @@ def apply_changes(tl: TaskLine, changes: LineChanges) -> LineEdit | TaskLineRefu
         removals.append((tl.block.start, tl.block.end))
     removing = {t.lower() for t in remove_tags}
     tag_scan_start = tl.description_end if new_description is not None else tl.text_start
+    # A description replacement also replaces run tag tokens that carry
+    # attached characters (``#a]]``): the token goes, and its tag (as the
+    # extractor reads it) is re-appended clean.
+    unclean_tags: list[str] = []
+    replaced_spans: list[tuple[int, int]] = []
+    if new_description is not None:
+        for t in tl.tokens:
+            if t.kind != "tag":
+                continue
+            m = INLINE_TAG_RE.match(" " + t.value)
+            clean = m is not None and "#" + m.group(1) == t.value
+            if clean or line[t.start : t.end] != tl.masked[t.start : t.end]:
+                continue
+            removals.append((t.start, t.end))
+            replaced_spans.append((t.start, t.end))
+            if m is not None and m.group(1).lower() not in removing:
+                unclean_tags.append(m.group(1))
     if removing:
-        for m in _tag_matches(line, tl.masked, tag_scan_start, tl.text_end):
-            if m.tag.lower() in removing:
-                removals.append((m.start, m.end))
-    for start, end in sorted(removals):
+        spans = _removable_tag_spans(
+            line, tl.masked, tag_scan_start, tl.text_end, removing, skip=replaced_spans
+        )
+        if isinstance(spans, TaskLineRefusal):
+            return spans
+        removals.extend(spans)
+    for start, end in sorted(set(removals)):
         plan.remove_token(start, end, lo=lo, hi=hi)
 
     # Tags that survive in the run after removals (for add_tags no-op).
@@ -931,7 +990,11 @@ def apply_changes(tl: TaskLine, changes: LineChanges) -> LineEdit | TaskLineRefu
     }
 
     if new_description is not None:
-        desc = _description_with_tags(tl.description, new_description, remove_tags, add_tags, surviving_run_tags)
+        desc = _description_with_tags(
+            tl.description, new_description, remove_tags, add_tags, surviving_run_tags, unclean_tags
+        )
+        if isinstance(desc, TaskLineRefusal):
+            return desc
         if tl.description_end > tl.text_start:
             plan.replace(tl.text_start, tl.description_end, desc)
         else:
@@ -954,21 +1017,58 @@ def apply_changes(tl: TaskLine, changes: LineChanges) -> LineEdit | TaskLineRefu
             return TaskLineRefusal(TASK_MALFORMED, "the requested changes overlap on this line")
     groups: dict[int, list[tuple[tuple, str]]] = {}
     for pos, key, core in plan.inserts:
+        inside = [r for r in ranges if r.start < pos < r.end]
+        if inside:
+            if inside[0].text:
+                # Inside a replacement: genuinely undeterminable.
+                return TaskLineRefusal(TASK_MALFORMED, "a field cannot be placed unambiguously on this line")
+            # Inside a pure deletion (a removed token and its separating
+            # space): the deleted bytes vanish either way, so place the
+            # insertion at the deletion's start; spacing is settled below.
+            pos = inside[0].start
         groups.setdefault(pos, []).append((key, core))
-    for pos in groups:
-        if any(r.start < pos < r.end for r in ranges):
-            return TaskLineRefusal(TASK_MALFORMED, "a field cannot be placed unambiguously on this line")
-    edits: list[Edit] = list(ranges)
+    # Pieces in output order: an insertion group sorts before a range that
+    # starts at the same position.
+    pieces: list[tuple[int, int, str, bool]] = [(r.start, r.end, r.text, False) for r in ranges]
     for pos, items in groups.items():
-        core = " ".join(c for _, c in sorted(items, key=lambda kc: kc[0]))
-        left = compose(line[:pos], [r for r in ranges if r.end <= pos])
-        right = compose(line, [Edit(pos, pos, "")] + [r for r in ranges if r.start >= pos])[pos:]
-        lead = " " if left and not left[-1].isspace() else ""
-        trail = " " if right and not right[0].isspace() else ""
-        edits.append(Edit(pos, pos, lead + core + trail))
-    # Insertions before a range that starts at the same position.
-    edits.sort(key=lambda e: (e.start, e.end != e.start))
-    new_line = compose(line, edits)
+        pieces.append((pos, pos, " ".join(c for _, c in sorted(items, key=lambda kc: kc[0])), True))
+    pieces.sort(key=lambda pc: (pc[0], not pc[3]))
+    # Emitted text between pieces, so every inserted token is separated from
+    # its neighbours by whitespace whatever else the call removes or inserts.
+    gaps = []
+    cursor = 0
+    for start, end, _text, _ins in pieces:
+        gaps.append(line[cursor:start])
+        cursor = end
+    gaps.append(line[cursor:])
+    emitted: list[str] = []
+    for i, (start, end, text, is_insert) in enumerate(pieces):
+        emitted.append(gaps[i])
+        if not is_insert:
+            emitted.append(text)
+            continue
+        before = "".join(emitted)
+        lead = " " if before and not before[-1].isspace() else ""
+        # The next emitted character: a following insertion adds its own
+        # leading space, so only original or replacement text counts.
+        following = ""
+        for j in range(i + 1, len(pieces) + 1):
+            if gaps[j]:
+                following = gaps[j]
+                break
+            if j == len(pieces) or pieces[j][3]:
+                break  # end of line, or an insertion with its own lead
+            if pieces[j][2]:
+                following = pieces[j][2]
+                break
+        trail = " " if following and not following[0].isspace() else ""
+        emitted.append(lead + text + trail)
+        pieces[i] = (start, end, lead + text + trail, True)
+    emitted.append(gaps[-1])
+    new_line = "".join(emitted)
+    edits = [Edit(start, end, text) for start, end, text, _ in pieces]
+    if compose(line, edits) != new_line:  # belt: the spans describe the result
+        return TaskLineRefusal(TASK_MALFORMED, "internal: the edit spans do not describe the result")
     result = LineEdit(old=line, line=new_line, edits=tuple(edits))
 
     problem = _verify(tl, changes, value_texts, add_tags, remove_tags, new_description, result)
@@ -1120,6 +1220,13 @@ def serialize_new_task(
     desc = validate_description(text)
     if isinstance(desc, TaskLineRefusal):
         return desc
+    tags = list(tags)
+    if len(tags) > MAX_NEW_TASK_TAGS:
+        return TaskLineRefusal(INVALID_ARGUMENT, f"at most {MAX_NEW_TASK_TAGS} tags")
+    if recurrence is not None:
+        rule = parse_rule(recurrence) if isinstance(recurrence, str) else None
+        if not isinstance(rule, Rule):
+            return TaskLineRefusal(RECURRENCE_UNSUPPORTED, "the recurrence rule is outside the supported grammar")
     parts = [desc]
     present = {m.tag.lower() for m in _tag_matches(desc, mask_code(desc, context=BODY), 0, len(desc))}
     added_tags = []
@@ -1161,12 +1268,12 @@ def serialize_new_task(
 __all__ = [
     "ALL_SIGNIFIERS", "CANCELLED", "CANONICAL_ORDER", "CANONICAL_RANK", "CREATED",
     "DATE_FAMILIES", "DEPENDS_ON", "DESCRIPTION_MAX_CHARS", "DONE", "DUE", "Edit",
-    "FAMILIES", "ID", "INVALID_ARGUMENT", "LineChanges", "LineEdit", "ON_COMPLETION",
+    "FAMILIES", "ID", "INVALID_ARGUMENT", "MAX_NEW_TASK_TAGS", "RECURRENCE_UNSUPPORTED", "LineChanges", "LineEdit", "ON_COMPLETION",
     "PRIORITY", "PRIORITY_NAMES", "PRIORITY_SYMBOLS", "READ_SYMBOLS", "RECURRENCE",
     "RunParse", "SCHEDULED", "START", "TASK_MALFORMED", "TaskId", "TaskLine",
     "TaskLineRefusal", "Token", "WRITE_SYMBOLS", "add_tag", "apply_changes",
     "check_families", "compose", "description_key", "description_region", "field_date",
-    "fold_text", "next_occurrence_line", "normalise_description", "parse", "parse_id",
+    "fold_text", "next_occurrence_line", "normalise_description", "normalise_tag", "parse", "parse_id",
     "parse_run", "plugin_description", "remove_field", "remove_tag", "render_id",
     "replace_description", "serialize_new_task", "set_field", "set_status",
     "tag_prefixes", "task_key", "valid_status", "valid_tag", "validate_description",
