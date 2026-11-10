@@ -18,6 +18,7 @@ Skipped unless `PGVECTOR_TEST_ADMIN_URL` is set (see `_harness`).
 import asyncio
 import itertools
 import os
+import threading
 import time
 
 import pytest
@@ -173,7 +174,11 @@ async def assert_converged(sessionmaker, root, path: str, uid: int | None = None
     assert row.tasks_source_hash == row.content_hash == canonical_note_hash(
         (root / path).read_bytes()
     )
-    assert row.tasks_refreshed_at is None
+    # Deliberately not `tasks_refreshed_at IS NULL`: a refresh that lands
+    # after a pass already derived the same bytes leaves a clean row with a
+    # stamp (the auditor's p4). That is harmless — R4 keeps rows only when
+    # the source hash differs from the pass's buffered hash, which a clean
+    # row's never does — and the design requires only the two facts here.
     assert await stored(sessionmaker, path, uid) == fresh(root, path)
 
 
@@ -614,3 +619,226 @@ async def test_a_refresh_of_a_version_4_note_writes_its_ids(sessionmaker, vault)
     row = await note(sessionmaker, "v4.md")
     assert row.extraction_version == 4, "the refresh never writes the version"
     assert all(r["task_key"] is not None for r in await stored(sessionmaker, "v4.md"))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Audit follow-ups (#428): the derivation holds no lock; more interleavings
+# ══════════════════════════════════════════════════════════════════════════
+
+A2 = "- [ ] alpha EDITED\n- [ ] beta #work\n"
+
+
+async def test_the_derivation_runs_before_the_row_lock(sessionmaker, vault, monkeypatch):
+    put(vault, "nolock.md", A)
+    await run_pass()
+    row_id = (await note(sessionmaker, "nolock.md")).id
+    entered, release = threading.Event(), threading.Event()
+    real = task_index.tasks_from_note_text
+
+    def blocking(raw):
+        entered.set()
+        assert release.wait(20)
+        return real(raw)
+
+    monkeypatch.setattr(task_index, "tasks_from_note_text", blocking)
+    pending = asyncio.create_task(Publication(vault, "nolock.md", B).refresh())
+    try:
+        assert await asyncio.to_thread(entered.wait, 10)
+        # While the refresh is deriving, nobody holds the row: NOWAIT succeeds.
+        async with sessionmaker() as other:
+            got = (await other.execute(
+                text("SELECT id FROM notes_metadata WHERE id = :i FOR UPDATE NOWAIT"),
+                {"i": row_id},
+            )).scalar_one()
+            assert got == row_id
+            await other.rollback()
+    finally:
+        release.set()
+    assert (await asyncio.wait_for(pending, 20)).refreshed
+    assert await stored(sessionmaker, "nolock.md") == fresh(vault, "nolock.md")
+
+
+async def test_a_derivation_failure_records_the_pass_style_mark(
+    sessionmaker, vault, monkeypatch
+):
+    put(vault, "fail.md", A)
+    await run_pass()
+
+    def boom(_raw):
+        raise RuntimeError("synthetic extractor bug")
+
+    monkeypatch.setattr(task_index, "tasks_from_note_text", boom)
+    result = await Publication(vault, "fail.md", B).refresh()
+    assert result == task_index.RefreshResult("lagged", "derivation_failed")
+    row = await note(sessionmaker, "fail.md")
+    assert row.tasks_failed is True
+    assert row.tasks_source_hash == canonical_note_hash(B.encode())
+    assert row.tasks_refreshed_at is not None
+    assert await stored(sessionmaker, "fail.md") == []
+    # The pass's own extractor is not patched: the dirty row is re-derived.
+    await run_pass()
+    await assert_converged(sessionmaker, vault, "fail.md")
+    assert (await note(sessionmaker, "fail.md")).tasks_failed is False
+
+
+async def test_a_refresh_between_the_locked_read_and_the_upsert_is_kept(
+    sessionmaker, vault, monkeypatch
+):
+    """The pass read A2 (a generic edit); a tool publishes and refreshes B
+    after the pass's locked read but before its upsert takes the row lock."""
+    put(vault, "p1.md", A)
+    await run_pass()
+    put(vault, "p1.md", A2)
+    loop = asyncio.get_running_loop()
+    real = indexer.parse_frontmatter
+    state: dict = {"armed": False, "result": None}
+
+    async def between():
+        state["armed"] = True
+        state["pub"] = Publication(vault, "p1.md", B)
+
+    def hooked(raw):
+        # Runs on a worker thread inside the change loop, before the upsert.
+        if state["armed"] and state["result"] is None:
+            state["result"] = asyncio.run_coroutine_threadsafe(
+                state["pub"].refresh(), loop
+            ).result(20)
+        return real(raw)
+
+    monkeypatch.setattr(indexer, "parse_frontmatter", hooked)
+    await run_pass(between=between)
+    monkeypatch.setattr(indexer, "parse_frontmatter", real)
+    assert state["result"].refreshed
+    row = await note(sessionmaker, "p1.md")
+    assert row.content_hash == canonical_note_hash(A2.encode()), "the pass upserted A2"
+    assert row.tasks_source_hash == canonical_note_hash(B.encode()), "kept B's rows"
+    assert await stored(sessionmaker, "p1.md") == fresh(vault, "p1.md")
+    await run_pass()
+    await assert_converged(sessionmaker, vault, "p1.md")
+
+
+async def test_a_dirty_row_reverted_and_renamed_on_disk_converges(sessionmaker, vault):
+    put(vault, "m.md", A)
+    await run_pass()
+    assert (await Publication(vault, "m.md", B).refresh()).refreshed
+    put(vault, "m.md", A)  # reverted: bytes == content_hash, rows describe B
+    os.rename(vault / "m.md", vault / "moved.md")
+    await run_pass()  # the id-preserving move pairs and re-derives it
+    await assert_converged(sessionmaker, vault, "moved.md")
+    assert await note(sessionmaker, "m.md") is None
+
+
+async def test_a_file_deleted_before_its_refresh_is_superseded_and_pruned(
+    sessionmaker, vault
+):
+    put(vault, "d.md", A)
+    put(vault, "keep.md", A)
+    await run_pass()
+    pub = Publication(vault, "d.md", B)
+    os.unlink(vault / "d.md")
+    assert (await pub.refresh()).code == "superseded"
+    await run_pass()
+    assert await note(sessionmaker, "d.md") is None
+    await assert_converged(sessionmaker, vault, "keep.md")
+
+
+async def test_a_refresh_after_a_pass_that_read_the_same_bytes(sessionmaker, vault):
+    put(vault, "same.md", A)
+    await run_pass()
+    pub = Publication(vault, "same.md", B)
+    await run_pass()  # the pass reads B first
+    assert (await pub.refresh()).refreshed  # then the refresh of B lands
+    row = await note(sessionmaker, "same.md")
+    assert row.tasks_refreshed_at is not None, "a harmless leftover stamp"
+    await assert_converged(sessionmaker, vault, "same.md")
+    await run_pass()
+    await assert_converged(sessionmaker, vault, "same.md")
+
+
+@pytest.mark.parametrize("first,second", [
+    ("before", "before"), ("before", "between"), ("before", "after"),
+    ("between", "between"), ("between", "after"), ("after", "after"),
+])
+async def test_two_tool_writes_inside_one_interleaving_converge(
+    sessionmaker, vault, first, second
+):
+    rel = "two.md"
+    put(vault, rel, A)
+    await run_pass()
+    results: list = []
+
+    async def write(body):
+        results.append(await Publication(vault, rel, body).refresh())
+
+    plan: dict = {"before": [], "between": [], "after": []}
+    plan[first].append(B)
+    plan[second].append(C)
+    for body in plan["before"]:
+        await write(body)
+
+    async def between():
+        for body in plan["between"]:
+            await write(body)
+
+    await run_pass(between=between)
+    for body in plan["after"]:
+        await write(body)
+    assert all(r.refreshed for r in results), results
+    assert await stored(sessionmaker, rel) == fresh(vault, rel), "read-your-writes"
+    await run_pass()
+    await run_pass()
+    await assert_converged(sessionmaker, vault, rel)
+
+
+async def test_a_move_note_between_publish_and_refresh(sessionmaker, vault, monkeypatch):
+    import src.mcp_server.tools as tools
+    from src.mcp_server.auth import current_permission
+
+    async def noop(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(tools.settings, "vault_path", str(vault), raising=False)
+    monkeypatch.setattr(tools, "async_session", sessionmaker)
+    monkeypatch.setattr(tools, "_log_usage", noop)
+    permission = current_permission.set("readwrite")
+    try:
+        put(vault, "mv.md", A)
+        await run_pass()
+        pub = Publication(vault, "mv.md", B)
+        assert "Moved" in str(await tools.move_note_impl("mv.md", "Moved/mv.md"))
+        result = await pub.refresh()
+        assert result.code in ("not_indexed", "superseded"), result
+    finally:
+        current_permission.reset(permission)
+    await run_pass()
+    await run_pass()
+    await assert_converged(sessionmaker, vault, "Moved/mv.md")
+    assert await note(sessionmaker, "mv.md") is None
+
+
+async def test_two_users_inside_one_interleaving(sessionmaker, vault):
+    root7, root8 = vault / "i7", vault / "i8"
+    rel = "Projects/Alpha.md"
+    put(root7, rel, A)
+    put(root8, rel, A)
+    u7 = await tenant(sessionmaker, root7, "inter-seven")
+    u8 = await tenant(sessionmaker, root8, "inter-eight")
+    await run_pass(u7)
+    await run_pass(u8)
+    results: dict = {}
+
+    async def between():
+        # During user 7's pass: user 8's tool write, then user 7's.
+        results[u8] = await Publication(root8, rel, C, uid=u8).refresh()
+        results[u7] = await Publication(root7, rel, B, uid=u7).refresh()
+
+    await run_pass(u7, between=between)
+    assert results[u7].refreshed and results[u8].refreshed
+    assert await stored(sessionmaker, rel, u8) == fresh(root8, rel)
+    assert await stored(sessionmaker, rel, u7) == fresh(root7, rel)
+    for _ in range(2):
+        await run_pass(u7)
+        await run_pass(u8)
+    await assert_converged(sessionmaker, root7, rel, u7)
+    await assert_converged(sessionmaker, root8, rel, u8)
+    assert await stored(sessionmaker, rel, u7) != await stored(sessionmaker, rel, u8)
