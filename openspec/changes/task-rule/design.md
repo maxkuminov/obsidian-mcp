@@ -115,7 +115,7 @@ The `unsure` predicate is `text_cut AND strpos(text, F) = 0` under `filter`, and
 
 ### D5. The response: one rule line, present only while a rule is in force
 
-The rule line is present **iff** `scope="default"` and the effective rule is not `all`. Under the rule `all`, and under `scope="all"` with any rule, every response is byte-identical to v1.3.0.
+The rule line is present **iff** `scope="default"` and either the effective rule is not `all`, or a configured rule could not be applied (`task_rule_unusable`, D8, which renders the fallback form given there). Under a deliberately chosen or inherited `all`, and under `scope="all"` with any rule, every response is byte-identical to v1.3.0.
 
 **`list_tasks`.** The rule line is line 3, after the query line. While the rule line is present, the query line is present too: its trigger "the default scope excludes anything" is extended to "or a task rule is in force". The query line's own text is unchanged. The exact formats:
 
@@ -191,6 +191,7 @@ Consequences:
 - **Already contains F** (in the text, in a tag the caller passed, `tags=["task"]` with F = `#task`, or anywhere in the serialised body): nothing is added.
 - **Case differs** (`#Task` in the text, F = `#task`): the substring test is case-sensitive, as the plugin's is, so F is prepended. The response says so, and the agent sees both.
 - **Length.** The D4 description bound (1,000 characters) applies to the combined description. A `text` whose combination would exceed it is refused `invalid_argument` with "text plus the global filter text (N characters) exceeds 1,000 characters", writing nothing.
+- **Structure, on the final description (Codex spec r1 #1).** `plan_add` runs `task_write._structure_refusal(…, context=False, what="text")`, the one check every entry point uses, a second time, on the **combined** description (F, a space, the caller's text) **before the dry run is answered and before anything is published**. That is: an even number of `%%`, every `<!--` closed by `-->` and no closer without an opener, no run of three or more backticks or tildes. A failure gives that check's own refusal, writing nothing. This guarantee does not depend on D9's validation of F: a filter text that reached the database some other way (a manual edit, a future writer) still cannot open a comment or a fence that hides the rest of the note. D5's verification is unchanged.
 - The duplicate key, the similar terms and the D5 verification all use the final line.
 - The response, and the dry run, carry `global filter added: <json F>` on its own line after the `line N:` line.
 
@@ -216,7 +217,7 @@ note: not a task under your task rule "filter" (the line does not contain <json 
 **Duplicate detection.**
 
 - **Index side (#428 D9 (b)) and the similar-task list:** both go through `scope_clause`, so they consider only tasks by the rule (D4). A plain checklist line elsewhere no longer refuses or crowds a new task.
-- **Target-note side (#428 D9 (a)) stays rule-independent**, as it is scope-independent today. It is a byte check of the note being written. A same-description checkbox in the same note is most likely the thing the agent means: `update_task` can give that line a date instead of adding a second one. `allow_duplicate=true` remains the escape. Under `filter` the new line carries F, so a plain checkbox without F has a different description key and cannot collide. This is listed as owner question Q1.
+- **Target-note side (#428 D9 (a)) stays rule-independent**, as it is scope-independent today. It is a byte check of the note being written. A same-description checkbox in the same note is most likely the thing the agent means: `update_task` can give that line a date instead of adding a second one. `allow_duplicate=true` remains the escape. Under `filter` the new line carries F, so a plain checkbox without F has a different description key and cannot collide. Owner decision Q1 (2026-11-10).
 
 **The rule never blocks a write.** Write resolution reads the note's bytes (#428 D2) and never consults `note_tasks` scope, so an id from a `scope="all"` listing works under any rule.
 
@@ -228,7 +229,10 @@ note: not a task under your task rule "filter" (the line does not contain <json 
 | `task_tags` | `varchar(128)[] NOT NULL DEFAULT '{}'` | ≤ 32, stored lower-case without `#` |
 | `global_filter` | `varchar(64) NULL` | NULL means none |
 
-A CHECK, `ck_task_settings_task_rule`, enforces `task_rule IN ('all','fields','filter')`; NULL passes.
+Two CHECKs make an unevaluable stored rule unrepresentable (Codex spec r1 #2):
+
+- `ck_task_settings_task_rule`: `task_rule IN ('all','fields','filter')`; NULL passes.
+- `ck_task_settings_global_filter`: `(global_filter IS NULL OR btrim(global_filter) <> '') AND (task_rule IS DISTINCT FROM 'filter' OR global_filter IS NOT NULL)`. An empty or blank filter text is never stored, and a stored `filter` rule always has its text.
 
 **Inheritance is per rule, not per field.**
 
@@ -237,7 +241,23 @@ A CHECK, `ck_task_settings_task_rule`, enforces `task_rule IN ('all','fields','f
 - **Rejected: per-field NULL inheritance**, the brief's "nullable columns, NULL follows the server default". A list column then needs a fourth state ("explicitly none" against "inherit"), which the card cannot show without extra controls. Worse, a user who picks `filter` could silently inherit a filter text they never see. With one unit, what the card shows is exactly what is used.
 - `task_tags` mirrors `excluded_note_tags` (`NOT NULL DEFAULT '{}'`). `global_filter` is NULL rather than empty.
 
-**`EffectiveTaskSettings`** gains `task_rule: str`, `task_tags: tuple[str, ...]`, `global_filter: str | None` and `task_rule_inherited: bool`. `effective()` is still one indexed read per call with no cache, so a saved change applies on the caller's next call. A tool already in flight keeps the snapshot it read.
+**`EffectiveTaskSettings`** gains `task_rule: str`, `task_tags: tuple[str, ...]`, `global_filter: str | None`, `task_rule_inherited: bool` and `task_rule_unusable: str | None`.
+
+**Defensive evaluation (Codex spec r1 #2 (b)).** The CHECKs and the startup validation mean the case below cannot arise through this server. If `_merge` nevertheless meets a rule it cannot evaluate, it does **not** build a predicate from it. The cases are:
+
+- an unknown kind;
+- `filter` with NULL, empty or blank text (for example from a manual database edit);
+- a stored filter text that fails D9's filter rule.
+
+Instead it sets `task_rule = "all"`, `task_tags = ()`, `global_filter = None` and `task_rule_unusable` to a short reason (`unknown rule`, `filter rule without filter text`, `filter text not allowed`), and logs one WARNING per call naming the scope's owner id, never the text. Under `scope="default"` the rule line is then present (D5) and reads:
+
+```
+Rule — task rule: all (the configured rule cannot be applied: <reason>) — pass scope="all" to list every checkbox
+```
+
+So nothing is omitted, and the response says why the rule is not in force. The write tools treat it as `all`: no prepend, no note line. The cursor digest treats it as `all`. A NULL text in a substring predicate can therefore never drop rows uncounted.
+
+**`fields` with zero task tags is valid** and means "fields only": `has_tag` is false and the `tags_cut` branch is off. It is not a fallback case. `effective()` is still one indexed read per call with no cache, so a saved change applies on the caller's next call. A tool already in flight keeps the snapshot it read.
 
 ### D9. Environment defaults and validation
 
@@ -255,11 +275,19 @@ A CHECK, `ck_task_settings_task_rule`, enforces `task_rule IN ('all','fields','f
 
 - spaces and tabs are stripped at both ends;
 - 1–64 characters;
-- no control character, line break or line/paragraph separator (`task_settings._CONTROL_RE`);
-- no backtick: it would open inline code and change how the added line is masked;
-- no code point of `task_line.ALL_SIGNIFIERS`, and no U+FE0F: a field emoji would add a field to every line it is prepended to.
+- not whitespace-only: after the strip, at least one character that is not Unicode whitespace;
+- a single line: no control character (C0, C1, DEL), line break, U+0085, U+2028 or U+2029 (`task_settings._CONTROL_RE`);
+- no backtick at all: it would open inline code and change how the added line is masked;
+- no code point of `task_line.ALL_SIGNIFIERS`, and no U+FE0F: a field emoji would add a field to every line it is prepended to;
+- **the caller-text structure rules** (Codex spec r1 #1 (a)): `task_write._structure_refusal(F, context=True, …)` must pass, so:
+  - an even number of `%%`;
+  - every `<!--` closed by `-->` within F, and no `-->` without an opener;
+  - no run of three or more backticks or tildes (already implied by the backtick rule, kept for tildes);
+  - and, because F begins the description, F must not begin with a list marker (`-`, `*`, `+` or 1–9 digits then `.` or `)` followed by whitespace), a checkbox (`[` + one character + `]`), a heading marker (`#` run followed by a space, or alone) or `>`.
 
-Each check has its own readable message (spec). Rejected: allowing any string, as the plugin does. The plugin never prepends to a line its own reader then re-reads with masking. These refusals cost nothing realistic: real filters are `#task`, `TODO` or `[t]`.
+  `#task` passes, since a `#` directly followed by a letter is a tag, not a heading.
+
+The same function validates `TASKS_GLOBAL_FILTER` at startup, so an invalid environment default refuses startup naming the variable, like every other task environment setting. Each check has its own readable message (spec). Rejected: allowing any string, as the plugin does. The plugin never prepends to a line its own reader then re-reads with masking. These refusals cost nothing realistic: real filters are `#task`, `TODO` or `[task]`. A one-character bracket such as `[t]` is refused, because it reads as a checkbox at the start of a line.
 
 **`save()` semantics.**
 
@@ -267,7 +295,8 @@ Each check has its own readable message (spec). Rejected: allowing any string, a
 - `task_tags` is one per line, at most 32.
 - `global_filter` is blank (store NULL) or text that passes the rule.
 - **An absent key leaves the stored value unchanged**, for all three, as for the four booleans. A client posting part of the card must not erase a rule.
-- **The combination check runs in `save()` after the row is locked**, over the merged result (submitted values over stored ones). A row whose own rule is `filter` must have a non-NULL `global_filter`. Refusal: "The “filter” rule needs a global filter text. Enter the text every task line contains (for example #task), or choose another rule." Nothing is written.
+- **Saves are serialised per owner scope (Codex spec r1 #2 (a)).** `save()` first takes `pg_advisory_xact_lock(<task-settings namespace constant>, <uid, or 0 for the NULL scope>)`, the two-key form (user ids start at 1). It takes it **before** reading the row, so two first saves for a scope with no row are serialised too. `FOR UPDATE` alone cannot lock a row that does not exist yet. The existing `FOR UPDATE` read and the `ON CONFLICT` upsert stay.
+- **The combination check runs in `save()` under that lock**, over the merged result (submitted values over stored ones). A row whose own rule is `filter` must have a non-NULL `global_filter`. A `CheckViolation` on `ck_task_settings_global_filter` at flush is caught as the last line of defence: rolled back, nothing saved, the same refusal. Refusal: "The “filter” rule needs a global filter text. Enter the text every task line contains (for example #task), or choose another rule." Nothing is written.
 - **Every other combination is accepted and means what the card says:**
   - `fields` with no task tags means "fields only";
   - tags or a filter text kept while the rule is `all`, `default` or the other kind are stored and unused, and the card labels each input with the rule that uses it.
@@ -298,30 +327,31 @@ Like the existing card, the block has no `<script>`, no inline handler, no `styl
 
 **`040_task_rule.py`**, `down_revision = "039"`, in 039's house style:
 
-- adds `task_rule`, `task_tags` and `global_filter` (D8) and the CHECK `ck_task_settings_task_rule`, each with a comment marker `"… (040_task_rule)"` (`COMMENT ON COLUMN` / `COMMENT ON CONSTRAINT`);
+- adds `task_rule`, `task_tags` and `global_filter` (D8) and the CHECKs `ck_task_settings_task_rule` and `ck_task_settings_global_filter`, each with a comment marker `"… (040_task_rule)"` (`COMMENT ON COLUMN` / `COMMENT ON CONSTRAINT`);
 - reconcile-or-refuse:
   - a column is verified by type, nullability, default and marker;
-  - the CHECK by its validated definition against a TEMP-table probe and its marker;
+  - each CHECK by its validated definition against a TEMP-table probe and its marker;
   - a same-named object of another shape, or one without the marker, is refused by name before anything is created;
 - `search_path` pinned; `lock_timeout` and `statement_timeout` set and `RESET`;
 - **no data written**: no row is updated, and `ADD COLUMN … DEFAULT '{}'` is metadata-only on PostgreSQL 16;
-- `downgrade()` drops only marked objects, CHECK first;
+- `downgrade()` drops only marked objects, the CHECKs first;
 - needs no superuser and creates no extension.
 
 **039 gains an allow-list.** 039 compares `task_settings` completely, against a TEMP twin of its own DDL (columns, constraints, indexes). A stamp-back to 038 that re-runs 039 over a 040 database would therefore refuse the table as foreign. The precedent is 032's allow-list for 039's `note_tasks` units. 039's `_shape` comparison leaves out exactly:
 
 - the columns `task_rule`, `task_tags` and `global_filter`;
-- the constraint `ck_task_settings_task_rule`,
+- the constraints `ck_task_settings_task_rule` and `ck_task_settings_global_filter`,
 
 each only when it carries its exact 040 marker. Any other extra column or constraint, or one of these names with another comment, is still compared and refused. The 032 allow-list is untouched: 040 adds nothing to `note_tasks`. A future revision adding to `task_settings` must extend 039's list on purpose.
 
-**Models and checks.** `src/models/db.py` mirrors the three columns and the CHECK (in `__table_args__`), with their markers, so `alembic check` reports "No new upgrade operations detected". `task_settings` is already durable for backups, so the new columns are dumped with it, and `tests/test_backup_derived_tables.py` is unchanged.
+**Models and checks.** `src/models/db.py` mirrors the three columns and both CHECKs (in `__table_args__`), with their markers, so `alembic check` reports "No new upgrade operations detected". `task_settings` is already durable for backups, so the new columns are dumped with it, and `tests/test_backup_derived_tables.py` is unchanged.
 
-**The previous image against the 040 schema.**
+**The previous image and the 040 schema (Codex spec r1 #3).** Two cases differ, and only the first is compatibility:
 
-- v1.3.0 maps `TaskSettings` without the new columns. Its insert names its own columns, so the new ones take NULL, `'{}'` and NULL, and its update touches only its own. It never reads them.
-- It therefore runs, and lists every checkbox: a rollback silently reverts to rule `all` (L6).
-- `alembic downgrade 039` (with the new image) drops the three columns and every saved rule.
+- **An already-running v1.3.0 process, during a rolling deploy.** It keeps working against 040. It maps `TaskSettings` without the new columns. Its insert names its own columns, so the new ones take NULL, `'{}'` and NULL, which both CHECKs admit. Its update touches only its own columns, and it never reads the new ones.
+- **A restarted or newly scheduled v1.3.0 pod cannot start.** Its migration init container runs `alembic upgrade head`, and its scripts end at 039, so a database at 040 is an unknown revision. That is the same as for every revision.
+- **Rollback is roll-forward.** If the previous image must run, first run `alembic downgrade 039` **with the 040-aware image**, then start the previous image. The downgrade drops the three columns and both CHECKs, **and with them every saved task rule, task tag and global filter text**. The rest of `task_settings` is untouched. That image then lists every checkbox (L6).
+- **What is tested.** The schema gate runs upgrade to head, `downgrade 039`, then upgrade to head again. It asserts that the downgrade leaves 039's exact `task_settings` shape (039's own reconcile accepts it on a stamp-back) and that the round trip ends with `alembic check` clean against the current models. Running `alembic check` under the 039-era models after the downgrade is not available in this tree, and is not claimed.
 
 ### D12. Tool surface: descriptions only
 
@@ -353,6 +383,7 @@ Once a user picks `fields` or `filter`:
 3. `add_task`'s index-side duplicate refusal and similar list ignore non-tasks.
 4. Cursors minted before a rule change are refused once.
 5. Startup refuses an invalid `TASKS_RULE`, `TASKS_RULE_TAGS` or `TASKS_GLOBAL_FILTER`, or `TASKS_RULE=filter` with no filter text. That is a new boot refusal, but only for a value someone set.
+6. After 040 is applied, the previous image's pods cannot be (re)started until `alembic downgrade 039` has run with the new image (D11).
 
 ## Accepted limitations
 
@@ -361,10 +392,10 @@ Once a user picks `fields` or `filter`:
 - **L3**: `filter` is a case-sensitive substring test of the whole body, as the plugin's is. It also counts the text inside a field value or inline code.
 - **L4**: Rows whose verdict depended on cut text or cut tags are listed (D3). They may be non-tasks, and they are counted.
 - **L5**: During a version-5 backfill, `fields` approximates recurrence, created and cancelled by signifier presence (D2). The rule line says so.
-- **L6**: Rolling back to v1.3.0 reverts listings to every checkbox without a statement, because the old image knows no rule.
+- **L6**: Rolling back to v1.3.0 needs `alembic downgrade 039` first, which drops every saved rule. The old image then lists every checkbox without a statement, because it knows no rule.
 - **L7**: The note line is decided from the written bytes. The listing reflects them after the write-time refresh (#428 D10), or after the next pass when the refresh lagged.
 - **L8**: `update_task` never re-adds the global filter. A description replacement that drops a non-tag filter makes the line a non-task, and the response says so.
-- **L9**: The duplicate check against the target note's own bytes ignores the rule (D7, Q1).
+- **L9**: The duplicate check against the target note's own bytes ignores the rule (D7, owner decision Q1).
 - **L10**: The plugin removes a global-filter tag from a task's tags when it reads the line. This server keeps it in `tags` and `tag_prefixes`, so `list_tasks(tags=["task"])` matches every filter-rule task when F is `#task`.
 - **L11**: A `scope="all"` response does not mention the caller's rule. Its query line says `scope: all`.
 
@@ -374,7 +405,8 @@ Once a user picks `fields` or `filter`:
 
 - `tests/test_task_rule.py`:
   - `extracted_is_task` over each field family, an invalid date, `🆔` only, task tags hierarchical and case-insensitive (`waiting-for` vs `Waiting-For/bob` vs `waiting-forever`), a 65th-tag `tags_cut` row with and without task tags, and `filter` case-sensitivity, a filter in inline code and in a field value, a 1,200-character line with the filter after and before the cut;
-  - the validators: every refusal message, `#`-stripping, trailing `/` refused, 33 tags, a 65-character filter, `\n`, U+2028, a backtick, `📅`, U+FE0F;
+  - the validators: every refusal message, `#`-stripping, trailing `/` refused, 33 tags, a 65-character filter, `\n`, U+2028, a backtick, `📅`, U+FE0F, `%%`, `<!--`, `-->`, `~~~`, a leading `- `, `[ ]`, `# ` and `>`, a whitespace-only filter (U+3000) are each refused, while `#task`, `TODO` and `[task]` are accepted;
+  - the defensive fallback: a merged row with an unknown kind, `filter` with NULL or blank text, or a disallowed stored text gives `task_rule="all"` with the reason, and the fallback rule line;
   - `rule_clause` returns `None` under `all`.
 - `tests/test_task_settings.py`:
   - `effective()` inheritance as a unit (row NULL gives the whole env rule; row `fields` with empty tags ignores `TASKS_RULE_TAGS`);
@@ -408,12 +440,16 @@ Once a user picks `fields` or `filter`:
 - **SQL and Python agree.** `extracted_is_task` equals `rule_clause` on every version-5 row of the fixture, for every rule.
 - **Writes end to end** (`tests/integration/test_task_tools_pg.py`, extended):
   - `add_task` under `filter`: prepended, already present (text or tag), case differs, the length refusal, dry run;
+  - layer (b) alone: `plan_add` handed an effective `filter` rule with `%%` or `<!--` directly (a unit test in `tests/test_task_write.py`, bypassing validation and the D8 fallback) is refused for a dry run and a write, with no plan published;
+  - with such a text written straight into `task_settings`: the D8 fallback treats the rule as `all`, and the note gains no `%%` or `<!--`;
+  - two concurrent first saves for one scope (one `filter` + `#task`, one a blank filter only): the end state is never `filter` without text, and the loser gets the readable refusal or a consistent merge;
+  - a row forced (with the CHECK dropped in the test) to `filter` with NULL text: `list_tasks()` treats it as `all`, lists every checkbox, and carries the fallback rule line;
   - `add_task` under `fields`: the note line present without a field, absent with `due`, absent with `set_created_date` on;
   - `update_task` removing the last field, and replacing a description that held a non-tag filter: the note line appears;
   - `complete_task` unchanged;
   - an id from a `scope="all"` listing completes a non-task under `fields`;
   - a plain checklist line elsewhere no longer refuses `add_task` as a duplicate under `fields`, while the same line in the target note still does.
-- **Schema** (`tests/integration/test_schema_check.py`, `make test-schema`): 040 fresh, stamp-back to 039 and to 038 over head (both reconcile, with 039's allow-list exercised), impostors (an unmarked `task_rule`; a `task_tags varchar(64)[]`; an unmarked CHECK), the CHECK refusing `'any'`, downgrade dropping only marked units, `test_nonsuperuser_migrations_pg.py`, and `alembic check` clean.
+- **Schema** (`tests/integration/test_schema_check.py`, `make test-schema`): 040 fresh, stamp-back to 039 and to 038 over head (both reconcile, with 039's allow-list exercised), impostors (an unmarked `task_rule`; a `task_tags varchar(64)[]`; an unmarked CHECK), the CHECKs refusing `'any'`, `filter` with NULL text and a blank filter text, the upgrade → `downgrade 039` → upgrade round trip (039's shape after the downgrade, `alembic check` clean at the end), downgrade dropping only marked units, `test_nonsuperuser_migrations_pg.py`, and `alembic check` clean.
 
 **Panel** (`tests/test_panel_task_settings.py`):
 
@@ -430,7 +466,7 @@ The change is small enough for two agents, in sequence or in parallel. The docs 
 
 | Slice | Owns (only these files) | Schema-test container |
 |---|---|---|
-| **I, implementation** | `src/services/task_rule.py` (new), `src/services/task_query.py`, `src/mcp_server/task_render.py`, `src/services/task_settings.py`, `src/config.py`, `src/models/db.py`, `alembic/versions/040_task_rule.py` (new), `alembic/versions/039_task_tools.py` (the allow-list only), `src/services/task_write.py`, `src/mcp_server/tools.py` (`add_task_impl`, `update_task_impl`), `src/mcp_server/server.py` (three descriptions), `src/control_panel/templates/_task_settings_card.html`, `src/control_panel/routes.py` (the two task helpers), `tests/test_task_rule.py` (new), `tests/test_task_render.py`, `tests/test_task_settings.py`, `tests/test_panel_task_settings.py`, `tests/golden/oidc_off/page_account_*`, `tests/fixtures/tools_list_full_v2.json`, `tests/fixtures/tools_list_readonly_oauth.json`, `tests/fixtures/tools_list_schema_additions.json` (descriptions only, if it carries them), `tests/integration/test_task_rule_pg.py` (new), `tests/integration/test_task_tools_pg.py`, `tests/integration/test_schema_check.py` | `omcp-tr-impl` / 55481 (`SCHEMA_TEST_CONTAINER` / `SCHEMA_TEST_PORT`; also used by `make test-integration`, never concurrently) |
+| **I, implementation** | `src/services/task_rule.py` (new), `src/services/task_query.py`, `src/mcp_server/task_render.py`, `src/services/task_settings.py`, `src/config.py`, `src/models/db.py`, `alembic/versions/040_task_rule.py` (new), `alembic/versions/039_task_tools.py` (the allow-list only), `src/services/task_write.py`, `src/mcp_server/tools.py` (`add_task_impl`, `update_task_impl`), `src/mcp_server/server.py` (three descriptions), `src/control_panel/templates/_task_settings_card.html`, `src/control_panel/routes.py` (the two task helpers), `tests/test_task_rule.py` (new), `tests/test_task_render.py`, `tests/test_task_write.py`, `tests/test_task_settings.py`, `tests/test_panel_task_settings.py`, `tests/golden/oidc_off/page_account_*`, `tests/fixtures/tools_list_full_v2.json`, `tests/fixtures/tools_list_readonly_oauth.json`, `tests/fixtures/tools_list_schema_additions.json` (descriptions only, if it carries them), `tests/integration/test_task_rule_pg.py` (new), `tests/integration/test_task_tools_pg.py`, `tests/integration/test_schema_check.py` | `omcp-tr-impl` / 55481 (`SCHEMA_TEST_CONTAINER` / `SCHEMA_TEST_PORT`; also used by `make test-integration`, never concurrently) |
 | **D, docs** | `README.md`, `.env.example`, `DEPLOYMENT.md`, `docs/architecture/vault-tools.md`, `docs/architecture/control-panel.md`, `docs/architecture/schema-and-migrations.md`, `CLAUDE.md` | none |
 
 **Seams the supervisor greps after merging** (a production caller of each):
@@ -442,15 +478,27 @@ The change is small enough for two agents, in sequence or in parallel. The docs 
 - `render_rule_line`: called by both renderers.
 - The three new form names: in `_save_task_settings`'s allow-list.
 
-## Open questions for the owner
+## Owner decisions (2026-11-10)
 
-- **Q1. The target note's own duplicate check ignores the rule (D7).** A plain `- [ ] Renew passport` in `Inbox.md` still refuses `add_task(path="Inbox.md", text="Renew passport", due=…)` under `fields`.
-  - **Recommendation: keep.** Same note, same words is almost always the same intent: give that line a date with `update_task`. `allow_duplicate=true` overrides.
-- **Q2. Rows whose verdict depended on cut data are kept, not excluded (D3).**
-  - **Recommendation: keep.** It is fail-visible, it is counted, and it is vanishingly rare (1,000-character lines, 65-tag lines).
-- **Q3. Prepend instead of the brief's "append before the field run" (D7).**
-  - **Recommendation: prepend.** It is the plugin's own behaviour, it is parse-safe for a non-tag filter, and it guarantees the stored text contains the filter.
-- **Q4. "Server default" inherits the whole rule (kind, tags and filter) rather than each field (D8).**
-  - **Recommendation: whole rule.** It is what the card can show honestly.
-- **Q5. The default stays `all`.** The evidence argues for `fields` on this vault. The brief and the 1.0 promise keep `all` for every deployment.
-  - **Recommendation:** the owner sets `fields` with the workflow tags on their own account after deploy. That is the live exercise in tasks §4.
+- **Q1. The target note's own duplicate check stays rule-independent (D7).** A plain `- [ ] Renew passport` in `Inbox.md` still refuses `add_task(path="Inbox.md", text="Renew passport", due=…)` under `fields`. Same note, same words is almost always the same intent: `update_task` can give that line a date. `allow_duplicate=true` overrides.
+- **Q2. Rows whose verdict depended on cut data stay listed and counted (D3).** This is fail-visible and vanishingly rare.
+- **Q3. The global filter text is prepended**, not appended before the field run (D7). It is the plugin's own behaviour, it is parse-safe for a non-tag filter, and it guarantees the stored text contains the filter.
+- **Q4. "Server default" inherits the whole rule** (kind, tags and filter), not each field (D8).
+- **Q5. The default stays `all`** for every deployment. The owner sets `fields` with their workflow tags on their own account after deploy (tasks §4.5).
+
+## Spec review record
+
+**Codex spec review, round 1 (2026-11-10): FAIL**, with 1 BLOCKER and 2 MAJOR. All three were accepted and folded. Round 2 is verification-only.
+
+1. **BLOCKER, accepted.** The filter text could damage a note: `%%` or `<!--` passed the proposed validator and was prepended after the caller's text had been checked. Fixed in two layers:
+   - (a) D9 validates F, at save time and for `TASKS_GLOBAL_FILTER` at startup, with the caller-text structure rules plus the single-line, signifier, leading-marker, whitespace-only and 64-character rules;
+   - (b) D7 has `add_task` run the structure check on the final combined description before the dry run and before publication.
+
+   Scenarios cover both layers.
+2. **MAJOR, accepted.** Two concurrent first saves could leave `filter` with no text. Fixed three ways:
+   - `ck_task_settings_global_filter` in 040 makes the state unrepresentable;
+   - `save()` serialises per owner scope with a transaction advisory lock taken before the read, and handles the CHECK violation as the same readable refusal;
+   - the query side treats an unevaluable rule as `all` and says so on the rule line (D8).
+
+   `fields` with zero task tags is stated to be valid.
+3. **MAJOR, accepted.** "The previous image keeps working" held only for a running process. D11, the schema-integrity delta and tasks §3.3 now distinguish a running old process (compatible) from a restarted one (cannot start at 040), state that rollback is roll-forward or `alembic downgrade 039` with the 040-aware image first (dropping every saved rule), and state exactly what the schema gate tests (the upgrade → downgrade 039 → upgrade round trip).

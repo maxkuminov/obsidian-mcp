@@ -12,9 +12,9 @@ There are two slices (design §"Slice plan"): **I** (groups 1–2) and **D** (gr
   - `unsure_clause(eff)` (D3);
   - `pending_approximate(eff)`;
   - `extracted_is_task(task, eff)`;
-  - the three validators (D9: rule kind, task tag, filter text), with the spec's messages.
-- [ ] 1.2 `alembic/versions/040_task_rule.py` (`revision="040"`, `down_revision="039"`): the three columns and the CHECK (D8, D11), markers `… (040_task_rule)`, reconcile-or-refuse, timeouts set and `RESET`, no data written, marked-only downgrade with the CHECK first.
-- [ ] 1.3 `alembic/versions/039_task_tools.py`: the allow-list only. `_shape` leaves out exactly 040's four units, each only when it carries its exact 040 marker. Change nothing else in 039.
+  - the three validators (D9: rule kind, task tag, filter text), with the spec's messages. The filter-text validator includes `task_write._structure_refusal(F, context=True)`'s rules; share that check rather than copying it, keeping `config.py` cycle-free.
+- [ ] 1.2 `alembic/versions/040_task_rule.py` (`revision="040"`, `down_revision="039"`): the three columns and both CHECKs (`ck_task_settings_task_rule`, `ck_task_settings_global_filter`; D8, D11), markers `… (040_task_rule)`, reconcile-or-refuse, timeouts set and `RESET`, no data written, marked-only downgrade with the CHECKs first.
+- [ ] 1.3 `alembic/versions/039_task_tools.py`: the allow-list only. `_shape` leaves out exactly 040's five units, each only when it carries its exact 040 marker. Change nothing else in 039.
 - [ ] 1.4 `src/models/db.py`: mirror the three columns and the CHECK (in `TaskSettings.__table_args__`) with their markers. `alembic check` must be clean.
 - [ ] 1.5 `src/config.py`:
   - `tasks_rule` (`all`);
@@ -23,13 +23,14 @@ There are two slices (design §"Slice plan"): **I** (groups 1–2) and **D** (gr
   - field validators calling the `task_rule` validators (imported inside the validator), and a model validator refusing `filter` with an empty filter text, naming both variables;
   - a comment block in the style of the #428 one, saying that the migration init container is refused too.
 - [ ] 1.6 `src/services/task_settings.py`:
-  - `EffectiveTaskSettings` gains `task_rule`, `task_tags`, `global_filter` and `task_rule_inherited`, with D8's one-unit inheritance in `_merge`;
+  - `EffectiveTaskSettings` gains `task_rule`, `task_tags`, `global_filter`, `task_rule_inherited` and `task_rule_unusable`, with D8's one-unit inheritance and its defensive fallback (an unevaluable rule becomes `all` with a reason and one WARNING) in `_merge`;
   - `validate`: the three keys, each absent → unchanged;
-  - `save`: the merged `filter`-needs-text check after the `FOR UPDATE` read, writing nothing on refusal.
+  - `save`: `pg_advisory_xact_lock` on the scope before the read; the merged `filter`-needs-text check; a `CheckViolation` on `ck_task_settings_global_filter` handled as the same refusal, writing nothing.
 - [ ] 1.7 Tests:
   - `tests/test_task_rule.py` (new);
   - `tests/test_task_settings.py` (unit: inheritance, absent keys, merged check, `Settings` refusals);
-  - `tests/integration/test_schema_check.py` (040 fresh, stamp-back to 039 and 038 over head, impostors, the CHECK, downgrade);
+  - `tests/integration/test_schema_check.py` (040 fresh, stamp-back to 039 and 038 over head, impostors, both CHECKs, the upgrade → `downgrade 039` → upgrade round trip);
+  - the concurrent-first-saves test, in `tests/integration/test_task_rule_pg.py`;
   - `test_nonsuperuser_migrations_pg.py` covering 040.
 
   Run `make test-schema SCHEMA_TEST_CONTAINER=omcp-tr-impl SCHEMA_TEST_PORT=55481`.
@@ -50,7 +51,7 @@ There are two slices (design §"Slice plan"): **I** (groups 1–2) and **D** (gr
   - `AGENDA_MIN_BUDGET` 3,121 with the line;
   - measured guarantee constants (≤ 1,921 never refused; 40 + 40 ≤ 1,962).
 - [ ] 2.3 `src/services/task_write.py`:
-  - `plan_add` prepends the filter text under `filter` (D7), with the combined-length refusal;
+  - `plan_add` prepends the filter text under `filter` (D7), with the combined-length refusal, and re-runs `_structure_refusal` on the final combined description before any dry-run answer or publication (unit-tested in `tests/test_task_write.py` with `%%` and `<!--` handed in directly);
   - the plan reports `filter_added`;
   - `duplicate_scan` is unchanged in code (it gets the rule through `scope_clause`), and a test pins that it calls `scope_clause`.
 - [ ] 2.4 `src/mcp_server/tools.py`, in `add_task_impl` and `update_task_impl` only: the `global filter added:` line, and the note line from `task_rule.extracted_is_task` over the written line's extraction (`tasks.tasks_from_note_text`), in the result and the dry run (D7). `complete_task_impl` is untouched.
@@ -73,7 +74,10 @@ There are two slices (design §"Slice plan"): **I** (groups 1–2) and **D** (gr
   - the settings table gains `TASKS_RULE`, `TASKS_RULE_TAGS` and `TASKS_GLOBAL_FILTER`;
   - the Tasks card paragraph names the new block.
 - [ ] 3.2 `.env.example`: the three variables, commented, with defaults and one line each.
-- [ ] 3.3 `DEPLOYMENT.md`: "Upgrading across migration 040 (task rule, #434)" in the 039 section's style: what 040 adds, that nothing changes until a rule is chosen, the new boot refusals (and that the init container is refused too), backups unchanged, and rollback (the previous image runs against 040 and lists every checkbox; `alembic downgrade 039` drops every saved rule).
+- [ ] 3.3 `DEPLOYMENT.md`: "Upgrading across migration 040 (task rule, #434)" in the 039 section's style: what 040 adds, that nothing changes until a rule is chosen, the new boot refusals (and that the init container is refused too), backups unchanged, and rollback stated precisely:
+  - an already-running previous-image process keeps working during the rolling deploy;
+  - a restarted previous image cannot start at revision 040;
+  - rollback is roll-forward, or `alembic downgrade 039` run with the 040-aware image **before** starting the previous image, which discards every saved task rule, task tag and filter text (the previous image then lists every checkbox).
 - [ ] 3.4 `docs/architecture/vault-tools.md` ("Task tools (#428)"):
   - the rule, its predicates and the one-place composition into `scope_clause`;
   - the counts, the rule line and its bounds;

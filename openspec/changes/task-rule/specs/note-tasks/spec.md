@@ -76,7 +76,9 @@ Default-scope responses SHALL carry a rule line when `scope="default"` and the e
 - `list_tasks` SHALL carry the query line, and directly after it one rule line;
 - `task_agenda` SHALL carry the same rule line directly after its header line.
 
-In every other case, including the rule `all` and any `scope="all"` call, no rule line SHALL appear, and the response SHALL be byte-identical to its form before this change.
+The same rule line SHALL appear under `scope="default"` when a configured rule could not be applied and was treated as `all`. It SHALL then read `Rule — task rule: all (the configured rule cannot be applied: <reason>) — pass scope="all" to list every checkbox`.
+
+In every other case, including a chosen or inherited rule `all` and any `scope="all"` call, no rule line SHALL appear, and the response SHALL be byte-identical to its form before this change.
 
 **Wording.** The rule line SHALL read, with every count stated even at zero:
 

@@ -35,8 +35,22 @@ The effective rule SHALL be part of the effective settings, read once per tool c
 - the rule value is not `default`, `all`, `fields` or `filter`;
 - a task tag, after one leading `#` is stripped and the tag is lower-cased, does not match the tag grammar, is over 128 characters, or ends in `/`;
 - more than 32 task tags are given;
-- the global filter text, after surrounding spaces and tabs are stripped, is longer than 64 characters, or contains a control character, a line break, a line or paragraph separator, a backtick, a Tasks field emoji or U+FE0F;
+- the global filter text fails the filter rule below;
 - the result of merging the submitted values over the stored ones has the rule `filter` and no global filter text.
+
+**The filter rule.** It SHALL be one function, used both for `TASKS_GLOBAL_FILTER` at startup and on save. After surrounding spaces and tabs are stripped, the text SHALL:
+- be 1–64 characters long, and not whitespace only;
+- be a single line, containing no control character, line break, U+0085, U+2028 or U+2029;
+- contain no backtick, no Tasks field emoji and no U+FE0F;
+- pass the structure check applied to caller-supplied task text, which requires:
+  - an even number of `%%`;
+  - no `<!--` without its `-->`, and no `-->` without its `<!--`;
+  - no run of three or more backticks or tildes;
+  - no leading list marker, checkbox, heading marker or `>`.
+
+**Serialised saves.** Saves for one owner scope SHALL be serialised by a transaction-scoped advisory lock on that scope, taken before the stored row is read, so that the merged-state check is sound even for two concurrent first saves. The database SHALL also reject a stored `filter` rule without a filter text, and a blank filter text, by a CHECK. A save that violates it SHALL be refused with the same readable message, storing nothing.
+
+**Defensive evaluation.** When the effective settings meet a rule they cannot evaluate, they SHALL treat it as `all` and record why. That is an unknown kind, `filter` with a NULL, empty or blank filter text, or a stored filter text that fails the filter rule. A response SHALL then state that the configured rule cannot be applied. The rule `fields` with no task tags is valid and means fields only.
 
 `default` SHALL store NULL. A blank global filter SHALL store NULL. A field absent from the submitted form SHALL leave its stored value unchanged. Task tags or a filter text stored while another rule is chosen SHALL be kept and unused.
 
@@ -59,8 +73,33 @@ Every variable SHALL be documented in `README.md` and `.env.example`.
 - **THEN** startup SHALL fail with a message naming both variables
 
 #### Scenario: Unsafe filter text is refused
-- **WHEN** a user saves the global filter `#task 📅`, a filter containing a backtick, a filter of 65 characters, or a filter containing U+2028
+- **WHEN** a user saves as the global filter any of:
+  - `#task 📅`;
+  - a filter containing a backtick;
+  - a filter of 65 characters;
+  - a filter containing U+2028;
+  - `%%`;
+  - `<!--`;
+  - `~~~`;
+  - `- todo`;
+  - `[t]`;
+  - `# task`;
+  - `> task`;
+  - a filter of U+3000 only
 - **THEN** each save SHALL be refused with a message naming the problem, and nothing SHALL be stored
+- **AND** `#task`, `TODO` and `[task]` SHALL be accepted
+
+#### Scenario: Unsafe filter text in the environment refuses startup
+- **WHEN** the server starts with `TASKS_GLOBAL_FILTER=%%` or `TASKS_GLOBAL_FILTER=<!--`
+- **THEN** startup SHALL fail with a message naming `TASKS_GLOBAL_FILTER`
+
+#### Scenario: Concurrent first saves cannot leave a filter rule without its text
+- **WHEN** a scope has no row, and two saves run concurrently: one submitting `task_rule=filter` with `#task`, the other submitting only a blank global filter
+- **THEN** the stored row SHALL never hold the rule `filter` without a filter text, and a refused save SHALL flash the filter-needs-text message with nothing stored
+
+#### Scenario: An unevaluable stored rule falls back to every checkbox, visibly
+- **WHEN** a row holds the rule `filter` with no filter text, written outside the server with the CHECK removed
+- **THEN** `list_tasks()` SHALL list every checkbox the scope allows, and SHALL state that the configured rule cannot be applied
 
 #### Scenario: Task tags are normalised and bounded
 - **WHEN** a user saves the task tags `#Someday` and `waiting-for`

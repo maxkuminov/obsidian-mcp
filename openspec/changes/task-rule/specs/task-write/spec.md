@@ -8,6 +8,7 @@
 
 **Global filter.** When the caller's effective task rule is `filter` and the line so built does not contain the global filter text as a case-sensitive substring after `- [ ] `, the description SHALL instead be the filter text, one space, then `text`, and the line SHALL be built again from it.
 - The 1,000-character description bound SHALL apply to that combined description. A combination over it SHALL be refused with `invalid_argument`, naming the global filter, and writing nothing.
+- The structure check applied to caller-supplied task text (balanced `%%`, balanced HTML comment markers, no run of three or more backticks or tildes) SHALL be applied again to the final combined description, before a dry run is answered and before anything is published. A failure SHALL be refused with that check's refusal, writing nothing, whatever the stored filter text is.
 - The response and the dry run SHALL then carry the line `global filter added: <filter as a JSON string>`.
 - Under any other rule, or when the line already contains the filter text, nothing SHALL be added.
 
@@ -52,6 +53,11 @@ A file without a final terminator SHALL keep none.
 #### Scenario: The filter match is case-sensitive
 - **WHEN** the caller's rule is `filter` with `#task`, and `add_task(text="Book flights #Task")` runs
 - **THEN** the line SHALL be `- [ ] #task Book flights #Task`
+
+#### Scenario: A filter that would open a comment cannot reach the note
+- **WHEN** the `add_task` planner is handed the effective rule `filter` with the text `%%` (or `<!--`) directly, bypassing both the settings validation and the settings fallback, and plans `text="Call bank"` for a dry run and for a write
+- **THEN** both SHALL be refused with `invalid_argument` naming the comment marker, and nothing SHALL be published
+- **AND** when such a text is stored in the database past the save validation, `add_task(text="Call bank")` SHALL treat the rule as `all`, and the note SHALL gain no `%%` or `<!--`
 
 #### Scenario: A non-tag filter is added the same way
 - **WHEN** the caller's rule is `filter` with `TODO`, and `add_task(text="Call the bank")` runs

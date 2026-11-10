@@ -49,6 +49,6 @@ None.
 ## Impact
 
 - **Code:** a new pure module `src/services/task_rule.py`; `src/services/task_query.py` (`scope_clause` and the counts), `src/mcp_server/task_render.py`, `src/services/task_settings.py`, `src/config.py`, `src/models/db.py`, `src/services/task_write.py`, `src/mcp_server/tools.py`, `src/mcp_server/server.py` (three descriptions), the Tasks card template and its two routes.
-- **Schema:** migration 040 adds three marked columns and one CHECK to `task_settings`. 039 gains an allow-list for exactly those units, as 032 did for 039's. No data is written, nothing is re-derived and nothing is re-embedded.
+- **Schema:** migration 040 adds three marked columns and two CHECKs to `task_settings`. 039 gains an allow-list for exactly those units, as 032 did for 039's. No data is written, nothing is re-derived and nothing is re-embedded. A running previous-image process keeps working, but a restarted previous image cannot start at 040. Rollback is roll-forward, or `alembic downgrade 039` with the new image first, which discards saved rules.
 - **Behaviour:** none until someone chooses a rule other than `all`. Under `all`, every response is byte-identical to v1.3.0 and every v1.3.0 cursor stays valid.
 - **Docs:** README (settings table and a short "which checkboxes are tasks"), `.env.example`, `DEPLOYMENT.md` (an upgrade note for 040), `docs/architecture/vault-tools.md`, `control-panel.md`, `schema-and-migrations.md`, `CLAUDE.md`.
