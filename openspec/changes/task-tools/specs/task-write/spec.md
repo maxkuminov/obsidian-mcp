@@ -26,7 +26,11 @@ Within one note's extracted tasks, in document order and under the same per-note
 - a bare key matching more than one task → `task_ambiguous`;
 - a suffixed id whose count differs from the current count → `task_changed`.
 
-No line number from the index, from a listing or from an earlier read SHALL be used to locate the line. Publication SHALL be bound to the bytes the id was resolved against, so a change to the file between that read and the publication is refused with `concurrent_write`. A note whose extraction exceeds the per-note task cap SHALL be refused with `size_limit`. Every refusal SHALL leave the file byte-identical and SHALL state that nothing was written.
+A suffixed id SHALL be accepted only with an `expected_hash` that matches the note's current bytes, in every deployment mode. Without one, the call SHALL be refused with `precondition_required` before any read, and the refusal SHALL say to `read_note` the note and pass its `content_hash`. With a matching hash, the ordinal SHALL be relative to exactly those bytes.
+
+No line number from the index, from a listing or from an earlier read SHALL be used to locate the line. Publication SHALL be bound to the bytes the id was resolved against.
+
+**Retry on conflict.** When publication reports that the file changed during the call and the caller supplied no `expected_hash`, the tool SHALL repeat the whole sequence from the read, up to 3 attempts in total: re-read, re-resolve, re-plan, re-verify, publish. It SHALL carry nothing over from an earlier attempt. After the third conflict it SHALL refuse with `concurrent_write`. With `expected_hash` supplied it SHALL NOT retry. A note whose extraction exceeds the per-note task cap SHALL be refused with `size_limit`. Every refusal SHALL leave the file byte-identical and SHALL state that nothing was written.
 
 #### Scenario: A short text does not match inside a longer one
 - **WHEN** a note holds `- [ ] Call Bob` and `- [ ] Call Bob about the lease`, and `complete_task` names the id of `Call Bob`
@@ -36,17 +40,34 @@ No line number from the index, from a listing or from an earlier read SHALL be u
 - **WHEN** a note holds two lines `- [ ] Water plants` and `complete_task` is called with the bare key
 - **THEN** it SHALL be refused with `task_ambiguous`, the response SHALL list both suffixed ids, and the file SHALL be unchanged
 
-#### Scenario: A count change since the listing is refused
-- **WHEN** a listing returned `<key>.2of2`, a third identical line was then added, and `complete_task` is called with `<key>.2of2`
-- **THEN** it SHALL be refused with `task_changed` and the file SHALL be unchanged
+#### Scenario: A suffixed id without a hash is refused
+- **WHEN** a listing returned `<key>.2of2` and `complete_task` is called with it and no `expected_hash`, on a deployment that does not require preconditions
+- **THEN** it SHALL be refused with `precondition_required`, telling the caller to `read_note` for `content_hash`, and the file SHALL be unchanged
+
+#### Scenario: Swapped identical lines cannot redirect a suffixed id
+- **WHEN** two identical `- [ ] Call` lines with different context below them swap places after the caller read the note, and `complete_task` is called with `<key>.1of2` and the old `content_hash`
+- **THEN** it SHALL be refused with `stale_precondition` and the file SHALL be unchanged
+- **AND** the same call with the current `content_hash` SHALL complete the first occurrence in the current bytes
 
 #### Scenario: A line changed since the listing is not found
 - **WHEN** the task's text was edited after the listing and `update_task` is called with the old id
 - **THEN** it SHALL be refused with `task_not_found` and the file SHALL be unchanged
 
-#### Scenario: A concurrent edit between read and publish is refused
-- **WHEN** another writer changes the note after `complete_task` read it and before it published
-- **THEN** the call SHALL be refused with `concurrent_write`, and the other writer's bytes SHALL be on disk unchanged
+#### Scenario: A concurrent edit with a hash is refused, not retried
+- **WHEN** another writer changes the note after `update_task` (called with a matching `expected_hash`) read it and before it published
+- **THEN** the call SHALL be refused, and the other writer's bytes SHALL be on disk unchanged
+
+#### Scenario: Parallel completions of different tasks all succeed
+- **WHEN** three `complete_task` calls without `expected_hash`, naming three different tasks of one note, are issued at once
+- **THEN** all three SHALL succeed, and the note SHALL contain all three completions and every other byte unchanged
+
+#### Scenario: Parallel completions of the same task succeed once
+- **WHEN** two `complete_task` calls name the same task at once
+- **THEN** exactly one SHALL succeed, and the other SHALL be refused with `already_completed` or `task_not_found`
+
+#### Scenario: Persistent conflict gives up after three attempts
+- **WHEN** every publication attempt of one call meets an in-call conflict
+- **THEN** the call SHALL be refused with `concurrent_write` after its third attempt, having written nothing
 
 #### Scenario: Checkboxes the extractor does not recognise are never targets
 - **WHEN** a note holds `- [ ] example` inside a fenced block, or `- [ ] x` inside its YAML frontmatter
@@ -97,7 +118,10 @@ Before any dry-run diff or publication, every plan SHALL be verified, and a fail
 1. the new note equals the old note outside the declared spans;
 2. the target and any inserted line re-extract as tasks with exactly the intended status and fields;
 3. every other task of the note re-extracts identically, with lines after an insertion shifted by the inserted count;
-4. no undeclared task appears.
+4. no undeclared task appears;
+5. no pre-existing line changes its owning task. A line's owning task is the nearest preceding task whose continuation block contains it.
+
+A task's **continuation block** is every following line that has a greater blockquote depth, or the same blockquote prefix and a greater indentation width (a tab counts as 4). Blank lines are crossed while a later line still belongs. The block has no line or character cap.
 
 #### Scenario: A duplicated due date is refused
 - **WHEN** `update_task` sets the due date on `- [ ] x 📅 2026-01-01 📅 2026-02-01`
@@ -218,7 +242,7 @@ The next-occurrence line SHALL be the completed task's original line, before com
 
 Every other byte SHALL be kept: prefix, field order, rule text, tags, priority, `🏁 keep` and trailing whitespace.
 
-**Placement.** The line SHALL be placed immediately above the completed line when the effective `next_recurrence_below` is false, and immediately below it when that setting is true. It SHALL use the original line's terminator, or the note's first terminator when the original is the last line and has none, else LF. A file without a final terminator SHALL still have none.
+**Placement.** The line SHALL be placed immediately above the completed line when the effective `next_recurrence_below` is false. When that setting is true, it SHALL be placed after the completed task's full continuation block, so no line changes its owning task. It SHALL use the original line's terminator, or the note's first terminator when the original is the last line and has none, else LF. A file without a final terminator SHALL still have none.
 
 #### Scenario: The plugin's dropped fields are dropped
 - **WHEN** `- [ ] Rent 🆔 r1 ⛔ a2 🔁 every month ➕ 2026-01-01 📅 2026-11-01 ✅ 2026-10-01 ^b1` is completed on 2026-11-02, with `set_created_date` false and defaults otherwise
@@ -228,6 +252,10 @@ Every other byte SHALL be kept: prefix, field order, rule text, tags, priority, 
 #### Scenario: Below, at end of file without a newline
 - **WHEN** the completed task is the last line of a file with no final newline, and `next_recurrence_below` is true
 - **THEN** the file SHALL end with the completed line, one terminator, and the next line, with no final terminator
+
+#### Scenario: Below keeps the completed task's children
+- **WHEN** a recurring task followed by three indented context lines is completed with `next_recurrence_below` true
+- **THEN** the next occurrence SHALL be inserted after the third context line, and all three SHALL still belong to the completed task
 
 #### Scenario: Rule text is not canonicalised
 - **WHEN** a task with `🔁 every Sunday` is completed
@@ -244,7 +272,7 @@ Every other byte SHALL be kept: prefix, field order, rule text, tags, priority, 
 - **Clearing.** It SHALL clear any of `due`, `scheduled`, `start`, `priority` and `recurrence` named in `clear`.
 - **Status.** It SHALL change the status to `open` (`[ ]`, removing `✅` and `❌`), `in_progress` (`[/]`, removing `✅` and `❌`) or `cancelled` (`[-]`, removing `✅`, and adding `❌ <today>` when the effective `set_cancelled_date` is true and none exists).
 - **Description.** It SHALL replace the description region with `text`, which must be a single line of 1–1,000 characters, contain no field signifier, `^block` suffix, line break or line-separator character, and not change how the line parses.
-- **Context.** It SHALL append one context line under the task (`append_context`, the same text rules).
+- **Context.** It SHALL append one context line under the task (`append_context`, the same text rules), after the task's full, uncapped continuation block.
 
 The following SHALL be refused with `invalid_argument`, writing nothing:
 
@@ -274,6 +302,10 @@ Cancelling SHALL write no next occurrence. A call that changes no byte SHALL ans
 - **WHEN** `update_task(append_context="called, left message")` names a task followed by two indented context lines
 - **THEN** a line `    - called, left message` SHALL be inserted after those two lines, and no other line SHALL change
 
+#### Scenario: A long continuation block is not split by append_context
+- **WHEN** a task is followed by 10 continuation lines, including a blank line and a deeper child task, and `update_task(append_context=…)` runs
+- **THEN** the new line SHALL be inserted after the tenth line, and no line SHALL change its owning task
+
 ### Requirement: `add_task` SHALL insert one new task line next to the region's task list in canonical order, and SHALL never create a note
 
 `add_task(path, text, section=None, due=None, scheduled=None, start=None, priority=None, tags=None, recurrence=None, context=None, allow_duplicate=False, dry_run=False, expected_hash=None)` SHALL refuse a missing note as the existing write tools do, and SHALL never create one.
@@ -284,7 +316,7 @@ Cancelling SHALL write no next occurrence. A call that changes no byte SHALL ans
 
 **Placement.** The line SHALL be inserted:
 
-1. after the context block of the last task line in the region whose indentation after its blockquote prefix is zero, copying that task's blockquote prefix and bullet, with an ordered marker incremented by one;
+1. after the full, uncapped continuation block of the last task line in the region whose indentation after its blockquote prefix is zero, copying that task's blockquote prefix and bullet, with an ordered marker incremented by one;
 2. or, with no such task, after the region's last non-blank line;
 3. or, for an empty region, after the section heading, or at the start of the body.
 
@@ -293,6 +325,10 @@ A file without a final terminator SHALL keep none.
 #### Scenario: Added after the section's task list
 - **WHEN** section `Today` holds a paragraph, then `- [ ] a` and `- [ ] b` with an indented context line under `b`, then a blank line and more prose, and `add_task(section="Today", text="c", due="2026-11-12")` runs
 - **THEN** `- [ ] c 📅 2026-11-12` SHALL be inserted directly after `b`'s context line, and no other line SHALL change
+
+#### Scenario: A nine-line continuation block is not split
+- **WHEN** the last top-level task of the region is followed by nine indented continuation lines and `add_task` runs
+- **THEN** the new line SHALL be inserted after the ninth line, and every one of the nine SHALL still belong to that task
 
 #### Scenario: Canonical serialisation
 - **WHEN** `add_task(text="Book flights", tags=["travel"], priority="high", recurrence="every year", scheduled="2026-11-20", due="2026-12-01")` runs with `set_created_date` true on 2026-11-10
@@ -343,7 +379,7 @@ A file without a final terminator SHALL keep none.
 - record a `modified` change-feed event attributed to the caller after a confirmed publication;
 - return typed body outcomes whose refusals end with one `MCP-REFUSAL` line.
 
-**`expected_hash`.** Each SHALL accept an optional `expected_hash`, compared against the whole file immediately after the in-call read, with the existing codes. When the deployment requires a precondition, `complete_task` and `update_task` SHALL treat the resolved `(path, id)` as satisfying it, and `add_task` SHALL be exempt.
+**`expected_hash`.** Each SHALL accept an optional `expected_hash`, compared against the whole file immediately after the in-call read, with the existing codes. When the deployment requires a precondition, `complete_task` and `update_task` with a bare id SHALL treat the resolved `(path, id)` as satisfying it, and `add_task` SHALL be exempt. A suffixed id always requires `expected_hash`.
 
 **Response.** A success response SHALL include:
 
@@ -363,7 +399,7 @@ Usage logs SHALL NOT record task description or context text.
 - **THEN** it SHALL be refused with `permission_denied` and nothing SHALL be written
 
 #### Scenario: Required mode is satisfied by the id
-- **WHEN** `WRITE_PRECONDITION_REQUIRED=true` and `complete_task` is called without `expected_hash`
+- **WHEN** `WRITE_PRECONDITION_REQUIRED=true` and `complete_task` is called with a bare id and without `expected_hash`
 - **THEN** it SHALL proceed, and a supplied `expected_hash` that does not match SHALL be refused with `stale_precondition`
 
 #### Scenario: Usage params hold no task text
@@ -377,13 +413,14 @@ After a confirmed publication, and before the change-feed event, each task write
 1. run in its own transaction;
 2. re-check the caller's root binding;
 3. lock the caller's `notes_metadata` row for the path within a 2-second lock wait;
-4. derive the tasks from the bytes this call published, with the index pass's function;
-5. replace that note's `note_tasks` rows;
-6. set `tasks_source_hash` to the canonical hash of those bytes and `tasks_refreshed_at` to the database clock.
+4. under that lock, re-read the file through the call's anchored target and confirm it holds exactly the bytes this call published. If it does not, write nothing and report `index: may lag (superseded)`;
+5. derive the tasks from the bytes this call published, with the index pass's function;
+6. replace that note's `note_tasks` rows;
+7. set `tasks_source_hash` to the canonical hash of those bytes and `tasks_refreshed_at` to the database clock.
 
 It SHALL NOT change `content_hash`, the stat columns, `extraction_version` or `derived_under`, and SHALL NOT take the index generation lock.
 
-When the refresh cannot run (lock wait exceeded, no index row, root changed, or any error), the write SHALL stand, the outcome SHALL remain a success, and the response SHALL say `index: may lag (<code>)`. A successful refresh SHALL be reported as `index: refreshed`.
+When the refresh cannot run (lock wait exceeded, no index row, root changed, file superseded, or any error), the write SHALL stand, the outcome SHALL remain a success, and the response SHALL say `index: may lag (<code>)`. A successful refresh SHALL be reported as `index: refreshed`.
 
 #### Scenario: List, complete, list
 - **WHEN** `list_tasks` shows an open task, `complete_task` completes it, and `list_tasks` is called again before any index pass
@@ -392,3 +429,7 @@ When the refresh cannot run (lock wait exceeded, no index row, root changed, or 
 #### Scenario: A held row lock makes the listing lag, not the write fail
 - **WHEN** another transaction holds the note's row lock for longer than 2 seconds during `update_task`
 - **THEN** the file SHALL carry the update, the response SHALL say `index: may lag (lock_timeout)`, and the next pass SHALL bring the listing up to date
+
+#### Scenario: Refreshes finishing out of order cannot install older rows
+- **WHEN** task write A publishes and pauses before its refresh, task write B then publishes and refreshes the same note, and A's refresh then runs
+- **THEN** A's refresh SHALL write nothing and report `index: may lag (superseded)`, and the task rows SHALL describe B's bytes

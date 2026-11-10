@@ -62,6 +62,7 @@ The source is `references/tasks-plugin-reference.md` in this change: Tasks 8.6.0
   - Grammar `^[0-9a-f]{12}(\.[1-9][0-9]{0,3}of[1-9][0-9]{0,3})?$`, at most 22 characters.
   - The write tools accept both forms. `<key>.1of1` is equivalent to `<key>`.
 - **Stored.** `note_tasks.task_key char(12)`, `key_ordinal int` and `key_count int` are written by the extractor (D11), so an id works for text beyond the 1,000-character cut and the listing needs no window query.
+- **A suffixed id names an occurrence, not a line** (Codex r1 #2). Two identical lines can swap places, or one can be replaced, with the count unchanged, and the ordinal then silently names the other occurrence. A write with a suffixed id is therefore accepted only together with a whole-note `expected_hash` that matches the current bytes (D2/D3), in every deployment mode. The ordinal is then relative to exactly the bytes the caller read.
 
 **Why the status is excluded.** A retry of `complete_task` on a task whose text did not change (the done-date setting is off) resolves and answers `already_completed` instead of `task_not_found`. With the done date on (the default), the text changes, so a retry with the old id is `task_not_found`. Either answer is safe, and a double completion is impossible.
 
@@ -101,13 +102,24 @@ The ordinal rules, given `n` = the number of tasks in the current bytes whose ke
 
 | Id form | n | Outcome |
 |---|---|---|
+| `.<i>of<m>`, no `expected_hash` | any | `precondition_required`, checked at entry before any read. The prose says to `read_note` the note and pass its `content_hash` as `expected_hash` |
 | any | `n = 0` | `task_not_found` |
 | bare key | `n = 1` | resolves |
-| bare key | `n > 1` | `task_ambiguous` (lists the `n` suffixed ids, with lines) |
-| `.<i>of<m>` | `m ≠ n` | `task_changed` |
-| `.<i>of<m>` | `m = n` | the `i`-th |
+| bare key | `n > 1` | `task_ambiguous` (lists the `n` suffixed ids with their lines, and says a suffixed id needs `expected_hash`) |
+| `.<i>of<m>` with a matching `expected_hash` | `m ≠ n` | `task_changed` (unreachable while the hash matches; kept as a belt) |
+| `.<i>of<m>` with a matching `expected_hash` | `m = n` | the `i`-th |
+
+A suffixed id with a non-matching hash is refused earlier, by the ladder (`stale_precondition`).
 
 **No line number from the index or from an earlier read is trusted.** The line printed in a response is informational only.
+
+**Listings do not print a precondition hash** (decided after checking the code). `notes_metadata.content_hash` is `canonical_note_hash`: SHA-256 of the newline-translated, NUL-stripped text (`src/services/note_hash.py`). The write ladder's `expected_hash` is `content_hash_for_bytes`: `sha256:` plus SHA-256 of the raw bytes (`vault.py:1863`). `is_canonical_content_hash` deliberately refuses the index digest. The two differ for every CRLF or NUL-bearing note, so the index cannot supply a valid precondition. A caller acting on a suffixed id calls `read_note` first. **Rejected:** storing a raw-byte hash in the index for this purpose. It would add a fourth hash to the pass for a case (identical sibling tasks) that one read already covers.
+
+**Bounded internal retry on an in-call conflict** (supervisor addition B). An agent asked to complete three tasks commonly issues three calls on one note at once. When step 13 reports an in-call conflict **and the caller supplied no `expected_hash`**, the tool repeats steps 5–13 from the read, up to **3 attempts in total**: re-read, re-resolve the id from the new bytes, re-plan, re-verify, publish. Nothing (line number, offsets, plan or diff) is carried from one attempt to the next. After the third conflict it refuses `concurrent_write`.
+
+With `expected_hash` supplied there is no retry: the caller bound a version, and a changed file is `stale_precondition` on the next read. Suffixed ids always carry a hash, so they never retry.
+
+Retries run inside one `_tracked` call. The gates (buckets, admission, concurrency slot, quota) are passed once, and every attempt still takes its own `_confirmed_publication` (#88). Safety is unchanged: each attempt is a complete, independent resolution against bytes it read through the same anchored descriptor, so a retry can only do what a fresh call would do. The same task completed twice in parallel yields one success and one refusal: the second attempt re-resolves against the completed line and answers `already_completed`, or `task_not_found` once the text changed.
 
 **Composition with the publish path.** Resolution, plan and diff are computed from `existing_bytes`, the bytes read through the anchored descriptor. Publication uses `write_file_at(…, expected=existing_bytes)`, which refuses when the file changed between this call's read and its rename (`concurrent_write`). So the bytes the id was re-derived from are exactly the bytes replaced. A concurrent change elsewhere in the note causes a refusal, never a lost edit. The caller simply retries.
 
@@ -115,17 +127,17 @@ The ordinal rules, given `n` = the number of tasks in the current bytes whose ke
 
 All three tools accept an optional `expected_hash`, which binds the whole file through the existing ladder, at the same position (immediately after the in-call read), with identical codes.
 
-**Required mode (`WRITE_PRECONDITION_REQUIRED=true`).**
+**Suffixed ids always need it.** In every mode, a `complete_task` or `update_task` whose id carries an ordinal suffix requires `expected_hash` (D1, D2). Without one, the call is refused `precondition_required` with nothing written.
 
-- For `complete_task` and `update_task`, **the `(path, id)` pair satisfies the requirement**. It is a content precondition on the exact line replaced, re-derived from the bytes the rename is bound to (D2). Every other byte is spliced from the current file, never from a caller-held copy. The hazard required mode exists to prevent, an unguarded write that overwrites newer content with a stale base, therefore cannot occur.
+**Required mode (`WRITE_PRECONDITION_REQUIRED=true`).** Owner decision, 2026-11-10.
+
+- For `complete_task` and `update_task` with a **bare** id, **the `(path, id)` pair satisfies the requirement**. It is a content precondition on the exact line replaced, re-derived from the bytes the rename is bound to (D2). Every other byte is spliced from the current file, never from a caller-held copy. The hazard required mode exists to prevent, an unguarded write that overwrites newer content with a stale base, therefore cannot occur.
 - `add_task` removes no byte. It is **exempt**, on the same reasoning that exempts a no-incumbent creation.
 - The ladder still runs: a supplied hash is compared, and a mismatch is `stale_precondition`.
 
 **Rejected:**
 
-- **Requiring `expected_hash` for task tools under required mode.** `list_tasks` rows carry no file hash, so every task write would need an extra `read_note`. That would reintroduce the read-then-write round trip these tools exist to remove, for no safety gain.
-
-Owner decision **Q1**.
+- **Requiring `expected_hash` for every task write under required mode.** A bare key names exactly one line in the bytes the rename is bound to. `list_tasks` rows carry no file hash, so every task write would need an extra `read_note`, reintroducing the read-then-write round trip these tools exist to remove, for no safety gain. The exception is suffixed ids, where the ordinal is positional and the hash is the binding.
 
 ### D4. The minimal one-line editor (`src/services/task_line.py`, pure)
 
@@ -190,6 +202,7 @@ A plan is a list of `(old line span → new text)` replacements and insertions, 
 2. `tasks_from_note_text(new)` yields the target (and any inserted line) as tasks, with exactly the intended `status`, dates, priority, tags and recurrence, read through both the extractor and `task_line.parse`.
 3. Every other task of the note extracts identically: same `full_text`, status and line. Lines after an insertion shift by exactly the number of inserted lines.
 4. No new task appears except the declared ones. This catches a context line or description that would create a checkbox or a heading.
+5. **No pre-existing line changes its owning task** (Codex r1 #1). A line's owning task is the nearest preceding task line whose **continuation block** contains it, where the continuation block is defined in D8: uncapped, crossing blank lines. Every line of the old note keeps its owner in the new note, except the declared new lines, which are owned as planned.
 
 A failed assertion is `task_malformed`, with nothing written. This is the last line of defence and the strongest safety property here. It is pinned by a property test over a corpus.
 
@@ -237,7 +250,7 @@ A failed assertion is `task_malformed`, with nothing written. This is the last l
 | `every year` / `every N years` | the same month and day N years later. **`A` = Feb 29 → `recurrence_unsupported`** (R§2c marks it UNVERIFIED) |
 | `every M on the K` (M = a full English month name, K valid for M; Feb 29 refused) | first date `> A` that is M-K |
 
-**Tier 2, refused by this change.** These shapes have no dates documented in R, or their text is lossy, and each would need a committed rrule-2.8.1 golden table before admission (owner question **Q2**):
+**Tier 2, refused by this change.** These shapes have no dates documented in R, or their text is lossy, and each would need a committed rrule-2.8.1 golden table before admission (owner decision 2026-11-10: stays refused; follow-up issue):
 
 - `every N weeks on D…`;
 - `every month on the last D`;
@@ -270,9 +283,9 @@ Everything else is identical: prefix, order, rule text, tags, priority, `🏁 ke
 
 **Placement and terminators.**
 
-- `next_recurrence_below = false` (the plugin default, R§2e): `next + T + completed`, replacing the original line's content. `true`: `completed + T + next`.
-- `T` is the original line's own terminator; if it has none (the last line), the note's first terminator; otherwise `\n`. A final line without a terminator stays without one.
-- The task's context lines stay under the completed line in both cases. "Below" puts the next line directly under the completed line, before its children, as the plugin does.
+- **`next_recurrence_below = false`** (the plugin default, R§2e): `next + T + completed`, replacing the original line's content. The completed task's continuation block stays directly under it, and no line changes owner.
+- **`next_recurrence_below = true`:** the next line goes **after the completed task's full continuation block** (D8, uncapped), so the completed task keeps its own children and no line changes owner (D5 check 5). This deliberately differs from the plugin, which writes the two lines adjacently and so hands the children to the new occurrence (L17). With no continuation block the result is the plugin's `completed + T + next`.
+- **Terminators.** `T` is the terminator of the line the new line follows (or precedes, for "above"). If that line has none (the last line), `T` is the note's first terminator, otherwise `\n`. A final line without a terminator stays without one.
 
 ### D8. `add_task`: canonical serialisation, a precise placement rule, and context lines
 
@@ -289,9 +302,18 @@ Everything else is identical: prefix, order, rule text, tags, priority, `🏁 ke
 
 **Anchor.** The last task line in `R` whose indentation width is 0 after its blockquote prefix, where tab counts as 4. Lines inside fenced code are never tasks, by the extractor.
 
+**Continuation block (the write rule, uncapped; Codex r1 #1).** A task's continuation block is every line that belongs to it in Markdown. Scanning forward from the task line, a line belongs when either:
+
+- it has a greater blockquote depth than the task; or
+- it has the same blockquote prefix and an indentation width (tab = 4) greater than the task's.
+
+Blank lines are crossed while a later non-blank line still belongs. The block ends at its last belonging non-blank line; trailing blank lines are not part of it. It stops at the first non-blank line that does not belong.
+
+There is **no line or character cap**, and headings or fences that are themselves deeper-indented belong. The 8-line / 600-character cap of D12 applies only to the context that is **stored and rendered**. Placement (D7, D8 and `append_context`) always uses this uncapped block, and D5 check 5 proves no pre-existing line changes its owner.
+
 **Insertion point.**
 
-1. **With an anchor:** directly after the anchor's **context block**. That block is the maximal run of following non-blank lines that are context under D12 `context`. The new line copies the anchor's blockquote prefix and its bullet character. An ordered anchor `N.` / `N)` gives `N+1` with the same delimiter, and later items are not renumbered (L10).
+1. **With an anchor:** directly after the anchor's **continuation block**. The new line copies the anchor's blockquote prefix and its bullet character. An ordered anchor `N.` / `N)` gives `N+1` with the same delimiter, and later items are not renumbered (L10).
 2. **No anchor, `R` has a non-blank line:** after `R`'s last non-blank line, as `- [ ] …` with no prefix.
 3. **`R` empty:** directly after the section's heading line, or at body start when there is no section. An empty body becomes the line.
 
@@ -302,7 +324,7 @@ The new line is terminated by `T`, chosen as in D7 from the line it follows. Whe
 **Context line** (`add_task(context=…)`, `update_task(append_context=…)`):
 
 - The line is `bq_prefix + indent + unit + "- " + text`, where `unit` is `\t` if the task's indentation contains a tab and otherwise four spaces.
-- It is inserted after the task's existing context block, so a context line is appended.
+- It is inserted after the task's full continuation block (uncapped), so a context line is appended and never lands inside a nested child task's own block. A deeper child's lines belong to the task too, and the new line goes after all of them.
 - The text follows the D4 description rules. D5 then refuses a line that would parse as a task, heading or fence.
 
 ### D9. Duplicate detection in `add_task`
@@ -349,7 +371,8 @@ The refusal names up to 5 matches as `path:line id`. The index side reflects the
 1. `SET LOCAL lock_timeout = '2s'` (`TASK_REFRESH_LOCK_WAIT`, a constant).
 2. Re-check that the caller is still bound to the root the tool ran under, the same check `change_feed.record_tool_events` performs.
 3. `SELECT id FROM notes_metadata WHERE file_path = :rel AND <owner predicate> FOR UPDATE`.
-4. Derive tasks from **the bytes this call published**, held in memory, with `tasks_from_note_text`.
+3a. **Still current?** (Codex r1 #4) Under that row lock, re-read the leaf through the call's anchored target (the same parent descriptor, `read_bytes_at` under the cap) and compare it byte for byte with the bytes this call published. If they differ, or the read fails, another writer has published since. The refresh then writes nothing and reports `index: may lag (superseded)`.
+4. Derive tasks from **the bytes this call published**, held in memory, with `tasks_from_note_text`. Step 3a has just shown them equal to disk, and rows are never derived from the re-read.
 5. Delete and insert that note's `note_tasks` rows, as the pass does.
 6. Set `tasks_source_hash = canonical_note_hash(published)`, `tasks_refreshed_at = clock_timestamp()`, and `tasks_truncated` / `tasks_failed` per the result.
 
@@ -369,7 +392,17 @@ The pass already holds the row lock of every note whose tasks it rewrites (D-con
 - R4 then cannot keep the rows, because `tasks_refreshed_at < scan_started_at`. That pass re-derives from current disk, and `tasks_source_hash = content_hash` again.
 - A row is never stuck: while it is task-dirty, R3 forces a read every pass. Pinned by an integration test that interleaves a pass's scan, a tool write, a refresh and a later edit in every order.
 
-**Failure mode.** A refresh that cannot take the row lock within 2 s, finds no row (a note never indexed, or a quarantined one), finds the root changed, or raises **leaves the write standing**. The response carries `index: may lag (<reason code>)`, and the usage params get `task_refresh = lagged:<code>`. A successful refresh carries `index: refreshed`. The refresh never changes the outcome classification. The next pass converges regardless.
+**Why a superseded refresh cannot leave uncorrected rows.**
+
+- A superseded refresh writes nothing. The rows keep whatever state they had: pass-derived, or written by an earlier refresh. The newer bytes on disk came from a later publication P2, and both cases are covered:
+  - **P2 by a task tool.** Its own refresh queues on the same row lock. Its 3a check passes unless yet another writer followed, in which case the same argument repeats with that writer.
+  - **P2 by a generic writer.** It changed the file's stat. If the rows are pass-derived, the next pass reads the file and derives it. If they came from an earlier refresh, the row is task-dirty, so R3 reads it regardless of the stat.
+- A refresh whose 3a check passes and is then followed, before its commit, by another publication P3 leaves rows describing its own bytes while disk holds P3's. That is the ordinary task-dirty state:
+  - If P3 was a task tool, its refresh runs after this one releases the lock, and wins.
+  - Otherwise R3 forces the next pass to read the note. R4 keeps the rows only for a pass whose scan began before this refresh. The first pass to begin after it derives from disk.
+- So the convergence claim above holds unchanged. Pinned by an integration test with two task writes on one note whose refreshes finish out of order: the second write's refresh runs first, and the first write's refresh reports `superseded`. The rows then describe the second write.
+
+**Failure mode.** A refresh that cannot take the row lock within 2 s, finds no row (a note never indexed, or a quarantined one), finds the root changed, finds the file superseded (3a), or raises **leaves the write standing**. The response carries `index: may lag (<reason code>)`, and the usage params get `task_refresh = lagged:<code>`. A successful refresh carries `index: refreshed`. The refresh never changes the outcome classification. The next pass converges regardless.
 
 **Ordering: publish → refresh → change-feed event.** A consumer that reacts to the feed event and then calls `list_tasks` sees the new state. The event is recorded whatever the refresh did.
 
@@ -411,7 +444,7 @@ The pass already holds the row lock of every note whose tasks it rewrites (D-con
 
 - `clean_at_version` gains `5: clean_for_embedding`, so **nothing is re-embedded**.
 - The first pass after deploy re-derives every note, at the same cost as the version 2–4 bumps.
-- `TASK_IDS_SINCE_EXTRACTION_VERSION = 5`. Rows at version 4 still list, with `id pending`. Write tools work on them regardless, because resolution re-derives from bytes. The header counts `task ids pending: N notes` (D12).
+- **Ids render from the row, not the note's version** (Codex r1 #6). A row renders its id whenever its `task_key` is populated, including rows a write-time refresh wrote into a note still stamped 4. A row with a NULL `task_key` (awaiting the version-5 backfill) renders `id pending`. The header counts such rows as `task ids pending: N tasks`: rows matching every other filter with `task_key IS NULL`, stated even at 0. Write tools work on any task regardless, because resolution re-derives from bytes. `TASK_IDS_SINCE_EXTRACTION_VERSION = 5` is kept only for the operator's backfill progress, and no listing decision reads it.
 - `move_note(rewrite_links=True)` returns `index_not_ready` for that one pass, the existing behaviour.
 - **Rollback is roll-forward**, the #350 L8 mechanism. A version-4 image re-extracts every note (its `marker_stale` sees `5 != 4`), leaves the new columns untouched, and never reads them.
 
@@ -434,7 +467,7 @@ Every existing argument keeps its name, position and default. All new arguments 
 - A task without that date is excluded when either bound is given.
 - `from > by` is `invalid_argument`.
 - `undated=true` means `due IS NULL AND scheduled IS NULL`, and `undated=false` its negation. It conflicts with any due or scheduled bound and with `has_due=true`, as `invalid_argument`.
-- `has_due` is `due IS [NOT] NULL`. It is an addition to the brief's list (owner **Q3**), required so that every `task_agenda` section has an exact one-call continuation (D13).
+- `has_due` is `due IS [NOT] NULL`. It is an addition to the brief's list (owner decision 2026-11-10: accepted), required so that every `task_agenda` section has an exact one-call continuation (D13).
 
 **`text`.**
 
@@ -489,7 +522,7 @@ Every existing argument keeps its name, position and default. All new arguments 
 
 **`detail`.**
 
-- `full` is today's row with ` — id <id>` inserted after `path:line`, or ` — id pending` for a version-4 row.
+- `full` is today's row with ` — id <id>` inserted after `path:line`, or ` — id pending` for a row whose `task_key` is still NULL (D11).
 - `brief` is `- [s] <id> \`<escaped path>\`:<line> — <dates> — <priority> — <tags> — <desc>`, where:
   - `<dates>` is `due …`, `sched …`, `start …`, `done …`, whichever are present;
   - `<priority>` is `p:<name>` when set;
@@ -507,7 +540,7 @@ Every existing argument keeps its name, position and default. All new arguments 
 
 **Header.**
 
-- **Line 1** is today's header, unchanged in tokens and order, plus `task ids pending: N notes` after `over the task cap`.
+- **Line 1** is today's header, unchanged in tokens and order, plus `task ids pending: N tasks` (rows with a NULL `task_key`, D11) after `over the task cap`.
 - **Line 2, the query line**, is present whenever any new argument is given, any relative date was resolved, or the default scope excludes anything:
   `Query — timezone: <tz> — today: <date> — <new filter echoes, each value cut at 32 chars, relative dates as "+7d=2026-11-17"> — scope: default|all — excluded by scope: N tasks — excluded folders: N [names…] — excluded note tags: N [names…]`.
   - The line is at most 600 characters. Names are listed while they fit, then `+N more`. The counts are always present, so exclusion is never silent.
@@ -516,7 +549,7 @@ Every existing argument keeps its name, position and default. All new arguments 
 **Bounds.**
 
 - **Calls without a query line**, which is every #350-only call under empty exclusion settings: the #350 guarantee at `MAX_READ_RESPONSE_CHARS = 1,000` still holds. The abbreviated-row structure bound is tightened to 100 (measured 86 in #350) to absorb the 24-character id token: 480 + 85 + 200 + 100 + 24 + 96 = 985 ≤ 1,000.
-- **Calls with a query line**: the guarantee holds at B ≥ 1,600 (985 + 600 + 1). Below that, when not even the abbreviated first row fits, the call is refused with `response_cap_too_small`, naming `MAX_READ_RESPONSE_CHARS`. This is never an empty page with a cursor (owner **Q4**).
+- **Calls with a query line**: the guarantee holds at B ≥ 1,600 (985 + 600 + 1). Below that, when not even the abbreviated first row fits, the call is refused with `response_cap_too_small`, naming `MAX_READ_RESPONSE_CHARS`. This is never an empty page with a cursor (owner decision 2026-11-10: accepted).
 
 ### D13. `task_agenda` (read-only)
 
@@ -536,7 +569,7 @@ task_agenda(date="today", days=7, folder=None, tags=None, exclude_tags=None, sco
 
 - **Coverage.** Every open task with `due ≤ D+days`, or with `scheduled ≤ D`, is in exactly one section. A task scheduled on or before `D` whose due date falls within the window appears under its due section.
 - **Rows.** Brief rows (D12). Caps: overdue 25, today 25, each scheduled sub-section 15, upcoming 50.
-- **Section headers.** Each section header always states its total count. A capped section ends with `continue: list_tasks(<the added arguments, dates resolved>, cursor="<compact v2 cursor>") with this call's folder, tags, exclude_tags and scope`. The cursor is minted for exactly that `list_tasks` query (same `o`, same `f`), from the last row shown.
+- **Section headers.** Each section header always states its total count. A capped section ends with `continue: list_tasks(<the added arguments, dates resolved>[, cursor="<compact v2 cursor>"]) with this call's folder, tags, exclude_tags and scope`. A cursor is minted (for exactly that `list_tasks` query: same `o`, same `f`) **only from a row actually shown**. A section that shows zero rows, because the response cap left no room, gives the same arguments **without** a cursor, which continue it from its first row (Codex r1 #5).
 - **Header.** `Agenda — timezone — date — days — scope — excluded by scope: N` plus the #350 counts (not yet scanned, could not be indexed, over cap, ids pending, cut tags with `tags`/`exclude_tags`).
 - **Budget.** Sections render in table order. A section that no longer fits renders only its header with `not shown (response cap)` and its continuation. B < 2,800 gives `response_cap_too_small`.
 - **Registration.** `scan` class, `_READ_ONLY`.
@@ -639,7 +672,9 @@ Every refusal ends with `MCP-REFUSAL {"code":…}` and carries `nothing_written:
 | `duplicate_task` | `add_task` exact open duplicate without `allow_duplicate` |
 | `response_cap_too_small` | read tools, D12/D13 (a read, so nothing written by definition) |
 
-**Reused codes:** `invalid_argument`, `validation_failed`, `selector_unresolved` and the section-write defect refusals, `size_limit` (note over the read cap, result over the note cap, note over the 5,000-task cap), `io_failure`, `malformed_precondition`, `stale_precondition`, `precondition_unavailable`, `concurrent_write`, `permission_denied`, the vault reassignment and anchor markers, and the rate and quota refusals.
+`precondition_required` (reused) also fires for a suffixed id without `expected_hash`, in every mode (D2).
+
+**Reused codes:** `invalid_argument`, `validation_failed`, `selector_unresolved` and the section-write defect refusals, `size_limit` (note over the read cap, result over the note cap, note over the 5,000-task cap), `io_failure`, `malformed_precondition`, `stale_precondition`, `precondition_unavailable`, `concurrent_write` (after the D2 retry budget), `permission_denied`, the vault reassignment and anchor markers, and the rate and quota refusals.
 
 A call that would change nothing (an absent tag removed, a value set to itself) answers `No changes for <path>` with nothing written, no event and no refresh.
 
@@ -723,7 +758,11 @@ Each item is deliberate and additive or necessary under the 1.0 tool-contract pr
 - **L12**: "Remove scheduled date on recurrence" and the global task filter are not modelled.
 - **L13**: `text` matches only the first 1,000 characters (reported by `tasks with cut text`).
 - **L14**: Duplicate detection reads the index for notes other than the target, so a duplicate written by a generic tool within the last pass interval may be missed (L5).
-- **L15**: Context lines are capped at 8 lines and 600 characters, and nesting is not modelled beyond them.
+- **L15**: Context lines are capped at 8 lines and 600 characters, in what is stored and rendered. Write placement always scans the uncapped continuation block (D8).
+- **L16**: Publication is bound to (path, bytes), not to inode identity, the same as `edit_note`. A move plus a byte-identical recreation at the same path inside the read→rename window receives the planned edit (Codex r1 #3, declined).
+- **L17**: With `next_recurrence_below`, the next occurrence goes after the completed task's continuation block, not on the adjacent line as the plugin writes it, so children stay with the completed task.
+- **L18**: A write with a suffixed id needs a `read_note` first for its `content_hash`. The index digest cannot serve as the precondition (D2).
+- **L19**: The internal retry gives up after 3 in-call conflicts with `concurrent_write`. More parallel writers to one note than that need the caller to retry.
 
 ## Test plan
 
@@ -769,11 +808,16 @@ Each item is deliberate and additive or necessary under the 1.0 tool-contract pr
   - an exact duplicate refused, then allowed;
   - similar tasks listed;
   - the scan bound.
+- **Parallel writes**: three parallel `complete_task` calls on different tasks of one note all succeed, and the note holds all three edits. Two parallel completions of the same task yield exactly one success, the other `already_completed` or `task_not_found`. With `expected_hash` supplied there is no retry (`stale_precondition`).
+- **Suffixed ids**: refused `precondition_required` without `expected_hash`, in default mode too. Two identical lines whose blocks swapped are refused `stale_precondition` under the old hash. With the current hash, the named occurrence changes.
+- **Placement**: an anchor with a 10-line continuation block (with a blank line inside and a deeper child task): `add_task`, `append_context` and below-placed recurrence all insert after the last line, and no line changes owner.
 - **Read-your-writes**:
   - list → complete → list shows the new state with no pass;
   - refresh lag with the row locked by a held transaction → `index: may lag (lock_timeout)` and the write stands;
   - the D10 interleavings: a pass scan started before the tool publish commits after the refresh; an edit after the refresh; a refresh before a pass that read older bytes. In each, after at most two more passes, `tasks_source_hash = content_hash` and the rows match disk;
   - the pass-derivation = refresh-derivation equality over a corpus.
+  - two task writes on one note whose refreshes finish out of order: the earlier write's refresh reports `superseded`, and the rows describe the later write.
+  - a refreshed version-4 note renders its ids; rows with a NULL key count as `task ids pending`.
 - **`list_tasks`**:
   - each new filter;
   - relative dates with the header echo;
@@ -825,9 +869,25 @@ Pre-flight: the base `origin/task-tools` with this change archived, committed, a
 
 Then run the full offline suite, `make test-integration`, `make test-schema` and `openspec validate` once on the merged result. That is the authoritative gate.
 
-## Open questions for the owner
+## Owner decisions (2026-11-10)
 
-- **Q1 (D3).** Under `WRITE_PRECONDITION_REQUIRED`, should `(path, id)` satisfy the requirement for `complete_task` and `update_task`, with `add_task` exempt? *Recommendation: yes.* The id binds the exact line, re-derived from the bytes the rename is bound to. Requiring a file hash would force a `read_note` before every task write for no safety gain.
-- **Q2 (D7).** Should tier-2 recurrence shapes (`every month on the last Friday`, `every 2 weeks on Monday`, `every month on the 2nd Wednesday`, and so on) stay refused in this change? *Recommendation: yes. Admit them in a follow-up* that commits a golden table generated with rrule 2.8.1 and admits each shape only when its rows match. Until then the refusal is explicit, and the series never ends silently.
-- **Q3 (D12/D13).** Should `list_tasks` gain `has_due` (not in the brief)? It is needed so that every agenda section has an exact one-call continuation. *Recommendation: yes.* It is additive and generic.
-- **Q4 (D12).** With the query line present, the one-row progress guarantee needs `MAX_READ_RESPONSE_CHARS ≥ 1,600`, and below that the tool refuses with `response_cap_too_small`. #350-only calls keep the 1,000 guarantee. *Recommendation: accept.* The default is 40,000, and changing the setting's lower bound would be a boot refusal for little benefit.
+- **D3 (required mode).** For a bare id, `(path, id)` satisfies `WRITE_PRECONDITION_REQUIRED`, and `add_task` is exempt. **Exception:** a suffixed id always needs a matching `expected_hash`, in every mode (Codex r1 #2).
+- **D7 (tier 2).** Tier-2 recurrence shapes stay refused in this change. Admitting them is a follow-up issue that commits a golden table generated with rrule 2.8.1 and admits each shape only when its rows match.
+- **D12/D13 (`has_due`).** Accepted as an additive `list_tasks` filter.
+- **D12 (response-cap guarantee).** Accepted: the guarantee holds at ≥ 1,600 when the query line is present, with `response_cap_too_small` below that. #350-only calls keep the 1,000 guarantee.
+
+## Spec review record
+
+**Codex spec review, round 1 (2026-11-10): FAIL**, with 3 BLOCKER, 2 MAJOR and 1 MINOR. Five were accepted and one declined.
+
+1. **BLOCKER, accepted.** `add_task` placement used the 8-line context cap, so a 9th continuation line could be reparented. Placement and `append_context` now scan the uncapped continuation block (D8), and D5 check 5 proves no line changes owner.
+2. **BLOCKER, accepted.** A suffixed id could name a swapped or replaced identical occurrence with the count unchanged. Suffixed ids now require a matching `expected_hash` in every mode (D1–D3). Listings do not print the hash, because the index digest is not the precondition digest (D2).
+3. **BLOCKER as reported, declined (L16).** A move plus a byte-identical recreation at the same path inside the read→rename window. The caller addressed that path, and the bytes there equal those the plan was verified against, so the applied edit is exactly the planned one and nothing is lost. This is the existing `edit_note` publish envelope, and changing the vault publish path is out of scope.
+4. **MAJOR, accepted.** A delayed refresh could overwrite newer rows. The refresh now re-reads through the anchored path under the row lock and reports `superseded` on a mismatch (D10 R1 3a), with a convergence argument and an out-of-order test.
+5. **MAJOR, accepted.** A zero-row agenda section had no cursor source. It now gives its arguments without a cursor, and cursors come only from shown rows (D13).
+6. **MINOR, accepted.** Ids render whenever `task_key` is populated, and the pending count is per row (D11).
+
+**Supervisor additions.**
+
+- **A.** With `next_recurrence_below`, the next line goes after the completed task's full continuation block (D7, L17).
+- **B.** A bounded internal retry, at most 3 attempts with full re-resolution, on an in-call conflict when no `expected_hash` was supplied (D2).

@@ -19,7 +19,7 @@ It SHALL also parse:
 - **Recurrence rule**: the value of a `🔁` field in the line's trailing field run, identified as the Tasks plugin parses it, cut at 256 characters with `recurrence_cut`.
 - **Description key**: the 16-hex normalised-description key of the `task-write` capability.
 - **Folded text**: the stored text with Unicode case folding applied.
-- **Context**: at most 8 lines, each cut to 160 characters, 600 characters in total, with `context_cut`. These are the non-blank lines directly below the task that have a greater blockquote depth, or the same blockquote prefix with a greater indentation width (a tab counts as 4). The run stops at a blank line, a heading, a fence line or the cap.
+- **Context**: at most 8 lines, each cut to 160 characters, 600 characters in total, with `context_cut`. These are the non-blank lines directly below the task that have a greater blockquote depth, or the same blockquote prefix with a greater indentation width (a tab counts as 4). The run stops at a blank line, a heading, a fence line or the cap. This cap bounds only what is stored and rendered; write placement uses the uncapped continuation block of the `task-write` capability.
 - **Task key, ordinal and count** of the `task-write` capability.
 
 Dates and priority SHALL be read from the masked text of the line, so a signifier inside inline code is not a field. When a date or priority family occurs more than once, the last occurrence SHALL win. A date that is not a valid calendar date, or a signifier with no date, SHALL store NULL for that field, and the task SHALL still be stored with its full text. A field value SHALL never cause an extraction error or a quarantine. With no priority signifier, the priority SHALL be NULL.
@@ -264,7 +264,7 @@ A call with a cursor SHALL return rows strictly after that key in that order.
 - the number of the caller's notes not yet scanned for tasks (indexed at an extraction version below 4);
 - the number of the caller's matching notes whose tasks could not be indexed (`tasks_failed`);
 - the number whose task extraction was capped;
-- the number of notes whose task ids are pending (indexed at version 4).
+- the number of matching task rows whose task id is pending (a NULL `task_key`, awaiting the version-5 backfill).
 
 Each count is stated even when it is zero. When `tags` or `exclude_tags` is given, line 1 SHALL also carry the number of tasks matching every other filter whose tags were cut. When `text` is given, it SHALL also carry the number of such tasks whose text was cut. Echoed values on line 1 SHALL be cut at 64 characters, and line 1 SHALL be at most 480 characters.
 
@@ -282,7 +282,7 @@ It SHALL name the excluded items while they fit.
 
 1. the raw marker;
 2. the path and line;
-3. `id <id>` (or `id pending`);
+3. `id <id>` whenever the row's `task_key` is populated, whatever the note's extraction version, otherwise `id pending`;
 4. any present dates and the priority;
 5. the tags and the heading path;
 6. the text, last.
@@ -323,8 +323,8 @@ This guarantees that every page with a match renders at least one row and its cu
 - **AND** once the pass has stamped every note, the header SHALL state `0`
 
 #### Scenario: Pending ids are counted
-- **WHEN** some of the caller's notes are stamped 4 and others 5
-- **THEN** the header SHALL state `task ids pending: N notes` for the version-4 notes, and their rows SHALL show `id pending`
+- **WHEN** some of the caller's task rows have no `task_key` yet, and a version-4 note was refreshed by a task write
+- **THEN** the header SHALL state `task ids pending: N tasks`, counting only the rows without a key; those rows SHALL show `id pending`; and the refreshed note's rows SHALL show their ids
 
 #### Scenario: A first row that cannot fit is abbreviated, not lost
 - **WHEN** `MAX_READ_RESPONSE_CHARS` is 1,000, no query line applies, and the only matching tasks have a 1,024-character path, 1,000 characters of text and 64 tags of 128 characters
@@ -384,7 +384,7 @@ Let D be the resolved date, with `days` from 1 to 31. The tool SHALL return, fro
 | scheduled and now due, due later | scheduled on or before D, due after D+days | 15 |
 | upcoming | due from D+1 through D+days, grouped by due date | 50 |
 
-Sections render in brief rows with ids, and no task SHALL appear in more than one section. Each section header SHALL state its total count. A section with more rows than shown SHALL end with the `list_tasks` arguments that continue it, with dates resolved, and a version-2 cursor minted for exactly that `list_tasks` query from the last row shown. The header SHALL carry the timezone, the date, `days`, the scope, the number excluded by scope and the `list_tasks` header counts.
+Sections render in brief rows with ids, and no task SHALL appear in more than one section. Each section header SHALL state its total count. A section with more rows than shown SHALL end with the `list_tasks` arguments that continue it, with dates resolved. When the section shows at least one row, it SHALL add a version-2 cursor minted for exactly that `list_tasks` query from the last row shown. A section that shows no row SHALL give the arguments without a cursor, and a cursor SHALL never be minted except from a shown row. The header SHALL carry the timezone, the date, `days`, the scope, the number excluded by scope and the `list_tasks` header counts.
 
 A section that does not fit the response cap SHALL render its header with `not shown (response cap)` and its continuation. When `MAX_READ_RESPONSE_CHARS` is below 2,800, the call SHALL be refused with `response_cap_too_small`.
 
@@ -395,6 +395,10 @@ A section that does not fit the response cap SHALL render its header with `not s
 #### Scenario: A capped section continues exactly
 - **WHEN** 40 tasks are overdue and `task_agenda()` is called
 - **THEN** the overdue section SHALL show 25 rows and state 40, and calling `list_tasks` with the stated arguments and cursor (and the same folder, tags, exclude_tags and scope) SHALL return exactly the remaining 15, in order
+
+#### Scenario: A section with no room shows its continuation without a cursor
+- **WHEN** the overdue section fills the response budget and the due-today section holds 5 tasks
+- **THEN** the due-today section SHALL state 5, show `not shown (response cap)`, and give `list_tasks` arguments with no cursor that return exactly those 5 tasks
 
 #### Scenario: Agenda respects the caller and the scope
 - **WHEN** user 7 calls `task_agenda` while user 8 has overdue tasks and user 7's settings exclude `Archive/`

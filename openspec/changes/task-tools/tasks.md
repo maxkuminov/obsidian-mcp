@@ -61,7 +61,7 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
   - insert the new columns.
   
   `src/services/embeddings.py`: `clean_at_version` gains `5: clean_for_embedding`.
-- [ ] 3.3 `src/services/task_index.py`: `refresh_note_tasks(*, uid, root, rel, published: bytes) -> RefreshResult(status, code)`, exactly R1. Its own session, `SET LOCAL lock_timeout`, root re-check, `FOR UPDATE` on the owner-scoped row, delete and insert, the hash and timestamp. It never raises to the caller, and takes no generation lock.
+- [ ] 3.3 `src/services/task_index.py`: `refresh_note_tasks(*, uid, root, target, rel, published: bytes) -> RefreshResult(status, code)`, exactly R1 including step 3a (re-read through the anchored `target` under the row lock; on a mismatch write nothing and return `superseded`). Its own session, `SET LOCAL lock_timeout`, root re-check, `FOR UPDATE` on the owner-scoped row, delete and insert, the hash and timestamp. It never raises to the caller, and takes no generation lock.
 - [ ] 3.4 Unit: `tests/test_note_tasks_extractor.py` gains the version-5 columns, the context rule and the run-based recurrence. Add an AST guard that `task_index` never calls `acquire_generation_lock*`.
 - [ ] 3.5 Integration (`tests/integration/test_task_refresh_pg.py`, container `omcp-tt-s3` / 55453):
   - the version 4 → 5 backfill (no `embedded_content_hash` cleared);
@@ -71,7 +71,8 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
   - no deadlock against a pass holding the generation lock;
   - pass and refresh derivations equal column for column;
   - tenancy (the user-8 refresh never touches user 7's same-path row);
-  - the #350 lifecycle tests still green.
+  - the #350 lifecycle tests still green;
+  - two task writes on one note whose refreshes finish out of order: the first write's refresh reports `superseded`, and the rows describe the second write.
 
 ## 4. S4: query service and rendering (wave 2, does not touch `tools.py`)
 
@@ -79,7 +80,8 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
   - `list_tasks_query(uid, args, settings) -> TaskPage | Refusal` (D12: validation, relative dates, every filter, `tag_prefixes` matching, `text_fold` with `strpos`, scope with the excluded count, every `order_by` with its keyset predicate, cursor version 2 encode and decode with the owner, filter and settings digests, the counts, one `REPEATABLE READ, READ ONLY` snapshot);
   - `task_agenda_query(uid, args, settings)` (D13: the five predicates, caps, totals, continuation cursors minted for the exact `list_tasks` query).
 - [ ] 4.2 `src/mcp_server/task_render.py`:
-  - header line 1 (the #350 tokens plus `task ids pending`) and the query line (≤ 600);
+  - header line 1 (the #350 tokens plus `task ids pending: N tasks`, counting rows with a NULL `task_key`) and the query line (≤ 600);
+  - an id rendered whenever `task_key` is populated, else `id pending`;
   - full rows with ids, brief rows (≤ 260 plus the path), context lines (`    ┆ `);
   - the abbreviated row (structure ≤ 100, plus id ≤ 24);
   - the agenda layout;
@@ -99,13 +101,15 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
   - Cyrillic, final sigma and `ß` text;
   - scope counts;
   - agenda disjointness over the generated combination set;
-  - continuation cursors accepted by `list_tasks_query`;
+  - continuation cursors accepted by `list_tasks_query`, minted only from shown rows;
+  - a zero-row section continuing without a cursor;
   - tenancy.
 
 ## 5. S5: write planning (wave 2, pure plans plus one query; does not publish)
 
 - [ ] 5.1 `src/services/task_write.py`:
-  - `resolve(tasks, id) -> target | refusal` (D2 table);
+  - `resolve(tasks, id, *, hash_supplied) -> target | refusal` (the D2 table: a suffixed id without a hash gives `precondition_required`);
+  - `continuation_block(lines, i)` (uncapped, D8), used by placement, `append_context` and below-placed recurrence;
   - `plan_complete`, `plan_update` and `plan_add(note_text, args, settings, today) -> Plan(spans, new_text, new_lines, new_ids) | refusal` (D4–D8);
   - `verify(old, new, plan)` (D5);
   - `async duplicate_scan(session, uid, settings, norm, terms) -> (exact, similar, stopped)` (D9).
@@ -118,6 +122,7 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
   - `add_task` placement cases 1–3 (ordered and callout anchors);
   - context-line insertion;
   - every D4(a)–(d) refusal;
+  - 9- and 10-line continuation blocks (a blank line inside, a deeper child task) for `add_task`, `append_context` and below placement, with D5 check 5 catching an injected reparenting;
   - D5 verification catching an injected corruption.
 - [ ] 5.4 `tests/integration/test_task_duplicates_pg.py` (container `omcp-tt-s5` / 55455): exact duplicate in scope and in the target note, similar listed, the scan bound, tenancy.
 
@@ -139,6 +144,7 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
   - **`task_agenda_impl`**;
   - **`complete_task_impl`, `update_task_impl` and `add_task_impl`**, following the D2 order exactly (reusing `_require_write`, `_precondition_syntax_error`, `open_mutable`, `_leaf_state_error`, `read_bytes_at`, `_precondition_error` with the D3 enforceability, `_note_size_error`, the `dry_run` diff, `_confirmed_publication` with `write_file_at(expected=…)`, `_concurrent_write_refusal`), then `task_index.refresh_note_tasks`, then `_record_note_events`, then the D16 response;
   - every refusal typed;
+  - the D2 bounded retry: on an in-call conflict with no `expected_hash`, repeat from the read, at most 3 attempts in total, carrying nothing over; no retry when a hash was supplied;
   - `_tracked(..., write_class=True)` for the three writes, never logging text or context.
 - [ ] 7.2 `src/mcp_server/server.py`:
   - register `task_agenda` (`_READ_ONLY`), `complete_task` (`_DESTRUCTIVE`), `update_task` (`_DESTRUCTIVE`) and `add_task` (`_ADDITIVE`) after `hybrid_search`, in that order, with D15 titles;
@@ -152,7 +158,11 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
   - regenerate the `list_tasks` entry in `tools_list_schema_additions.json`, append the four new tools, and add the additive-amendment test;
   - generate `tools_list_full_v2.json` and the v1-derivation test; regenerate `tools_list_readonly_oauth.json` (20);
   - update `test_issue_343_tool_metadata.py` (32, `READ_TOOLS` 19, the destructive rule), `test_issue_358_scoped_tools_list.py`, `test_issue_295_unknown_arguments.py`, `test_issue_263_coverage_registry.py`, `test_issue_261_controller.py`, `test_issue_261_tool_admission.py`, `test_body_budget_config.py`, `test_tei_identity.py`, `test_search_confidence.py`, `test_transfer_overlap_gate.py`, and anything else the grep finds.
-- [ ] 7.6 `tests/integration/test_task_tools_pg.py` (container `omcp-tt-s7` / 55457): the end-to-end `task-write` scenarios through the registered tools. That covers resolution (wrong line, duplicates, count changed, concurrent modification, CRLF, blockquote, fence, frontmatter look-alike), each write tool, `dry_run`, required mode, permission refusal, the change-feed event after the refresh, read-your-writes (list → complete → list), usage params free of task text, and tenancy.
+- [ ] 7.6 `tests/integration/test_task_tools_pg.py` (container `omcp-tt-s7` / 55457): the end-to-end `task-write` scenarios through the registered tools. That covers resolution (wrong line, duplicates, count changed, concurrent modification, CRLF, blockquote, fence, frontmatter look-alike), each write tool, `dry_run`, required mode, permission refusal, the change-feed event after the refresh, read-your-writes (list → complete → list), usage params free of task text, and tenancy. It also covers:
+  - suffixed ids refused without `expected_hash` in default mode;
+  - swapped identical lines refused under the old hash;
+  - three parallel completions of different tasks in one note all succeeding;
+  - two parallel completions of the same task yielding exactly one success.
 
 ## 8. Integration and seams (orchestrator, after S7 merges)
 
