@@ -89,6 +89,13 @@ def vault(monkeypatch, tmp_path):
     monkeypatch.setattr(tools.settings, "vault_path", str(tmp_path))
     monkeypatch.setattr(vault_service.settings, "vault_path", str(tmp_path))
     monkeypatch.setattr(tools.settings, "write_precondition_required", False)
+    # The task tools (#428) read their settings first; stand it in.
+    from src.services import task_settings
+
+    async def task_defaults(_uid):
+        return task_settings.defaults()
+
+    monkeypatch.setattr(tools, "_effective_task_settings", task_defaults)
     vault_service.clear_user_vault_cache()
     return tmp_path
 
@@ -962,6 +969,12 @@ async def _call_without_hash(tool, path):
         return await tools.set_frontmatter_impl(path, updates={"a": 1})
     if tool == "delete_note":
         return await tools.delete_note_impl(path)
+    if tool == "complete_task":
+        return await tools.complete_task_impl(path, "0123456789ab")
+    if tool == "update_task":
+        return await tools.update_task_impl(path, "0123456789ab", due="today")
+    if tool == "add_task":
+        return await tools.add_task_impl(path, "a task")
     return await tools.move_note_impl(path, "elsewhere.md")
 
 
@@ -978,6 +991,14 @@ async def _call_with_hash(tool, path, value):
         )
     if tool == "delete_note":
         return await tools.delete_note_impl(path, expected_hash=value)
+    if tool == "complete_task":
+        return await tools.complete_task_impl(path, "0123456789ab", expected_hash=value)
+    if tool == "update_task":
+        return await tools.update_task_impl(
+            path, "0123456789ab", due="today", expected_hash=value
+        )
+    if tool == "add_task":
+        return await tools.add_task_impl(path, "a task", expected_hash=value)
     return await tools.move_note_impl(path, "elsewhere.md", expected_hash=value)
 
 
@@ -987,6 +1008,10 @@ SLICE_B_TOOLS = [
     "set_frontmatter",
     "delete_note",
     "move_note",
+    # #428: the task write tools run the same ladder at the same position.
+    "complete_task",
+    "update_task",
+    "add_task",
 ]
 
 

@@ -1353,11 +1353,13 @@ async def list_tasks(
     checkboxes work; Tasks-plugin emoji fields (📅 due, ⏳ scheduled, 🛫 start,
     ✅ done, 🔁 recurrence, priority) are optional and read when present. Query
     blocks are text and are not evaluated; a checkbox in code is not a task.
-    The index follows each pass (default every 300 s); the task write tools
-    refresh it at once for the note they write.
+    The index follows each pass (default every 300 s); task writes refresh it
+    at once.
 
     Each row: the raw marker, the path in backticks with `:line`, `— id <id>`,
-    the dates, priority, tags, `under:` heading and `text:` last.
+    the dates, priority, tags, `under:` heading and `text:` last. In a path,
+    whitespace, `\\` and a backtick are shown as `\\`-escapes (`\\n`, `\\t`,
+    `\\uXXXX`, `\\\\`, `` \\` ``); the write tools take the unescaped path.
     `complete_task` and `update_task` take that id with the path; an id shaped
     `<key>.<i>of<n>` (identical lines) also needs `expected_hash`, the note's
     `content_hash` from `read_note`. `detail="brief"` prints one short line per
@@ -1366,9 +1368,8 @@ async def list_tasks(
     Status: `[ ]`, `[/]` and other markers are `open`; `[x]`/`[X]` are `done`;
     `[-]` is `cancelled` (only in `cancelled` and `all`). Dates accept
     `YYYY-MM-DD`, `today`, `tomorrow`, `yesterday`, `+Nd` or `-Nd`, resolved in
-    your task timezone, which a query line under the header states with each
-    resolved date. `*_from` / `*_by` are inclusive and exclude tasks without
-    that date.
+    your task timezone (the query line states it and each resolved date).
+    `*_from` / `*_by` are inclusive and exclude tasks without that date.
 
     The header always states what the index could not show — notes not yet
     scanned, tasks that could not be indexed, notes over the 5,000-task cap,
@@ -1378,9 +1379,7 @@ async def list_tasks(
     `next: <cursor>`: pass it back with the same arguments. A cursor from other
     arguments, an older server version, or a relative-date query continued
     after midnight is refused (`invalid_argument`): start again without one.
-    Invalid arguments are refused `invalid_argument`;
-    `response_cap_too_small` means the deployment's response cap cannot hold
-    one row.
+    `response_cap_too_small`: the response cap cannot hold one row.
 
     Args:
         folder: Only notes under this path prefix (e.g. "Projects/").
@@ -1390,8 +1389,7 @@ async def list_tasks(
         tags: Tasks carrying every one of these tags on the task line, matched
             by `/` segment and case-insensitively (`a` matches `#a` and `#A/b`,
             not `#ab`). At most 32, a leading `#` optional.
-        limit: Tasks per page, 1–500 (default 100); the response cap can end a
-            page sooner and `next` continues it.
+        limit: Tasks per page, 1–500 (default 100).
         cursor: The `next` value from the previous page of the same query.
         due_from: Due on or after this date.
         scheduled_from: Scheduled on or after this date.
@@ -1579,7 +1577,8 @@ async def task_agenda(
       or with a due date after the window;
     - upcoming: due in the `days` days after `date`, grouped by due date.
 
-    Rows are brief: marker, id, the path in backticks with `:line`, dates,
+    Rows are brief: marker, id, the path in backticks with `:line` (escaped
+    as in `list_tasks`; pass it unescaped), dates,
     priority, tags and description. `complete_task` and `update_task` take
     that id with the path. A section shows at most 25 rows (overdue, due
     today), 15 (each scheduled part) or 50 (upcoming); one with more ends
@@ -1662,15 +1661,18 @@ async def complete_task(
 
     Codes: `task_not_found` (the line changed since the listing: list again),
     `task_ambiguous` (lists the suffixed ids), `task_changed`,
-    `precondition_required`, `stale_precondition`, `concurrent_write`,
+    `precondition_required`, `stale_precondition`, `malformed_precondition`,
+    `concurrent_write`,
     `already_completed`, `task_cancelled` (reopen it with
     `update_task(status="open")` first), `recurrence_unsupported`,
     `on_completion_unsupported` (`🏁 delete`), `task_malformed` (fix the line
-    with `edit_note`), `size_limit`, `invalid_argument`, `not_found`,
+    with `edit_note`), `content_unsafe` (a malformed frontmatter block: the
+    refusal names the repair), `size_limit`, `invalid_argument`, `not_found`,
     `permission_denied`.
 
     Args:
-        path: The note's vault-relative path, as a listing prints it.
+        path: The note's vault-relative path, unescaped (a listing shows
+            whitespace, `\\` and backticks as `\\`-escapes).
         id: The task id from a `list_tasks` or `task_agenda` row.
         done_on: The completion date: `YYYY-MM-DD`, `today` (default),
             `yesterday`, `+Nd` or `-Nd`, in your task timezone.
@@ -1714,17 +1716,17 @@ async def update_task(
 
     The id, from a `list_tasks` or `task_agenda` row, is re-checked against
     the note's current text, never a line number, so the call changes only
-    the line it names or
-    refuses. A task's id changes whenever its line changes; the response
-    returns the new one. An id shaped `<key>.<i>of<n>` names one of several
-    identical lines and is accepted only with `expected_hash`, the note's
-    `content_hash` from `read_note`; without it the call is refused
-    `precondition_required`. To complete a task use `complete_task`.
+    the line it names or refuses. A task's id changes whenever its line
+    changes; the response returns the new one. An id shaped `<key>.<i>of<n>`
+    names one of several identical lines and is accepted only with
+    `expected_hash`, the note's `content_hash` from `read_note`; without it
+    the call is refused `precondition_required`. To complete a task use
+    `complete_task`.
 
     Only the named fields change: a value is replaced where it stands, an
     added field goes into the trailing emoji fields, and every other
-    character of the line and the note is kept. Plain checkboxes work; the
-    Tasks-plugin fields are added when you set them. `text` replaces the
+    character of the line and the note is kept. Plain checkboxes work;
+    Tasks-plugin fields are added as you set them. `text` replaces the
     description's words and keeps its tags; only `remove_tags` removes a tag
     (whole tags, case-insensitive). `status`: `open` (`[ ]`) or `in_progress`
     (`[/]`) drop `✅`/`❌`; `cancelled` (`[-]`) adds `❌ <today>` per your task
@@ -1742,31 +1744,30 @@ async def update_task(
 
     Codes: `task_not_found` (the line changed since the listing: list again),
     `task_ambiguous`, `task_changed`, `precondition_required`,
-    `stale_precondition`, `concurrent_write`, `recurrence_unsupported`,
-    `task_malformed` (fix the line with `edit_note`), `size_limit`,
-    `invalid_argument` (also `status="done"`), `not_found`,
-    `permission_denied`.
+    `stale_precondition`, `malformed_precondition`, `concurrent_write`,
+    `recurrence_unsupported`, `task_malformed` (fix the line with
+    `edit_note`), `content_unsafe` (a malformed frontmatter block: the
+    refusal names the repair), `size_limit`, `invalid_argument` (also
+    `status="done"`), `not_found`, `permission_denied`.
 
     Args:
-        path: The note's vault-relative path, as a listing prints it.
+        path: The note's vault-relative path, unescaped (a listing shows
+            `\\`-escapes).
         id: The task id from a `list_tasks` or `task_agenda` row.
-        due: New due date (📅): `YYYY-MM-DD`, `today`, `tomorrow`,
-            `yesterday`, `+Nd` or `-Nd`, in your task timezone.
+        due: New due date (📅), a date form as above.
         scheduled: New scheduled date (⏳), same forms.
         start: New start date (🛫), same forms.
         priority: `highest`, `high`, `medium`, `low` or `lowest`.
-        add_tags: Tags to add, e.g. ["waiting"] (at most 32).
+        add_tags: Tags to add (at most 32).
         remove_tags: Tags to remove.
         recurrence: A 🔁 rule from the grammar `complete_task` lists.
         status: `open`, `in_progress` or `cancelled`.
-        text: The new description: one line, 1–1,000 characters, no field
-            emoji.
+        text: The new description: one line, 1–1,000 characters, no emoji.
         append_context: One line of context to add under the task.
         clear: Fields to remove: any of `due`, `scheduled`, `start`,
             `priority`, `recurrence`.
         dry_run: Preview the change without writing.
-        expected_hash: The note's `content_hash` from `read_note`; required
-            with a suffixed id.
+        expected_hash: `content_hash` from `read_note`; needed for a suffixed id.
     """
     return await update_task_impl(
         path, id, due=due, scheduled=scheduled, start=start, priority=priority,

@@ -8584,7 +8584,7 @@ LIST_TASKS_ECHO_MAX = 64
 #: minus this much, so some text always shows.
 _ABBREVIATED_TEXT_RESERVE = 40
 
-_PATH_ESCAPE_RE = re.compile(r"[^\S ]|\\")
+_PATH_ESCAPE_RE = re.compile(r"[^\S ]|[\\`]")
 
 
 def _task_owner_discriminator(uid: int | None) -> str:
@@ -8622,14 +8622,29 @@ def _escape_task_path(path: str) -> str:
     """The path, exact and on one line: every whitespace character other than
     U+0020 — each one `_one_line` would collapse — is shown as an escape, and
     a literal backslash is doubled, so the rendering is injective: `a\\nb.md`
-    (backslash, n) and `a<LF>b.md` never look alike (Codex round 1)."""
+    (backslash, n) and `a<LF>b.md` never look alike (Codex round 1).
+
+    A backtick is escaped too (`\\``, #428 Codex round 2): every task tool
+    prints the path inside a backtick-delimited field, and since #428 that
+    row is the handle the write tools act on, so a file name carrying a
+    backtick must never close the field and present a forged path, line or
+    id. Unescaping is `\\\\` → `\\`, `\\`` → `` ` ``, `\\n` / `\\r` / `\\t`,
+    `\\uXXXX` → that character; the result is the original path, which is
+    what the write tools take."""
     def _esc(m: re.Match) -> str:
         ch = m.group(0)
-        return {"\\": "\\\\", "\n": "\\n", "\r": "\\r", "\t": "\\t"}.get(
+        return {"\\": "\\\\", "`": "\\`", "\n": "\\n", "\r": "\\r", "\t": "\\t"}.get(
             ch, f"\\u{ord(ch):04x}"
         )
 
     return _PATH_ESCAPE_RE.sub(_esc, path)
+
+
+def _echo_path(path: str, limit: int = LIST_TASKS_ECHO_MAX) -> str:
+    """A path echo (a header or query-line value) at most `limit` characters:
+    escaped like a row's path, cut around `…` without splitting an escape."""
+    escaped = _escape_task_path(path)
+    return escaped if len(escaped) <= limit else _cut_escaped_path(path, limit)
 
 
 def _cut_escaped_path(path: str, room: int) -> str:
@@ -8670,7 +8685,7 @@ def render_task_header(*, status: str, folder: str | None, due_by: str | None,
                        capped: int, cut_tags: int | None) -> str:
     parts = [f"Tasks — status: {status}"]
     if folder:
-        parts.append(f"folder: {_echo(folder)}")
+        parts.append(f"folder: {_echo_path(folder)}")
     if due_by:
         parts.append(f"due by: {_echo(due_by)}")
     if scheduled_by:
@@ -8802,6 +8817,13 @@ def _task_now():
     return None
 
 
+def _task_clock() -> datetime:
+    """ONE clock reading per call (D19): every relative date, "today", the
+    validation and the query of a call all see the same instant, so no check
+    can disagree with the query across midnight."""
+    return _task_now() or datetime.now(timezone.utc)
+
+
 async def _effective_task_settings(uid: int | None):
     """The caller's `EffectiveTaskSettings`, read once per call (D14)."""
     async with async_session() as session:
@@ -8864,16 +8886,16 @@ async def list_tasks_impl(
         recurring=recurring, exclude_tags=exclude_tags, path=path,
         order_by=order_by, detail=detail, context=context, scope=scope,
     )
-    now = _task_now()
-    # Every argument is validated before any statement (the settings read
-    # included): the defaults decide validity exactly as the caller's own
-    # settings do — they change only the zone a relative date resolves in and
-    # the exclusion lists, never whether an argument is acceptable.
-    pre = task_query.normalise_list_args(args, task_settings_service.defaults(), now=now)
-    if isinstance(pre, task_query.QueryRefusal):
-        return _query_refusal(pre)
+    now = _task_clock()
+    # Every argument is validated against the caller's EFFECTIVE settings and
+    # this call's one clock reading — the zone decides what `today` is, so a
+    # date-order check under any other zone could refuse a valid query
+    # (verifier, #428). The settings read is the only statement before it.
     uid = current_user_id.get()
     effective = await _effective_task_settings(uid)
+    pre = task_query.normalise_list_args(args, effective, now=now)
+    if isinstance(pre, task_query.QueryRefusal):
+        return _query_refusal(pre)
     page = await task_query.list_tasks_query(
         uid, args, effective, now=now, session_factory=async_session
     )
@@ -8910,7 +8932,7 @@ async def task_agenda_impl(
         uid,
         task_query.AgendaArgs(date=date, days=days, folder=folder, tags=tags,
                               exclude_tags=exclude_tags, scope=scope),
-        effective, now=_task_now(), session_factory=async_session,
+        effective, now=_task_clock(), session_factory=async_session,
     )
     if isinstance(page, task_query.QueryRefusal):
         return _query_refusal(page)
@@ -8957,7 +8979,7 @@ def _task_write_refusal(tool: str, path: str, r: "task_write.TaskWriteRefusal") 
     if r.code == refusals.PRECONDITION_REQUIRED:
         return _precondition_refusal(
             f"{tool}: {reason}. Nothing was written.", refusals.PRECONDITION_REQUIRED, path=path)
-    prose = f"{tool}: {path}: {reason}. Nothing was written."
+    prose = f"{tool}: `{_escape_task_path(path)}`: {reason}. Nothing was written."
     if r.matches:
         with_path = r.code == "duplicate_task"
         prose += "\n" + "\n".join(_task_ref_line(m, with_path=with_path) for m in r.matches)
@@ -9083,9 +9105,11 @@ def _task_recurrence_error(tool: str, value, path: str) -> BodyOutcome | None:
 def _task_diff(path: str, old: str, new: str) -> str:
     import difflib
 
+    # The lines keep their own terminators; the default `lineterm` ends the
+    # `---` / `+++` / `@@` header lines, which `lineterm=""` ran together.
     return "".join(difflib.unified_diff(
         old.splitlines(keepends=True), new.splitlines(keepends=True),
-        fromfile=path, tofile=path, lineterm="",
+        fromfile=path, tofile=path,
     ))
 
 
@@ -9135,7 +9159,7 @@ async def _run_task_write(
     with target:
         if err := _leaf_state_error(
             target, path,
-            missing=f"Note not found: {path}. {tool} never creates a note; "
+            missing=f"Note not found: `{_escape_task_path(path)}`. {tool} never creates a note; "
             "use create_note to create it.",
         ):
             return err
@@ -9180,7 +9204,7 @@ async def _run_task_write(
                     return extra
             if not plan.changed:
                 timing.record("task_refresh", "skipped")
-                return f"No changes for {path} — nothing was written."
+                return f"No changes for `{_escape_task_path(rel)}` — nothing was written."
             if err := _note_size_error(plan.new_text):
                 return err
             new_text = plan.new_text
@@ -9189,7 +9213,9 @@ async def _run_task_write(
                 timing.record("task_refresh", "skipped")
                 lines = ["Dry run — nothing was written.", *describe(plan, rel, extra)]
                 lines.append("diff:")
-                lines.append(_task_diff(path, existing, new_text))
+                # The diff BODY is note content (prefixed `+`/`-`/` `, so no
+                # line of it can start a row); only its header names the path.
+                lines.append(_task_diff(_escape_task_path(rel), existing, new_text))
                 return "\n".join(lines)
             try:
                 err, _ = await _confirmed_publication(
@@ -9272,7 +9298,7 @@ async def complete_task_impl(
         return err
     uid = current_user_id.get()
     effective = await _effective_task_settings(uid)
-    dates = _TaskDates(tool, path, effective, _task_now())
+    dates = _TaskDates(tool, path, effective, _task_clock())
     done, err = dates.resolve("done_on", done_on, default_today=True)
     if err:
         return err
@@ -9383,7 +9409,7 @@ async def update_task_impl(
 
     uid = current_user_id.get()
     effective = await _effective_task_settings(uid)
-    dates = _TaskDates(tool, path, effective, _task_now())
+    dates = _TaskDates(tool, path, effective, _task_clock())
     resolved = {}
     for name in ("due", "scheduled", "start"):
         resolved[name], err = dates.resolve(name, supplied[name])
@@ -9453,7 +9479,7 @@ async def add_task_impl(
         return err
     uid = current_user_id.get()
     effective = await _effective_task_settings(uid)
-    dates = _TaskDates(tool, path, effective, _task_now())
+    dates = _TaskDates(tool, path, effective, _task_clock())
     resolved = {}
     for name, value in (("due", due), ("scheduled", scheduled), ("start", start)):
         resolved[name], err = dates.resolve(name, value)
@@ -9476,7 +9502,7 @@ async def add_task_impl(
                 session, uid, effective, plan.norm or "", plan.terms, exclude_path=rel)
         if exact and not allow_duplicate:
             return _task_refusal(
-                f"{tool}: {rel}: an open task with the same description already "
+                f"{tool}: `{_escape_task_path(rel)}`: an open task with the same description already "
                 "exists; pass allow_duplicate=true to add it anyway. Nothing was "
                 "written.\n" + "\n".join(_task_ref_line(m, with_path=True) for m in exact),
                 "duplicate_task", rel)

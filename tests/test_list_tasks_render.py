@@ -148,7 +148,8 @@ def test_the_incomplete_notice():
 def test_echoes_are_cut_at_64():
     out = render([], folder="F" * 300, tags=["t" * 128] * 32, cut_tags=0)
     header = out.splitlines()[0]
-    assert "folder: " + "F" * 63 + "…" in header
+    assert "folder: " + tools._echo_path("F" * 300) in header
+    assert len(tools._echo_path("F" * 300)) == 64
     assert len(header) <= LIST_TASKS_HEADER_MAX
 
 
@@ -311,19 +312,24 @@ def call(**kw):
     (dict(due_from="2026-11-12", due_by="2026-11-11"), "due_from"),
 ])
 def test_invalid_arguments_are_refused_before_any_statement(monkeypatch, kw, bound):
+    """Validation runs against the caller's own settings (the zone decides
+    `today`), so the settings read is the one statement allowed before it."""
+    from src.services import task_settings as ts
+
     sessions = []
     reads = []
 
     async def effective(uid):
         reads.append(uid)
-        raise AssertionError("the settings read must not run for an invalid argument")
+        return ts.defaults()
 
     monkeypatch.setattr(tools, "async_session", lambda: sessions.append(1) or _FakeSession())
     monkeypatch.setattr(tools, "_effective_task_settings", effective)
     out = call(**kw)
     assert bound in out
     assert out.rstrip().splitlines()[-1].startswith('MCP-REFUSAL {"code":"invalid_argument"')
-    assert sessions == [] and reads == [], "no statement may run for an invalid argument"
+    assert sessions == [], "no query may run for an invalid argument"
+    assert reads == [None], "only the one settings read"
 
 
 def test_a_version_1_cursor_is_refused(fake_db):
