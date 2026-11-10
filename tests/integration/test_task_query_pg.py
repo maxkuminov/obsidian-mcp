@@ -361,7 +361,7 @@ async def test_priority_recurring_undated_has_due_done_and_path(db, seed):
     dict(status="pending"), dict(due_by="next week"), dict(undated=True, due_by="today"),
     dict(undated=False, scheduled_from="2026-01-01"), dict(undated=True, has_due=True),
     dict(order_by="title"), dict(tags=["t"] * 33), dict(tags=["a" * 129]), dict(tags=["#"]),
-    dict(tags=["a/"]), dict(due_from="2026-11-02", due_by="2026-11-01"),
+    dict(tags=["a/!"]), dict(due_from="2026-11-02", due_by="2026-11-01"),
     dict(due_by="+3661d"), dict(text=""), dict(text=" ".join("t" * 9)), dict(text="x" * 257),
     dict(priority=["urgent"]), dict(priority=[]), dict(detail="short"), dict(scope="mine"),
     dict(cursor="garbage"), dict(path=""), dict(text="a\x00b"),
@@ -713,3 +713,87 @@ async def test_agenda_refuses_invalid_arguments(db):
                dict(tags=["#"]), dict(scope="x")):
         assert refused(await task_query.task_agenda_query(None, AgendaArgs(**kw), DEFAULT,
                                                           now=NOW, session_factory=db))
+
+
+# ── audit round 1: rows built by the real extractor ─────────────────────────
+
+V5_ONLY = ("task_key", "key_ordinal", "key_count", "description_key", "text_fold",
+           "tag_prefixes", "recurrence", "created", "cancelled", "context")
+
+
+async def real_note(maker, path, body, *, uid=None, pending=False, note_tags=None):
+    """A note's rows through `tasks.tasks_from_note_text` / `note_task_row`.
+    `pending=True` stamps the note 4 and blanks every version-5 column, as a
+    row awaiting the backfill holds them."""
+    from sqlalchemy import insert
+    from src.models.db import NoteTask
+    from src.services import tasks as task_extract
+
+    extracted, _capped = task_extract.tasks_from_note_text(body)
+    async with maker() as session:
+        note_id = (await session.execute(text(
+            "INSERT INTO notes_metadata (user_id, file_path, title, content_hash, "
+            " extraction_version, tags) VALUES (:u, :p, 't', 'h', :v, :tg) RETURNING id"
+        ), {"u": uid, "p": path, "v": 4 if pending else 5, "tg": note_tags})).scalar_one()
+        rows = [task_extract.note_task_row(note_id, t) for t in extracted]
+        if pending:
+            rows = [{**r, **{c: None for c in V5_ONLY}} for r in rows]
+        if rows:
+            await session.execute(insert(NoteTask), rows)
+        await session.commit()
+    return len(rows)
+
+
+NOTICE = "approximate until the next index pass."
+
+
+async def test_pending_rows_raise_the_notice_for_text(db):
+    await real_note(db, "old.md", "- [ ] Visit Straße 5\n- [ ] Café run\n", pending=True)
+    await real_note(db, "new.md", "- [ ] Strasse sweep\n")
+    out = await call(db, text="strasse")
+    assert "Strasse sweep" in texts(out)
+    assert out.splitlines()[-1] == f"Incomplete list: text filter {NOTICE}"
+    assert "task ids pending: 2 tasks" in out.splitlines()[0]
+    # No pending row among the matches of the other filters: no notice.
+    clean = await call(db, text="strasse", path="new.md")
+    assert NOTICE not in clean
+    # A filter exact on pending rows (tags, dates) does not raise it.
+    assert NOTICE not in await call(db, due_by="2030-01-01")
+
+
+async def test_recurring_judges_pending_rows_by_their_text(db):
+    body = "- [ ] Pay rent 🔁 every month 📅 2026-12-01\n- [ ] One-off 📅 2026-12-02\n"
+    await real_note(db, "old.md", body, pending=True)
+    await real_note(db, "new.md", body)
+    rec = await call(db, recurring=True)
+    assert sorted(texts(rec)) == ["Pay rent 🔁 every month 📅 2026-12-01"] * 2
+    assert rec.splitlines()[-1] == f"Incomplete list: recurring filter {NOTICE}"
+    once = await call(db, recurring=False)
+    assert sorted(texts(once)) == ["One-off 📅 2026-12-02"] * 2
+    assert NOTICE in once
+    both = await call(db, recurring=True, text="rent")
+    assert both.splitlines()[-1] == f"Incomplete list: text and recurring filters {NOTICE}"
+
+
+async def test_trailing_slash_tag_values_are_normalised(db):
+    await real_note(db, "w.md", "- [ ] a #Work/Alpha\n- [ ] b #workshop\n- [ ] c\n")
+    assert texts(await call(db, tags=["work/"])) == ["a #Work/Alpha"]
+    assert texts(await call(db, exclude_tags=["#WORK//"])) == ["b #workshop", "c"]
+    assert isinstance(await agenda(db, tags=["work/"], exclude_tags=["x/"]), str)
+
+
+@pytest.mark.parametrize("stored", ["#private", "private", "#Private/Journal", "PRIVATE"])
+async def test_scope_strips_a_leading_hash_from_note_tags(db, stored):
+    await real_note(db, "a.md", "- [ ] secret\n", note_tags=[stored])
+    await real_note(db, "b.md", "- [ ] lookalike\n", note_tags=["#privateer"])
+    out = await call(db, ts=settings_for(excluded_note_tags=("private",)))
+    assert texts(out) == ["lookalike"]
+    assert "excluded by scope: 1 tasks" in out
+
+
+async def test_real_extractor_rows_render_ids_and_page(db):
+    body = "".join(f"- [ ] item {i} 📅 2026-11-{1 + i % 28:02d}\n" for i in range(60))
+    assert await real_note(db, "r.md", body) == 60
+    seen, pages = await follow(db, limit=7, order_by="due")
+    assert len(seen) == 60 == len(set(seen)) and len(pages) == 9
+    assert all(re.search(r"`:\d+ — id [0-9a-f]{12} — due ", ln) for ln in seen)

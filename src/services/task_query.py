@@ -94,6 +94,25 @@ DATE_ARGS = ("due_from", "due_by", "scheduled_from", "scheduled_by", "done_from"
 #: its #350 meaning (the 1.0 tool-contract promise).
 LEGACY_ARGS = ("folder", "status", "due_by", "scheduled_by", "tags", "limit", "cursor")
 
+#: The plugin's recurrence signifier (R§1.2), read from a pending row's text.
+RECURRENCE_SIGNIFIER = "\U0001F501"
+
+
+def pending_v5_filters(n: "Normalised") -> list[str]:
+    """The filters of this call that read a version-5 column and are only
+    approximated on a row awaiting the backfill (NULL `task_key`): `text`
+    (folded text; falls back to `lower(text)`) and `recurring` (falls back
+    to the 🔁 signifier in the stored text). Tags are exact on such rows (the
+    stored `tags` are evaluated by the same rule); dates, priority,
+    `has_due`, `undated`, the scope and every order read version-4 columns."""
+    out = []
+    if n.terms:
+        out.append("text")
+    if n.recurring is not None:
+        out.append("recurring")
+    return out
+
+
 CURSOR_FOREIGN = "list_tasks: cursor does not belong to this query; start without one."
 CURSOR_GONE = (
     "list_tasks: the note this cursor stopped at is no longer indexed; start "
@@ -323,14 +342,16 @@ def _validate_tags(name: str, tags: Any, tool: str) -> list[str] | QueryRefusal:
                 f"{tool}: each {name} entry must be 1 to {TAG_ARG_MAX_CHARS} "
                 "characters after a leading '#' is removed."
             )
-        low = stripped.lower()
-        if not _TAG_ARG_RE.fullmatch(low) or low.endswith("/"):
+        # Normalised exactly like a stored tag (lower-case, `/` runs
+        # collapsed, a trailing `/` stripped), then checked: `work/` means
+        # `work`, hierarchically.
+        norm = task_line.normalise_tag(stripped)
+        if not norm or not _TAG_ARG_RE.fullmatch(norm):
             return _refuse(
                 f"{tool}: {name} entry {_shown(stripped)!r} is not a tag: it must "
                 "start with a letter and contain only letters, digits, '_', '-' "
-                "and '/', with no trailing '/'."
+                "and '/'."
             )
-        norm = task_line.normalise_tag(low)
         if norm not in out:
             out.append(norm)
     return out
@@ -367,6 +388,13 @@ def _resolve_date(name: str, value: Any, zone, now, tool: str) -> ResolvedDate |
             f"(got {_shown(value)!r})."
         )
     return ResolvedDate(name, value.lower(), resolved, task_dates.is_relative(value))
+
+
+def snapshot_now(now: datetime.datetime | None) -> datetime.datetime:
+    """The call's one clock read (aware UTC). Every relative date, the echoed
+    "today" and the cursor digest derive from this instant, so a call that
+    spans midnight cannot resolve its dates against two different days."""
+    return now if now is not None else datetime.datetime.now(datetime.timezone.utc)
 
 
 def _zone(task_settings):
@@ -408,6 +436,7 @@ def normalise_list_args(
     if isinstance(folder, QueryRefusal):
         return folder
 
+    now = snapshot_now(now)
     zone, unavailable = _zone(task_settings)
     today = task_dates.today(zone, now=now)
     dates: dict[str, ResolvedDate] = {}
@@ -644,7 +673,7 @@ def decode_cursor(token: Any, *, owner: str, filters: str, order_by: str) -> dic
 
 # ── SQL building blocks ──────────────────────────────────────────────────────
 
-def hier_any(column, values: list[str]):
+def hier_any(column, values: list[str], *, strip_hash: bool = False):
     """`EXISTS` an element of the `varchar[]` `column` that, normalised like
     `task_line.normalise_tag`, equals one of `values` or lies beneath it
     (`value + "/"` prefix) — hierarchical, case-insensitive. `values` are
@@ -652,7 +681,8 @@ def hier_any(column, values: list[str]):
     from sqlalchemy import func, literal, or_, select
 
     t = func.unnest(column).table_valued("v").render_derived(name="t")
-    norm = func.rtrim(func.regexp_replace(func.lower(t.c.v), "/{2,}", "/", "g"), "/")
+    v = func.regexp_replace(t.c.v, "^#", "") if strip_hash else t.c.v
+    norm = func.rtrim(func.regexp_replace(func.lower(v), "/{2,}", "/", "g"), "/")
     conds = [or_(norm == value, func.left(norm, len(value) + 1) == value + "/")
              for value in values]
     return select(literal(1)).select_from(t).where(or_(*conds)).exists()
@@ -709,7 +739,9 @@ def scope_clause(task_settings):
     if tags:
         from src.models.db import NoteMetadata
 
-        keep.append(not_(hier_any(NoteMetadata.tags, tags)))
+        # Frontmatter may store a note tag as `#private`: one leading `#` is
+        # stripped before the same hierarchical, case-insensitive rule.
+        keep.append(not_(hier_any(NoteMetadata.tags, tags, strip_hash=True)))
     if not keep:
         return None
     return and_(*keep)
@@ -811,7 +843,7 @@ class _Filters:
     exactly the group it reports on."""
 
     def __init__(self, n: Normalised, task_settings):
-        from sqlalchemy import and_, func, or_
+        from sqlalchemy import and_, func, not_, or_
         from src.models.db import NoteMetadata, NoteTask
         from src.services.filters import folder_prefix_clause
 
@@ -850,11 +882,20 @@ class _Filters:
             func.strpos(func.coalesce(NoteTask.text_fold, func.lower(NoteTask.text)), term) > 0
             for term in n.terms
         ]
+        # A pending row (NULL `task_key`: not yet re-derived at version 5)
+        # has no `recurrence` column value to read, so it is judged by its
+        # stored text: recurring when the text holds the 🔁 signifier. That
+        # is approximate (the rule must be in the trailing field run), so
+        # the response always says so (`pending_v5_filters`).
+        is_recurring = or_(
+            and_(NoteTask.task_key.isnot(None), NoteTask.recurrence.isnot(None)),
+            and_(NoteTask.task_key.is_(None), func.strpos(NoteTask.text, RECURRENCE_SIGNIFIER) > 0),
+        )
         self.recurring = []
         if n.recurring is True:
-            self.recurring.append(NoteTask.recurrence.isnot(None))
+            self.recurring.append(is_recurring)
         elif n.recurring is False:
-            self.recurring.append(NoteTask.recurrence.is_(None))
+            self.recurring.append(not_(is_recurring))
         tag = []
         if n.tags:
             tag.append(tags_all_clause(n.tags))
@@ -961,6 +1002,7 @@ async def list_tasks_query(
     from sqlalchemy import func, select
     from src.models.db import NoteMetadata, NoteTask
 
+    now = snapshot_now(now)
     n = normalise_list_args(args, settings, now=now)
     if isinstance(n, QueryRefusal):
         return n
@@ -1092,6 +1134,7 @@ async def task_agenda_query(
     from sqlalchemy import func, not_, or_, select
     from src.models.db import NoteMetadata, NoteTask
 
+    now = snapshot_now(now)
     zone, unavailable = _zone(settings)
     if not isinstance(args.date, str):
         return _refuse("task_agenda: date must be a string date.")
