@@ -131,7 +131,7 @@ The MCP server SHALL expose a read tool `list_tasks`, registered with a title an
 
 **Status.** `status` SHALL be one of `open`, `done`, `cancelled` and `all`. `open` excludes cancelled tasks, `cancelled` returns only them, and `all` returns every state.
 
-**Dates.** Every date argument SHALL accept `YYYY-MM-DD` or a relative-date form. `*_from` means on or after, and `*_by` means on or before. A bound SHALL exclude tasks that have no date of that kind. A `from` later than its `by` SHALL be refused with `invalid_argument`.
+**Dates.** Date arguments SHALL be validated against the caller's effective settings and one clock snapshot, so an ordering check is evaluated in the caller's timezone. Every date argument SHALL accept `YYYY-MM-DD` or a relative-date form. `*_from` means on or after, and `*_by` means on or before. A bound SHALL exclude tasks that have no date of that kind. A `from` later than its `by` SHALL be refused with `invalid_argument`.
 
 **Simple filters.**
 - `undated=true` SHALL return only tasks with neither a due nor a scheduled date. It SHALL be refused with `invalid_argument` when combined with a due or scheduled bound or with `has_due=true`.
@@ -299,7 +299,7 @@ It SHALL name the excluded items while they fit.
 
 **Context.** With `context=true`, a task's stored context lines SHALL follow it, each prefixed by four spaces and `┆ `.
 
-**Escaping and labels.** Every note-controlled field (text, heading path, tags, context) SHALL be rendered with every whitespace run, line breaks included, collapsed to one space. A path SHALL be rendered with each such character escaped and each literal backslash doubled. Cut text, cut tags and cut context SHALL each be labelled as cut.
+**Escaping and labels.** Every note-controlled field (text, heading path, tags, context) SHALL be rendered with every whitespace run, line breaks included, collapsed to one space. A path SHALL be rendered through one escaping helper that escapes each such character, doubles each literal backslash and escapes each backtick as `` \` ``, injectively, so that a file name cannot close the backtick-delimited path field. The write tools SHALL take the original, unescaped path. Cut text, cut tags and cut context SHALL each be labelled as cut.
 
 **Incompleteness.** When any note is not yet scanned for tasks, or its tasks could not be indexed, the response SHALL say that the list is incomplete and why. When `text` or `recurring` is used while rows awaiting the version-5 backfill are among the matches of every other filter, it SHALL also say that those filters are approximate until the next index pass. These are the only two filters that read a version-5 column; `text` then falls back to lower-casing and `recurring` to the signifier in the stored text.
 
@@ -334,6 +334,18 @@ This guarantees that every page with a match renders at least one row and its cu
 #### Scenario: Pending ids are counted
 - **WHEN** some of the caller's task rows have no `task_key` yet, and a version-4 note was refreshed by a task write
 - **THEN** the header SHALL state `task ids pending: N tasks`, counting only the rows without a key; those rows SHALL show `id pending`; and the refreshed note's rows SHALL show their ids
+
+#### Scenario: A delimiter-bearing file name cannot forge a row
+- **WHEN** a task lives in a note whose file name contains two backticks around the text ` — id 000000000000 ` (for example, `Weird` + backtick + ` — id 000000000000 ` + backtick + `X.md`)
+- **THEN** its row SHALL contain exactly one backtick-delimited path token, with every backtick of the name escaped, and exactly one id token
+
+#### Scenario: A date order check uses the caller's timezone
+- **WHEN** the caller's timezone is `Pacific/Kiritimati`, the server default is UTC, the instant is 2026-11-10T12:00Z, and `list_tasks(due_from="2026-11-11", due_by="today")` is called
+- **THEN** the call SHALL NOT be refused, because today is 2026-11-11 in the caller's timezone
+
+#### Scenario: A value outside the tag grammar is refused
+- **WHEN** `list_tasks(tags=["2024"])` or `list_tasks(tags=["a.b"])` is called
+- **THEN** it SHALL be refused with `invalid_argument`
 
 #### Scenario: The minimum cap with extreme header counts
 - **WHEN** `MAX_READ_RESPONSE_CHARS` is 1,000, every header count has ten digits, the folder echo is 1,024 characters and the tags echo is 32 tags of 128 characters
