@@ -2919,6 +2919,10 @@ def _owner_scoped_rows_stmt(user_id: int | None, *, with_id: bool):
     ]
     if with_id:
         columns.insert(0, NoteMetadata.id)
+    else:
+        # #428 D10 R2: the snapshot statement's start on the database clock,
+        # carried on every row (one value per statement).
+        columns.append(func.statement_timestamp().label("scan_clock"))
     stmt = select(*columns)
     if user_id is None:
         return stmt.where(NoteMetadata.user_id.is_(None))
@@ -3016,10 +3020,13 @@ async def _index_vault_pinned(
         # under an attempt's lock, which can only be later), so R4's "a
         # refresh at or after this instant may be newer than what I read"
         # holds for every attempt; an earlier instant only keeps more, and a
-        # kept row stays task-dirty, so the next pass re-reads it.
+        # kept row stays task-dirty, so the next pass re-reads it. It is the
+        # snapshot statement's own start (`statement_timestamp()`, on the
+        # rows); an empty scope reads the clock on its own.
         scan_started_at = (
-            await session.execute(text("SELECT clock_timestamp()"))
-        ).scalar()
+            getattr(snapshot_rows[0], "scan_clock", None) if snapshot_rows
+            else (await session.execute(text("SELECT clock_timestamp()"))).scalar()
+        )
         await session.commit()
     snapshot = {row.file_path: SnapshotRow.of(row) for row in snapshot_rows}
 
