@@ -132,10 +132,15 @@ jobs:
   # `-include`s that file optionally and `test-schema` uses none of its
   # variables. PYTHON= points the target at setup-python's interpreter, which
   # is the one carrying the installed deps.
+  #
+  # The budget follows the gate, which grows by a handful of cases with every
+  # migration (each case migrates a fresh database to head): about 18 minutes
+  # at 038, about 23 at 039 (#428), where a 20-minute budget cancelled a run
+  # whose every case was passing.
   schema-gate:
     name: schema-gate
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
 
