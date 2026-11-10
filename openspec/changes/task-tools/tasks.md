@@ -108,7 +108,7 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
 
 ## 5. S5: write planning (wave 2, pure plans plus one query; does not publish)
 
-- [ ] 5.1 `src/services/task_write.py`:
+- [x] 5.1 `src/services/task_write.py`:
   - `resolve(tasks, id, *, hash_supplied) -> target | refusal` (the D2 table: a suffixed id without a hash gives `precondition_required`);
   - `continuation_block(lines, i)` (uncapped, D8), used by placement, `append_context` and below-placed recurrence;
   - `plan_complete`, `plan_update` and `plan_add(note_text, args, settings, today) -> Plan(spans, new_text, new_lines, new_ids) | refusal` (D4–D8);
@@ -116,8 +116,8 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
   - `async duplicate_scan(session, uid, settings, norm, terms) -> (exact, similar, stopped)` (D9).
   
   It uses `task_line`, `task_recurrence`, `task_dates` and `tasks.tasks_from_note_text`.
-- [ ] 5.2 `src/services/refusals.py`: add `task_not_found`, `task_ambiguous`, `task_changed`, `already_completed`, `task_cancelled`, `task_malformed`, `recurrence_unsupported`, `on_completion_unsupported`, `duplicate_task` and `response_cap_too_small`, with the catalogue entries their siblings carry.
-- [ ] 5.3 `tests/test_task_write.py`: every `task-write` scenario reachable without a database, including:
+- [x] 5.2 `src/services/refusals.py`: add `task_not_found`, `task_ambiguous`, `task_changed`, `already_completed`, `task_cancelled`, `task_malformed`, `recurrence_unsupported`, `on_completion_unsupported`, `duplicate_task` and `response_cap_too_small`, with the catalogue entries their siblings carry.
+- [x] 5.3 `tests/test_task_write.py`: every `task-write` scenario reachable without a database, including:
   - the D6 table;
   - next-line construction and placement, above and below, at end of file without a terminator;
   - `add_task` placement cases 1–3 (ordered and callout anchors);
@@ -127,7 +127,7 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
   - the next-occurrence terminator in a mixed CRLF/LF note for both placements;
   - 9- and 10-line continuation blocks (a blank line inside, a deeper child task) for `add_task`, `append_context` and below placement, with D5 check 5 catching an injected reparenting;
   - D5 verification catching an injected corruption.
-- [ ] 5.4 `tests/integration/test_task_duplicates_pg.py` (container `omcp-tt-s5` / 55455): exact duplicate in scope and in the target note, similar listed, the scan bound, tenancy.
+- [x] 5.4 `tests/integration/test_task_duplicates_pg.py` (container `omcp-tt-s5` / 55455): exact duplicate in scope and in the target note, similar listed, the scan bound, tenancy.
 
 ## 6. S6: panel Tasks card (wave 2)
 
