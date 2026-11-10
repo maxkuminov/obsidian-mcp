@@ -100,11 +100,14 @@ async def test_single_user_scope_is_the_null_row(db):
     assert row.timezone == "Europe/Berlin"
     assert row.excluded_folders == ["Archive/"]
     assert row.excluded_note_tags == ["ticket"]
+    # The two flags the form did not send stay NULL (follow the server default);
+    # an absent key never stores False (S2 audit, #428).
     assert (row.set_done_date, row.set_cancelled_date, row.set_created_date,
-            row.next_recurrence_below) == (True, True, False, False)
+            row.next_recurrence_below) == (True, True, None, None)
 
     eff = await effective(db, None)
     assert eff.timezone == "Europe/Berlin"
+    assert (eff.set_created_date, eff.next_recurrence_below) == (False, False)
     assert eff.excluded_folders == ("Archive/",)
 
     # A second save updates the same row; it never inserts a second NULL row.
