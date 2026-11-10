@@ -228,6 +228,11 @@ _EXTRACTION_CLEANERS = {
     # derived for every note once, but the embedding text is untouched, so a
     # v3-stamped row compares equal here and is NOT re-embedded.
     4: clean_for_embedding,
+    # Version 5 adds task ids and the other task-tool columns (#428): every
+    # note's `note_tasks` rows are re-derived once, the embedding text is
+    # untouched, so a v4-stamped row compares equal here and is NOT
+    # re-embedded.
+    5: clean_for_embedding,
 }
 
 

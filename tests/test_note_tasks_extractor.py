@@ -281,3 +281,288 @@ def test_the_extractor_is_linear_on_adversarial_input(fragment):
     elapsed = time.monotonic() - started
     assert elapsed < TIME_BOUND_SECONDS, f"{elapsed:.1f}s on {fragment!r}"
     assert len(tasks) <= MAX_TASKS_PER_NOTE
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Version 5 (#428, design D1, D9, D11; `note-tasks` delta)
+# ══════════════════════════════════════════════════════════════════════════
+
+import ast  # noqa: E402
+import inspect  # noqa: E402
+
+from src.services import indexer  # noqa: E402
+from src.services import task_index  # noqa: E402
+from src.services import task_line  # noqa: E402
+from src.services.tasks import (  # noqa: E402
+    TASK_IDS_SINCE_EXTRACTION_VERSION,
+    note_task_row,
+    tasks_from_note_text,
+)
+
+
+def test_created_cancelled_and_recurrence_are_parsed():
+    t = only("- [-] Rent 🔁 every month ➕ 2026-01-01 📅 2026-11-01 ❌ 2026-11-02")
+    assert t.recurrence == "every month" and t.recurrence_cut is False
+    assert t.created == datetime.date(2026, 1, 1)
+    assert t.cancelled == datetime.date(2026, 11, 2)
+    assert t.due == datetime.date(2026, 11, 1)
+
+
+def test_a_rule_outside_the_trailing_run_is_not_a_recurrence():
+    assert only("- [ ] the 🔁 every day plan is late [[Notes]]").recurrence is None
+
+
+def test_the_recurrence_is_the_runs_rule_trimmed_and_cut():
+    assert only("- [ ] a 🔁 every week when done 📅 2026-01-01").recurrence == (
+        "every week when done"
+    )
+    long = only("- [ ] a 🔁 " + "every " * 60 + "day")
+    assert long.recurrence_cut is True and len(long.recurrence) == 256
+    assert only("- [ ] a 🔁   ").recurrence is None  # no value is no rule
+    # Created and cancelled follow the #350 date rules: invalid -> NULL.
+    t = only("- [ ] a ➕ 2026-02-30 ❌")
+    assert t.created is None and t.cancelled is None
+
+
+def test_tag_prefixes_support_hierarchical_matching():
+    t = only("- [ ] chase #Waiting-For/Chase")
+    assert t.tags == ["Waiting-For/Chase"]
+    assert t.tag_prefixes == ["waiting-for", "waiting-for/chase"]
+
+
+def test_empty_segments_are_normalised():
+    t = only("- [ ] chase #Waiting-For//Chase/")
+    assert t.tag_prefixes == ["waiting-for", "waiting-for/chase"]
+
+
+def test_no_tags_store_an_empty_prefix_array_not_null():
+    assert only("- [ ] plain").tag_prefixes == []
+
+
+def test_tag_prefixes_are_lossless_at_the_largest_buildable_case():
+    tags = [f"t{i:02d}" + "/b" * 62 for i in range(64)]
+    assert all(len(tag) == 127 for tag in tags)
+    t = only("- [ ] x " + " ".join("#" + tag for tag in tags))
+    assert t.tags_cut is False and t.tags == tags
+    assert len(t.tag_prefixes) == 64 * 63 == 4_032
+    assert set(t.tag_prefixes) == set(task_line.tag_prefixes(tags))
+
+
+def test_the_4096_prefix_bound_is_reached():
+    firsts = [chr(97 + i // 26) + chr(97 + i % 26) for i in range(64)]
+    tags = [first + "/b" * 63 for first in firsts]
+    assert all(len(tag) == 128 for tag in tags)
+    t = only("- [ ] x " + " ".join("#" + tag for tag in tags))
+    assert t.tags_cut is False
+    assert len(t.tag_prefixes) == 4_096 == len(set(t.tag_prefixes))
+
+
+def test_context_lines_are_captured():
+    tasks, _ = extract("- [ ] Call bank\n    - ref 1234\n    more notes\n\n- [ ] next\n")
+    assert tasks[0].context == "- ref 1234\nmore notes"
+    assert tasks[0].context_cut is False
+    assert tasks[1].context is None and tasks[1].context_cut is False
+
+
+@pytest.mark.parametrize("stop", ["", "    # heading", "    ```", "    ~~~", "- sibling",
+                                  "not indented"])
+def test_context_stops_at_a_blank_heading_fence_or_non_belonging_line(stop):
+    t = extract(f"- [ ] t\n    one\n{stop}\n    after\n")[0][0]
+    assert t.context == "one" and t.context_cut is False
+
+
+def test_context_tab_counts_as_four_and_blockquotes_nest():
+    t = extract("\t- [ ] t\n\t\tdeeper\n    \tdeeper too\n\tsame\n")[0][0]
+    assert t.context == "deeper\ndeeper too"
+    q = extract("> - [ ] quoted\n>   more\n>> deeper quote\n> - [ ] next\n")[0][0]
+    assert q.context == ">   more\n>> deeper quote"
+
+
+def test_context_includes_a_child_task_and_the_child_has_its_own():
+    tasks, _ = extract("- [ ] parent\n    - [ ] child\n        detail\n")
+    assert tasks[0].context == "- [ ] child\ndetail"
+    assert tasks[1].context == "detail"
+
+
+def test_context_caps_lines_chars_and_total():
+    eight = "".join(f"    line {i}\n" for i in range(8))
+    assert extract("- [ ] t\n" + eight)[0][0].context_cut is False
+    nine = extract("- [ ] t\n" + eight + "    line 8\n")[0][0]
+    assert nine.context.count("\n") == 7 and nine.context_cut is True
+    wide = extract("- [ ] t\n    " + "w" * 200 + "\n")[0][0]
+    assert wide.context == "w" * 160 and wide.context_cut is True
+    total = extract("- [ ] t\n" + "".join("    " + "z" * 150 + "\n" for _ in range(8)))[0][0]
+    assert len(total.context) <= 600 and total.context_cut is True
+    assert not total.context.endswith("\n")
+
+
+def test_stored_context_crosses_no_blank_line():
+    # The uncapped continuation block (D8, write placement) crosses blank
+    # lines; the stored context does not.
+    assert extract("- [ ] t\n    a\n\n    b\n")[0][0].context == "a"
+
+
+def test_the_task_key_is_over_the_uncut_text():
+    text_ = "k" * 1_500
+    t = only("- [x] " + text_ + "   ")
+    assert t.text_cut is True and len(t.text) == TASK_TEXT_MAX_CHARS
+    assert t.task_key == task_line.task_key(text_)
+    # Status, indentation, marker and quote prefix are excluded.
+    assert only("> \t1. [ ] " + text_).task_key == t.task_key
+
+
+def test_ordinals_count_identical_tasks_in_document_order():
+    tasks, _ = extract("- [ ] same\n- [ ] other\n* [x] same\n    - [ ] same\n")
+    same = [t for t in tasks if t.text == "same"]
+    assert [(t.key_ordinal, t.key_count) for t in same] == [(1, 3), (2, 3), (3, 3)]
+    assert {t.task_key for t in same} == {task_line.task_key("same")}
+    other = next(t for t in tasks if t.text == "other")
+    assert (other.key_ordinal, other.key_count) == (1, 1)
+    assert task_line.render_id(other.task_key, 1, 1) == other.task_key
+
+
+def test_ordinals_are_counted_within_the_cap():
+    tasks, truncated = extract("- [ ] same\n" * 5, max_tasks=3)
+    assert truncated is True
+    assert [(t.key_ordinal, t.key_count) for t in tasks] == [(1, 3), (2, 3), (3, 3)]
+
+
+def test_text_fold_is_nfc_casefold_of_the_stored_text():
+    t = only("- [ ] Позвонить в БАНК Straße ΟΔΟΣ")
+    assert t.text_fold == task_line.fold_text(t.text)
+    assert "банк" in t.text_fold and "strasse" in t.text_fold and "οδοσ" in t.text_fold
+
+
+CORPUS = [
+    "- [ ] plain",
+    "- [ ] Pay rent 🔁 every month 📅 2026-11-01 #home ^abc-1",
+    "- [x] Done 🔁 every week when done ✅ 2026-11-10 ⏫",
+    "- [ ] the 🔁 every day plan is late [[Notes]]",
+    "- [ ] Mixed CASE #Tag/Sub   #two 📅 2026-01-01  ",
+    "- [ ] code `🔁 every day` 🔁 every 2 days",
+    "> - [/] quoted 🔁 every weekday 🏁 keep 🆔 abc ⛔ x,y",
+    "- [ ] 🔁 every year #a #b ⏬",
+    "\t- [-] cancelled ❌ 2026-01-02 🔁 every month on the 31st",
+    "- [ ] Ünïcödé  SPACING\tand  tabs #x",
+]
+
+
+@pytest.mark.parametrize("line", CORPUS)
+def test_one_run_parse_matches_the_write_planners_definitions(line):
+    """`_run_derived` spells two `task_line` derivations over one parse; pin
+    them to `task_line.parse(...).recurrence` and `description_key(
+    normalise_description(...))`, which the write planner uses."""
+    t = only(line)
+    tl = task_line.parse(line)
+    assert t.recurrence == (tl.recurrence or None)
+    assert t.description_key == task_line.description_key(
+        task_line.normalise_description(tl.full_text)
+    )
+
+
+def test_tasks_from_note_text_is_split_offset_and_extraction():
+    raw = "---\ntitle: x\ntags: [a]\n---\nintro\n- [ ] first 📅 2026-01-01\n- [x] second\n"
+    tasks, truncated = tasks_from_note_text(raw)
+    body = "intro\n- [ ] first 📅 2026-01-01\n- [x] second\n"
+    assert (tasks, truncated) == extract(body, offset=4)
+    assert [t.line for t in tasks] == [6, 7]
+    # Bytes and text agree; CRLF, a lone CR and a NUL are canonicalised
+    # exactly as the index hashes them.
+    crlf = raw.replace("\n", "\r\n").replace("first", "fi\x00rst")
+    assert tasks_from_note_text(crlf.encode("utf-8")) == (tasks, False)
+    assert tasks_from_note_text(crlf) == (tasks, False)
+    with pytest.raises(UnicodeDecodeError):
+        tasks_from_note_text(b"- [ ] \xff\n")
+
+
+def test_a_frontmatter_lookalike_is_not_a_task():
+    tasks, _ = tasks_from_note_text("---\nnote: |\n  - [ ] not a task\n---\n- [ ] real\n")
+    assert [(t.line, t.text) for t in tasks] == [(5, "real")]
+
+
+def test_note_task_row_carries_every_column_of_the_model():
+    from src.models.db import NoteTask
+
+    row = note_task_row(7, only("- [ ] a #t 🔁 every day ➕ 2026-01-01"))
+    assert set(row) == {c.name for c in NoteTask.__table__.columns} - {"id"}
+    assert row["note_id"] == 7
+
+
+def test_version_five_is_the_task_id_bump_and_re_embeds_nothing():
+    from src.services.embeddings import clean_at_version
+
+    assert indexer.CURRENT_EXTRACTION_VERSION == 5 == TASK_IDS_SINCE_EXTRACTION_VERSION
+    for body in ["- [ ] t 🔁 every day\n```\nx\n```\n", "[[L]] `c` #t\n~~~\ny\n~~~\n", ""]:
+        assert clean_at_version(5, body) == clean_at_version(4, body)
+        assert indexer._grammar_changed_the_embedding_text(4, body) is False
+        assert indexer._grammar_changed_the_embedding_text(3, body) is False
+
+
+def test_a_snapshot_row_is_task_dirty_unless_its_tasks_describe_its_hash():
+    from types import SimpleNamespace
+
+    base = dict(content_hash="h", extraction_version=5, stat_size=None,
+                stat_mtime_ns=None, stat_ctime_ns=None, stat_ino=None,
+                derived_under=None)
+    of = indexer.SnapshotRow.of
+    assert of(SimpleNamespace(**base, tasks_source_hash="h")).task_dirty is False
+    assert of(SimpleNamespace(**base, tasks_source_hash="other")).task_dirty is True
+    assert of(SimpleNamespace(**base, tasks_source_hash=None)).task_dirty is True
+    assert of(SimpleNamespace(**base)).task_dirty is False  # no such column
+    assert of(SimpleNamespace(**base, tasks_source_hash="x")) != of(
+        SimpleNamespace(**base, tasks_source_hash="h")
+    ), "part of the C4 comparison"
+
+
+def test_a_task_dirty_row_needs_its_body():
+    v = indexer.CURRENT_EXTRACTION_VERSION
+    dirty = indexer.SnapshotRow("h", v, None, None, True)
+    assert indexer._needs_body("a.md", "h", {"a.md": dirty}, False) is True
+    clean = indexer.SnapshotRow("h", v, None, None, False)
+    assert indexer._needs_body("a.md", "h", {"a.md": clean}, False) is False
+
+
+# ── the write-time refresh's structural guards (D10) ────────────────────────
+
+
+def _module_tree(module):
+    return ast.parse(inspect.getsource(module))
+
+
+def test_the_refresh_never_takes_the_generation_lock():
+    tree = _module_tree(task_index)
+    names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)} | {
+        n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)
+    }
+    assert not {n for n in names if n.startswith("acquire_generation_lock")}
+    assert "advisory" not in inspect.getsource(task_index)
+    imported = {
+        alias.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
+        for alias in n.names
+    }
+    assert not {n for n in imported if "generation" in n or n == "indexer"}
+
+
+def test_the_refresh_writes_only_the_r1_columns():
+    tree = _module_tree(task_index)
+    touched = {
+        n.attr for n in ast.walk(tree)
+        if isinstance(n, ast.Attribute) and getattr(n.value, "id", None) == "NoteMetadata"
+    }
+    assert touched <= {"id", "file_path", "user_id"}, touched
+    stamp = next(n for n in ast.walk(tree)
+                 if isinstance(n, ast.AsyncFunctionDef) and n.name == "_stamp")
+    keys = {k.value for n in ast.walk(stamp) if isinstance(n, ast.Dict)
+            for k in n.keys if isinstance(k, ast.Constant)}
+    keys |= {t.slice.value for n in ast.walk(stamp) if isinstance(n, ast.Assign)
+             for t in n.targets if isinstance(t, ast.Subscript)}
+    assert keys == {"tasks_source_hash", "tasks_refreshed_at", "tasks_failed",
+                    "tasks_truncated"}
+
+
+def test_refresh_result_renders_the_d16_and_d17_forms():
+    ok = task_index.RefreshResult(task_index.REFRESHED)
+    assert (ok.refreshed, ok.usage, ok.line) == (True, "refreshed", "index: refreshed")
+    lag = task_index.RefreshResult(task_index.LAGGED, task_index.LAG_SUPERSEDED)
+    assert lag.usage == "lagged:superseded"
+    assert lag.line == "index: may lag (superseded)"
