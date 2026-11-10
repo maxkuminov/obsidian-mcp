@@ -302,6 +302,20 @@ List-valued settings: `TRUSTED_PROXY_IPS`, `FTS_CONFIGS` and
 | `TRANSFER_MAX_CONCURRENT_UPLOADS` | `4` | Simultaneous `PUT /transfer/upload`. |
 | `IMPORT_ALLOW_HTTP` | `false` | Let `import_from_url` fetch plain http (the base NetworkPolicy allows only 443 egress). |
 
+### Task tools
+
+The server defaults for the task tools (#428). Each user overrides them on
+the panel's Tasks card. See the README's
+[Tasks (optional)](../README.md#tasks-optional).
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `TASKS_DEFAULT_TIMEZONE` | `UTC` | IANA timezone for "today" and relative task dates. An unknown or host-only name (`localtime`) refuses startup, **in the `migrate` initContainer too**: set it in the ConfigMap, never on the app container alone. |
+| `TASKS_SET_DONE_DATE` | `true` | `complete_task` adds `✅ <date>`. |
+| `TASKS_SET_CANCELLED_DATE` | `true` | Cancelling a task adds `❌ <date>`. |
+| `TASKS_SET_CREATED_DATE` | `false` | New tasks and a recurring task's next occurrence get `➕ <date>`. |
+| `TASKS_NEXT_RECURRENCE_BELOW` | `false` | A recurring task's next occurrence goes below the completed one instead of above. |
+
 ### Rate limits, quotas and concurrency
 
 All of these live in the one process. See
@@ -690,6 +704,27 @@ The procedure:
    `kubectl -n obsidian-mcp exec deploy/obsidian-mcp -- alembic check` should print
    "No new upgrade operations detected."
 
+**Across migration 039 (task tools, #428)** there is no operator step
+beyond one check: if the ConfigMap sets `TASKS_DEFAULT_TIMEZONE`, it must
+be an IANA timezone the image knows (`Europe/Berlin`), not a misspelling or
+a host-only name such as `localtime`. A bad value fails the `migrate`
+initContainer, and under `Recreate` that is downtime until you fix the
+ConfigMap or revert the image. 039 adds nullable columns, one CHECK and two
+indexes to `note_tasks`, two nullable columns to `notes_metadata`, and the
+durable `task_settings` table; it writes no row and rewrites no table, as
+the non-superuser owner. The first pass after the rollout re-derives every
+note once at extraction version 5 (no re-embedding). Until it finishes,
+`list_tasks` shows `id pending` rows and a `task ids pending` count, its
+`text` / `recurring` filters say they are approximate, and
+`move_note(rewrite_links=True)` returns `index_not_ready`. A `list_tasks`
+cursor from before the rollout is refused once (`invalid_argument`).
+`CLASS_MAPPING_VERSION` moves to 6, which starts a new readiness epoch for
+`make concurrency-report`. The image pins `tzdata`. The backup Job dumps
+`task_settings` with its rows. Rolling the image back is roll-forward, as
+for 032: the previous image re-derives every note and re-chunks with full
+vector reuse. Downgrading 039 drops the saved task settings. The details
+are in [`DEPLOYMENT.md`](../DEPLOYMENT.md#upgrading-across-migration-039-task-tools-428).
+
 **Upgrading to the reranker release (#367)** there is no migration and no
 operator step: `semantic_search` and `hybrid_search` gain an optional
 `rerank` argument whose `false` default leaves their output unchanged, and
@@ -822,7 +857,8 @@ Two things hold state: the **vault** and the **database**.
   check` is clean) and the indexer rebuilds the rows after a restore.
   `BACKUP_FULL=1` in the Job's env dumps everything; run a second, weekly
   CronJob with it if restore time matters more than dump size. The other
-  twelve tables are always dumped.
+  sixteen tables (users and credentials, usage, quotas, the concurrency
+  evidence, the change feed, `task_settings`) are always dumped.
 
 [`components/db-backup`](../deploy/kubernetes/components/db-backup/) is a
 nightly CronJob that follows `make db-backup`'s contract. It writes a
