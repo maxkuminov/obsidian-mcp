@@ -327,9 +327,89 @@ def test_response_cap_too_small_at_1000_with_exclusions():
     out = R.render_list_tasks(page, budget=1000)
     assert isinstance(out, Q.QueryRefusal) and out.code == "response_cap_too_small"
     assert "MAX_READ_RESPONSE_CHARS" in out.prose
-    # An empty page whose header does not fit is refused too, never cut.
-    empty = dataclasses.replace(page, rows=[], more_rows=False)
-    assert R.render_list_tasks(empty, budget=1000).code == "response_cap_too_small"
+
+
+def test_an_empty_result_is_never_refused_its_echoes_give_way():
+    """Spec "Empty result": no row means no row to abbreviate, so never a
+    refusal — the echoes shorten until the header fits; mandatory parts stay."""
+    ts = settings_for(excluded_folders=tuple(f"F{i:02d}" + "f" * 40 + "/" for i in range(32)))
+    for page in (
+        make_page([], ts=ts, counts=BIG, excluded=BIG, due_by="+7d",
+                  tags=["t" * 128] * 32, folder="F" * 1024),
+        _worst_query_page()[1],
+    ):
+        out = R.render_list_tasks(page, budget=1000)
+        assert isinstance(out, str) and len(out) <= 1000, out
+        assert "shown: 0" in out and "next:" not in out
+        q = out.splitlines()[1]
+        assert "today: 2026-11-10" in q and "excluded by scope: " in q
+        assert "excluded folders: 32" in q and "excluded note tags: " in q
+        for rd in page.args.dates.values():
+            if rd.relative:
+                assert f"{rd.name}: {rd.given}={rd.value.isoformat()}" in q
+
+
+def _pending_page(**kw):
+    page = make_page([row(key=None)], **kw)
+    return dataclasses.replace(page, ids_pending=3)
+
+
+def test_pending_rows_raise_the_notice_for_text_and_recurring():
+    out = R.render_list_tasks(_pending_page(text="bank"), budget=40_000)
+    assert out.splitlines()[-1] == (
+        "Incomplete list: text filter approximate until the next index pass.")
+    assert "task ids pending: 3 tasks" in out.splitlines()[0]
+    both = R.render_list_tasks(_pending_page(text="bank", recurring=False), budget=40_000)
+    assert both.splitlines()[-1] == (
+        "Incomplete list: text and recurring filters approximate until the next index pass.")
+    mixed = dataclasses.replace(_pending_page(recurring=True), not_scanned=1)
+    assert R.render_task_notice(mixed).startswith(
+        "Incomplete list: unscanned notes; recurring filter approximate")
+    worst = dataclasses.replace(_pending_page(text="x", recurring=True), not_scanned=1, failed=1)
+    assert len(R.render_task_notice(worst)) <= 120
+    # Filters that are exact on pending rows, or no pending row: #350's notice.
+    assert R.render_task_notice(_pending_page(tags=["a"], priority=["high"])) is None
+    no_pending = dataclasses.replace(_pending_page(text="bank"), ids_pending=0)
+    assert R.render_task_notice(no_pending) is None
+    legacy = dataclasses.replace(_pending_page(), failed=1)
+    assert R.render_task_notice(legacy) == tools.render_incomplete_notice(0, 1)
+
+
+def test_one_clock_read_per_call(monkeypatch):
+    """A call spanning midnight resolves every date and the echo from one
+    instant: the clock is read once."""
+    import types
+    from src.services import task_dates
+
+    class Clock(datetime.datetime):
+        calls = 0
+
+        @classmethod
+        def now(cls, tz=None):
+            cls.calls += 1
+            t = datetime.datetime(2026, 11, 10, 23, 59, 58, tzinfo=datetime.timezone.utc)
+            t += datetime.timedelta(seconds=cls.calls)
+            return t if tz is None else t.astimezone(tz)
+
+    shim = types.SimpleNamespace(**{k: getattr(datetime, k) for k in dir(datetime)
+                                    if not k.startswith("_")})
+    shim.datetime = Clock
+    monkeypatch.setattr(Q, "datetime", shim)
+    monkeypatch.setattr(task_dates, "datetime", shim)
+    n = Q.normalise_list_args(Q.ListTasksArgs(due_from="today", due_by="+0d",
+                                              scheduled_by="yesterday"), DEFAULT)
+    assert Clock.calls == 1
+    assert n.dates["due_from"].value == n.dates["due_by"].value == n.today == D(2026, 11, 10)
+    assert n.dates["scheduled_by"].value == D(2026, 11, 9)
+
+
+def test_tag_values_with_a_trailing_slash_are_normalised():
+    n = Q.normalise_list_args(Q.ListTasksArgs(tags=["work/"], exclude_tags=["#Home//"]),
+                              DEFAULT, now=NOW)
+    assert n.tags == ["work"] and n.exclude_tags == ["home"]
+    for bad in (["/"], ["9a/"], ["a b"]):
+        out = Q.normalise_list_args(Q.ListTasksArgs(tags=bad), DEFAULT, now=NOW)
+        assert isinstance(out, Q.QueryRefusal) and out.code == "invalid_argument"
 
 
 def test_the_abbreviated_structure_bound():
@@ -470,7 +550,7 @@ def test_relative_dates_resolve_per_zone():
     (dict(tags=["a" * 129]), "1 to 128"),
     (dict(tags=["#"]), "1 to 128"),
     (dict(tags=["9a"]), "is not a tag"),
-    (dict(exclude_tags=["a/"]), "is not a tag"),
+    (dict(exclude_tags=["a/!"]), "is not a tag"),
     (dict(text=" ".join("abcdefghi")), "1 to 8"),
     (dict(scheduled_from="2026-02-01", scheduled_by="2026-01-01"), "is later than"),
 ])

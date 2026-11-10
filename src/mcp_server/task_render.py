@@ -37,6 +37,7 @@ from src.services.task_query import (
     QueryRefusal,
     TaskPage,
     encode_cursor,
+    pending_v5_filters,
 )
 
 # ── fixed bounds (each pinned by `tests/test_task_render.py`) ────────────────
@@ -73,7 +74,7 @@ LIST_WITH_QUERY_MIN_BUDGET = 1600
 #: text. The paper figures (985 / 1,600) did not include the id token and
 #: the `task ids pending` count at their widest.
 LIST_ABBREVIATED_FULL_BUDGET = 1031
-LIST_WITH_QUERY_FULL_BUDGET = 1608
+LIST_WITH_QUERY_FULL_BUDGET = 1641
 #: D13: below this the agenda is refused.
 AGENDA_MIN_BUDGET = 2800
 CONTEXT_PREFIX = "    ┆ "
@@ -215,6 +216,10 @@ def render_abbreviated_row(row: dict, room: int, *, context_omitted: bool = Fals
 
 
 def render_header_line1(page: TaskPage, *, shown: int, more: bool) -> str:
+    return _header_line1(page, shown=shown, more=more, line_max=HEADER_MAX)
+
+
+def _header_line1(page: TaskPage, *, shown: int, more: bool, line_max: int) -> str:
     """Line 1: the #350 header, tokens and order unchanged, plus
     `task ids pending: N tasks` after `over the task cap`, then `tasks with
     cut tags` (with `tags` / `exclude_tags`) and `tasks with cut text` (with
@@ -239,11 +244,11 @@ def render_header_line1(page: TaskPage, *, shown: int, more: bool) -> str:
         return line
 
     line = build(n.folder)
-    if len(line) > HEADER_MAX and n.folder:
+    if len(line) > line_max and n.folder:
         # Only at the synthetic extreme (every count 10 digits, both cut
         # counts, a 64-character folder echo): the folder echo gives way so
         # the #350 line bound holds; it stays labelled cut (`…`).
-        over = len(line) - HEADER_MAX
+        over = len(line) - line_max
         shown_folder = _t()._one_line(n.folder)
         keep = max(min(len(shown_folder), _legacy_echo_max()) - 1 - over, 1)
         line = build(shown_folder[:keep] + "…")
@@ -285,6 +290,14 @@ def render_query_line(page: TaskPage) -> str:
     excluded note tags: N [names…]`, at most `QUERY_LINE_MAX`. The timezone,
     today and every resolved date are never cut; the counts are always
     present; names are listed while they fit."""
+    return _query_line(page)
+
+
+def _query_line(page: TaskPage, *, line_max: int = QUERY_LINE_MAX,
+                echo_max: int | None = None) -> str:
+    """`render_query_line` with a smaller line or echo bound: an empty page
+    whose header would not fit the response cap shortens its echoes instead
+    of being refused (the mandatory parts are never cut)."""
     tools = _t()
     n = page.args
     ex = page.exclusions
@@ -317,13 +330,16 @@ def render_query_line(page: TaskPage) -> str:
         parts.append(f"excluded by scope: {ex.excluded} tasks")
         return parts
 
-    parts = build(QUERY_ECHO_MAX)
     counts = [f"excluded folders: {len(ex.folders)}", f"excluded note tags: {len(ex.note_tags)}"]
-    if len(" — ".join(parts + counts)) > QUERY_LINE_MAX:
-        parts = build(QUERY_ECHO_TIGHT)
+    if echo_max is not None:
+        parts = build(echo_max)
+    else:
+        parts = build(QUERY_ECHO_MAX)
+        if len(" — ".join(parts + counts)) > line_max:
+            parts = build(QUERY_ECHO_TIGHT)
     fixed = len(" — ".join(parts + counts))
     # Names fill what is left, folders first; each part keeps its count.
-    spare = QUERY_LINE_MAX - fixed
+    spare = line_max - fixed
     folders = _names_part("excluded folders", ex.folders, len(counts[0]) + max(spare, 0))
     spare -= len(folders) - len(counts[0])
     tags = _names_part("excluded note tags", ex.note_tags, len(counts[1]) + max(spare, 0))
@@ -331,6 +347,31 @@ def render_query_line(page: TaskPage) -> str:
 
 
 # ── list_tasks response ──────────────────────────────────────────────────────
+
+
+def render_task_notice(page: TaskPage) -> str | None:
+    """The closing incomplete-list notice. Byte-identical to #350's
+    (`tools.render_incomplete_notice`) unless this call uses a filter that a
+    row awaiting the version-5 backfill can only approximate (`text`,
+    `recurring` — `task_query.pending_v5_filters`) while such rows exist
+    among the matches of every other filter: then it names those filters,
+    and that the next index pass fixes it (the count is line 1's
+    `task ids pending`). Never silent."""
+    tools = _t()
+    pending = pending_v5_filters(page.args) if page.ids_pending else []
+    if not pending:
+        return tools.render_incomplete_notice(page.not_scanned, page.failed)
+    # Short on purpose: it is reserved before any row, and the counts are
+    # in line 1 (`task ids pending`). At most 120 characters.
+    reasons = []
+    if page.not_scanned:
+        reasons.append("unscanned notes")
+    if page.failed:
+        reasons.append("unindexable tasks")
+    lead = "Incomplete list: " + (", ".join(reasons) + "; " if reasons else "")
+    names = " and ".join(pending)
+    return (f"{lead}{names} filter{'s' if len(pending) > 1 else ''} approximate "
+            "until the next index pass.")
 
 
 def _row_unit(row: dict, *, detail: str, context: bool) -> list[str]:
@@ -357,7 +398,7 @@ def render_list_tasks(page: TaskPage, *, budget: int) -> str | QueryRefusal:
     n = page.args
     worst_header = render_header_line1(page, shown=999, more=True)
     qline = render_query_line(page) if page.query_line else None
-    notice = tools.render_incomplete_notice(page.not_scanned, page.failed)
+    notice = render_task_notice(page)
     fixed = len(worst_header) + (len(qline) + 1 if qline else 0) + (len(notice) + 1 if notice else 0)
     room = budget - fixed - 1 - FOOTER_MAX - 1
 
@@ -391,6 +432,8 @@ def render_list_tasks(page: TaskPage, *, budget: int) -> str | QueryRefusal:
             rendered.append([line])
             last_index = i
         break
+    if not page.rows:
+        return _render_empty(page, budget=budget, qline=qline, notice=notice)
     more = page.more_rows or last_index < len(page.rows) - 1
     lines = [render_header_line1(page, shown=len(rendered), more=more)]
     if qline:
@@ -405,6 +448,28 @@ def render_list_tasks(page: TaskPage, *, budget: int) -> str | QueryRefusal:
     out = "\n".join(lines)
     if len(out) > budget:
         return cap_refusal(budget, len(out))
+    return out
+
+
+def _render_empty(page: TaskPage, *, budget: int, qline: str | None,
+                  notice: str | None) -> str:
+    """An empty result is the header, never a refusal (spec "Empty
+    result"). When it does not fit the cap, the echoes give way step by
+    step: the query line's free-text echoes and exclusion names, then line
+    1's folder echo. The mandatory parts (timezone, today, every resolved
+    date, every count) are never cut."""
+    tail = [notice] if notice else []
+    steps = [(HEADER_MAX, None, QUERY_LINE_MAX), (HEADER_MAX, 8, 0), (HEADER_MAX, 1, 0),
+             (0, 1, 0)]
+    out = ""
+    for header_max, echo_max, line_max in steps:
+        lines = [_header_line1(page, shown=0, more=False, line_max=header_max)]
+        if page.query_line:
+            lines.append(qline if echo_max is None and qline else
+                         _query_line(page, line_max=line_max, echo_max=echo_max))
+        out = "\n".join(lines + tail)
+        if len(out) <= budget:
+            return out
     return out
 
 
