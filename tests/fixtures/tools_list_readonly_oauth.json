@@ -17,5 +17,6 @@
  "request_download",
  "list_tasks",
  "get_changes",
- "hybrid_search"
+ "hybrid_search",
+ "task_agenda"
 ]

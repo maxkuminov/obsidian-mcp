@@ -38,7 +38,8 @@ from src.services.pool_budget import CLASS_CONNECTIONS, budget_terms
 # 3: `list_tasks` added to `scan` (#350).
 # 4: `get_changes` added to `scan` (#351).
 # 5: hybrid_search added to embedding (#354).
-CLASS_MAPPING_VERSION = 5
+# 6: complete_task, update_task, add_task added to write; task_agenda to scan (#428).
+CLASS_MAPPING_VERSION = 6
 
 TOOL_CLASSES = {
     # `hybrid_search` makes the same provider round trip as `semantic_search`,
@@ -47,10 +48,15 @@ TOOL_CLASSES = {
     "find_related": "vector",
     **dict.fromkeys(("create_note", "edit_note", "move_note", "delete_note",
                      "set_frontmatter", "write_file", "delete_file",
-                     "import_from_url"), "write"),
+                     "import_from_url",
+                     # #428: the three task write tools publish a note through
+                     # the same envelope as `edit_note` (mapping version 6).
+                     "complete_task", "update_task", "add_task"), "write"),
     **dict.fromkeys(("keyword_search", "list_notes", "get_tags",
                      "get_neighborhood", "find_orphans", "list_files",
-                     "list_tasks", "get_changes"), "scan"),
+                     "list_tasks", "get_changes",
+                     # #428: one snapshot of `note_tasks`, like `list_tasks`.
+                     "task_agenda"), "scan"),
     **dict.fromkeys(("read_note", "read_file", "get_recent", "get_vault_guide",
                      "get_backlinks", "get_links", "request_upload",
                      "check_upload", "request_download"), "light"),

@@ -37,14 +37,13 @@ from src.auth.session import (
     current_user_id,
 )
 from src.config import (
-    LIST_TASKS_MAX_TAG_ARGS,
     MAX_CHUNKS_PER_NOTE,
     MAX_IMPORT_URL_CHARS,
     MAX_LINKS_PER_NOTE,
     MAX_MOVE_REWRITE_BYTES,
     MAX_NOTE_BYTES,
     MAX_SEARCH_QUERY_CHARS,
-    TASK_TAG_MAX_CHARS,
+    TASK_SIMILAR_SCAN_MAX,
     TASK_TEXT_MAX_CHARS,
     max_move_rewrite_sources,
     settings,
@@ -57,7 +56,7 @@ from src.mcp_server.auth import (
     current_permission,
     current_transport_queue_ms,
 )
-from src.mcp_server import tool_permissions
+from src.mcp_server import task_render, tool_permissions
 from src.mcp_server.read_result import (
     ReadNoteResult,
     apply_metadata_budget,
@@ -85,6 +84,15 @@ from src.services.search import full_text_search
 from src.services.usage_params import render_usage_params
 from src.services.usage_stats import OVER_QUOTA_PARAM
 from src.services import change_feed, transfer, vault_fs
+from src.services import (
+    task_dates,
+    task_index,
+    task_line,
+    task_query,
+    task_recurrence,
+    task_write,
+)
+from src.services import task_settings as task_settings_service
 from src.services.note_hash import canonical_note_hash
 from src.services.vault import (
     MAX_PATH_CHARS,
@@ -8553,20 +8561,19 @@ async def delete_file_impl(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# list_tasks (#350, design D6–D8)
+# list_tasks and task_agenda: the #350 row helpers (#428 wiring below)
 # ════════════════════════════════════════════════════════════════════════════
 #
-# Reads `note_tasks` joined to `notes_metadata` under the total owner mapping,
-# never a file. One `REPEATABLE READ, READ ONLY` snapshot for the page, every
-# header count and the compact-cursor resolution. Every note-controlled field
-# is rendered through `_one_line` and the path through `_escape_task_path`, so
-# a note cannot forge a server-authored line (#344, Codex C-2). The response is
-# bounded by `MAX_READ_RESPONSE_CHARS` with an abbreviated first row, so every
-# page with a match renders one row and its cursor advances (D7).
+# The query and the page renderer moved to `src/services/task_query.py` and
+# `src/mcp_server/task_render.py` (#428, D12/D13). What stays here are the
+# #350 row and header helpers `task_render` builds on (it imports this module
+# lazily, at call time): every note-controlled field goes through `_one_line`
+# and the path through `_escape_task_path`, so a note cannot forge a
+# server-authored line (#344, Codex C-2).
 
-LIST_TASKS_STATUSES = ("open", "done", "cancelled", "all")
-LIST_TASKS_DEFAULT_LIMIT = 100
-LIST_TASKS_CURSOR_MAX_CHARS = 2048
+#: The retired #350 cursor version. `list_tasks` refuses it since #428 (D12:
+#: a deliberate one-time break); `encode_task_cursor` is kept so the tests
+#: can mint one and see it refused.
 LIST_TASKS_CURSOR_VERSION = 1
 #: Fixed bounds of D7, each pinned by `tests/test_list_tasks_render.py`.
 LIST_TASKS_HEADER_MAX = 480
@@ -8577,53 +8584,13 @@ LIST_TASKS_ECHO_MAX = 64
 #: minus this much, so some text always shows.
 _ABBREVIATED_TEXT_RESERVE = 40
 
-_ISO_DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
-_HEX32_RE = re.compile(r"[0-9a-f]{32}")
-_HEX16_RE = re.compile(r"[0-9a-f]{16}")
 _PATH_ESCAPE_RE = re.compile(r"[^\S ]|\\")
-
-_CURSOR_FOREIGN = (
-    "list_tasks: cursor does not belong to this query; start without one."
-)
-_CURSOR_GONE = (
-    "list_tasks: the note this cursor stopped at is no longer indexed; start "
-    "without a cursor."
-)
-
-
-class _TaskCursorRefused(Exception):
-    def __init__(self, prose: str):
-        super().__init__(prose)
-        self.prose = prose
 
 
 def _task_owner_discriminator(uid: int | None) -> str:
     """`o`: bound to the owner scope, never to a credential, and no raw id."""
     scope = "owner:null" if uid is None else f"owner:{uid}"
     return hashlib.sha256(scope.encode("utf-8")).hexdigest()[:16]
-
-
-def _task_filters_digest(
-    folder: str | None,
-    status: str,
-    due_by: str | None,
-    scheduled_by: str | None,
-    tags: list[str] | None,
-) -> str:
-    """`f`: the call's normalised filters (`limit` excluded)."""
-    normalised = json.dumps(
-        {
-            "folder": folder or "",
-            "status": status,
-            "due_by": due_by or "",
-            "scheduled_by": scheduled_by or "",
-            "tags": sorted(set(tags or [])),
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return hashlib.sha256(normalised.encode("utf-8")).hexdigest()[:16]
 
 
 def _task_path_hash(path: str) -> str:
@@ -8638,8 +8605,8 @@ def _b64url(data: bytes) -> str:
 
 def encode_task_cursor(*, owner: str, filters: str, due_key: str, path: str,
                        line: int, compact: bool) -> str:
-    """The `next` token (design D8): full form carries the path, compact form
-    its hash. Never a `notes_metadata.id`."""
+    """The retired version-1 `next` token (#350 D8), which `list_tasks` now
+    refuses (#428 D12). Kept for the tests that prove the refusal."""
     payload: dict = {"v": LIST_TASKS_CURSOR_VERSION, "o": owner, "f": filters,
                      "d": due_key}
     if compact:
@@ -8651,61 +8618,8 @@ def encode_task_cursor(*, owner: str, filters: str, due_key: str, path: str,
     return _b64url(raw.encode("utf-8"))
 
 
-def decode_task_cursor(token: str, *, owner: str, filters: str) -> dict:
-    """Validate a `next` token. Returns `{"d", "l", "p" | "h"}`; raises
-    `_TaskCursorRefused` on any failure (D8's checks, in full)."""
-    try:
-        if not re.fullmatch(r"[A-Za-z0-9_-]+", token or ""):
-            raise ValueError("alphabet")
-        raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
-        payload = json.loads(raw.decode("utf-8"))
-    except (ValueError, binascii.Error, UnicodeDecodeError):
-        raise _TaskCursorRefused(_CURSOR_FOREIGN) from None
-    if not isinstance(payload, dict):
-        raise _TaskCursorRefused(_CURSOR_FOREIGN)
-    keys = set(payload)
-    if keys not in ({"v", "o", "f", "d", "p", "l"}, {"v", "o", "f", "d", "h", "l"}):
-        raise _TaskCursorRefused(_CURSOR_FOREIGN)
-    v, o, f, d, line = (payload[k] for k in ("v", "o", "f", "d", "l"))
-    if type(v) is not int or v != LIST_TASKS_CURSOR_VERSION:
-        raise _TaskCursorRefused(_CURSOR_FOREIGN)
-    if not (isinstance(o, str) and _HEX16_RE.fullmatch(o)) or not (
-        isinstance(f, str) and _HEX16_RE.fullmatch(f)
-    ):
-        raise _TaskCursorRefused(_CURSOR_FOREIGN)
-    if not isinstance(d, str) or (d != "infinity" and _parse_iso_date(d) is None):
-        raise _TaskCursorRefused(_CURSOR_FOREIGN)
-    if type(line) is not int or not 1 <= line <= 2_147_483_647:
-        raise _TaskCursorRefused(_CURSOR_FOREIGN)
-    out: dict = {"d": d, "l": line}
-    if "p" in payload:
-        p = payload["p"]
-        # A NUL or an unpaired surrogate can never be a stored path, and would
-        # fail at the bind as a database error rather than a refusal.
-        if (not isinstance(p, str) or not p or len(p) > MAX_PATH_CHARS
-                or "\x00" in p or not is_encodable(p)):
-            raise _TaskCursorRefused(_CURSOR_FOREIGN)
-        out["p"] = p
-    else:
-        h = payload["h"]
-        if not isinstance(h, str) or not _HEX32_RE.fullmatch(h):
-            raise _TaskCursorRefused(_CURSOR_FOREIGN)
-        out["h"] = h
-    # The binding checks: another owner's boundary, or another query's.
-    if o != owner or f != filters:
-        raise _TaskCursorRefused(_CURSOR_FOREIGN)
-    return out
 
 
-def _parse_iso_date(value: str):
-    import datetime as _dt
-
-    if not isinstance(value, str) or not _ISO_DATE_RE.fullmatch(value):
-        return None
-    try:
-        return _dt.date.fromisoformat(value)
-    except ValueError:
-        return None
 
 
 def _escape_task_path(path: str) -> str:
@@ -8858,74 +8772,64 @@ def render_abbreviated_task_row(row, room: int) -> str:
     return assemble(path_shown, path_cut, text[:text_room], text_cut)
 
 
-def _task_due_key(due) -> str:
-    return "infinity" if due is None else due.isoformat()
+# ════════════════════════════════════════════════════════════════════════════
+# The task tools (#428): list_tasks, task_agenda, complete_task, update_task,
+# add_task
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Thin wiring. The two read tools delegate to `task_query` (validation, one
+# `REPEATABLE READ, READ ONLY` snapshot) and `task_render` (the bounded page).
+# The three write tools run `edit_note`'s safety envelope piece by piece, in
+# the normative order of design D2, around the pure planners of `task_write`:
+# the id is re-resolved from the bytes read through the anchored descriptor,
+# the plan is verified, and publication is bound to exactly those bytes
+# (`write_file_at(expected=existing_bytes)`). After a confirmed publication the
+# note's task rows are refreshed (`task_index`, D10) and then the change-feed
+# event is recorded. Usage params never carry task text, description or
+# context (D17).
+
+#: D2: attempts in total when publication meets an in-call conflict and the
+#: caller supplied no `expected_hash`. Nothing is carried between attempts.
+TASK_WRITE_MAX_ATTEMPTS = 3
+#: Longest id the grammar admits is 23 characters (`<12 hex>.9999of9999`);
+#: anything longer is refused pre-body like any over-long argument.
+TASK_ID_ARG_MAX_CHARS = 64
+#: Note-controlled text quoted in a refusal or a similar-task listing.
+_TASK_QUOTE_MAX = 120
+_TASK_STATUSES_WRITABLE = ("open", "in_progress", "cancelled")
+_TASK_CLEARABLE = ("due", "scheduled", "start", "priority", "recurrence")
 
 
-def render_task_results(rows: list, *, budget: int, header_args: dict,
-                        cursor_args: dict, more_rows: bool) -> str:
-    """The `list_tasks` response (design D7/D8), at most `budget` characters.
-
-    `rows` are the fetched rows in order (at most `limit`); `more_rows` says
-    whether the query had a row past them. The header and the closing notice
-    are reserved first, the footer room next, then rows are appended while
-    each fits; a first row that does not fit is rendered abbreviated.
-    """
-    worst_header = render_task_header(**{**header_args, "shown": 999, "more": True})
-    notice = render_incomplete_notice(header_args["not_scanned"], header_args["failed"])
-    fixed = len(worst_header) + (len(notice) + 1 if notice else 0)
-    # Room for rows before the footer: header + "\n" + rows… + "\n" + footer.
-    room = budget - fixed - 1 - LIST_TASKS_FOOTER_MAX - 1
-
-    rendered: list[str] = []
-    used = 0
-    last = None
-    stopped = False
-    for row in rows:
-        line = render_task_row(row)
-        cost = len(line) + 1
-        if used + cost <= room:
-            rendered.append(line)
-            used += cost
-            last = row
-            continue
-        stopped = True
-        if not rendered:
-            rendered.append(render_abbreviated_task_row(row, room - 1))
-            last = row
-        break
-    more = stopped or more_rows
-    if stopped and rendered and last is rows[-1] and not more_rows:
-        # The abbreviated or last row was the final match: nothing remains.
-        more = len(rendered) < len(rows)
-    header = render_task_header(**{**header_args, "shown": len(rendered), "more": more})
-    lines = [header, *rendered]
-    if notice:
-        lines.append(notice)
-    if more and last is not None:
-        so_far = len("\n".join(lines)) + 1
-        full = "next: " + encode_task_cursor(
-            **cursor_args, due_key=_task_due_key(last["due"]),
-            path=last["file_path"], line=last["line"], compact=False,
-        )
-        if len(full) - len("next: ") <= LIST_TASKS_CURSOR_MAX_CHARS and so_far + len(full) <= budget:
-            lines.append(full)
-        else:
-            lines.append("next: " + encode_task_cursor(
-                **cursor_args, due_key=_task_due_key(last["due"]),
-                path=last["file_path"], line=last["line"], compact=True,
-            ))
-    return "\n".join(lines)
+def _task_now():
+    """The clock the task tools resolve "today" against: `None` is the real
+    clock. A test replaces this function to pin a date (D19)."""
+    return None
 
 
-def _list_tasks_refusal(message: str) -> BodyOutcome:
-    return _body_refusal(message, "invalid_argument")
+async def _effective_task_settings(uid: int | None):
+    """The caller's `EffectiveTaskSettings`, read once per call (D14)."""
+    async with async_session() as session:
+        return await task_settings_service.effective(session, uid)
+
+
+def _query_refusal(refusal: "task_query.QueryRefusal") -> BodyOutcome:
+    """A `task_query` / `task_render` refusal, one to one (nothing written:
+    a read)."""
+    return _body_refusal(refusal.prose, refusal.code)
 
 
 @_tracked(
     "list_tasks",
-    ["folder", "status", "due_by", "scheduled_by", "tags", "limit", "cursor"],
-    arg_char_caps={"cursor": LIST_TASKS_CURSOR_MAX_CHARS, "folder": MAX_PATH_CHARS},
+    ["folder", "status", "due_by", "scheduled_by", "tags", "limit", "cursor",
+     "due_from", "scheduled_from", "done_from", "done_by", "undated", "has_due",
+     "text", "priority", "recurring", "exclude_tags", "path", "order_by",
+     "detail", "context", "scope"],
+    arg_char_caps={
+        "cursor": task_query.CURSOR_MAX_CHARS,
+        "folder": MAX_PATH_CHARS,
+        "path": MAX_PATH_CHARS,
+        "text": task_query.TEXT_MAX_CHARS,
+    },
 )
 async def list_tasks_impl(
     folder: str | None = None,
@@ -8933,161 +8837,681 @@ async def list_tasks_impl(
     due_by: str | None = None,
     scheduled_by: str | None = None,
     tags: list[str] | None = None,
-    limit: int = LIST_TASKS_DEFAULT_LIMIT,
+    limit: int = task_query.DEFAULT_LIMIT,
     cursor: str | None = None,
+    due_from: str | None = None,
+    scheduled_from: str | None = None,
+    done_from: str | None = None,
+    done_by: str | None = None,
+    undated: bool | None = None,
+    has_due: bool | None = None,
+    text: str | None = None,
+    priority: list[str] | None = None,
+    recurring: bool | None = None,
+    exclude_tags: list[str] | None = None,
+    path: str | None = None,
+    order_by: str = "due",
+    detail: str = "full",
+    context: bool = False,
+    scope: str = "default",
 ) -> str:
-    """Checkbox tasks from the index (#350). See `server.list_tasks`."""
-    from sqlalchemy import Date, Integer, String, and_, bindparam, cast, func, select
-    from src.models.db import NoteMetadata, NoteTask
-    from src.services.filters import folder_prefix_clause
-    from src.services.tasks import TASKS_SINCE_EXTRACTION_VERSION
+    """Checkbox tasks from the index (#350, #428 D12). See `server.list_tasks`.
 
-    # ── argument validation, before any query ──────────────────────────────
-    if status not in LIST_TASKS_STATUSES:
-        return _list_tasks_refusal(
-            f"list_tasks: status must be one of {', '.join(LIST_TASKS_STATUSES)} "
-            f"(got {_echo(str(status))!r})."
-        )
-    dates = {}
-    for name, value in (("due_by", due_by), ("scheduled_by", scheduled_by)):
-        if value is None:
-            continue
-        parsed = _parse_iso_date(value)
-        if parsed is None:
-            return _list_tasks_refusal(
-                f"list_tasks: {name} must be a YYYY-MM-DD date "
-                f"(got {_echo(str(value))!r})."
-            )
-        dates[name] = parsed
-    wanted_tags: list[str] = []
-    if tags is not None:
-        if not isinstance(tags, list) or len(tags) > LIST_TASKS_MAX_TAG_ARGS:
-            return _list_tasks_refusal(
-                f"list_tasks: tags accepts at most {LIST_TASKS_MAX_TAG_ARGS} entries."
-            )
-        for entry in tags:
-            if not isinstance(entry, str):
-                return _list_tasks_refusal("list_tasks: every tags entry must be a string.")
-            stripped = entry[1:] if entry.startswith("#") else entry
-            if not 1 <= len(stripped) <= TASK_TAG_MAX_CHARS:
-                return _list_tasks_refusal(
-                    f"list_tasks: each tags entry must be 1 to {TASK_TAG_MAX_CHARS} "
-                    "characters after a leading '#' is removed."
-                )
-            wanted_tags.append(stripped)
-    limit = _clamp_limit(limit)
-    folder = folder or None
-    uid = current_user_id.get()
-    owner = _task_owner_discriminator(uid)
-    filters = _task_filters_digest(folder, status, due_by, scheduled_by, wanted_tags)
-    boundary = None
-    if cursor:
-        try:
-            boundary = decode_task_cursor(cursor, owner=owner, filters=filters)
-        except _TaskCursorRefused as e:
-            return _list_tasks_refusal(e.prose)
-
-    owner_pred = _note_owner_predicate(uid)
-    join_on = and_(NoteMetadata.id == NoteTask.note_id, owner_pred)
-
-    def scoped(stmt, *, with_tags: bool):
-        if folder:
-            stmt = stmt.where(folder_prefix_clause(folder))
-        if status != "all":
-            stmt = stmt.where(NoteTask.state == status)
-        if "due_by" in dates:
-            stmt = stmt.where(NoteTask.due <= dates["due_by"])
-        if "scheduled_by" in dates:
-            stmt = stmt.where(NoteTask.scheduled <= dates["scheduled_by"])
-        if with_tags and wanted_tags:
-            stmt = stmt.where(NoteTask.tags.contains(wanted_tags))
-        return stmt
-
-    infinity = cast(bindparam("inf", "infinity", type_=String), Date)
-    sort_due = func.coalesce(NoteTask.due, infinity)
-
-    async with async_session() as session:
-        # One snapshot for the page, the counts and the cursor (#344's pattern).
-        await session.execute(
-            text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-        )
-        if boundary is not None and "h" in boundary:
-            matches = (await session.execute(
-                select(NoteMetadata.file_path).where(
-                    owner_pred,
-                    func.substr(
-                        func.encode(
-                            func.sha256(func.convert_to(NoteMetadata.file_path, "UTF8")),
-                            "hex",
-                        ),
-                        1,
-                        32,
-                    ) == boundary["h"],
-                ).limit(2)
-            )).scalars().all()
-            if len(matches) != 1:
-                return _list_tasks_refusal(_CURSOR_GONE)
-            boundary["p"] = matches[0]
-
-        not_scanned = (await session.execute(
-            select(func.count()).select_from(NoteMetadata).where(
-                owner_pred,
-                NoteMetadata.extraction_version < TASKS_SINCE_EXTRACTION_VERSION,
-            )
-        )).scalar_one()
-        note_counts = select(
-            func.count().filter(NoteMetadata.tasks_failed.is_(True)),
-            func.count().filter(NoteMetadata.tasks_truncated.is_(True)),
-        ).select_from(NoteMetadata).where(owner_pred)
-        if folder:
-            note_counts = note_counts.where(folder_prefix_clause(folder))
-        failed, capped = (await session.execute(note_counts)).one()
-        cut_tags = None
-        if wanted_tags:
-            cut_tags = (await session.execute(
-                scoped(
-                    select(func.count()).select_from(NoteTask).join(NoteMetadata, join_on),
-                    with_tags=False,
-                ).where(NoteTask.tags_cut.is_(True))
-            )).scalar_one()
-
-        page = scoped(
-            select(
-                NoteTask.status_char, NoteMetadata.file_path, NoteTask.line,
-                NoteTask.due, NoteTask.scheduled, NoteTask.start, NoteTask.done_on,
-                NoteTask.priority, NoteTask.tags, NoteTask.tags_cut,
-                NoteTask.heading_path, NoteTask.text, NoteTask.text_cut,
-            ).select_from(NoteTask).join(NoteMetadata, join_on),
-            with_tags=True,
-        )
-        if boundary is not None:
-            page = page.where(
-                text(
-                    "(coalesce(note_tasks.due, 'infinity'::date), "
-                    "notes_metadata.file_path, note_tasks.line) > "
-                    "(CAST(:cd AS date), CAST(:cp AS varchar), :cl)"
-                ).bindparams(
-                    bindparam("cd", boundary["d"], type_=String),
-                    bindparam("cp", boundary["p"], type_=String),
-                    bindparam("cl", boundary["l"], type_=Integer),
-                )
-            )
-        page = page.order_by(sort_due, NoteMetadata.file_path, NoteTask.line).limit(limit + 1)
-        fetched = [dict(r._mapping) for r in (await session.execute(page)).all()]
-
-    more_rows = len(fetched) > limit
-    rows = fetched[:limit]
-    return render_task_results(
-        rows,
-        budget=settings.max_read_response_chars,
-        header_args=dict(
-            status=status, folder=folder, due_by=due_by, scheduled_by=scheduled_by,
-            tags=wanted_tags, not_scanned=not_scanned, failed=failed, capped=capped,
-            cut_tags=cut_tags,
-        ),
-        cursor_args=dict(owner=owner, filters=filters),
-        more_rows=more_rows,
+    `text` is logged like `keyword_search`'s `query` (the caller's search
+    terms, not note content; D17).
+    """
+    args = task_query.ListTasksArgs(
+        folder=folder, status=status, due_by=due_by, scheduled_by=scheduled_by,
+        tags=tags, limit=limit, cursor=cursor, due_from=due_from,
+        scheduled_from=scheduled_from, done_from=done_from, done_by=done_by,
+        undated=undated, has_due=has_due, text=text, priority=priority,
+        recurring=recurring, exclude_tags=exclude_tags, path=path,
+        order_by=order_by, detail=detail, context=context, scope=scope,
     )
+    now = _task_now()
+    # Every argument is validated before any statement (the settings read
+    # included): the defaults decide validity exactly as the caller's own
+    # settings do — they change only the zone a relative date resolves in and
+    # the exclusion lists, never whether an argument is acceptable.
+    pre = task_query.normalise_list_args(args, task_settings_service.defaults(), now=now)
+    if isinstance(pre, task_query.QueryRefusal):
+        return _query_refusal(pre)
+    uid = current_user_id.get()
+    effective = await _effective_task_settings(uid)
+    page = await task_query.list_tasks_query(
+        uid, args, effective, now=now, session_factory=async_session
+    )
+    if isinstance(page, task_query.QueryRefusal):
+        return _query_refusal(page)
+    out = task_render.render_list_tasks(page, budget=settings.max_read_response_chars)
+    if isinstance(out, task_query.QueryRefusal):
+        return _query_refusal(out)
+    return out
+
+
+@_tracked(
+    "task_agenda",
+    ["date", "days", "folder", "tags", "exclude_tags", "scope"],
+    arg_char_caps={"folder": MAX_PATH_CHARS},
+)
+async def task_agenda_impl(
+    date: str = "today",
+    days: int = 7,
+    folder: str | None = None,
+    tags: list[str] | None = None,
+    exclude_tags: list[str] | None = None,
+    scope: str = "default",
+) -> str:
+    """The dated overview of open tasks (#428 D13). See `server.task_agenda`."""
+    budget = settings.max_read_response_chars
+    if budget < task_render.AGENDA_MIN_BUDGET:
+        # Decided by configuration alone: refused before any statement.
+        return _query_refusal(task_render.cap_refusal(
+            budget, task_render.AGENDA_MIN_BUDGET, what="task_agenda"))
+    uid = current_user_id.get()
+    effective = await _effective_task_settings(uid)
+    page = await task_query.task_agenda_query(
+        uid,
+        task_query.AgendaArgs(date=date, days=days, folder=folder, tags=tags,
+                              exclude_tags=exclude_tags, scope=scope),
+        effective, now=_task_now(), session_factory=async_session,
+    )
+    if isinstance(page, task_query.QueryRefusal):
+        return _query_refusal(page)
+    out = task_render.render_task_agenda(page, budget=budget)
+    if isinstance(out, task_query.QueryRefusal):
+        return _query_refusal(out)
+    return out
+
+
+# ── the write envelope (D2, D3, D16) ────────────────────────────────────────
+
+
+def _task_refusal(prose: str, code: str, path: str | None) -> BodyOutcome:
+    """A typed task-tool refusal: `nothing_written: true` and the path (D16)."""
+    return BodyOutcome(
+        prose,
+        refusals.Refusal(code=code, path=_precondition_path(path), nothing_written=True),
+    )
+
+
+def _task_quote(value: str | None, limit: int = _TASK_QUOTE_MAX) -> str:
+    """Note-controlled text on one line, cut at `limit` with `…`."""
+    shown = _one_line(value or "")
+    return shown if len(shown) <= limit else shown[: limit - 1] + "…"
+
+
+def _task_ref_line(ref, *, with_path: bool) -> str:
+    """One `TaskRef` as a listing line: `path:line id — text`."""
+    where = f"`{_escape_task_path(ref.path)}`:{ref.line}" if with_path and ref.path else f"line {ref.line}"
+    return f"- {where} id {ref.id or 'pending'} — {_task_quote(ref.text, 80)}"
+
+
+def _task_write_refusal(tool: str, path: str, r: "task_write.TaskWriteRefusal") -> BodyOutcome:
+    """A planner refusal, one to one onto its code (D16). The section-write
+    defects reuse `edit_note`'s messages (same shapes, same repair)."""
+    if r.code == "content_unsafe" and isinstance(r.detail, tuple) and r.detail:
+        if r.detail[0] == "frontmatter_defect":
+            return _frontmatter_defect_error(tool, path, r.detail[1])
+        if r.detail[0] == "unmatched_fence":
+            err = _unmatched_fence_error(path, r.detail[1], r.detail[2])
+            if err is not None:
+                return err.with_prose(err.prose.replace("edit_note:", f"{tool}:", 1))
+    reason = r.reason.rstrip(".")
+    if r.code == refusals.PRECONDITION_REQUIRED:
+        return _precondition_refusal(
+            f"{tool}: {reason}. Nothing was written.", refusals.PRECONDITION_REQUIRED, path=path)
+    prose = f"{tool}: {path}: {reason}. Nothing was written."
+    if r.matches:
+        with_path = r.code == "duplicate_task"
+        prose += "\n" + "\n".join(_task_ref_line(m, with_path=with_path) for m in r.matches)
+    return _task_refusal(prose, r.code, path)
+
+
+def _task_id_error(tool: str, task_id, expected_hash, path: str) -> BodyOutcome | None:
+    """D2 step 2 for `complete_task` / `update_task`: the id grammar, and a
+    suffixed id without `expected_hash` refused at entry, before any read
+    (D1/D3: in every deployment mode)."""
+    parsed = task_line.parse_id(task_id)
+    if parsed is None:
+        return _task_refusal(
+            f"{tool}: id is not a task id. An id is 12 lowercase hex characters, "
+            "optionally followed by `.<i>of<n>`, exactly as a `list_tasks` or "
+            "`task_agenda` row prints it. Nothing was written.",
+            "invalid_argument", path,
+        )
+    if parsed.suffixed and expected_hash is None:
+        return _precondition_refusal(
+            f"{tool}: the id `{task_id}` names one of several identical task lines "
+            "by position, so it is accepted only together with expected_hash. "
+            "Call read_note on the note and pass its content_hash as "
+            "expected_hash. Nothing was written.",
+            refusals.PRECONDITION_REQUIRED, path=path,
+        )
+    return None
+
+
+class _TaskDates:
+    """D19: every date argument of one call, resolved once in the caller's
+    task timezone, with what was relative recorded for the response echo."""
+
+    def __init__(self, tool: str, path: str, effective, now):
+        self.tool = tool
+        self.path = path
+        self.effective = effective
+        self.now = now
+        self.today = task_dates.today(effective.timezone, now=now)
+        self.echo: list[str] = []
+        self.used_today = False
+
+    def resolve(self, name: str, value, *, default_today: bool = False):
+        """`(date | None, refusal | None)`."""
+        if value is None and not default_today:
+            return None, None
+        given = "today" if value is None else value
+        got = task_dates.resolve(given, self.effective.timezone, now=self.now)
+        if isinstance(got, task_dates.InvalidDate):
+            return None, _task_refusal(
+                f"{self.tool}: {name} must be YYYY-MM-DD, today, tomorrow, "
+                f"yesterday, +Nd or -Nd ({got.reason}). Nothing was written.",
+                "invalid_argument", self.path,
+            )
+        if value is None or task_dates.is_relative(given):
+            self.used_today = True
+            self.echo.append(f"{name}: {_task_quote(str(given), 16)}={got.isoformat()}")
+        return got, None
+
+    def line(self) -> str | None:
+        """The D16 dates line, when a relative date or "today" was used."""
+        if not self.used_today:
+            return None
+        zone = self.effective.timezone
+        if self.effective.timezone_fallback:
+            zone += " (configured zone unavailable)"
+        parts = [f"timezone: {zone}", f"today: {self.today.isoformat()}", *self.echo]
+        return "dates — " + " — ".join(parts)
+
+
+def _task_tags_error(tool: str, name: str, value, path: str):
+    """`(tuple of tags, refusal | None)` for a tag-list argument."""
+    if value is None:
+        return (), None
+    if not isinstance(value, list) or len(value) > task_line.MAX_NEW_TASK_TAGS:
+        return (), _task_refusal(
+            f"{tool}: {name} accepts a list of at most {task_line.MAX_NEW_TASK_TAGS} "
+            "tags. Nothing was written.", "invalid_argument", path)
+    for tag in value:
+        bare = tag[1:] if isinstance(tag, str) and tag.startswith("#") else tag
+        if not task_line.valid_tag(bare):
+            return (), _task_refusal(
+                f"{tool}: every {name} entry must be an inline tag — a letter, then "
+                "letters, digits, `_`, `/` or `-`, at most 128 characters, a "
+                "leading `#` optional. Nothing was written.", "invalid_argument", path)
+    return tuple(value), None
+
+
+def _task_text_error(tool: str, name: str, value, path: str) -> BodyOutcome | None:
+    if value is None:
+        return None
+    got = task_line.validate_description(value)
+    if isinstance(got, task_line.TaskLineRefusal):
+        return _task_refusal(
+            f"{tool}: {name}: {got.reason}. It must be one line of 1–1,000 "
+            "characters with no Tasks-plugin field emoji and no `^block` suffix. "
+            "Nothing was written.", "invalid_argument", path)
+    return None
+
+
+def _task_priority_error(tool: str, value, path: str) -> BodyOutcome | None:
+    if value is None or value in task_line.PRIORITY_SYMBOLS:
+        return None
+    return _task_refusal(
+        f"{tool}: priority must be highest, high, medium, low or lowest. "
+        "Nothing was written.", "invalid_argument", path)
+
+
+def _task_recurrence_error(tool: str, value, path: str) -> BodyOutcome | None:
+    if value is None:
+        return None
+    rule = task_recurrence.parse_rule(value) if isinstance(value, str) else None
+    if isinstance(rule, task_recurrence.Rule):
+        return None
+    return _task_refusal(
+        f"{tool}: the recurrence rule is outside the supported grammar (every "
+        "day / N days / weekday / week / N weeks / week on <weekday>[, …] / "
+        "<weekday>[, …] / month / N months / month on the <Nth> / month on the "
+        "last / year / N years / <month> on the <Nth>, optionally `when done`). "
+        "Nothing was written.", "recurrence_unsupported", path)
+
+
+def _task_diff(path: str, old: str, new: str) -> str:
+    import difflib
+
+    return "".join(difflib.unified_diff(
+        old.splitlines(keepends=True), new.splitlines(keepends=True),
+        fromfile=path, tofile=path, lineterm="",
+    ))
+
+
+async def _refresh_task_rows(uid: int | None, target, published: bytes):
+    """D10 R1, after a confirmed publication. Never raises; a refresh that
+    cannot run leaves the write standing (`index: may lag (<code>)`)."""
+    try:
+        root = _vault_root(uid)
+    except Exception:  # noqa: BLE001 - the write stands; the pass converges
+        return task_index.RefreshResult(task_index.LAGGED, task_index.LAG_ROOT_CHANGED)
+    return await task_index.refresh_note_tasks(
+        uid=uid, root=root, target=target, rel=target.rel, published=published
+    )
+
+
+async def _run_task_write(
+    *,
+    tool: str,
+    path: str,
+    expected_hash: str | None,
+    dry_run: bool,
+    plan_fn,
+    describe,
+    after_plan=None,
+):
+    """D2 steps 3–16 for one task write. `plan_fn(text)` is a pure planner
+    (run off the event loop); `describe(plan, rel, extra)` renders the D16
+    lines; `after_plan(plan, rel)` (add_task's index-side duplicate scan) may
+    return a refusal, else its result is passed to `describe` as `extra`.
+
+    **The bounded retry (D2).** When publication reports an in-call conflict
+    and the caller supplied no `expected_hash`, the whole sequence repeats from
+    the read — re-read, re-resolve, re-plan, re-verify, publish — at most
+    `TASK_WRITE_MAX_ATTEMPTS` times in total; nothing is carried between
+    attempts. With `expected_hash` there is no retry. All attempts run inside
+    the one `_tracked` call, so the gates, the quota, the usage row and the
+    change-feed event happen once.
+    """
+    uid = current_user_id.get()
+    # D2 step 3: ahead of `open_mutable` and every read.
+    if err := _precondition_syntax_error(tool, expected_hash, path=path):
+        return err
+    try:
+        target = open_mutable(path, user_id=uid)
+    except ValueError as e:
+        return _body_refusal(str(e), "validation_failed")
+    with target:
+        if err := _leaf_state_error(
+            target, path,
+            missing=f"Note not found: {path}. {tool} never creates a note; "
+            "use create_note to create it.",
+        ):
+            return err
+        rel = target.rel
+        cap_name, cap_bytes = _note_precondition_cap()
+        may_retry = expected_hash is None
+        for attempt in range(1, TASK_WRITE_MAX_ATTEMPTS + 1):
+            try:
+                existing_bytes = read_bytes_at(target, max_bytes=cap_bytes, label=path)
+            except ValueError as e:
+                # D3: the (path, id) pair satisfies required mode for these
+                # tools (add_task is exempt), so the ladder runs unenforced;
+                # a supplied hash is still compared.
+                if err := _precondition_error(
+                    tool, path, None, expected_hash, cap_name=cap_name,
+                    cap_bytes=cap_bytes, over_cap=True, enforceable=False,
+                ):
+                    return err
+                return _body_refusal(f"Failed to read {path}: {e}", "size_limit")
+            except Exception as e:  # noqa: BLE001 - ELOOP and friends: a refusal
+                return _body_refusal(f"Failed to read {path}: {e}", "io_failure")
+
+            if err := _precondition_error(
+                tool, path, existing_bytes, expected_hash,
+                cap_name=cap_name, cap_bytes=cap_bytes, enforceable=False,
+            ):
+                return err
+            try:
+                existing = existing_bytes.decode("utf-8")
+            except Exception as e:  # noqa: BLE001
+                return _body_refusal(f"Failed to read {path}: {e}", "io_failure")
+
+            # D2 steps 8–10: resolve the id from THESE bytes, plan, verify.
+            # About a second for a 5,000-task note, so off the event loop.
+            plan = await asyncio.to_thread(plan_fn, existing)
+            if isinstance(plan, task_write.TaskWriteRefusal):
+                return _task_write_refusal(tool, rel, plan)
+            extra = None
+            if after_plan is not None:
+                extra = await after_plan(plan, rel)
+                if isinstance(extra, BodyOutcome):
+                    return extra
+            if not plan.changed:
+                timing.record("task_refresh", "skipped")
+                return f"No changes for {path} — nothing was written."
+            if err := _note_size_error(plan.new_text):
+                return err
+            new_text = plan.new_text
+            new_bytes = new_text.encode("utf-8")
+            if dry_run:
+                timing.record("task_refresh", "skipped")
+                lines = ["Dry run — nothing was written.", *describe(plan, rel, extra)]
+                lines.append("diff:")
+                lines.append(_task_diff(path, existing, new_text))
+                return "\n".join(lines)
+            try:
+                err, _ = await _confirmed_publication(
+                    uid,
+                    lambda c: write_file_at(
+                        target, new_text, expected=existing_bytes, confirmation=c
+                    ),
+                )
+                if err:
+                    return err
+            except (ValueError, RuntimeError, vault_fs.VaultFSError) as e:
+                if _is_in_call_conflict(e):
+                    if may_retry and attempt < TASK_WRITE_MAX_ATTEMPTS:
+                        continue
+                    if may_retry:
+                        timing.record("task_write_attempts", attempt)
+                        return _concurrent_write_refusal(
+                            f"{e} — {attempt} attempts, each re-reading the note and "
+                            "re-resolving the task, met a concurrent change. Nothing "
+                            "was written; call again.", path)
+                    return _concurrent_write_refusal(str(e), path)
+                return _body_refusal(str(e), "validation_failed")
+            except OSError as e:
+                return _body_refusal(f"Failed to write {path}: {e}", "io_failure")
+            if attempt > 1:
+                timing.record("task_write_attempts", attempt)
+            # D10: publish → refresh → change-feed event.
+            refresh = await _refresh_task_rows(uid, target, new_bytes)
+            timing.record("task_refresh", refresh.usage)
+            await _record_note_events(uid, [_content_event("modified", rel, new_bytes)])
+            lines = describe(plan, rel, extra)
+            lines.append(f"content_hash: {content_hash_for_bytes(new_bytes)}")
+            lines.append(refresh.line)
+            return "\n".join(lines)
+    raise AssertionError("unreachable: every attempt returns or continues")  # pragma: no cover
+
+
+def _plan_line(plan, kind: str) -> str | None:
+    for nl in plan.new_lines:
+        if nl.kind == kind:
+            return nl
+    return None
+
+
+def _target_lines(plan) -> list[str]:
+    nl = _plan_line(plan, "target")
+    out = []
+    if nl is not None:
+        out.append(f"line {nl.line}: {_one_line(nl.text)}")
+    out.append(f"id: {plan.new_ids.get('target') or 'none (the line no longer parses as a task)'}")
+    return out
+
+
+def _context_lines(plan) -> list[str]:
+    return [f"context line {nl.line}: {_one_line(nl.text)}"
+            for nl in plan.new_lines if nl.kind == "context"]
+
+
+@_tracked(
+    "complete_task",
+    ["path", "id", "done_on", "dry_run", "expected_hash"],
+    transforms={"expected_hash": lambda v: v is not None},
+    write_class=True,
+    arg_char_caps={"path": MAX_PATH_CHARS, "id": TASK_ID_ARG_MAX_CHARS},
+)
+async def complete_task_impl(
+    path: str,
+    id: str,
+    done_on: str | None = None,
+    dry_run: bool = False,
+    expected_hash: str | None = None,
+) -> str:
+    """Mark one task done; a recurring task's next occurrence is written in
+    the same publication or the call is refused (#428 D6/D7). See
+    `server.complete_task`."""
+    tool = "complete_task"
+    if err := _require_write():
+        return err
+    if err := _task_id_error(tool, id, expected_hash, path):
+        return err
+    uid = current_user_id.get()
+    effective = await _effective_task_settings(uid)
+    dates = _TaskDates(tool, path, effective, _task_now())
+    done, err = dates.resolve("done_on", done_on, default_today=True)
+    if err:
+        return err
+    if effective.set_created_date:
+        dates.used_today = True  # a next occurrence would carry ➕ today
+    args = task_write.CompleteArgs(id=id, done_on=done, hash_supplied=expected_hash is not None)
+    today = dates.today
+
+    def describe(plan, rel, _extra):
+        lines = [f"Completed task in `{_escape_task_path(rel)}`", *_target_lines(plan)]
+        if plan.replaced_status not in (None, " "):
+            lines.append(f"replaced marker: `{_one_line(plan.replaced_status)}`")
+        nxt = _plan_line(plan, "next")
+        if nxt is not None:
+            lines.append(f"next occurrence, line {nxt.line} ({plan.position}): {_one_line(nxt.text)}")
+            lines.append(f"next id: {plan.new_ids.get('next') or 'none'}")
+        if (dl := dates.line()) is not None:
+            lines.append(dl)
+        return lines
+
+    return await _run_task_write(
+        tool=tool, path=path, expected_hash=expected_hash, dry_run=dry_run,
+        plan_fn=lambda text: task_write.plan_complete(text, args, effective, today),
+        describe=describe,
+    )
+
+
+@_tracked(
+    "update_task",
+    ["path", "id", "status", "clear", "dry_run", "expected_hash"],
+    transforms={"expected_hash": lambda v: v is not None},
+    write_class=True,
+    arg_char_caps={"path": MAX_PATH_CHARS, "id": TASK_ID_ARG_MAX_CHARS},
+)
+async def update_task_impl(
+    path: str,
+    id: str,
+    due: str | None = None,
+    scheduled: str | None = None,
+    start: str | None = None,
+    priority: str | None = None,
+    add_tags: list[str] | None = None,
+    remove_tags: list[str] | None = None,
+    recurrence: str | None = None,
+    status: str | None = None,
+    text: str | None = None,
+    append_context: str | None = None,
+    clear: list[str] | None = None,
+    dry_run: bool = False,
+    expected_hash: str | None = None,
+) -> str:
+    """Change fields, status, description or context of one task; never
+    complete it (#428 D4/D6/D8). See `server.update_task`. The usage row
+    records the NAMES of the fields set, never their text (D17)."""
+    tool = "update_task"
+    if err := _require_write():
+        return err
+    if err := _task_id_error(tool, id, expected_hash, path):
+        return err
+    if status == "done":
+        return _task_refusal(
+            f"{tool}: status=\"done\" is not an update: use complete_task, which "
+            "also writes a recurring task's next occurrence. Nothing was written.",
+            "invalid_argument", path)
+    if status is not None and status not in _TASK_STATUSES_WRITABLE:
+        return _task_refusal(
+            f"{tool}: status must be open, in_progress or cancelled. Nothing was written.",
+            "invalid_argument", path)
+    if clear is not None and (not isinstance(clear, list)
+                              or any(c not in _TASK_CLEARABLE for c in clear)):
+        return _task_refusal(
+            f"{tool}: clear accepts a list drawn from {', '.join(_TASK_CLEARABLE)}. "
+            "Nothing was written.", "invalid_argument", path)
+    cleared = frozenset(clear or ())
+    supplied = {"due": due, "scheduled": scheduled, "start": start,
+                "priority": priority, "recurrence": recurrence}
+    for name, value in supplied.items():
+        if value is not None and name in cleared:
+            return _task_refusal(
+                f"{tool}: {name} is both set and cleared. Nothing was written.",
+                "invalid_argument", path)
+    if err := _task_priority_error(tool, priority, path):
+        return err
+    added, err = _task_tags_error(tool, "add_tags", add_tags, path)
+    if err:
+        return err
+    removed, err = _task_tags_error(tool, "remove_tags", remove_tags, path)
+    if err:
+        return err
+    if err := _task_recurrence_error(tool, recurrence, path):
+        return err
+    if err := _task_text_error(tool, "text", text, path):
+        return err
+    if err := _task_text_error(tool, "append_context", append_context, path):
+        return err
+    fields_set = sorted(
+        [n for n, v in supplied.items() if v is not None]
+        + (["text"] if text is not None else [])
+        + (["add_tags"] if added else []) + (["remove_tags"] if removed else [])
+        + (["append_context"] if append_context is not None else [])
+    )
+    if not (fields_set or cleared or status is not None):
+        return _task_refusal(
+            f"{tool}: name at least one change (a date, priority, tags, recurrence, "
+            "status, text, append_context or clear). Nothing was written.",
+            "invalid_argument", path)
+    timing.record("fields", fields_set)
+
+    uid = current_user_id.get()
+    effective = await _effective_task_settings(uid)
+    dates = _TaskDates(tool, path, effective, _task_now())
+    resolved = {}
+    for name in ("due", "scheduled", "start"):
+        resolved[name], err = dates.resolve(name, supplied[name])
+        if err:
+            return err
+    if status == "cancelled" and effective.set_cancelled_date:
+        dates.used_today = True  # ❌ today
+    args = task_write.UpdateArgs(
+        id=id, hash_supplied=expected_hash is not None,
+        due=resolved["due"], scheduled=resolved["scheduled"], start=resolved["start"],
+        priority=priority, add_tags=added, remove_tags=removed, recurrence=recurrence,
+        status=status, text=text, append_context=append_context, clear=cleared,
+    )
+    today = dates.today
+
+    def describe(plan, rel, _extra):
+        changed = ", ".join(plan.fields_changed) or "none"
+        lines = [f"Updated task in `{_escape_task_path(rel)}` — fields changed: {changed}",
+                 *_target_lines(plan), *_context_lines(plan)]
+        if (dl := dates.line()) is not None:
+            lines.append(dl)
+        return lines
+
+    return await _run_task_write(
+        tool=tool, path=path, expected_hash=expected_hash, dry_run=dry_run,
+        plan_fn=lambda body: task_write.plan_update(body, args, effective, today),
+        describe=describe,
+    )
+
+
+@_tracked(
+    "add_task",
+    ["path", "section", "dry_run", "allow_duplicate"],
+    write_class=True,
+    arg_char_caps={"path": MAX_PATH_CHARS},
+)
+async def add_task_impl(
+    path: str,
+    text: str,
+    section: str | None = None,
+    due: str | None = None,
+    scheduled: str | None = None,
+    start: str | None = None,
+    priority: str | None = None,
+    tags: list[str] | None = None,
+    recurrence: str | None = None,
+    context: str | None = None,
+    allow_duplicate: bool = False,
+    dry_run: bool = False,
+    expected_hash: str | None = None,
+) -> str:
+    """Insert one task line into an existing note (#428 D8/D9). See
+    `server.add_task`. Never logs `text` or `context` (D17)."""
+    tool = "add_task"
+    if err := _require_write():
+        return err
+    if err := _task_text_error(tool, "text", text, path):
+        return err
+    if err := _task_text_error(tool, "context", context, path):
+        return err
+    if err := _task_priority_error(tool, priority, path):
+        return err
+    tag_list, err = _task_tags_error(tool, "tags", tags, path)
+    if err:
+        return err
+    if err := _task_recurrence_error(tool, recurrence, path):
+        return err
+    uid = current_user_id.get()
+    effective = await _effective_task_settings(uid)
+    dates = _TaskDates(tool, path, effective, _task_now())
+    resolved = {}
+    for name, value in (("due", due), ("scheduled", scheduled), ("start", start)):
+        resolved[name], err = dates.resolve(name, value)
+        if err:
+            return err
+    if effective.set_created_date:
+        dates.used_today = True  # ➕ today
+    args = task_write.AddArgs(
+        text=text, section=section, due=resolved["due"], scheduled=resolved["scheduled"],
+        start=resolved["start"], priority=priority, tags=tag_list, recurrence=recurrence,
+        context=context, allow_duplicate=bool(allow_duplicate),
+    )
+    today = dates.today
+
+    async def scan(plan, rel):
+        """D9 (b): the index side, owner- and default-scope-scoped; the target
+        note itself was checked against its current bytes by the planner."""
+        async with async_session() as session:
+            exact, similar, stopped = await task_write.duplicate_scan(
+                session, uid, effective, plan.norm or "", plan.terms, exclude_path=rel)
+        if exact and not allow_duplicate:
+            return _task_refusal(
+                f"{tool}: {rel}: an open task with the same description already "
+                "exists; pass allow_duplicate=true to add it anyway. Nothing was "
+                "written.\n" + "\n".join(_task_ref_line(m, with_path=True) for m in exact),
+                "duplicate_task", rel)
+        timing.record("similar_count", len(similar))
+        return similar, stopped
+
+    def describe(plan, rel, extra):
+        similar, stopped = extra if extra is not None else ((), False)
+        lines = [f"Added task to `{_escape_task_path(rel)}`"]
+        nl = _plan_line(plan, "task")
+        if nl is not None:
+            lines.append(f"line {nl.line}: {_one_line(nl.text)}")
+        lines.append(f"id: {plan.new_ids.get('task') or 'none'}")
+        lines.extend(_context_lines(plan))
+        if similar:
+            lines.append("similar open tasks:")
+            lines.extend(_task_ref_line(s, with_path=True) for s in similar)
+        else:
+            lines.append("similar open tasks: none")
+        if stopped:
+            lines.append(f"similar-task scan stopped at {TASK_SIMILAR_SCAN_MAX} candidates")
+        if (dl := dates.line()) is not None:
+            lines.append(dl)
+        return lines
+
+    return await _run_task_write(
+        tool=tool, path=path, expected_hash=expected_hash, dry_run=dry_run,
+        plan_fn=lambda body: task_write.plan_add(body, args, effective, today),
+        describe=describe, after_plan=scan,
+    )
+
 
 
 # ════════════════════════════════════════════════════════════════════════════

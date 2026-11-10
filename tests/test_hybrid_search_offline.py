@@ -787,10 +787,14 @@ def test_the_hybrid_description_states_the_contract():
         assert token in doc, token
 
 
-def test_hybrid_search_is_registered_last_with_read_only_annotations():
+def test_hybrid_search_is_registered_after_get_changes_with_read_only_annotations():
+    # Registered last when it shipped (#354); the four task tools of #428 are
+    # appended after it, so it is now the fifth from the end.
     listed = asyncio.run(server.mcp.list_tools())
-    tool = listed[-1]
-    assert tool.name == "hybrid_search" and listed[-2].name == "get_changes"
+    names = [t.name for t in listed]
+    tool = listed[names.index("hybrid_search")]
+    assert names[-6:-4] == ["get_changes", "hybrid_search"]
+    assert names[-4:] == ["task_agenda", "complete_task", "update_task", "add_task"]
     assert tool.title == "Hybrid search"
     a = tool.annotations
     assert (a.readOnlyHint, a.destructiveHint, a.idempotentHint, a.openWorldHint) == (
@@ -812,7 +816,8 @@ def test_the_instructions_lead_names_the_three_peers():
 
 def test_the_class_mapping():
     assert concurrency.TOOL_CLASSES["hybrid_search"] == "embedding"
-    assert concurrency.CLASS_MAPPING_VERSION == 5
+    # 6 since #428 (the task tools); hybrid_search's class is unchanged.
+    assert concurrency.CLASS_MAPPING_VERSION == 6
 
 
 @pytest.mark.parametrize("value", [0, 1001])

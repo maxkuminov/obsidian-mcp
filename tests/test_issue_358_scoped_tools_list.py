@@ -1,17 +1,20 @@
 """#358 — `tools/list` scoped by the authorization presented on the request.
 
-An OAuth grant without `readwrite` lists 19 tools: the full list minus the
-nine names in `tool_permissions.WRITE_REQUIRED_TOOLS`, the one registry that
+An OAuth grant without `readwrite` lists 20 tools: the full list minus the
+twelve names in `tool_permissions.WRITE_REQUIRED_TOOLS`, the one registry that
 also drives `_tracked`'s body-boundary write gate. Everyone else — API keys of
 either permission, `readwrite` grants, sandbox mode, in-process callers —
-lists all 28, byte-identical to before. Enforcement is unchanged in outcome.
+lists all 32. Enforcement is unchanged in outcome.
 
-**The oracle.** `tests/fixtures/tools_list_full_v1.json` is the complete
-`tools/list` result (all 28 tools, every serialised field) captured over the
-Streamable HTTP transport for a `readwrite` API-key principal on the pre-change
-tree (c491326 + spec commits, no `src/` change; committed alone, before the
-code). It is the 1.0 contract-freeze fixture: the 5a391ca / additions /
-amendments fixtures pin only names and schemas. Comparison is byte identity of
+**The oracle.** `tests/fixtures/tools_list_full_v2.json` is the complete
+`tools/list` result (all 32 tools, every serialised field) captured over the
+Streamable HTTP transport for a `readwrite` API-key principal; the task-tools
+change (#428) generated it deliberately. `tests/fixtures/tools_list_full_v1.json`
+is the 1.0 contract-freeze fixture (28 tools, captured on c491326 + spec
+commits), kept unedited: `test_v1_derives_from_v2` proves v2 minus the four
+task-tools entries equals it, apart from `list_tasks`'s description and its
+added optional input properties. The 5a391ca / additions / amendments
+fixtures pin only names and schemas. Comparison is byte identity of
 the canonical serialisation (UTF-8, keys sorted, no insignificant whitespace);
 the file itself is stored indented for review. Regenerate — only for a change
 that deliberately alters the published surface and says so in its spec delta —
@@ -46,14 +49,18 @@ from src.mcp_server.server import SERVER_INSTRUCTIONS, mcp
 from src.services import rate_limits
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
-ORACLE = FIXTURES / "tools_list_full_v1.json"
+ORACLE = FIXTURES / "tools_list_full_v2.json"
+V1 = FIXTURES / "tools_list_full_v1.json"
 READONLY = FIXTURES / "tools_list_readonly_oauth.json"
 REPO = Path(__file__).resolve().parent.parent
 
-NINE = {
+TWELVE = {
     "create_note", "edit_note", "move_note", "delete_note", "set_frontmatter",
     "write_file", "delete_file", "import_from_url", "request_upload",
+    "complete_task", "update_task", "add_task",  # #428
 }
+#: The four tools the task-tools change (#428) appended, in order.
+TASK_TOOLS = ("task_agenda", "complete_task", "update_task", "add_task")
 
 
 def oracle() -> dict:
@@ -103,10 +110,11 @@ async def test_oracle_capture(vault_root):
     )
 
 
-def test_the_oracle_is_the_complete_28_tool_result():
+def test_the_oracle_is_the_complete_32_tool_result():
     result = oracle()
     names = [t["name"] for t in result["tools"]]
-    assert len(names) == 28 and len(set(names)) == 28
+    assert len(names) == 32 and len(set(names)) == 32
+    assert tuple(names[-4:]) == TASK_TOOLS
     assert "nextCursor" not in result
     for tool in result["tools"]:
         assert {"name", "title", "description", "inputSchema", "annotations"} <= tool.keys()
@@ -126,14 +134,44 @@ async def test_the_full_list_is_byte_identical_to_the_oracle(cred, vault_root):
 # ══════════════════════════════════════════════════════════════════════════
 
 
-def test_the_readonly_fixture_is_the_oracle_minus_the_nine():
-    expected = [t["name"] for t in oracle()["tools"] if t["name"] not in NINE]
+def test_v1_derives_from_v2():
+    """The 1.0 oracle is kept unedited (#428 D15): v2 minus the four task-tools
+    entries equals v1, except `list_tasks`'s description and its added
+    optional input properties — every v1 property kept with the same schema,
+    `required` unchanged."""
+    v1 = json.loads(V1.read_text(encoding="utf-8"))
+    v2 = oracle()
+    kept = [t for t in v2["tools"] if t["name"] not in TASK_TOOLS]
+    assert [t["name"] for t in kept] == [t["name"] for t in v1["tools"]]
+    by_name = {t["name"]: t for t in v1["tools"]}
+    derived = []
+    for entry in kept:
+        entry = json.loads(json.dumps(entry))
+        if entry["name"] == "list_tasks":
+            old = by_name["list_tasks"]
+            props = entry["inputSchema"]["properties"]
+            added = set(props) - set(old["inputSchema"]["properties"])
+            assert added == {
+                "due_from", "scheduled_from", "done_from", "done_by", "undated",
+                "has_due", "text", "priority", "recurring", "exclude_tags", "path",
+                "order_by", "detail", "context", "scope",
+            }
+            assert not added & set(entry["inputSchema"].get("required", []))
+            for name in added:
+                del props[name]
+            entry["description"] = old["description"]
+        derived.append(entry)
+    assert h.canonical({**v2, "tools": derived}) == h.canonical(v1)
+
+
+def test_the_readonly_fixture_is_the_oracle_minus_the_twelve():
+    expected = [t["name"] for t in oracle()["tools"] if t["name"] not in TWELVE]
     assert readonly_names() == expected
-    assert len(expected) == 19
+    assert len(expected) == 20
 
 
 @pytest.mark.parametrize("cred", [h.READ_GRANT, h.READ_GRANT_2], ids=lambda c: c.bearer)
-async def test_a_readonly_grant_lists_19_entries_identical_to_the_oracle(cred, vault_root):
+async def test_a_readonly_grant_lists_20_entries_identical_to_the_oracle(cred, vault_root):
     by_name = {t["name"]: t for t in oracle()["tools"]}
     async with h.running_client(mcp, vault_root) as client:
         result = await h.list_result(client, cred)
@@ -145,7 +183,7 @@ async def test_a_readonly_grant_lists_19_entries_identical_to_the_oracle(cred, v
 
 @pytest.mark.parametrize(
     "cred,count",
-    [(h.READ_GRANT, 19), (h.READ_KEY, 28), (h.READWRITE_KEY, 28), (h.READWRITE_GRANT, 28)],
+    [(h.READ_GRANT, 20), (h.READ_KEY, 32), (h.READWRITE_KEY, 32), (h.READWRITE_GRANT, 32)],
     ids=lambda v: getattr(v, "bearer", str(v)),
 )
 async def test_a_cursor_does_not_change_the_result(cred, count, vault_root):
@@ -170,12 +208,12 @@ def _reset(tokens):
 @pytest.mark.parametrize(
     "principal,permission,count",
     [
-        (("oauth", "g"), "read", 19),
-        (("oauth", "g"), "readwrite", 28),
-        (("api_key", 1), "read", 28),
-        (("api_key", 1), "readwrite", 28),
-        (None, "read", 28),
-        (None, "readwrite", 28),
+        (("oauth", "g"), "read", 20),
+        (("oauth", "g"), "readwrite", 32),
+        (("api_key", 1), "read", 32),
+        (("api_key", 1), "readwrite", 32),
+        (None, "read", 32),
+        (None, "readwrite", 32),
     ],
 )
 async def test_in_process_listing_per_principal(principal, permission, count):
@@ -185,7 +223,7 @@ async def test_in_process_listing_per_principal(principal, permission, count):
     finally:
         _reset(tokens)
     assert len(listed) == count
-    if count == 28:
+    if count == 32:
         # The same order and schemas as the oracle and the #343 fixtures.
         assert [t.name for t in listed] == [t["name"] for t in oracle()["tools"]]
         for tool, row in zip(listed, oracle()["tools"]):
@@ -241,7 +279,7 @@ async def test_the_list_follows_a_scope_change_on_the_next_request(vault_root):
             after = await h.list_result(client, upgraded)
     finally:
         h.ALL.pop(upgraded.bearer, None)
-    assert len(before["tools"]) == 19
+    assert len(before["tools"]) == 20
     assert h.canonical(after) == h.canonical(oracle())
 
 
@@ -292,7 +330,7 @@ async def test_no_credential_is_refused_before_the_handler(monkeypatch):
     assert spy.calls == 0
 
 
-async def test_sandbox_mode_lists_all_28(monkeypatch, vault_root):
+async def test_sandbox_mode_lists_all_32(monkeypatch, vault_root):
     """The real middleware in sandbox mode passes straight through with no
     principal set, so the registry introspection a sandbox exists for sees
     every tool."""
@@ -480,8 +518,8 @@ async def test_l5_a_pre_permission_refusal_is_now_permission_denied_for_a_readon
 # ══════════════════════════════════════════════════════════════════════════
 
 
-def test_the_registry_is_the_nine():
-    assert tool_permissions.WRITE_REQUIRED_TOOLS == NINE
+def test_the_registry_is_the_twelve():
+    assert tool_permissions.WRITE_REQUIRED_TOOLS == TWELVE
     assert tool_permissions.hidden_names() is tool_permissions.WRITE_REQUIRED_TOOLS
 
 
@@ -489,9 +527,9 @@ def test_the_registry_is_the_write_bucket_plus_request_upload():
     assert tool_permissions.WRITE_REQUIRED_TOOLS == tools.production_write_bucket_tools() | {"request_upload"}
 
 
-def test_the_registry_is_the_destructive_set_plus_create_note():
+def test_the_registry_is_the_destructive_set_plus_the_additive_writers():
     destructive = {t["name"] for t in oracle()["tools"] if t["annotations"]["destructiveHint"]}
-    assert tool_permissions.WRITE_REQUIRED_TOOLS == destructive | {"create_note"}
+    assert tool_permissions.WRITE_REQUIRED_TOOLS == destructive | {"create_note", "add_task"}
     assert "request_download" not in tool_permissions.WRITE_REQUIRED_TOOLS
     assert "check_upload" not in tool_permissions.WRITE_REQUIRED_TOOLS
     registered = {t.name for t in mcp._tool_manager.list_tools()}
@@ -519,7 +557,7 @@ def _minimal_args(tool) -> dict:
 
 
 async def test_every_tool_under_a_readonly_grant_is_refused_iff_in_the_registry(read_only_in_process, monkeypatch):
-    """All 28, called through the server with a read-only OAuth principal.
+    """All 32, called through the server with a read-only OAuth principal.
     Anything that would reach the database fails fast instead; only the
     `permission_denied` set matters here."""
 
