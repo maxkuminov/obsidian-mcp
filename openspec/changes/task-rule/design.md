@@ -279,6 +279,7 @@ So nothing is omitted, and the response says why the rule is not in force. The w
 - a single line: no control character (C0, C1, DEL), line break, U+0085, U+2028 or U+2029 (`task_settings._CONTROL_RE`);
 - no backtick at all: it would open inline code and change how the added line is masked;
 - no code point of `task_line.ALL_SIGNIFIERS`, and no U+FE0F: a field emoji would add a field to every line it is prepended to;
+- **no comment delimiter at all** (Codex spec r2): no `%%`, no `<!--` and no `-->`, balanced or not. A filter is a marker, never a comment;
 - **the caller-text structure rules** (Codex spec r1 #1 (a)): `task_write._structure_refusal(F, context=True, …)` must pass, so:
   - an even number of `%%`;
   - every `<!--` closed by `-->` within F, and no `-->` without an opener;
@@ -491,7 +492,7 @@ The change is small enough for two agents, in sequence or in parallel. The docs 
 **Codex spec review, round 1 (2026-11-10): FAIL**, with 1 BLOCKER and 2 MAJOR. All three were accepted and folded. Round 2 is verification-only.
 
 1. **BLOCKER, accepted.** The filter text could damage a note: `%%` or `<!--` passed the proposed validator and was prepended after the caller's text had been checked. Fixed in two layers:
-   - (a) D9 validates F, at save time and for `TASKS_GLOBAL_FILTER` at startup, with the caller-text structure rules plus the single-line, signifier, leading-marker, whitespace-only and 64-character rules;
+   - (a) D9 validates F, at save time and for `TASKS_GLOBAL_FILTER` at startup, with the caller-text structure rules (since round 2, no comment delimiter at all) plus the single-line, signifier, leading-marker, whitespace-only and 64-character rules;
    - (b) D7 has `add_task` run the structure check on the final combined description before the dry run and before publication.
 
    Scenarios cover both layers.
@@ -502,3 +503,5 @@ The change is small enough for two agents, in sequence or in parallel. The docs 
 
    `fields` with zero task tags is stated to be valid.
 3. **MAJOR, accepted.** "The previous image keeps working" held only for a running process. D11, the schema-integrity delta and tasks §3.3 now distinguish a running old process (compatible) from a restarted one (cannot start at 040), state that rollback is roll-forward or `alembic downgrade 039` with the 040-aware image first (dropping every saved rule), and state exactly what the schema gate tests (the upgrade → downgrade 039 → upgrade round trip).
+
+**Codex spec review, round 2 (2026-11-10), verification only:** findings 2 and 3 were VERIFIED. Finding 1 was VERIFIED for its original input, and one MINOR gap was tightened: the filter-text validator had forbidden only *unbalanced* comment delimiters, so `%%x%%` or a whole HTML comment was accepted. The filter text now may not contain `%%`, `<!--` or `-->` at all. `add_task`'s check on the final combined description is unchanged. There is no round 3.

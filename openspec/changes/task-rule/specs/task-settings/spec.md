@@ -42,6 +42,7 @@ The effective rule SHALL be part of the effective settings, read once per tool c
 - be 1–64 characters long, and not whitespace only;
 - be a single line, containing no control character, line break, U+0085, U+2028 or U+2029;
 - contain no backtick, no Tasks field emoji and no U+FE0F;
+- contain no `%%`, no `<!--` and no `-->` at all, balanced or not;
 - pass the structure check applied to caller-supplied task text, which requires:
   - an even number of `%%`;
   - no `<!--` without its `-->`, and no `-->` without its `<!--`;
@@ -88,6 +89,14 @@ Every variable SHALL be documented in `README.md` and `.env.example`.
   - a filter of U+3000 only
 - **THEN** each save SHALL be refused with a message naming the problem, and nothing SHALL be stored
 - **AND** `#task`, `TODO` and `[task]` SHALL be accepted
+
+#### Scenario: A balanced Obsidian comment is refused as a filter
+- **WHEN** a user saves the global filter `%%x%%`
+- **THEN** the save SHALL be refused with a message naming the comment marker, and nothing SHALL be stored
+
+#### Scenario: A balanced HTML comment is refused as a filter
+- **WHEN** a user saves the global filter `<!-- task -->`
+- **THEN** the save SHALL be refused with a message naming the comment marker, and nothing SHALL be stored
 
 #### Scenario: Unsafe filter text in the environment refuses startup
 - **WHEN** the server starts with `TASKS_GLOBAL_FILTER=%%` or `TASKS_GLOBAL_FILTER=<!--`
