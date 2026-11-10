@@ -618,3 +618,11 @@ async def test_a_check_violation_at_flush_is_the_same_refusal(db, monkeypatch):
     assert await _save(db, 7, {"task_rule": "fields"}) == []
     assert await _save(db, 7, {"task_rule": "filter"}) == [task_rule.FILTER_NEEDS_TEXT]
     assert await _stored(db, 7) == ("fields", [], None)
+
+
+@pytest.mark.parametrize("value,fragment", [("%%x%%", "%%"), ("<!-- task -->", "HTML comment")])
+async def test_a_balanced_comment_is_refused_as_a_filter(db, value, fragment):
+    """Codex spec r2: no comment delimiter at all, balanced or not."""
+    errors = await _save(db, 7, {"task_rule": "filter", "global_filter": value})
+    assert len(errors) == 1 and fragment in errors[0] and "comment marker" in errors[0]
+    assert await _stored(db, 7) is None
