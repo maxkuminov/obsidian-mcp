@@ -44,6 +44,12 @@ pyyaml==6.0.3
 # Settings
 pydantic-settings==2.15.0
 
+# IANA time zone data for `zoneinfo` (#428): the task tools resolve "today"
+# and relative dates in each owner's configured zone, and
+# `TASKS_DEFAULT_TIMEZONE` is validated at startup. Pure data; pinned so the
+# zone set does not depend on the image's OS packages.
+tzdata==2026.6
+
 # Templates
 jinja2==3.1.6
 
