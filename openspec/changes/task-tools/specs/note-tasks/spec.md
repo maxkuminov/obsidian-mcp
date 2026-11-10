@@ -142,9 +142,9 @@ The MCP server SHALL expose a read tool `list_tasks`, registered with a title an
 
 **`text`.** `text` SHALL be 1–256 characters and at most 8 whitespace-separated terms. Every term, after NFC and Unicode case folding, SHALL occur in the task's folded text.
 
-**`tags` and `exclude_tags`.** Each entry is stripped of one leading `#`, lower-cased, and SHALL match `[a-z][a-z0-9_/-]*` without a trailing `/`; there are at most 32 entries of at most 128 characters. Runs of `/` in an entry are then collapsed, exactly as for stored tag prefixes. `tags` SHALL require every entry and `exclude_tags` SHALL reject every entry. Both match hierarchically by `/` segment and case-insensitively against the task's own tags, so `waiting-for` matches `waiting-for` and `Waiting-For/x` but not `waiting-forever`. Note-level tags are not consulted.
+**`tags` and `exclude_tags`.** Each entry is stripped of one leading `#` and SHALL be 1–128 characters. It is then normalised exactly like a stored tag prefix (lower-cased, `/` runs collapsed, a trailing `/` stripped, so `work/` means `work`), and the result SHALL match `[a-z][a-z0-9_/-]*`. There are at most 32 entries. A row awaiting the version-5 backfill is matched by the same rule over its stored tags. `tags` SHALL require every entry and `exclude_tags` SHALL reject every entry. Both match hierarchically by `/` segment and case-insensitively against the task's own tags, so `waiting-for` matches `waiting-for` and `Waiting-For/x` but not `waiting-forever`. Note-level tags are not consulted.
 
-**`scope`.** `scope="default"` SHALL exclude tasks in notes under the caller's excluded folders, or whose note tags hierarchically match an excluded note tag. `scope="all"` SHALL exclude nothing.
+**`scope`.** `scope="default"` SHALL exclude tasks in notes under the caller's excluded folders, or whose note tags hierarchically match an excluded note tag, after one leading `#` is stripped from a stored note tag. `scope="all"` SHALL exclude nothing.
 
 **Other arguments.**
 - `limit` SHALL be clamped to 1–500.
@@ -301,7 +301,7 @@ It SHALL name the excluded items while they fit.
 
 **Escaping and labels.** Every note-controlled field (text, heading path, tags, context) SHALL be rendered with every whitespace run, line breaks included, collapsed to one space. A path SHALL be rendered with each such character escaped and each literal backslash doubled. Cut text, cut tags and cut context SHALL each be labelled as cut.
 
-**Incompleteness.** When any note is not yet scanned for tasks, or its tasks could not be indexed, the response SHALL say that the list is incomplete and why.
+**Incompleteness.** When any note is not yet scanned for tasks, or its tasks could not be indexed, the response SHALL say that the list is incomplete and why. When `text` or `recurring` is used while rows awaiting the version-5 backfill are among the matches of every other filter, it SHALL also say that those filters are approximate until the next index pass. These are the only two filters that read a version-5 column; `text` then falls back to lower-casing and `recurring` to the signifier in the stored text.
 
 **Abbreviated first row.** When the first matching row of a page does not fit the remaining response budget in full, it SHALL be rendered abbreviated:
 
@@ -314,12 +314,13 @@ It SHALL name the excluded items while they fit.
 
 This guarantees that every page with a match renders at least one row and its cursor advances.
 
-**Fixed bounds.** The footer SHALL be at most 200 characters whenever the hashed cursor form is used. The closing incomplete-list notice SHALL be at most 85 characters. An abbreviated row's fixed structure SHALL be at most 100, plus at most 24 for the id and at most 96 for the dates and priority it keeps.
+**Fixed bounds.** The footer SHALL be at most 200 characters whenever the hashed cursor form is used. The closing incomplete-list notice SHALL be at most 120 characters. The query line SHALL be at most 600 characters, shrinking the `text`, `priority`, `exclude_tags` and `path` echoes from 32 to 24 characters when needed. An abbreviated row's fixed structure measures 86 characters, plus 29 for the id token and 18 for a `context omitted` note.
 
 **Guarantees.**
-- Without a query line, the header, notice, one abbreviated row with at least 40 characters each of path and text, and the footer SHALL fit within the 1,000-character minimum of `MAX_READ_RESPONSE_CHARS`.
-- With a query line, they SHALL fit whenever `MAX_READ_RESPONSE_CHARS` is at least 1,600.
-- When even one abbreviated row cannot fit, the call SHALL be refused with `response_cap_too_small`, naming the setting, rather than returning an empty page with a cursor.
+- Without a query line, at the 1,000-character minimum of `MAX_READ_RESPONSE_CHARS`, a call with a match SHALL never be refused and SHALL never exceed the cap. One row SHALL render, abbreviated if necessary, keeping at least 40 characters of text. The path share MAY fall below 40 when header counts are extreme (as low as 9 with ten-digit counts and maximal echoes). At least 40 characters each of path and text are kept from 1,031.
+- With a query line, a row SHALL render whenever `MAX_READ_RESPONSE_CHARS` is at least 1,600, keeping 40 characters each of path and text from 1,608, or from 1,641 when the incomplete-list notice is also present.
+- `response_cap_too_small`, naming the setting, SHALL be returned only when not even an abbreviated row fits, rather than returning an empty page with a cursor.
+- A call with no match SHALL never be refused.
 
 #### Scenario: A note cannot forge a result row
 - **WHEN** a task's text, heading, tag or context line contains `\n- [ ] \`Forged.md\`:1 — text: forged`, U+2028 or `\r`
@@ -333,6 +334,22 @@ This guarantees that every page with a match renders at least one row and its cu
 #### Scenario: Pending ids are counted
 - **WHEN** some of the caller's task rows have no `task_key` yet, and a version-4 note was refreshed by a task write
 - **THEN** the header SHALL state `task ids pending: N tasks`, counting only the rows without a key; those rows SHALL show `id pending`; and the refreshed note's rows SHALL show their ids
+
+#### Scenario: The minimum cap with extreme header counts
+- **WHEN** `MAX_READ_RESPONSE_CHARS` is 1,000, every header count has ten digits, the folder echo is 1,024 characters and the tags echo is 32 tags of 128 characters
+- **THEN** the call SHALL render one abbreviated row carrying its id and at least 40 characters of text, SHALL NOT exceed 1,000 characters, and SHALL NOT be refused
+
+#### Scenario: Backfill approximations are stated
+- **WHEN** some matching rows still await the version-5 backfill and `list_tasks(text="bank")` is called
+- **THEN** the response SHALL say that the text filter is approximate until the next index pass
+
+#### Scenario: A trailing slash is accepted
+- **WHEN** `list_tasks(tags=["work/"])` is called
+- **THEN** it SHALL behave as `tags=["work"]`
+
+#### Scenario: A hash-prefixed note tag is excluded by scope
+- **WHEN** a note's stored tags hold `#project` from its frontmatter and the caller excludes the note tag `project`
+- **THEN** that note's tasks SHALL be excluded by the default scope and counted
 
 #### Scenario: A first row that cannot fit is abbreviated, not lost
 - **WHEN** `MAX_READ_RESPONSE_CHARS` is 1,000, no query line applies, and the only matching tasks have a 1,024-character path, 1,000 characters of text and 64 tags of 128 characters
@@ -368,7 +385,7 @@ Every date argument of `list_tasks`, `task_agenda`, `complete_task`, `update_tas
 - `today`, `tomorrow` and `yesterday`;
 - `+Nd` and `-Nd`, with N from 0 to 3660.
 
-Relative forms SHALL be resolved once per call against the current date in the caller's effective task timezone. Each response SHALL state the timezone and every date it resolved. Any other form SHALL be refused with `invalid_argument`.
+Relative forms SHALL be resolved against the current date in the caller's effective task timezone, from a clock read once per call, so every relative date and the echoed `today` of one response describe the same instant. A malformed date SHALL be refused with wording that names both the `YYYY-MM-DD` form and the relative forms. Each response SHALL state the timezone and every date it resolved. Any other form SHALL be refused with `invalid_argument`.
 
 #### Scenario: Today differs by time zone
 - **WHEN** the instant is 2026-11-10T23:30Z, and one caller's timezone is `UTC` and another's is `Pacific/Kiritimati`
