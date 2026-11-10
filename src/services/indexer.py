@@ -91,7 +91,11 @@ from src.services.links import (
     resolve_target,
 )
 from src.oauth.grants import lock_account_guard
-from src.services.tasks import extract_tasks_bounded, frontmatter_line_offset
+from src.services.tasks import (
+    extract_tasks_bounded,
+    frontmatter_line_offset,
+    note_task_row,
+)
 from src.services.note_hash import canonical_note_text_strict, text_hash
 from src.services import vault_overlap
 from src.services.transfer import canonical_vault_root
@@ -786,7 +790,17 @@ def _content_hash(content: str) -> str:
 # `list_tasks` counts the caller's rows still below it as "not yet scanned
 # for tasks". A change to the task grammar or to any task-extraction cap is a
 # bump, like a change to the fence or link grammar.
-CURRENT_EXTRACTION_VERSION = 4
+#
+# Version 5 adds task ids (#428). Every task row gains its D1 key, ordinal and
+# count, the D9 description key, the folded text, the tag prefixes, the
+# run-based recurrence rule, the created and cancelled dates and its context
+# run, so every note is re-derived once — at the cost of the version 2-4
+# bumps. The fence grammar did not change, so version 5's cleaner is version
+# 4's under a new key and nothing is re-embedded.
+# `src.services.tasks.TASK_IDS_SINCE_EXTRACTION_VERSION` names this version,
+# for the operator's backfill progress only: a listing renders an id from the
+# row, never from the note's version.
+CURRENT_EXTRACTION_VERSION = 5
 
 
 def _grammar_changed_the_embedding_text(stamped_version: int, body: str) -> bool:
@@ -2146,15 +2160,28 @@ class SnapshotRow:
     extraction_version: int
     stat: StatTuple | None
     derived_under: str | None = None
+    #: #428 D10 R3: the row's task rows describe other bytes than its
+    #: `content_hash` (`tasks_source_hash IS DISTINCT FROM content_hash`, so a
+    #: row no version-5 derivation has reached is task-dirty too). A task-dirty
+    #: row is never stat-shortcut, and, being part of the C4 comparison, a row
+    #: a refresh dirtied between the snapshot and the lock is re-read under it.
+    task_dirty: bool = False
 
     @classmethod
     def of(cls, row) -> "SnapshotRow":
+        source = getattr(row, "tasks_source_hash", _NO_TASKS_SOURCE)
         return cls(
             content_hash=row.content_hash,
             extraction_version=row.extraction_version,
             stat=_row_stat(row),
             derived_under=getattr(row, "derived_under", None),
+            task_dirty=source is not _NO_TASKS_SOURCE and source != row.content_hash,
         )
+
+
+#: A row object without the column (a hand-built test row), as opposed to a
+#: NULL `tasks_source_hash`, which is task-dirty.
+_NO_TASKS_SOURCE = object()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -2303,6 +2330,8 @@ def _needs_body(
         or row is None
         or row.content_hash != h
         or row.extraction_version != CURRENT_EXTRACTION_VERSION
+        # #428 R3: the task stage derives a task-dirty row from this body.
+        or row.task_dirty
     )
 
 
@@ -2363,6 +2392,8 @@ def _scan_vault(
                 and row.stat is not None
                 and row.extraction_version == CURRENT_EXTRACTION_VERSION
                 and (not re_derive or _row_is_current(facts, rel, row))
+                # #428 R3: a task-dirty row is read whatever its stat says.
+                and not row.task_dirty
             ):
                 try:
                     current = _stat_tuple(_stat_follow(found.parent_fd, found.name))
@@ -2873,7 +2904,8 @@ async def index_vault(user_id: int | None = None, *, full_hash: bool = False):
 
 
 def _owner_scoped_rows_stmt(user_id: int | None, *, with_id: bool):
-    """The rows C4 compares: path, hash, extraction marker and stat."""
+    """The rows C4 compares: path, hash, extraction marker, stat and (#428)
+    whether the row is task-dirty."""
     columns = [
         NoteMetadata.file_path,
         NoteMetadata.content_hash,
@@ -2883,6 +2915,7 @@ def _owner_scoped_rows_stmt(user_id: int | None, *, with_id: bool):
         NoteMetadata.stat_ctime_ns,
         NoteMetadata.stat_ino,
         NoteMetadata.derived_under,
+        NoteMetadata.tasks_source_hash,
     ]
     if with_id:
         columns.insert(0, NoteMetadata.id)
@@ -2976,6 +3009,17 @@ async def _index_vault_pinned(
         snapshot_rows = (
             await session.execute(_owner_scoped_rows_stmt(user_id, with_id=False))
         ).fetchall()
+        # #428 D10 R2: the scan's start on the database clock — the clock the
+        # write-time refresh stamps `tasks_refreshed_at` with — read before
+        # the walk's first file read. Every byte this invocation's attempts
+        # derive tasks from was read after it (the walk, and any C4 re-read
+        # under an attempt's lock, which can only be later), so R4's "a
+        # refresh at or after this instant may be newer than what I read"
+        # holds for every attempt; an earlier instant only keeps more, and a
+        # kept row stays task-dirty, so the next pass re-reads it.
+        scan_started_at = (
+            await session.execute(text("SELECT clock_timestamp()"))
+        ).scalar()
         await session.commit()
     snapshot = {row.file_path: SnapshotRow.of(row) for row in snapshot_rows}
 
@@ -3055,6 +3099,7 @@ async def _index_vault_pinned(
                 unverified=list(unverified),
                 auth=auth,
                 assignment=assignment,
+                scan_started_at=scan_started_at,
             )
         except PoisonNote as poison:
             for note in poison.notes:
@@ -3178,10 +3223,14 @@ async def _index_vault_attempt(
     unverified: list[str],
     auth: "empty_prune.Authorisation | None" = None,
     assignment: str | None = None,
+    scan_started_at: datetime | None = None,
 ) -> "IndexPassResult":
     """One transaction of `_index_vault_pinned`: classification under the
     generation lock through the commit. Raises `PoisonNote` (after which
-    nothing of it is committed) when a write site identifies poison notes."""
+    nothing of it is committed) when a write site identifies poison notes.
+
+    `scan_started_at` is #428's R2 instant, read once before the walk; the
+    task stage's R4 keep rule compares a refresh against it."""
     seen = scan.seen
     async with async_session() as session:
         # ── The generation lock, at the HEAD of this transaction (C1) ──────
@@ -3408,6 +3457,12 @@ async def _index_vault_attempt(
         # D3a): row id → (path, raw-or-body, is_raw). Filled on a backstop
         # pass only, from bytes this pass already holds.
         digest_candidates: dict[int, tuple[str, str, bool]] = {}
+        # #428 D10 R3: unchanged notes whose task rows are task-dirty. Their
+        # task derivation joins the task stage's list (and only that stage's:
+        # they are not upserted), from the body buffered here, with their
+        # buffered hash for R4.
+        task_only: list[str] = []
+        task_only_hash: dict[str, str] = {}
         for rel_path, found in scan.files.items():
             h = found.content_hash
             # A stale extraction marker makes a note changed even when its
@@ -3448,6 +3503,11 @@ async def _index_vault_attempt(
                 if backstop and found.read and found.raw is not None:
                     digest_candidates[locked_ids[rel_path]] = (
                         rel_path, found.raw, True,
+                    )
+                if locked[rel_path].task_dirty:
+                    await _buffer_task_only(
+                        root_fd, rel_path, found, path_to_content,
+                        path_to_line_offset, task_only, task_only_hash,
                     )
                 continue
 
@@ -4110,6 +4170,8 @@ async def _index_vault_attempt(
         # previously-dangling rows now matching their path.
         # Moved notes need outgoing-link re-extraction too: same-folder
         # resolution can change once the note sits in a different directory.
+        changed_for_derivation: list[str] = []
+        link_paths_to_id: dict[str, int] | None = None
         if to_upsert or deleted_paths or moved_new_paths:
             # Every link-rebuild skip is on a changed path — one this pass
             # selected for upsert or moved — so every one withholds (D8).
@@ -4137,23 +4199,40 @@ async def _index_vault_attempt(
             skips.extend(link_skips)
             withholding.extend(link_skips)
 
-            # ── Task rows for changed notes (#350, D4) ───────────────────
-            # The second per-note derivation, after the link rebuild, for the
-            # same changed list, in this transaction. Its missing-body and
-            # missing-id skips withhold exactly as the link rebuild's do; a
-            # task-derivation failure is isolated to that note's task rows
-            # (`tasks_failed`) and is never poison, never a skip. A third
-            # derivation (#351) is one more call after this one.
+        # ── Task rows for changed notes (#350, D4) ───────────────────────
+        # The second per-note derivation, after the link rebuild, for the
+        # same changed list, in this transaction. Its missing-body and
+        # missing-id skips withhold exactly as the link rebuild's do; a
+        # task-derivation failure is isolated to that note's task rows
+        # (`tasks_failed`) and is never poison, never a skip. A third
+        # derivation (#351) is one more call after this one.
+        #
+        # #428 R3: the task-dirty unchanged notes join this stage only (their
+        # ids are the locked rows': being seen and unchanged, they are neither
+        # moved nor pruned), and R4 decides keep-or-derive for every note.
+        changed_set = set(changed_for_derivation)
+        task_paths = changed_for_derivation + [
+            p for p in task_only if p not in changed_set
+        ]
+        if task_paths:
+            task_ids = None
+            if link_paths_to_id is not None:
+                task_ids = {
+                    **{p: locked_ids[p] for p in task_only if p in locked_ids},
+                    **link_paths_to_id,
+                }
             task_skips: list[str] = []
             await _update_tasks_for_changed(
                 session,
-                changed_for_derivation,
+                task_paths,
                 user_id=user_id,
-                paths_to_id=link_paths_to_id,
+                paths_to_id=task_ids,
                 bodies=path_to_content,
                 line_offsets=path_to_line_offset,
                 skips=task_skips,
                 skipped_paths=underived,
+                scan_started_at=scan_started_at,
+                source_hashes={**task_only_hash, **upsert_hash},
             )
             skips.extend(task_skips)
             withholding.extend(task_skips)
@@ -4902,6 +4981,45 @@ class _TaskExtractionFailed(Exception):
         self.cause = cause
 
 
+async def _buffer_task_only(
+    root_fd: int,
+    rel: str,
+    found: "ScannedFile",
+    bodies: dict[str, str],
+    offsets: dict[str, int],
+    task_only: list[str],
+    hashes: dict[str, str],
+) -> None:
+    """Buffer an unchanged, task-dirty note for the task stage (#428, R3).
+
+    The body is the scan's (the shortcut never applies to a task-dirty row,
+    and C4 re-reads one that became task-dirty under the walk), split as the
+    change loop splits it. Should it be absent all the same, the note is read
+    here, like the change loop's own fallback. A note that cannot be read or
+    split is left out with one WARNING: it is not a skip — its row, keyword
+    vector and links are current — and it stays task-dirty, so the next pass
+    reads it again.
+    """
+    raw, h = found.raw, found.content_hash
+    try:
+        if raw is None:
+            again = await asyncio.to_thread(_rescan_one, root_fd, rel)
+            raw, h = again.raw, again.content_hash
+        _frontmatter, content = await asyncio.to_thread(parse_frontmatter, raw)
+    except Exception as e:  # noqa: BLE001 - logged; the next pass retries
+        logger.warning(
+            "Task rows of %s not re-derived this pass (%s): the note could not "
+            "be read or split; they are re-derived by a later pass.",
+            _loggable_path(rel),
+            type(e).__name__,
+        )
+        return
+    bodies[rel] = content
+    offsets[rel] = frontmatter_line_offset(raw, content)
+    task_only.append(rel)
+    hashes[rel] = h
+
+
 async def _task_savepoint(session, run) -> BaseException | None:
     """Run `await run()` in a savepoint (#350, D4).
 
@@ -4939,6 +5057,8 @@ async def _update_tasks_for_changed(
     line_offsets: dict[str, int],
     skips: list[str],
     skipped_paths: set[str] | None,
+    scan_started_at: datetime | None = None,
+    source_hashes: dict[str, str] | None = None,
 ) -> None:
     """Re-derive `note_tasks` for every changed note (#350, design D4).
 
@@ -4965,6 +5085,21 @@ async def _update_tasks_for_changed(
       pass with nothing committed.
     - A note over `MAX_TASKS_PER_NOTE` keeps its first N tasks, has
       `tasks_truncated` set and is logged at ERROR. Not a skip.
+
+    **The write-time refresh (#428, design D10).** `changed_paths` also holds
+    the pass's task-dirty unchanged notes (R3). Per note, inside its
+    savepoint, the row is locked (`FOR UPDATE`: a no-op for a row this pass
+    already upserted or moved, the lock a task-dirty row needs) and **R4**
+    decides: when `tasks_refreshed_at >= scan_started_at` and
+    `tasks_source_hash` differs from the buffered hash
+    (`source_hashes[path]`), a task tool wrote the rows from bytes published
+    after this pass began reading, so they are **kept** — not a skip, not a
+    failure, DEBUG only. Otherwise the rows are derived as above, and the
+    same UPDATE sets `tasks_source_hash` to the buffered hash and clears
+    `tasks_refreshed_at` (a failed derivation records the same, so its mark
+    describes those bytes and it is not retried until they change, as
+    before). Without `scan_started_at` the keep rule is not evaluated; without
+    a path's buffered hash its `tasks_source_hash` is left as it is.
     """
     if not changed_paths:
         return
@@ -4982,6 +5117,8 @@ async def _update_tasks_for_changed(
     total_rows = 0
     truncated_count = 0
     failed_count = 0
+    kept_count = 0
+    hashes = source_hashes or {}
     for path in changed_paths:
         note_id = paths_to_id.get(path)
         if note_id is None:
@@ -4998,9 +5135,36 @@ async def _update_tasks_for_changed(
             continue
 
         outcome: dict = {}
+        source_hash = hashes.get(path)
+        # Bound only when there is a hash to record: the predicate below is
+        # then extended to "or the task source moves", never otherwise.
+        source_values = (
+            {} if source_hash is None
+            else {"tasks_source_hash": source_hash, "tasks_refreshed_at": None}
+        )
 
-        async def _derive(note_id=note_id, body=body, offset=offset, outcome=outcome):
+        async def _derive(note_id=note_id, body=body, offset=offset, outcome=outcome,
+                          source_hash=source_hash, source_values=source_values):
             outcome.clear()
+            if scan_started_at is not None:
+                # R4, under the row lock (taken here for a task-dirty row,
+                # already held for an upserted or moved one).
+                held = (await session.execute(
+                    select(
+                        NoteMetadata.tasks_source_hash,
+                        NoteMetadata.tasks_refreshed_at,
+                    )
+                    .where(NoteMetadata.id == note_id)
+                    .with_for_update()
+                )).first()
+                if (
+                    held is not None
+                    and held.tasks_refreshed_at is not None
+                    and held.tasks_refreshed_at >= scan_started_at
+                    and held.tasks_source_hash != source_hash
+                ):
+                    outcome["kept"] = True
+                    return
             try:
                 # Off the loop, like `extract_links_bounded` (#180, D3).
                 extracted, truncated = await asyncio.to_thread(
@@ -5012,38 +5176,25 @@ async def _update_tasks_for_changed(
             except Exception as e:
                 raise _TaskExtractionFailed(e) from e
             await session.execute(delete(NoteTask).where(NoteTask.note_id == note_id))
-            rows = [
-                {
-                    "note_id": note_id,
-                    "line": t.line,
-                    "status_char": t.status_char,
-                    "state": t.state,
-                    "text": t.text,
-                    "text_cut": t.text_cut,
-                    "due": t.due,
-                    "scheduled": t.scheduled,
-                    "start": t.start,
-                    "done_on": t.done_on,
-                    "priority": t.priority,
-                    "tags": t.tags,
-                    "tags_cut": t.tags_cut,
-                    "heading_path": t.heading_path,
-                }
-                for t in extracted
-            ]
+            # `note_task_row` is the one mapping the write-time refresh uses
+            # too, so pass and refresh rows agree column for column (#428).
+            rows = [note_task_row(note_id, t) for t in extracted]
             extracted = []
             for start in range(0, len(rows), 1000):
                 await session.execute(insert(NoteTask).values(rows[start:start + 1000]))
+            changed = [
+                NoteMetadata.tasks_failed.is_(True),
+                NoteMetadata.tasks_truncated.is_(not truncated),
+            ]
+            if source_values:
+                changed += [
+                    NoteMetadata.tasks_source_hash.is_distinct_from(source_hash),
+                    NoteMetadata.tasks_refreshed_at.is_not(None),
+                ]
             await session.execute(
                 update(NoteMetadata)
-                .where(
-                    NoteMetadata.id == note_id,
-                    or_(
-                        NoteMetadata.tasks_failed.is_(True),
-                        NoteMetadata.tasks_truncated.is_(not truncated),
-                    ),
-                )
-                .values(tasks_failed=False, tasks_truncated=truncated)
+                .where(NoteMetadata.id == note_id, or_(*changed))
+                .values(tasks_failed=False, tasks_truncated=truncated, **source_values)
             )
             outcome["rows"] = len(rows)
             outcome["truncated"] = truncated
@@ -5052,14 +5203,14 @@ async def _update_tasks_for_changed(
         if first is not None:
             again = await _task_savepoint(session, _derive)
             if again is not None:
-                async def _mark_failed(note_id=note_id):
+                async def _mark_failed(note_id=note_id, source_values=source_values):
                     await session.execute(
                         delete(NoteTask).where(NoteTask.note_id == note_id)
                     )
                     await session.execute(
                         update(NoteMetadata)
                         .where(NoteMetadata.id == note_id)
-                        .values(tasks_failed=True)
+                        .values(tasks_failed=True, **source_values)
                     )
 
                 async with session.begin_nested():
@@ -5080,6 +5231,16 @@ async def _update_tasks_for_changed(
                     poison_sqlstate(cause) or "none",
                 )
                 continue
+        if outcome.get("kept"):
+            kept_count += 1
+            logger.debug(
+                "Kept the task rows of %s: a task tool refreshed them at or "
+                "after this pass's scan start, from bytes newer than the ones "
+                "this pass read (#428, R4). The row stays task-dirty, so the "
+                "next pass re-reads it.",
+                _loggable_path(path),
+            )
+            continue
         total_rows += outcome.get("rows", 0)
         if outcome.get("truncated"):
             truncated_count += 1
@@ -5098,6 +5259,7 @@ async def _update_tasks_for_changed(
         f"Re-extracted tasks for {len(changed_paths)} notes ({total_rows} task rows)"
         + (f", {truncated_count} truncated at {MAX_TASKS_PER_NOTE}" if truncated_count else "")
         + (f", {failed_count} failed" if failed_count else "")
+        + (f", {kept_count} kept as refreshed by a task tool" if kept_count else "")
     )
 
 
