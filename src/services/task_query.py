@@ -1102,7 +1102,10 @@ async def task_agenda_query(
     if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= AGENDA_MAX_DAYS:
         return _refuse(f"task_agenda: days must be an integer from 1 to {AGENDA_MAX_DAYS}.")
     try:
-        (rd.value + datetime.timedelta(days=days + 1), rd.value - datetime.timedelta(days=1))
+        # The section bounds reach D−1 and D+days+1; refuse a date at the
+        # calendar's edge rather than fail while building them.
+        rd.value + datetime.timedelta(days=days + 1)
+        rd.value - datetime.timedelta(days=1)
     except OverflowError:
         return _refuse("task_agenda: the date window is out of range.")
     folder = _validate_folder(args.folder, "task_agenda")

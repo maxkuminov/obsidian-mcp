@@ -61,9 +61,19 @@ FOOTER_MAX = 200
 #: D12: an abbreviated row's fixed structure, plus the id token.
 ABBREVIATED_STRUCTURE_MAX = 100
 ABBREVIATED_ID_TOKEN_MAX = 3 + 3 + ID_MAX  # " — id " + id
-#: D12 guarantees.
+#: The note an abbreviated row adds when `context=true` and it had context.
+ABBREVIATED_CONTEXT_NOTE = len(" — context omitted")
+#: D12 guarantees: at these caps one abbreviated row always renders (no
+#: refusal) — without a query line at the 1,000 minimum, with one at 1,600.
 LIST_MIN_BUDGET = 1000
 LIST_WITH_QUERY_MIN_BUDGET = 1600
+#: Measured by rendering the synthetic worst case (every count 10 digits, a
+#: 10-digit line, the 23-character id, all four dates and a priority): the
+#: caps from which that abbreviated row keeps 40 characters each of path and
+#: text. The paper figures (985 / 1,600) did not include the id token and
+#: the `task ids pending` count at their widest.
+LIST_ABBREVIATED_FULL_BUDGET = 1031
+LIST_WITH_QUERY_FULL_BUDGET = 1608
 #: D13: below this the agenda is refused.
 AGENDA_MIN_BUDGET = 2800
 CONTEXT_PREFIX = "    ┆ "
@@ -212,19 +222,36 @@ def render_header_line1(page: TaskPage, *, shown: int, more: bool) -> str:
     n = page.args
     due_by = n.dates.get("due_by")
     scheduled_by = n.dates.get("scheduled_by")
-    line = _t().render_task_header(
-        status=n.status, folder=n.folder,
-        due_by=due_by.given if due_by else None,
-        scheduled_by=scheduled_by.given if scheduled_by else None,
-        tags=n.tags, shown=shown, more=more, not_scanned=page.not_scanned,
-        failed=page.failed, capped=page.capped, cut_tags=None,
-    )
-    line += f" — task ids pending: {page.ids_pending} tasks"
-    if page.cut_tags is not None:
-        line += f" — tasks with cut tags: {page.cut_tags}"
-    if page.cut_text is not None:
-        line += f" — tasks with cut text: {page.cut_text}"
+
+    def build(folder: str | None) -> str:
+        line = _t().render_task_header(
+            status=n.status, folder=folder,
+            due_by=due_by.given if due_by else None,
+            scheduled_by=scheduled_by.given if scheduled_by else None,
+            tags=n.tags, shown=shown, more=more, not_scanned=page.not_scanned,
+            failed=page.failed, capped=page.capped, cut_tags=None,
+        )
+        line += f" — task ids pending: {page.ids_pending} tasks"
+        if page.cut_tags is not None:
+            line += f" — tasks with cut tags: {page.cut_tags}"
+        if page.cut_text is not None:
+            line += f" — tasks with cut text: {page.cut_text}"
+        return line
+
+    line = build(n.folder)
+    if len(line) > HEADER_MAX and n.folder:
+        # Only at the synthetic extreme (every count 10 digits, both cut
+        # counts, a 64-character folder echo): the folder echo gives way so
+        # the #350 line bound holds; it stays labelled cut (`…`).
+        over = len(line) - HEADER_MAX
+        shown_folder = _t()._one_line(n.folder)
+        keep = max(min(len(shown_folder), _legacy_echo_max()) - 1 - over, 1)
+        line = build(shown_folder[:keep] + "…")
     return line
+
+
+def _legacy_echo_max() -> int:
+    return _t().LIST_TASKS_ECHO_MAX
 
 
 def _tz_part(timezone: str, unavailable: bool) -> str:
