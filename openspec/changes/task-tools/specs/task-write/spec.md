@@ -106,7 +106,7 @@ The indentation, list marker, blockquote prefix, the gap after the box, every un
 
 ### Requirement: A task write SHALL refuse a line it cannot edit unambiguously
 
-A task write SHALL be refused with `task_malformed`, writing nothing, in any of these cases:
+A task write SHALL be refused with `content_unsafe`, writing nothing, when the note's frontmatter diagnosis reports a defect (line 1 is exactly `---` and either no closing `---` follows or the YAML between them is invalid). It SHALL also be refused that way for `add_task(section=…)` on an unmatched indented fence. Caller-supplied description or context text SHALL be refused with `invalid_argument` when it holds an odd number of `%%`, an unpaired `<!--` or `-->`, or a run of three or more backticks or tildes. Context text SHALL also be refused that way when it starts with a list marker, a checkbox, a `#` heading or `>`. A note containing NUL SHALL be refused with `task_malformed`. A task write SHALL be refused with `task_malformed`, writing nothing, in any of these cases:
 
 - a field family the call changes, removes or adds occurs more than once in the task text;
 - such a family occurs only in the description region, where the Tasks plugin would not parse it;
@@ -278,7 +278,7 @@ Every other byte SHALL be kept: prefix, field order, rule text, tags, priority, 
 - **Clearing.** It SHALL clear any of `due`, `scheduled`, `start`, `priority` and `recurrence` named in `clear`.
 - **Status.** It SHALL change the status to `open` (`[ ]`, removing `✅` and `❌`), `in_progress` (`[/]`, removing `✅` and `❌`) or `cancelled` (`[-]`, removing `✅`, and adding `❌ <today>` when the effective `set_cancelled_date` is true and none exists).
 - **Description.** It SHALL replace the words of the description region with `text`, keeping every tag of the old description region (re-appended in original order when `text` does not contain it). The new `text` which must be a single line of 1–1,000 characters, contain no field signifier, `^block` suffix, line break or line-separator character, and not change how the line parses.
-- **Context.** It SHALL append one context line under the task (`append_context`, the same text rules), after the task's full, uncapped continuation block.
+- **Context.** It SHALL append one context line under the task (`append_context`, the same text rules), after the task's full, uncapped continuation block. The line SHALL copy the leading text of the task's first shallowest direct child list item when one exists, and otherwise the task's own leading text plus a tab (when the task or the note nests with tabs) or four spaces.
 
 The following SHALL be refused with `invalid_argument`, writing nothing:
 
@@ -372,7 +372,7 @@ A file without a final terminator SHALL keep none.
 2. applying NFC and Unicode case folding;
 3. collapsing whitespace runs.
 
-**Exact duplicates.** It SHALL refuse with `duplicate_task`, writing nothing, when an open task with the same normalised description exists among the target note's current bytes, or among the caller's indexed tasks under the default scope. The exception is `allow_duplicate=true`. The refusal SHALL name up to 5 matches.
+**Exact duplicates.** It SHALL refuse with `duplicate_task`, writing nothing, when an open task with the same normalised description exists among the target note's current bytes (its index rows are not consulted), or among the caller's other indexed tasks under the default scope. The exception is `allow_duplicate=true`. The refusal SHALL name up to 5 matches.
 
 **Similar tasks.** It SHALL list, in the response and in the dry run, up to 5 similar open tasks from the caller's default scope. These are tasks whose term-set Jaccard similarity is at least 0.5, or whose term set contains (or is contained in) the new task's with at least 2 terms in the smaller set, scanning at most 2,000 candidates and saying so when the bound stops the scan. A similar task SHALL never cause a refusal.
 
@@ -432,11 +432,11 @@ Usage logs SHALL NOT record task description or context text.
 
 After a confirmed publication, and before the change-feed event, each task write tool SHALL refresh the task rows of the note it wrote. The refresh SHALL:
 
-1. run in its own transaction;
+1. derive the tasks from the published bytes before opening its transaction, holding no lock or connection while it does so, and then run in its own transaction;
 2. re-check the caller's root binding;
 3. lock the caller's `notes_metadata` row for the path within a 2-second lock wait;
 4. under that lock, re-read the file through the call's anchored target and confirm it holds exactly the bytes this call published. If it does not, write nothing and report `index: may lag (superseded)`;
-5. derive the tasks from the bytes this call published, with the index pass's function;
+5. use the tasks derived in step 1 from the bytes this call published, with the index pass's function;
 6. replace that note's `note_tasks` rows;
 7. set `tasks_source_hash` to the canonical hash of those bytes and `tasks_refreshed_at` to the database clock.
 
@@ -455,3 +455,19 @@ When the refresh cannot run (lock wait exceeded, no index row, root changed, fil
 #### Scenario: Refreshes finishing out of order cannot install older rows
 - **WHEN** task write A publishes and pauses before its refresh, task write B then publishes and refreshes the same note, and A's refresh then runs
 - **THEN** A's refresh SHALL write nothing and report `index: may lag (superseded)`, and the task rows SHALL describe B's bytes
+
+### Requirement: Task line parsing and planning SHALL be linear-time and SHALL run off the event loop
+
+Parsing a task line's trailing field run SHALL take time linear in the line's length. A 10 MiB adversarial line SHALL parse in under 2 seconds. Planning and verifying a task write SHALL run off the event loop. A plan that changes no byte SHALL answer that there were no changes, and SHALL publish nothing, record no event and run no refresh.
+
+#### Scenario: A 10 MiB line parses quickly
+- **WHEN** `task_line.parse` runs on a 10 MiB line of repeated date fields, or of repeated spaces
+- **THEN** it SHALL return in under 2 seconds
+
+#### Scenario: A no-op plan writes nothing
+- **WHEN** `update_task(add_tags=["home"])` names a task already tagged `#Home`
+- **THEN** the response SHALL say there were no changes, the file SHALL be unchanged, and no event SHALL be recorded
+
+#### Scenario: A defective frontmatter block refuses every task write
+- **WHEN** a note's line 1 is `---` and no closing `---` follows, and `complete_task`, `update_task` or `add_task` names it
+- **THEN** each SHALL be refused with `content_unsafe`, and the file SHALL be unchanged

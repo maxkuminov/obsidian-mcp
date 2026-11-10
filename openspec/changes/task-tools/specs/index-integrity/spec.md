@@ -2,7 +2,7 @@
 
 ### Requirement: The write-time task refresh SHALL compose with the index pass without a lock cycle and SHALL always converge to disk
 
-The index pass SHALL read the database clock as its scan start before the first file read of each attempt. The scan SHALL treat a row whose `tasks_source_hash` differs from its `content_hash` (a task-dirty row) as ineligible for the stat shortcut and read it. The task stage SHALL then derive it even when its content hash is unchanged.
+The index pass SHALL read the database clock as its scan start before its first file read, once per pass invocation. An earlier instant only makes the pass keep more refreshed rows, and a kept row stays task-dirty. The scan SHALL treat a row whose `tasks_source_hash` differs from its `content_hash` (a task-dirty row) as ineligible for the stat shortcut and read it. The task stage SHALL then derive it even when its content hash is unchanged.
 
 When the pass derives a note, it SHALL keep that note's task rows unchanged in exactly one case: the row's `tasks_refreshed_at` is at or after the attempt's scan start, and its `tasks_source_hash` differs from the buffered body's hash. Otherwise it SHALL replace the task rows, set `tasks_source_hash` to the buffered hash and clear `tasks_refreshed_at`. Keeping rows SHALL NOT be a skip and SHALL NOT be a failure.
 

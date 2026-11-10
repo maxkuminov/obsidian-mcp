@@ -90,7 +90,7 @@ Every write tool follows this order. Ordering is normative.
 7. UTF-8 decode.
 8. `tasks_from_note_text(raw)`: the indexer's frontmatter split plus `frontmatter_line_offset` plus `extract_tasks_bounded`. It is the one shared function the pass and the refresh also use (D10). If the extraction is truncated, the call is refused with `size_limit`: the 5,000-task cap would make a count unverifiable.
 9. Match the id: key equality, then the ordinal rules below.
-10. Build the plan (D4–D8), then verify it (D5).
+10. Build the plan (D4–D8), then verify it (D5). Planning and verification run **off the event loop** (`asyncio.to_thread`), because a 5,000-task note takes about a second to plan. Every planner first refuses `content_unsafe` (detail `frontmatter_defect`) when the note's frontmatter diagnosis reports a defect. That diagnosis is the one `edit_note(section=…)` uses: line 1 is exactly `---`, and either no closing `---` follows or the YAML between them is invalid. `add_task(section=…)` also refuses `content_unsafe` (detail `unmatched_fence`) on an unmatched indented fence. Both reuse `edit_note`'s refusal messages. A plan whose `changed` is false means "No changes": nothing is published, and there is no event and no refresh.
 11. `_note_size_error`.
 12. `dry_run`: a diff of the old and new note plus the new line(s), with nothing published.
 13. `_confirmed_publication(uid, lambda c: write_file_at(target, new, expected=existing_bytes, confirmation=c))`. An in-call conflict gives `concurrent_write`.
@@ -187,7 +187,8 @@ The run is a sequence of tokens with their exact spans: fields, tags and the blo
 - **Replace the description.** Replace the description region. The new text must:
   - be a single line, 1–1,000 characters, stripped;
   - contain no field signifier, no `^block` suffix and no line-break or format character (CR, LF, U+0085, U+2028, U+2029);
-  - not make the line re-parse differently (D5).
+  - not make the line re-parse differently (D5);
+  - not contain an odd number of `%%`, an unpaired `<!--` / `-->`, or a run of three or more backticks or tildes. A context line also may not start with a list marker, a checkbox, a `#` heading or `>`. Each of these is refused `invalid_argument`.
 
   **Tags survive a description replacement** (Codex r2 #1). `text` replaces the *words* of the description. Tags are a separately controlled field. Trailing tags are run tokens under the plugin's parse, so they are untouched anyway. Every tag token that was in the old description region and does not occur in the new text (whole tag, case-insensitive, unmasked) is re-appended at the end of the new description region, in its original order, each as `" #" + tag` spelled exactly as before. A tag the caller typed inside the new text stays where it was typed and is not duplicated. `[[links]]` and all other description text are ordinary words, and are replaced with the description.
 
@@ -208,6 +209,17 @@ A plan is a list of `(old line span → new text)` replacements and insertions, 
 4. No new task appears except the declared ones. This catches a context line or description that would create a checkbox or a heading.
 5. **No pre-existing line changes its owning task** (Codex r1 #1). A line's owning task is the nearest preceding task line whose **continuation block** contains it, where the continuation block is defined in D8: uncapped, crossing blank lines. Every line of the old note keeps its owner in the new note, except the declared new lines, which are owned as planned.
 6. **Tags are conserved** (Codex r2 #1). The target's tag set after the write (whole tags, case-insensitive) equals the set before, plus `add_tags`, plus any tag the caller typed inside a replacement `text` (the caller wrote it, so it is a named change), minus `remove_tags`. No tag is ever lost unless `remove_tags` names it.
+
+**As implemented, `verify` is stricter than checks 1–6:**
+
+- Check 1 is line-level. Every span is either a line-confined edit of the declared target line or a whole-line insertion at a line boundary. Every other line keeps its content and terminator.
+- The target and the next-occurrence line are compared byte for byte with the original outside the intended tokens: prefix, gap, trailing whitespace, the description (or its exact replacement composition), and untouched run tokens in their place and order.
+- For field families a call does not touch, the expectation is "reads exactly as on the original line". A priority emoji stranded in a description therefore does not block a recurring completion.
+- The frontmatter block, every heading and every pre-existing line's code mask are unchanged, and no inserted line lies inside code.
+- No task disappears.
+- A note containing NUL is refused.
+
+A result over the per-note task cap is `size_limit`.
 
 A failed assertion is `task_malformed`, with nothing written. This is the last line of defence and the strongest safety property here. It is pinned by a property test over a corpus.
 
@@ -321,7 +333,7 @@ There is **no line or character cap**, and headings or fences that are themselve
 
 **Insertion point.**
 
-1. **With an anchor:** directly after the anchor's **continuation block**. The new line copies the anchor's blockquote prefix and its bullet character. An ordered anchor `N.` / `N)` gives `N+1` with the same delimiter, and later items are not renumbered (L10).
+1. **With an anchor:** directly after the anchor's **continuation block**. The new line copies the anchor's blockquote prefix and its bullet character. An ordered anchor `N.` / `N)` gives `N+1` with the same delimiter and the anchor's following whitespace. The number is written without leading zeros (`007)` gives `8)`), and later items are not renumbered (L10, L25).
 2. **No anchor, `R` has a non-blank line:** after `R`'s last non-blank line, as `- [ ] …` with no prefix.
 3. **`R` empty:** directly after the section's heading line, or at body start when there is no section. An empty body becomes the line.
 
@@ -331,7 +343,7 @@ The new line is terminated by `T`, chosen as in D7 from the line it follows. Whe
 
 **Context line** (`add_task(context=…)`, `update_task(append_context=…)`):
 
-- The line is `bq_prefix + indent + unit + "- " + text`, where `unit` is `\t` if the task's indentation contains a tab and otherwise four spaces.
+- **Indentation.** If the task has direct child list items in its continuation block, the line copies the exact leading text (blockquote prefix and indentation) of the first shallowest one, so the new bullet is their sibling. Otherwise it is the task's own leading text plus one unit: a tab when the task's indentation or the note's nested list items use tabs, otherwise four spaces. It is refused `task_malformed` only when the D5 ownership check fails.
 - It is inserted after the task's full continuation block (uncapped), so a context line is appended and never lands inside a nested child task's own block. A deeper child's lines belong to the task too, and the new line goes after all of them.
 - The text follows the D4 description rules. D5 then refuses a line that would parse as a task, heading or fence.
 
@@ -347,7 +359,7 @@ The new line is terminated by `T`, chosen as in D7 from the line it follows. Whe
 
 **Exact duplicate** gives `duplicate_task`, nothing written, unless `allow_duplicate=true`. An open task (state `open`) with the same `description_key`:
 
-- (a) among the current bytes of the target note, always, whatever the scope; or
+- (a) among the current bytes of the target note, always, whatever the scope. `duplicate_scan(..., exclude_path=<target>)` leaves the target's index rows out, so a stale index can neither hide nor invent a duplicate there; or
 - (b) in the index, among the caller's tasks under the default scope (D14). The query is `state='open' AND description_key = :k` joined under the owner predicate, with a partial index.
 
 The refusal names up to 5 matches as `path:line id`. The index side reflects the caller's own earlier task writes through D10.
@@ -374,13 +386,13 @@ The refusal names up to 5 matches as `path:line id`. The index side reflects the
 - `notes_metadata.tasks_refreshed_at timestamptz NULL` is set only by the tool refresh.
 - **Invariant:** the task rows describe the bytes whose hash is `tasks_source_hash`. Either that equals `content_hash` (pass-derived, the #350 D1 state), or a task tool published those bytes after the row's scan, and the row is **task-dirty**.
 
-**R1. Refresh (`task_index.refresh_note_tasks`).** It runs after a confirmed publication, in its own transaction:
+**R1. Refresh (`task_index.refresh_note_tasks`).** It runs after a confirmed publication. It first derives the tasks from the published bytes **off the loop, before opening its transaction**, so neither the row lock nor a pooled connection is held during the derivation. The result, or its failure, is applied only after step 3a passes. The refresh then runs in its own transaction:
 
 1. `SET LOCAL lock_timeout = '2s'` (`TASK_REFRESH_LOCK_WAIT`, a constant).
 2. Re-check that the caller is still bound to the root the tool ran under, the same check `change_feed.record_tool_events` performs.
 3. `SELECT id FROM notes_metadata WHERE file_path = :rel AND <owner predicate> FOR UPDATE`.
 3a. **Still current?** (Codex r1 #4) Under that row lock, re-read the leaf through the call's anchored target (the same parent descriptor, `read_bytes_at` under the cap) and compare it byte for byte with the bytes this call published. If they differ, or the read fails, another writer has published since. The refresh then writes nothing and reports `index: may lag (superseded)`.
-4. Derive tasks from **the bytes this call published**, held in memory, with `tasks_from_note_text`. Step 3a has just shown them equal to disk, and rows are never derived from the re-read.
+4. Use the tasks already derived from **the bytes this call published** (`tasks_from_note_text`). Step 3a has just shown those bytes equal to disk, and rows are never derived from the re-read.
 5. Delete and insert that note's `note_tasks` rows, as the pass does.
 6. Set `tasks_source_hash = canonical_note_hash(published)`, `tasks_refreshed_at = clock_timestamp()`, and `tasks_truncated` / `tasks_failed` per the result.
 
@@ -388,16 +400,17 @@ It **never** writes `content_hash`, the stat columns, `derived_under`, `extracti
 
 The pass already holds the row lock of every note whose tasks it rewrites (D-context), so the two writers of a note's `note_tasks` are serialised by that row lock. No unique-key race on `(note_id, line)` is possible.
 
-**R2.** The pass reads `scan_started_at = clock_timestamp()` from the database **before the scan's first file read**, once per attempt.
+**R2.** The pass takes `scan_started_at` from the database before the scan's first file read: the snapshot statement's `statement_timestamp()`, read **once per pass invocation**, not once per attempt. An earlier instant is safe. It can only make R4 keep more refreshed rows, and a kept row stays task-dirty, so R3 re-reads it on the next pass.
 
 **R3.** A row with `tasks_source_hash IS DISTINCT FROM content_hash` is **ineligible for the stat shortcut**: the scan reads it. Its task derivation joins the changed list for the task stage only. It is not upserted when its hash is unchanged.
 
-**R4.** In `_update_tasks_for_changed`, per note, under the row lock the pass already holds: if `tasks_refreshed_at >= scan_started_at` and `tasks_source_hash ≠` the pass's buffered hash, **keep the task rows**. The tool wrote them from bytes published after this pass began reading, so they may be newer. This is not a skip and not a failure, and is logged at DEBUG. Otherwise derive as today, and set `tasks_source_hash` to the buffered hash and `tasks_refreshed_at = NULL`.
+**R4.** In `_update_tasks_for_changed`, per note, under the note's row lock (the pass re-reads `tasks_refreshed_at` and `tasks_source_hash` with one `SELECT … FOR UPDATE` per derived note; that row is already locked by the pass's upsert or move, so this costs a round trip, not a wait): if `tasks_refreshed_at >= scan_started_at` and `tasks_source_hash ≠` the pass's buffered hash, **keep the task rows**. The tool wrote them from bytes published after this pass began reading, so they may be newer. This is not a skip and not a failure, and is logged at DEBUG. Otherwise derive as today, and set `tasks_source_hash` to the buffered hash and `tasks_refreshed_at = NULL`.
 
 **Convergence.**
 
 - After the last write to a note at time W, the first pass whose `scan_started_at` is later than both W and the last refresh reads the note, through the stat change or R3.
 - R4 then cannot keep the rows, because `tasks_refreshed_at < scan_started_at`. That pass re-derives from current disk, and `tasks_source_hash = content_hash` again.
+- **Cost.** When only task-dirty notes changed, the task stage reads every id in the scope. R4 adds one round trip per derived note, which matters only during the one-time backfill.
 - A row is never stuck: while it is task-dirty, R3 forces a read every pass. Pinned by an integration test that interleaves a pass's scan, a tool write, a refresh and a later edit in every order.
 
 **Why a superseded refresh cannot leave uncorrected rows.**
@@ -444,9 +457,13 @@ The pass already holds the row lock of every note whose tasks it rewrites (D-con
 | `notes_metadata.tasks_refreshed_at` | `timestamptz NULL` |
 | table `task_settings` | D14 |
 
+**032's reconcile compares the complete `note_tasks` shape**, so a stamp-back that re-runs 032 over a head database would refuse 039's units as foreign. 032 therefore carries an **allow-list**: exactly 039's named units (columns, the CHECK and the two indexes), each carrying its exact 039 marker. Any other name, or the right name with any other comment, is still compared and refused. A future revision that adds a unit to `note_tasks` must extend that list on purpose.
+
+**Stored context** keeps each line verbatim, including its blockquote prefix and any child-task lines. Rendering neutralises them (D12, the forged-row tests).
+
 **Columns are nullable** because existing rows have no value until the version-5 pass re-derives them. Pass and refresh always write all of them. `ck_note_tasks_key_shape` keeps the triple coherent. The models mirror this byte for byte, so `alembic check` stays clean. Partial and GIN indexes are declared with `postgresql_where` / `postgresql_using`.
 
-**`tag_prefixes`.** **Normalisation and prefixes** (Codex r3 NIT). The shared tag grammar allows empty `/` segments, so a tag is normalised before its prefixes are taken, in three steps: lower-case it (the grammar is ASCII), collapse every run of `/` to one `/`, and strip a trailing `/`. Its prefixes are then the normalised tag cut immediately before each `/`, plus the whole normalised tag. Every segment is non-empty, so no prefix is empty or ends with `/`. A `tags` / `exclude_tags` value is normalised the same way before matching (a trailing `/` is still refused, as before), so `a//b` and `a/b` match each other. Matching is therefore lossless for every stored tag under this one rule, and agrees with the stored `tags` up to that normalisation. Example: `Waiting-For//Chase/` → `waiting-for/chase` → `waiting-for`, `waiting-for/chase`.
+**`tag_prefixes`.** **Normalisation and prefixes** (Codex r3 NIT). The shared tag grammar allows empty `/` segments, so a tag is normalised before its prefixes are taken, in three steps: lower-case it (the grammar is ASCII), collapse every run of `/` to one `/`, and strip a trailing `/`. Its prefixes are then the normalised tag cut immediately before each `/`, plus the whole normalised tag. Every segment is non-empty, so no prefix is empty or ends with `/`. A `tags` / `exclude_tags` value is normalised the same way before matching (a trailing `/` is accepted and stripped), so `a//b` and `a/b` match each other. Matching is therefore lossless for every stored tag under this one rule, and agrees with the stored `tags` up to that normalisation. Example: `Waiting-For//Chase/` → `waiting-for/chase` → `waiting-for`, `waiting-for/chase`.
 
 The array is deduplicated and **not capped** (Codex r2 #2). **The bound, derived.** A normalised tag with k segments needs at least 2k − 1 characters (k non-empty segments and k − 1 slashes). The 128-character limit applies to the tag as written, and normalisation only shortens it, so 2k − 1 ≤ 128, which gives k ≤ 64 prefixes per tag. With at most 64 stored tags, the array holds at most 64 × 64 = 4,096 entries. That bound is reachable (64 tags of a distinct 2-character first segment plus 63 one-character segments are 128 characters and 64 prefixes each); the scenario below builds a 4,032-entry case and the unit test also builds the 4,096 one. `tags` / `exclude_tags` can therefore never disagree with the stored `tags`. `tags_cut` keeps exactly its #350 meaning: a tag dropped from the stored list (over 128 characters, or past the 64th).
 
@@ -471,7 +488,7 @@ list_tasks(folder=None, status="open", due_by=None, scheduled_by=None, tags=None
 
 Every existing argument keeps its name, position and default. All new arguments are optional.
 
-**Dates.** Every date argument accepts `YYYY-MM-DD`, `today`, `tomorrow`, `yesterday`, `+Nd` or `-Nd` (N from 0 to 3660), case-insensitive. Relative dates are resolved once per call by `task_dates.resolve(value, tz)` against the current date in the caller's effective timezone (D14).
+**Dates.** Every date argument accepts `YYYY-MM-DD`, `today`, `tomorrow`, `yesterday`, `+Nd` or `-Nd` (N from 0 to 3660), case-insensitive. Relative dates are resolved by `task_dates.resolve(value, tz, now=…)` against the current date in the caller's effective timezone (D14). The clock is read **once per call** (`snapshot_now`), and every relative date, the echoed "today", and the agenda's date use that one instant. A malformed date is refused `invalid_argument` with the wording "must be a YYYY-MM-DD date or one of today, tomorrow, …". This replaces #350's YYYY-MM-DD-only message, because `due_by` and `scheduled_by` now also accept relative forms.
 
 - `*_from` is inclusive (`>=`), and `*_by` is inclusive (`<=`).
 - A task without that date is excluded when either bound is given.
@@ -496,8 +513,8 @@ Every existing argument keeps its name, position and default. All new arguments 
 
 **`tags`, amended, and `exclude_tags`.**
 
-- Each argument is stripped of one leading `#`, lower-cased, and must match `[a-z][a-z0-9_/-]*` without a trailing `/`. Up to 32 entries of up to 128 characters. Runs of `/` are then collapsed, exactly as for stored tags (D11).
-- `tags` is `tag_prefixes @> ARRAY[…]` (AND). `exclude_tags` is `NOT (tag_prefixes && ARRAY[…])`.
+- Each argument is stripped of one leading `#` and must be 1–128 characters. It is then normalised exactly like a stored tag (`task_line.normalise_tag`: lower-cased, `/` runs collapsed, a trailing `/` stripped), and the result must match `[a-z][a-z0-9_/-]*`. A trailing slash is therefore **accepted and normalised**: `work/` means `work`, as #350 also accepted it. Duplicates are dropped, and there are at most 32 entries.
+- `tags` is `tag_prefixes @> ARRAY[…]` (AND). `exclude_tags` is `NOT (tag_prefixes && ARRAY[…])`. A row awaiting the version-5 backfill (NULL `tag_prefixes`) is matched by the same rule evaluated over its stored `tags` in SQL. That is exact, because stored tags are ASCII.
 - Hierarchical by segment and case-insensitive: `waiting-for` matches `waiting-for` and `Waiting-For/x`, never `waiting-forever` (supervisor ruling 5).
 - **Rejected: the plugin's per-tag substring match** (`#home` matches `#homework`, R§4).
 - With `tags` or `exclude_tags`, the existing `tasks with cut tags` count covers both. A cut row might hide a matching or an excluded tag.
@@ -507,7 +524,7 @@ Every existing argument keeps its name, position and default. All new arguments 
 
 **`scope`.**
 
-- `default` applies the caller's settings: a task is excluded when its note's `file_path` starts with an excluded folder (the `folder_prefix_clause` semantics), or when the note's `notes_metadata.tags` hierarchically match an excluded note tag. This is the same segment rule applied to the note's tags.
+- `default` applies the caller's settings: a task is excluded when its note's `file_path` starts with an excluded folder (the `folder_prefix_clause` semantics), or when the note's `notes_metadata.tags` hierarchically match an excluded note tag. This is the same segment rule applied to the note's tags, and a leading `#` on a stored note tag (as a frontmatter tag may be stored) is stripped before matching.
 - `all` applies nothing.
 - The header always states the scope and `excluded by scope: N tasks`: rows matching every other filter that the scope removed, stated even at 0.
 - Scope applies to `path` and `folder` too. An explicitly named note inside an excluded folder lists 0 rows and reports its exclusion count.
@@ -556,10 +573,23 @@ Every existing argument keeps its name, position and default. All new arguments 
   - The line is at most 600 characters. Names are listed while they fit, then `+N more`. The counts are always present, so exclusion is never silent.
   - The timezone and every resolved date are mandatory and never cut.
 
-**Bounds.**
+**Backfill window.** On rows still awaiting the version-5 backfill (NULL `task_key`), only `text` and `recurring` read a version-5 column, and both fall back:
 
-- **Calls without a query line**, which is every #350-only call under empty exclusion settings: the #350 guarantee at `MAX_READ_RESPONSE_CHARS = 1,000` still holds. The abbreviated-row structure bound is tightened to 100 (measured 86 in #350) to absorb the 24-character id token: 480 + 85 + 200 + 100 + 24 + 96 = 985 ≤ 1,000.
-- **Calls with a query line**: the guarantee holds at B ≥ 1,600 (985 + 600 + 1). Below that, when not even the abbreviated first row fits, the call is refused with `response_cap_too_small`, naming `MAX_READ_RESPONSE_CHARS`. This is never an empty page with a cursor (owner decision 2026-11-10: accepted).
+- `text` falls back to `lower(text)`, which can miss a non-ASCII case match;
+- `recurring` falls back to the `🔁` signifier anywhere in the stored text.
+
+While such rows are among the matches of every other filter, the response carries the incomplete-list notice `Incomplete list: [unscanned notes, unindexable tasks; ]<text|recurring|text and recurring> filter(s) approximate until the next index pass.`, at most 120 characters. Tags, dates, priority, `has_due`, `undated`, scope and every order read version-4 columns, and are exact. `task ids pending` ignores `text` and `recurring`: it is a conservative "might match" count.
+
+**Bounds, as implemented and measured** (S4 audit). The synthetic worst case has every header count at 10 digits, a 10-digit line number, a 23-character id, a 1,024-character folder echo and a 32 × 128-character tags echo.
+
+- **Never refused, never over the cap.** At B = 1,000 with no query line (every #350-only call under empty exclusion settings), a row always renders, abbreviated if necessary, and the response never exceeds B. `response_cap_too_small` is returned only when **no** abbreviated row fits at all. It is never returned merely because the shares fall below 40.
+- **Text share.** The text keeps at least 40 characters.
+- **Path share** (L22). The path share can fall below 40 in extreme header cases at B = 1,000. Rendered values are 140 characters with zero counts, 39 with 4-digit counts, 29 with 6-digit counts, and 9 with 10-digit counts. #350 kept 183 / 77 / 61. The difference is the 29-character id token. 40 + 40 needs B ≥ 1,031 in the extreme case.
+- **With the query line**, a row always renders from B = 1,531. The "never refused at B ≥ 1,600" guarantee holds. 40 + 40 needs 1,608 (at 1,600 the path keeps 32). With the incomplete-list notice also present, a row renders from 1,564 and 40 + 40 needs 1,641.
+- **Header line 1** is at most 480 characters. In the extreme case the folder echo is shortened so that 480 holds; 481 was measured before the fix.
+- **The query line** is at most 600 characters, measured at 591, because the `text`, `priority`, `exclude_tags` and `path` echoes shrink from 32 to 24 characters when needed.
+- **The abbreviated row's fixed structure** measures 86 characters, plus 29 for the ` — id <id>` token, plus 18 for `— context omitted` when context was requested. The design's earlier paper bound of 100 + 24 is superseded by these measurements.
+- **An empty result is never refused.** It is the header with `shown: 0` and no cursor.
 
 ### D13. `task_agenda` (read-only)
 
@@ -619,18 +649,21 @@ updated_at            timestamptz NOT NULL DEFAULT now()
 
 **Service.** `task_settings.effective(session, uid) -> EffectiveTaskSettings` is a frozen dataclass merging the row over the defaults. It is read once per call. `task_settings.save(session, uid, form)` validates:
 
-- the timezone against `zoneinfo.available_timezones()`;
+- the timezone against `zoneinfo.available_timezones()`, refusing host pseudo-zones (`localtime`, `Factory`, `posixrules`, and anything under `posix/` or `right/`);
 - folders as vault-relative, without `..`, without a leading `/`, at most `MAX_PATH_CHARS`, normalised to end with `/`;
 - tags against the tag grammar;
 - at most 32 of each.
 
-It upserts under `FOR UPDATE`.
+It upserts under `FOR UPDATE`. Each write-behaviour field takes `"on"`, `"off"` or `"default"`. `"default"` stores NULL, so the environment default applies. **A boolean key absent from the form leaves the stored value unchanged** (NULL for a new row).
 
 **Panel.**
 
-- A "Tasks" card with a timezone `<input list>` backed by a `<datalist>` of IANA names, two textareas (one item per line), and four checkboxes, each labelled with the plugin's own setting name.
-- **Multi-user mode:** on `/account`, editing the signed-in user's own row (`POST /account/tasks`).
-- **Single-user mode:** on `/admin/settings`, editing the NULL-scope row (`POST /admin/settings/tasks`, admin).
+- **The card** is one shared template, `templates/_task_settings_card.html`. It has:
+  - a timezone `<input list>` backed by a `<datalist>` of a fixed list of 79 common IANA names (`TASK_TIMEZONE_SUGGESTIONS`). Any IANA name the validator accepts may still be typed;
+  - two textareas, one item per line;
+  - four **three-option selects** (server default with its current value / on / off), each labelled with the plugin's own setting name.
+- **Multi-user mode:** on the account page, editing the signed-in user's own row (`POST /admin/account/tasks`; 404 in single-user mode).
+- **Single-user mode:** on the Settings page, editing the NULL-scope row (`POST /admin/settings/tasks`, admin; 404 in multi-user mode).
 - Both use CSRF, the session flash, a 303 redirect, `data-*` attributes and no inline handler or style. Any client behaviour goes through a delegated listener in `panel.js`.
 - **Rejected:** a card on `/account` in single-user mode, which 404s there by design (D23 of #197).
 - The `page_account_*` goldens are regenerated deliberately. The settings page has no golden. The owner walks the card by hand with devtools open, and zero CSP violations is part of the bar.
@@ -683,6 +716,8 @@ Every refusal ends with `MCP-REFUSAL {"code":…}` and carries `nothing_written:
 | `response_cap_too_small` | read tools, D12/D13 (a read, so nothing written by definition) |
 
 `precondition_required` (reused) also fires for a suffixed id without `expected_hash`, in every mode (D2).
+
+`content_unsafe` (reused from `edit_note`'s section mode) is returned by every planner on a defective frontmatter block (detail `frontmatter_defect`), and by `add_task(section=…)` on an unmatched indented fence (detail `unmatched_fence`). The prose is `edit_note`'s.
 
 **Reused codes:** `invalid_argument`, `validation_failed`, `selector_unresolved` and the section-write defect refusals, `size_limit` (note over the read cap, result over the note cap, note over the 5,000-task cap), `io_failure`, `malformed_precondition`, `stale_precondition`, `precondition_unavailable`, `concurrent_write` (after the D2 retry budget), `permission_denied`, the vault reassignment and anchor markers, and the rate and quota refusals.
 
@@ -743,7 +778,18 @@ Each item is deliberate and additive or necessary under the 1.0 tool-contract pr
 
 1. **`list_tasks` rows gain ` — id <id>`** after `path:line`. This is an additive token, inserted before the fields so the `text:`-last rule holds. It is required for the write tools.
 2. **`list_tasks(tags=…)` matching becomes hierarchical and case-insensitive.** It fixes a silently empty answer. Every previously matching row still matches, and only more rows can match.
-3. **The `list_tasks` header line 1 gains `task ids pending`**, and a query line appears when new features are in use or exclusions are configured. With empty settings and no new arguments, only the `task ids pending` token is new.
+3. **The `list_tasks` header line 1 gains `task ids pending: N tasks`**, and a query line appears when new features are in use or exclusions are configured.
+
+**Everything a #350-only call can observe** (no new arguments, empty settings):
+
+- the ` — id <id>` token on every row;
+- the `task ids pending` header token;
+- the line-1 `tags:` echo is the normalised value, so `#Work` shows as `#work`;
+- hierarchical, case-insensitive tag matching;
+- a shorter abbreviated-row path share at very small caps (L22);
+- cursor version 2, with version-1 cursors refused once;
+- `due_by` / `scheduled_by` accepting relative dates, so the malformed-date refusal wording changed ("YYYY-MM-DD date or one of today, tomorrow, …");
+- a trailing-slash tag value is normalised (`work/` = `work`).
 4. **Default scope.** Once an owner configures exclusions, an argument-less `list_tasks` excludes them and says so. With no settings (the default), results are unchanged.
 5. **Cursor version 2.** Version-1 cursors are refused once after deploy, with `invalid_argument` ("start without one").
 6. **The `list_tasks` description** grows to cover the new arguments. The schema changes only by additive optional properties.
@@ -773,6 +819,12 @@ Each item is deliberate and additive or necessary under the 1.0 tool-contract pr
 - **L17**: With `next_recurrence_below`, the next occurrence goes after the completed task's continuation block, not on the adjacent line as the plugin writes it, so children stay with the completed task.
 - **L18**: A write with a suffixed id needs a `read_note` first for its `content_hash`. The index digest cannot serve as the precondition (D2).
 - **L19**: The internal retry gives up after 3 in-call conflicts with `concurrent_write`. More parallel writers to one note than that need the caller to retry.
+- **L20**: 039's downgrade drops a foreign, unmarked index that sits on a 039 column, because PostgreSQL drops a column's indexes with it.
+- **L21**: The refresh's root re-check is not under a lock. A root reassignment between the check and the write stores rows under the old scope's row, which the provenance discard then purges.
+- **L22**: At the 1,000-character minimum cap, the abbreviated row's path share can fall below 40 characters in extreme header cases (as low as 9), because the id token costs 29 characters. The text keeps 40. A row always renders, and the cap is never exceeded.
+- **L23**: A clean row (`tasks_source_hash = content_hash`) may keep a non-NULL `tasks_refreshed_at`, when a pass read B and then the refresh of B landed. It is harmless.
+- **L24**: A note whose line 1 is a `---` thematic break with no closing `---` reads as a defective frontmatter block, so no task in it can be written (`content_unsafe`).
+- **L25**: A lone-CR-terminated task with below-placement is refused by `verify`. An ordered anchor `007)` gives `8)`, losing the zero padding. `<key>.1of1` on a line that has since been duplicated answers `task_ambiguous`.
 
 ## Test plan
 
@@ -796,7 +848,7 @@ Each item is deliberate and additive or necessary under the 1.0 tool-contract pr
   - next-line construction (fields removed, created per setting) and placement above or below at end of file without a terminator.
 - **`task_dates`**: every relative form at UTC, `Pacific/Kiritimati` and `America/Adak` around midnight, using the injectable clock; `+3661d` refused.
 - **D1 id**: the key over a 1,500-character text; ordinals for 3 identical lines; `.1of1` equivalence; the grammar.
-- **Rendering bounds**: a brief row ≤ 260 plus the path; query line ≤ 600; the #350 minimum-cap test with ids (985); `response_cap_too_small` at B = 1,000 with exclusions configured; agenda at B = 2,800; context lines never start with `- [`; the forged-row cases through context.
+- **Rendering bounds**: a brief row ≤ 260 plus the path; query line ≤ 600; the minimum-cap test with ids at B = 1,000 (never refused, never over the cap, text ≥ 40, path share as measured in D12); 40 + 40 at 1,031 / 1,608 / 1,641; `response_cap_too_small` only when no abbreviated row fits; agenda at B = 2,800; context lines never start with `- [`; the forged-row cases through context.
 
 **Integration (`tests/integration/`, real Postgres):**
 
@@ -904,6 +956,16 @@ Then run the full offline suite, `make test-integration`, `make test-schema` and
 3. **MINOR.** The next-occurrence terminator rule differed between placements. One rule now applies: the original task line's terminator.
 
 Round 3 is verification only, per the review budget.
+
+**Implementation audits (2026-11-10).** Each slice was audited independently after it merged.
+
+| Slice | Result |
+|---|---|
+| S1 (pure modules) | 1 MAJOR, 3 MINOR, 2 NIT, all fixed. This includes the `task_line` performance fix: the run parse is now linear, and a 10 MiB line parses in under 2 s, where the old rescan-per-pass took about 25 s |
+| S2 (schema, settings) | no BLOCKER or MAJOR; 4 fixed (032 allow-list, `save` on absent booleans, pseudo-zones, docs), 1 accepted (L20) |
+| S3 (indexer, refresh) | no BLOCKER or MAJOR; 1 fixed (derive before the row lock), 2 accepted (L21, L23) |
+| S4 (query, render) | 1 MAJOR (transient), 4 fixed (incomplete notice during the backfill, one clock read per call, empty result never refused, `#`-prefixed note tags in scope), 2 spec-text corrections (bounds, trailing slash) |
+| S5 (write planning) | 1 MAJOR and 4 MINOR fixed (frontmatter-defect refusal in every planner, a stronger `verify`, caller-text structure refusals, context-line indentation, the similar-task rule), 3 accepted (L25) |
 
 **Supervisor additions** (round 1).
 

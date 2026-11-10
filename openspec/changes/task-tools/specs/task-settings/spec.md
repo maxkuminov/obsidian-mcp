@@ -35,9 +35,9 @@ With no exclusions configured, the default scope SHALL exclude nothing. Startup 
 
 ### Requirement: Task settings SHALL be validated on save and read once per tool call
 
-Saving settings SHALL validate the following, refusing the whole save with a flashed message and nothing stored when any check fails:
+Each write-behaviour field SHALL take `on`, `off` or `default`. `default` stores NULL, so the environment default applies, and a field absent from the submitted form SHALL leave its stored value unchanged (NULL for a new row). Saving settings SHALL validate the following, refusing the whole save with a flashed message and nothing stored when any check fails:
 
-- the timezone SHALL be a member of the available IANA timezones;
+- the timezone SHALL be a member of the available IANA timezones, and SHALL NOT be a host pseudo-zone (`localtime`, `Factory`, `posixrules`, or a name under `posix/` or `right/`);
 - each excluded folder SHALL be vault-relative, contain no `..` segment and no leading `/`, be at most `MAX_PATH_CHARS` long, and be stored normalised with a trailing `/`;
 - each excluded note tag SHALL match the inline-tag grammar after one leading `#` is stripped;
 - there SHALL be at most 32 of each list.
@@ -54,13 +54,13 @@ Each task tool SHALL read the caller's effective settings once per call. A store
 
 ### Requirement: The control panel SHALL offer a Tasks settings card for the caller's own scope in both modes, under the panel's CSP rules
 
-In multi-user mode, the account page SHALL show a "Tasks" card that edits the signed-in user's own row (`POST /account/tasks`). In single-user mode, where the account page does not exist, the Settings page SHALL show the same card, editing the NULL-scope row (`POST /admin/settings/tasks`, administrators only).
+In multi-user mode, the account page SHALL show a "Tasks" card that edits the signed-in user's own row (`POST /admin/account/tasks`, 404 in single-user mode). In single-user mode, where the account page does not exist, the Settings page SHALL show the same card, editing the NULL-scope row (`POST /admin/settings/tasks`, administrators only, 404 in multi-user mode). Both pages SHALL render one shared card template.
 
 The card SHALL offer:
 
-- a timezone input backed by a list of IANA names;
+- a timezone input with suggestions from a fixed list of common IANA names, accepting any valid IANA name;
 - excluded folders and excluded note tags, one per line;
-- the four write-behaviour checkboxes, each labelled with the Tasks plugin's own setting name.
+- the four write behaviours, each as a three-option select (server default, showing its current value; on; off), labelled with the Tasks plugin's own setting name.
 
 The card SHALL show the effective defaults. Each form SHALL carry the CSRF token, answer with a session flash and a 303 redirect, and SHALL contain no inline event handler, no inline `style` attribute and no `javascript:` URL. Any `<script>` or `<style>` SHALL carry the CSP nonce. No user SHALL be able to read or change another user's task settings through these routes.
 
@@ -70,8 +70,16 @@ The card SHALL show the effective defaults. Each form SHALL carry the CSRF token
 
 #### Scenario: Single-user mode uses the Settings page
 - **WHEN** the server runs in single-user mode
-- **THEN** `/account/tasks` SHALL answer 404, the Settings page SHALL show the Tasks card, and saving it SHALL update the NULL-scope row that MCP callers there use
+- **THEN** `POST /admin/account/tasks` SHALL answer 404, the Settings page SHALL show the Tasks card, and saving it SHALL update the NULL-scope row that MCP callers there use
 
 #### Scenario: The card passes the CSP checks
 - **WHEN** the account and settings pages are rendered and scanned
 - **THEN** neither SHALL contain an `on*=` attribute, a `style=` attribute or a `javascript:` URL, and every `<script>` and `<style>` SHALL carry the nonce
+
+#### Scenario: Pseudo-zones are refused
+- **WHEN** a user saves the timezone `localtime`, `Factory` or `posix/Europe/Berlin`
+- **THEN** the save SHALL be refused, and nothing SHALL be stored
+
+#### Scenario: An absent field keeps its stored value
+- **WHEN** a user's row stores `set_done_date = false`, and a save submits the form without the `set_done_date` field
+- **THEN** `set_done_date` SHALL remain false, and a save submitting `default` SHALL store NULL
