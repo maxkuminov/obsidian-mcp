@@ -603,3 +603,20 @@ def test_every_new_refusal_code_is_produced_by_the_wiring():
             "complete_task", "A.md", task_write.TaskWriteRefusal(code, "because"))
         assert code_of(out) == code
         assert payload_of(out)["nothing_written"] is True
+
+
+def test_the_primer_names_the_task_tools_neutrally(world):
+    """`vault-guide` delta (#428): the Tasks section names the five tools,
+    says the writes take a path plus a task id, that plain checkboxes work
+    and the plugin fields are optional, and that query blocks are not
+    evaluated — ranking no tool above another."""
+    result = run(tools.get_vault_guide_impl())
+    tasks = result.split("## Tasks", 1)[1].split("\n## ", 1)[0]
+    flat = " ".join(tasks.split())
+    for name in ("list_tasks", "task_agenda", "complete_task", "update_task", "add_task"):
+        assert f"`{name}`" in tasks, name
+    assert "note path plus the task id a listing prints" in flat
+    assert "Plain checkboxes work without the Tasks plugin" in flat and "optional" in flat
+    assert "not evaluate" in flat
+    for word in ("MUST", "IMPORTANT", "always use", "primary"):
+        assert word not in tasks

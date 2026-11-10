@@ -8618,10 +8618,6 @@ def encode_task_cursor(*, owner: str, filters: str, due_key: str, path: str,
     return _b64url(raw.encode("utf-8"))
 
 
-
-
-
-
 def _escape_task_path(path: str) -> str:
     """The path, exact and on one line: every whitespace character other than
     U+0020 — each one `_one_line` would collapse — is shown as an escape, and
@@ -9511,7 +9507,6 @@ async def add_task_impl(
         plan_fn=lambda body: task_write.plan_add(body, args, effective, today),
         describe=describe, after_plan=scan,
     )
-
 
 
 # ════════════════════════════════════════════════════════════════════════════
