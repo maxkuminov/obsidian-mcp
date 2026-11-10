@@ -299,7 +299,7 @@ It SHALL name the excluded items while they fit.
 
 **Context.** With `context=true`, a task's stored context lines SHALL follow it, each prefixed by four spaces and `┆ `.
 
-**Escaping and labels.** Every note-controlled field (text, heading path, tags, context) SHALL be rendered with every whitespace run, line breaks included, collapsed to one space. A path SHALL be rendered through one escaping helper that escapes each such character, doubles each literal backslash and escapes each backtick as `` \` ``, injectively, so that a file name cannot close the backtick-delimited path field. The write tools SHALL take the original, unescaped path. Cut text, cut tags and cut context SHALL each be labelled as cut.
+**Escaping and labels.** Every note-controlled field (text, heading path, tags, context) SHALL be rendered with every whitespace run, line breaks included, collapsed to one space. A path SHALL be rendered through one escaping helper that escapes each such character, doubles each literal backslash and escapes each backtick as `\u0060`, injectively, so that a file name cannot close the backtick-delimited path field. The write tools SHALL take the original, unescaped path. Cut text, cut tags and cut context SHALL each be labelled as cut.
 
 **Incompleteness.** When any note is not yet scanned for tasks, or its tasks could not be indexed, the response SHALL say that the list is incomplete and why. When `text` or `recurring` is used while rows awaiting the version-5 backfill are among the matches of every other filter, it SHALL also say that those filters are approximate until the next index pass. These are the only two filters that read a version-5 column; `text` then falls back to lower-casing and `recurring` to the signifier in the stored text.
 
