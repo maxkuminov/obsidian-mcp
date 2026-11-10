@@ -142,26 +142,26 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
 
 ## 7. S7: wiring and tool surface (wave 3, after S3–S5 merge)
 
-- [ ] 7.1 `src/mcp_server/tools.py`:
+- [x] 7.1 `src/mcp_server/tools.py`:
   - **`list_tasks_impl`** delegates to `task_query` and `task_render`, with `_tracked` params extended (D17) and `arg_char_caps` for `path`, `text` and `cursor`;
   - **`task_agenda_impl`**;
   - **`complete_task_impl`, `update_task_impl` and `add_task_impl`**, following the D2 order exactly (reusing `_require_write`, `_precondition_syntax_error`, `open_mutable`, `_leaf_state_error`, `read_bytes_at`, `_precondition_error` with the D3 enforceability, `_note_size_error`, the `dry_run` diff, `_confirmed_publication` with `write_file_at(expected=…)`, `_concurrent_write_refusal`), then `task_index.refresh_note_tasks`, then `_record_note_events`, then the D16 response;
   - every refusal typed;
   - the D2 bounded retry: on an in-call conflict with no `expected_hash`, repeat from the read, at most 3 attempts in total, carrying nothing over; no retry when a hash was supplied;
   - `_tracked(..., write_class=True)` for the three writes, never logging text or context.
-- [ ] 7.2 `src/mcp_server/server.py`:
+- [x] 7.2 `src/mcp_server/server.py`:
   - register `task_agenda` (`_READ_ONLY`), `complete_task` (`_DESTRUCTIVE`), `update_task` (`_DESTRUCTIVE`) and `add_task` (`_ADDITIVE`) after `hybrid_search`, in that order, with D15 titles;
   - descriptions ≤ 4,000 characters, leading with the contract;
   - the extended `list_tasks` signature and description;
   - update the classification comment (19 read-only; destructive = write bucket minus `create_note` and `add_task` plus `request_upload`);
   - replace the `list_tasks` sentence in `SERVER_INSTRUCTIONS` with the D15 sentence, keeping the lead byte-identical.
-- [ ] 7.3 `src/mcp_server/tool_permissions.py`: add the three write tools (12 names). `src/services/concurrency.py`: the three in `write`, `task_agenda` in `scan`, `CLASS_MAPPING_VERSION = 6` with a comment line.
-- [ ] 7.4 `src/mcp_server/vault_guide_primer.md`: the Tasks section per the `vault-guide` delta, neutral.
-- [ ] 7.5 Fixtures and pinned counts (re-grep `tests/` for `28`, `19`, `eighteen`, `nine`, `eight`, `full_v1`, `CLASS_MAPPING_VERSION`):
+- [x] 7.3 `src/mcp_server/tool_permissions.py`: add the three write tools (12 names). `src/services/concurrency.py`: the three in `write`, `task_agenda` in `scan`, `CLASS_MAPPING_VERSION = 6` with a comment line.
+- [x] 7.4 `src/mcp_server/vault_guide_primer.md`: the Tasks section per the `vault-guide` delta, neutral.
+- [x] 7.5 Fixtures and pinned counts (re-grep `tests/` for `28`, `19`, `eighteen`, `nine`, `eight`, `full_v1`, `CLASS_MAPPING_VERSION`):
   - regenerate the `list_tasks` entry in `tools_list_schema_additions.json`, append the four new tools, and add the additive-amendment test;
   - generate `tools_list_full_v2.json` and the v1-derivation test; regenerate `tools_list_readonly_oauth.json` (20);
   - update `test_issue_343_tool_metadata.py` (32, `READ_TOOLS` 19, the destructive rule), `test_issue_358_scoped_tools_list.py`, `test_issue_295_unknown_arguments.py`, `test_issue_263_coverage_registry.py`, `test_issue_261_controller.py`, `test_issue_261_tool_admission.py`, `test_body_budget_config.py`, `test_tei_identity.py`, `test_search_confidence.py`, `test_transfer_overlap_gate.py`, and anything else the grep finds.
-- [ ] 7.6 `tests/integration/test_task_tools_pg.py` (container `omcp-tt-s7` / 55457): the end-to-end `task-write` scenarios through the registered tools. That covers resolution (wrong line, duplicates, count changed, concurrent modification, CRLF, blockquote, fence, frontmatter look-alike), each write tool, `dry_run`, required mode, permission refusal, the change-feed event after the refresh, read-your-writes (list → complete → list), usage params free of task text, and tenancy. It also covers:
+- [x] 7.6 `tests/integration/test_task_tools_pg.py` (container `omcp-tt-s7` / 55457): the end-to-end `task-write` scenarios through the registered tools. That covers resolution (wrong line, duplicates, count changed, concurrent modification, CRLF, blockquote, fence, frontmatter look-alike), each write tool, `dry_run`, required mode, permission refusal, the change-feed event after the refresh, read-your-writes (list → complete → list), usage params free of task text, and tenancy. It also covers:
   - suffixed ids refused without `expected_hash` in default mode;
   - swapped identical lines refused under the old hash;
   - three parallel completions of different tasks in one note all succeeding;
