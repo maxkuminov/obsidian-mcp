@@ -121,7 +121,7 @@ async def test_single_user_scope_is_the_null_row(db):
     async with db() as session:
         row = (await session.execute(select(TaskSettings))).scalar_one()
     assert (row.set_done_date, row.set_cancelled_date, row.set_created_date,
-            row.next_recurrence_below) == (True, True, None, False)
+            row.next_recurrence_below) == (True, True, None, None)
 
 
 async def test_a_save_without_flags_never_switches_a_default_off(db):
