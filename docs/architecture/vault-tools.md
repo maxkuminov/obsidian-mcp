@@ -1850,6 +1850,23 @@ are listed in the response and the dry run. `pg_trgm` was rejected: it is not
 installed, an extension would need the init scripts, and trigram similarity
 misbehaves on short multilingual text.
 
+### Every printed path goes through one escaper
+
+Every note path the task tools print — `list_tasks` full and brief rows,
+`task_agenda` rows, `add_task`'s similar-tasks list, refusal listings
+(`task_ambiguous`, `duplicate_task`) and the write responses — goes through
+one helper, `_escape_task_path` in `src/mcp_server/tools.py`. Whitespace
+other than U+0020 is shown as an escape (`\n`, `\r`, `\t`, `\uXXXX`), a
+literal backslash is doubled, and a **backtick is escaped too** (```), so
+the rendering is injective and stays on one line. **The backtick rule is
+load-bearing.** The path sits in a backtick-delimited field, and a file name
+can contain backticks (a web-clipped title is enough); printed raw, one could
+close the field and forge a second path, line or id inside one row. Since
+#428 a row is the handle the write tools act on, so a forged row is a write
+aimed at another task. Found by the cross-family review. The write tools take
+the **original** path as it is on disk, never the escaped display form: a
+caller undoes the escapes when a row shows any.
+
 ### Refusal codes
 
 New, in `refusals.TASK_CODES` (body-only, no retry interval): `task_not_found`,
@@ -1906,7 +1923,9 @@ optional: `due_from`, `scheduled_from`, `done_from`, `done_by`, `undated`,
   A normalised value must match `[a-z][a-z0-9_/-]*`, so a value outside the
   tag grammar (`2024`, `a.b`, a non-ASCII tag), which under #350 returned an
   empty page, is now `invalid_argument`; the `tags:` echo is the normalised,
-  lower-cased value.
+  lower-cased value. A path containing a backtick is now shown with the
+  backtick escaped (```, see "Every printed path goes through one
+  escaper"); #350 printed it raw.
   `tag_prefixes` is uncapped and lossless (at most 64 prefixes per tag and
   4,096 per task, by construction), so a filter can never disagree with the
   stored tags.
