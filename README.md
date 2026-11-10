@@ -453,7 +453,10 @@ key computed from the task's text. To change a task, pass the note's
 `path` and that id. The server finds the line by recomputing the ids
 from the note's current text, never from a stored line number, and
 because a write changes the line's text, the response returns the task's
-new id. Nothing is ever written into a note to identify a task. When a
+new id. Nothing is ever written into a note to identify a task. Pass the
+path as it is on disk: a row escapes unusual characters in a path (a tab
+as `\t`, a backtick as ```, a backslash doubled), so undo those
+escapes if the row shows any. When a
 note holds several identical task lines, their ids carry an occurrence
 suffix (`3f9a0c1b2d4e.2of3`), and a write with such an id also needs
 the note's `content_hash` from `read_note` as `expected_hash`.
@@ -1303,8 +1306,9 @@ Across the task-tools release (migration 039, #428):
   tag grammar (`["2024"]`, `["a.b"]`, a non-ASCII tag), which used to
   return an empty page, is now refused `invalid_argument`; `due_by` and
   `scheduled_by` also accept relative dates, so the wording of the
-  malformed-date refusal changed; and the header gains
-  `task ids pending`. A `list_tasks` cursor issued before the upgrade is
+  malformed-date refusal changed; a path containing a backtick is now
+  shown with the backtick escaped as ``` (it was printed raw); and
+  the header gains `task ids pending`. A `list_tasks` cursor issued before the upgrade is
   refused once (`invalid_argument`): list again without it.
 - **Four new tools and the counts that follow.** `task_agenda`,
   `complete_task`, `update_task` and `add_task` bring the tool list to 32.
@@ -2426,12 +2430,23 @@ spending daily quota. Zero wait means immediate admission or refusal; a positive
 wait uses a bounded queue and one deadline. A retry hint is not a promise that
 a running call will finish by that time.
 
-The four tool classes each default to one concurrent call: `semantic_search`
-uses embedding, `find_related` uses vector, the eleven vault-mutating tools use
-write, and the remaining tools use other. Global, tenant and principal ceilings
-default to 4, 3 and 2. OAuth refresh keeps the same principal. Full request and
-per-bearer ceilings default to 32 and 4, authentication to 2, and usage writers
-to 1. All settings and queue limits are listed in `.env.example`.
+Every tool belongs to one of five classes (`src/services/concurrency.py`,
+`CLASS_MAPPING_VERSION` 6), each with its own ceiling:
+
+| Class | Tools | Default ceiling |
+| --- | --- | --- |
+| `embedding` | `semantic_search`, `hybrid_search` | 1 |
+| `vector` | `find_related` | 1 |
+| `write` | the eleven vault-mutating tools, including `complete_task`, `update_task` and `add_task` | 1 |
+| `scan` | `keyword_search`, `list_notes`, `get_tags`, `get_neighborhood`, `find_orphans`, `list_files`, `list_tasks`, `get_changes`, `task_agenda` | 2 |
+| `light` | `read_note`, `read_file`, `get_recent`, `get_vault_guide`, `get_backlinks`, `get_links`, `request_upload`, `check_upload`, `request_download` | 4 |
+
+Global, tenant and principal ceilings default to 6, 4 and 3. OAuth refresh
+keeps the same principal. Full request and per-bearer ceilings default to 64
+and 20, authentication to 2, and usage writers to 1. The mapping version is
+part of the readiness epoch, so a change to the classes (such as #428's) starts
+a fresh window for `make concurrency-report`. All settings and queue limits
+are listed in `.env.example`.
 
 Startup validates the pool budget as `auth + 2 × tools + writers + 4 ≤ 15`.
 The four connections of headroom are shared with panel, OAuth, indexing and

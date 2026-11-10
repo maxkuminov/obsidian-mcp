@@ -1361,7 +1361,8 @@ every other tool. What an operator has to know:
   (every row that matched before still matches) and the `tags:` header
   echo is lower-cased, a `tags` value outside the tag grammar (`["2024"]`,
   `["a.b"]`, a non-ASCII tag) that used to return an empty page is now
-  refused `invalid_argument`, and `due_by` /
+  refused `invalid_argument`, a path containing a backtick is now shown
+  with the backtick escaped as ``` (it was printed raw), and `due_by` /
   `scheduled_by` also accept relative dates, which changes the wording of
   the malformed-date refusal.
 - **A new concurrency-readiness epoch.** `complete_task`, `update_task`
