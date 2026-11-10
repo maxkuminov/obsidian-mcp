@@ -77,10 +77,10 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
 
 ## 4. S4: query service and rendering (wave 2, does not touch `tools.py`)
 
-- [ ] 4.1 `src/services/task_query.py`:
+- [x] 4.1 `src/services/task_query.py`:
   - `list_tasks_query(uid, args, settings) -> TaskPage | Refusal` (D12: validation, relative dates, every filter, `tag_prefixes` matching, `text_fold` with `strpos`, scope with the excluded count, every `order_by` with its keyset predicate, cursor version 2 encode and decode with the owner, filter and settings digests, the counts, one `REPEATABLE READ, READ ONLY` snapshot);
   - `task_agenda_query(uid, args, settings)` (D13: the five predicates, caps, totals, continuation cursors minted for the exact `list_tasks` query).
-- [ ] 4.2 `src/mcp_server/task_render.py`:
+- [x] 4.2 `src/mcp_server/task_render.py`:
   - header line 1 (the #350 tokens plus `task ids pending: N tasks`, counting rows with a NULL `task_key`) and the query line (≤ 600);
   - an id rendered whenever `task_key` is populated, else `id pending`;
   - full rows with ids, brief rows (≤ 260 plus the path), context lines (`    ┆ `);
@@ -89,13 +89,13 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
   - `response_cap_too_small`.
   
   Move or reuse the #350 helpers (`_escape_task_path`, `_one_line`, cursor helpers) by import. Do not edit `tools.py`; S7 rewires.
-- [ ] 4.3 `tests/test_task_render.py`:
+- [x] 4.3 `tests/test_task_render.py`:
   - every bound;
   - the minimum-cap test with ids at 1,000 (985 arithmetic);
   - `response_cap_too_small` at 1,000 with exclusions;
   - the agenda at 2,800;
   - forged rows through text, heading, tag and context.
-- [ ] 4.4 `tests/integration/test_task_query_pg.py` (container `omcp-tt-s4` / 55454): every `list_tasks` and `task_agenda` scenario of the `note-tasks` delta, including:
+- [x] 4.4 `tests/integration/test_task_query_pg.py` (container `omcp-tt-s4` / 55454): every `list_tasks` and `task_agenda` scenario of the `note-tasks` delta, including:
   - exactly-once paging per `order_by` over 1,234 tasks;
   - a version-1 cursor refused;
   - hierarchical tags vs `waiting-forever`;
