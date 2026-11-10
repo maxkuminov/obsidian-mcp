@@ -996,7 +996,8 @@ Round 3 is verification only, per the review budget.
   - **Accepted and fixed (MAJOR):** a backtick in a path could forge a row.
   - **Declined:** the publish-path window (L26). It is an owner-declared residual, needs an external writer at one exact instant, and is shared with `edit_note`.
   - **Declined:** migration 039 on a multi-million-row table (L27). The size is implausible for this server.
-- **Full gates on the merged result at 3145320:** the offline suite passed (10,093 tests). The supervisor appends the integration-suite and schema-gate results.
+- **Full gates on the merged result at 3145320** (before the final fix round): the offline suite passed (10,093 tests) and the full integration suite passed (1,565 tests, none skipped, real PostgreSQL). The schema gate passed three times during the slice work (404 tests each: the schema slice, its auditor, the indexer slice).
+- **After the final fix round and the docs (the tree this change is archived from):** the full offline suite passed (10,160 tests); the integration modules the round touched passed on a throwaway database (task tools, duplicates, refresh, query, `list_tasks`: 163, then the task-tool module again with the path round trip: 19); `make audit` is clean. CI on the pull request runs the complete suite, the schema gate and `openspec validate --specs --strict` on that tree and is the authoritative gate.
 
 **Supervisor additions** (round 1).
 

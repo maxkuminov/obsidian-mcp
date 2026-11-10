@@ -169,7 +169,7 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
 
 ## 8. Integration and seams (orchestrator, after S7 merges)
 
-- [ ] 8.1 Grep for a production caller of every new export (design §Slice plan, "Seams"):
+- [x] 8.1 Grep for a production caller of every new export (design §Slice plan, "Seams"):
   - `refresh_note_tasks`, `tasks_from_note_text`, `effective`;
   - `list_tasks_query`, `task_agenda_query`;
   - `plan_complete`, `plan_update`, `plan_add`, `duplicate_scan`;
@@ -178,7 +178,7 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
   - the R2/R3/R4 hooks.
   
   Any export without one blocks.
-- [ ] 8.2 Full offline `pytest tests`, then `make test-integration`, then `make test-schema` (not concurrently), on the merged result. This is the authoritative gate.
+- [x] 8.2 Full offline `pytest tests`, then `make test-integration`, then `make test-schema` (not concurrently), on the merged result. This is the authoritative gate.
 
 ## 9. S8: docs (same PR)
 
@@ -206,10 +206,10 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
 
 ## 10. Gates
 
-- [ ] 10.1 `openspec validate task-tools --strict`.
-- [ ] 10.2 `make audit` (including `tzdata`), `make test-schema`, `make test-integration`, `make db-check` (after deploy).
-- [ ] 10.3 `openspec-verifier` subagent against this change, iterated to zero blocking gaps.
-- [ ] 10.4 Adversarial Codex. This is mandatory: write tools, recurrence correctness and an index-path change. Frame "wrong" as a write to the wrong line or damage to a note, a series that ends silently or gets a wrong date, a listing that silently omits or wrongly includes, and a tenant boundary crossed. Two rounds by default, with triage per the workflow.
+- [x] 10.1 `openspec validate task-tools --strict`.
+- [x] 10.2 `make audit` (including `tzdata`), `make test-schema`, `make test-integration`, `make db-check` (after deploy).
+- [x] 10.3 `openspec-verifier` subagent against this change, iterated to zero blocking gaps.
+- [x] 10.4 Adversarial Codex. This is mandatory: write tools, recurrence correctness and an index-path change. Frame "wrong" as a write to the wrong line or damage to a note, a series that ends silently or gets a wrong date, a listing that silently omits or wrongly includes, and a tenant boundary crossed. Two rounds by default, with triage per the workflow.
 - [ ] 10.5 After deploy, an end-to-end exercise against the live server, recording which tools were called and the results:
   - `list_tasks(due_from="today", due_by="+7d")`;
   - `list_tasks(tags=["<a nested tag's parent>"])`;
@@ -224,7 +224,7 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
   
   Confirm the not-yet-scanned and ids-pending counts reached 0.
 - [ ] 10.6 The owner's manual panel pass: walk the Tasks card in the deployed mode with devtools open, save valid and invalid values, and confirm zero CSP violations.
-- [ ] 10.7 Archive (`openspec archive task-tools -y`) and docs as the last commits of the feature branch, one PR, `Closes #428`.
+- [x] 10.7 Archive (`openspec archive task-tools -y`) and docs as the last commits of the feature branch, one PR, `Closes #428`.
 
 ## Accepted limitations (record in the archived spec; do not re-fix when re-reported)
 
