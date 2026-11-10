@@ -575,7 +575,7 @@ def test_an_invalid_date_in_a_changed_field_is_refused():
 
 def test_a_context_line_that_would_create_a_task_is_refused():
     line = "- [ ] x"
-    refused(update(line + "\n", line, append_context="[ ] sneaky"), "task_malformed")
+    refused(update(line + "\n", line, append_context="[ ] sneaky"), "invalid_argument")
 
 
 def test_reopening_removes_the_done_date():
@@ -764,12 +764,10 @@ def test_a_suffixed_id_is_refused_before_the_text_is_read():
     refused(update("- [ ] a", f"{k}.1of2", due=D(2026, 1, 1)), "precondition_required")
 
 
-def test_a_context_line_a_shallow_child_would_own_is_refused():
-    """The context unit is four columns; a child indented by two whose block
-    reaches the insertion point would own the new line. D5 check 5 refuses
-    rather than reparent."""
+def test_a_context_line_under_a_shallow_child_is_its_sibling():
     note = "- [ ] a\n  - [ ] child\n"
-    refused(update(note, "- [ ] a", append_context="note"), "task_malformed")
+    p = ok(update(note, "- [ ] a", append_context="note"))
+    assert p.new_text == "- [ ] a\n  - [ ] child\n  - note\n"
 
 
 def test_a_large_note_plans_in_bounded_time():
@@ -829,7 +827,7 @@ def test_add_with_a_context_line():
     p = ok(add("- [ ] a\n", "b", context="ref 1234"))
     assert p.new_text == "- [ ] a\n- [ ] b\n    - ref 1234\n"
     assert [n.kind for n in p.new_lines] == ["task", "context"]
-    refused(add("- [ ] a\n", "b", context="[ ] x"), "task_malformed")
+    refused(add("- [ ] a\n", "b", context="[ ] x"), "invalid_argument")
 
 
 def test_an_exact_duplicate_in_the_note_is_refused_then_allowed():
@@ -922,7 +920,7 @@ def test_verify_catches_a_lost_tag():
     p = ok(update(note, "- [ ] Pay rent #finance #home 📅 2026-12-01", text="Pay landlord"))
     new2, p2 = _replace_target(p, note, "- [ ] Pay landlord #home 📅 2026-12-01")
     r = tw.verify(note, new2, p2)
-    assert r.code == "task_malformed" and "tags" in r.reason
+    assert r.code == "task_malformed"
 
 
 def test_verify_catches_a_reparented_line():
@@ -1194,3 +1192,129 @@ def test_property_every_resolvable_task_completes_or_refuses_by_code():
             else:
                 assert t.status_char not in "xX-"
                 assert tw.verify(note, plan.new_text, plan) is None
+
+
+# ── S5 audit regressions (#428) ──────────────────────────────────────────────
+
+# 1. A defective frontmatter block is never touched.
+
+@pytest.mark.parametrize("note", [
+    "---\n- [ ] x\n---\nbody\n",         # YAML error: the extractor sees line 2
+    "---\n- [ ] x\nbody\n",               # an unclosed fence
+    "---\r\nk: [\r\n---\r\n- [ ] x\r\n",  # malformed YAML, CRLF
+])
+def test_every_planner_refuses_a_defective_frontmatter_block(note):
+    for plan in (complete(note, "- [ ] x"), update(note, "- [ ] x", due=D(2026, 1, 1)),
+                 add(note, "new"), add(note, "new", section="A")):
+        r = refused(plan, "content_unsafe")
+        assert r.detail[0] == "frontmatter_defect"
+
+
+def test_valid_frontmatter_and_a_later_rule_still_work():
+    note = "---\na: 1\n---\n- [ ] x\n\n---\n\n- [ ] y\n"
+    assert ok(complete(note, "- [ ] x")).new_text.splitlines()[3] == f"- [x] x ✅ {TODAY}"
+    assert ok(add(note, "z")).new_text.endswith("- [ ] y\n- [ ] z\n")
+    note = "intro\n---\n- [ ] x\n"  # a thematic break that is not on line 1
+    assert ok(complete(note, "- [ ] x")).new_text == f"intro\n---\n- [x] x ✅ {TODAY}\n"
+
+
+# 2. A stranded priority in the description does not block a completion.
+
+@pytest.mark.parametrize("line", [
+    "- [ ] ⏫ a 🔁 every day 📅 2026-01-01",
+    "- [ ] fix ⏫ thing 🔁 every day 📅 2026-01-01",
+])
+def test_a_description_priority_does_not_block_a_recurring_completion(line):
+    p = ok(complete(line + "\n", line))
+    nxt = next(n for n in p.new_lines if n.kind == "next")
+    assert nxt.text == line.replace("2026-01-01", "2026-01-02")
+
+
+# 3. verify pins the target and next lines outside the fields.
+
+def _hand_built(note, plan, new_target):
+    new2, p2 = _replace_target(plan, note, new_target)
+    return tw.verify(note, new2, p2)
+
+
+@pytest.mark.parametrize("bad", [
+    "- [ ] Pay rents #y #x 📅 2026-01-01",       # description rewritten under tag-only intent
+    "- [ ] #y #x 📅 2026-01-01",                  # description deleted under tag-only intent
+    "- [ ] Pay rent #y 📅 2026-01-01",             # #x lost: intent adds #y only
+    "- [ ]  Pay rent #y #x 📅 2026-01-01",         # gap widened
+    "- [ ] Pay rent #y  #x 📅 2026-01-01",         # extra space before a tag
+    "- [ ] Pay rent #y #x  📅 2026-01-01",         # extra space before a field
+])
+def test_verify_refuses_changes_outside_the_named_tags(bad):
+    note = "- [ ] Pay rent #x 📅 2026-01-01\n"
+    p = ok(update(note, "- [ ] Pay rent #x 📅 2026-01-01", add_tags=("y",)))
+    assert p.new_text == "- [ ] Pay rent #y #x 📅 2026-01-01\n"
+    assert _hand_built(note, p, bad).code == "task_malformed"
+
+
+def test_verify_refuses_text_after_a_replacement_description_and_reordered_tokens():
+    note = "- [ ] Pay rent ⏳ 2026-01-01 📅 2026-01-02\n"
+    p = ok(update(note, "- [ ] Pay rent ⏳ 2026-01-01 📅 2026-01-02", text="Pay landlord"))
+    assert _hand_built(note, p, "- [ ] Pay landlord GARBAGE ⏳ 2026-01-01 📅 2026-01-02").code == "task_malformed"
+    assert _hand_built(note, p, "- [ ] Pay landlord 📅 2026-01-02 ⏳ 2026-01-01").code == "task_malformed"
+    p = ok(update(note, "- [ ] Pay rent ⏳ 2026-01-01 📅 2026-01-02", due=D(2026, 2, 2)))
+    assert _hand_built(note, p, "- [ ] Pay rent 📅 2026-02-02 ⏳ 2026-01-01").code == "task_malformed"
+
+
+@pytest.mark.parametrize("bad_next", [
+    "- [ ] Rent changed 🔁 every day 📅 2026-11-11",      # description differs
+    "  - [ ] Rent 🔁 every day 📅 2026-11-11",            # indentation differs
+    "- [ ] Rent 🔁 every day 🏁 delete 📅 2026-11-11",    # gains 🏁 delete
+    "- [ ] Rent 🔁 every day 📅 2026-11-11 ⏫",            # gains a priority
+])
+def test_verify_refuses_a_next_line_that_is_not_a_copy_of_the_original(bad_next):
+    line = "- [ ] Rent 🔁 every day 📅 2026-11-10"
+    note = line + "\n"
+    p = ok(complete(note, line))
+    span = p.spans[0]
+    p2 = dataclasses.replace(p, spans=(tw.Span(span.start, span.end, bad_next + "\n"),) + p.spans[1:],
+                             inserted=(dataclasses.replace(p.inserted[0], text=bad_next),))
+    assert tw.verify(note, tw._compose(note, p2.spans), p2).code == "task_malformed"
+
+
+# 4. Caller text cannot smuggle structure.
+
+@pytest.mark.parametrize("ctx", ["- [ ] sneaky", "[ ] sneaky", "* item", "2. item", "# heading", "> quote",
+                                 "a %% hidden", "<!-- open", "close -->", "``` fence", "~~~", "a ```` b"])
+def test_context_text_cannot_smuggle_structure(ctx):
+    refused(update("- [ ] a\n", "- [ ] a", append_context=ctx), "invalid_argument")
+    refused(add("- [ ] a\n", "b", context=ctx), "invalid_argument")
+
+
+@pytest.mark.parametrize("text", ["a %% hidden", "x <!-- open", "close --> y", "run ``` fence", "~~~ x"])
+def test_description_text_cannot_smuggle_structure(text):
+    refused(update("- [ ] a\n", "- [ ] a", text=text), "invalid_argument")
+    refused(add("- [ ] a\n", text), "invalid_argument")
+
+
+def test_balanced_markup_is_ordinary_text():
+    ok(update("- [ ] a\n", "- [ ] a", append_context="see %%note%% and <!-- c --> and `code` #2"))
+    ok(add("- [ ] a\n", "call #bob re `x` %%y%%"))
+
+
+# 5. Context indentation adapts to the task's children.
+
+@pytest.mark.parametrize("note, task, want", [
+    ("- [ ] a\n  - [ ] child\n", "- [ ] a", "  - note"),                         # 2-space
+    ("- [ ] a\n    - child\n", "- [ ] a", "    - note"),                         # 4-space
+    ("- [ ] a\n\t- child\n", "- [ ] a", "\t- note"),                             # tab
+    ("- [ ] a\n   - c1\n  - [ ] c2\n", "- [ ] a", "  - note"),                   # mixed: shallowest
+    ("> - [ ] a\n>   - child\n", "> - [ ] a", ">   - note"),                     # blockquote
+    ("1. [ ] a\n   - child\n", "1. [ ] a", "   - note"),                         # ordered
+    ("- [ ] a\n  - c\n    - [ ] deep\n      ctx\n", "- [ ] a", "  - note"),      # deeper child
+    ("- [ ] a\nx\n- [ ] b\n\t- c\n", "- [ ] a", "\t- note"),                     # tab-nested note
+    ("- [ ] a\n", "- [ ] a", "    - note"),                                      # no children
+])
+def test_context_indentation_adapts(note, task, want):
+    p = ok(update(note, task, append_context="note"))
+    assert next(n for n in p.new_lines if n.kind == "context").text == want
+
+
+def test_add_task_context_uses_tabs_in_a_tab_nested_note():
+    p = ok(add("- [ ] a\n\t- c\n", "b", context="why"))
+    assert p.new_text == "- [ ] a\n\t- c\n- [ ] b\n\t- why\n"
