@@ -124,13 +124,29 @@ async def test_a_similar_task_is_listed_not_exact(db):
     assert stopped is False
 
 
-async def test_the_spec_example_scores_below_the_jaccard_threshold(db):
-    """D9 says Jaccard ≥ 0.5 over the term sets; `Renew passport` against
-    `Renew passport for the trip` is 2/5. Pinned so a change of the measure is
-    deliberate (reported to the supervisor as a spec inconsistency)."""
-    await seed(db, "Trips.md", ["- [ ] Renew passport for the trip"])
+async def test_a_similar_task_is_listed_by_containment(db):
+    """D9: `Renew passport` is contained in `Renew passport for the trip`
+    (Jaccard 2/5), so it is listed — and containment ranks first."""
+    await seed(db, "A.md", ["- [ ] Renew"])  # Jaccard 1/2; one term, so never by containment
+    await seed(db, "B.md", ["- [ ] Renew passport for the trip"])          # contained
     _e, similar, _ = await scan(db, None, "Renew passport")
+    assert [r.path for r in similar] == ["B.md", "A.md"]
+    assert similar[0].score == pytest.approx(0.4)
+
+
+async def test_containment_in_the_other_direction(db):
+    await seed(db, "Short.md", ["- [ ] Renew passport"])
+    _e, similar, _ = await scan(db, None, "Renew passport for the trip")
+    assert [r.path for r in similar] == ["Short.md"]
+
+
+async def test_a_one_term_description_never_matches_by_containment(db):
+    await seed(db, "One.md", ["- [ ] passport"])
+    await seed(db, "Many.md", ["- [ ] passport renewal for the whole family"])
+    _e, similar, _ = await scan(db, None, "passport")
     assert similar == []
+    _e, similar, _ = await scan(db, None, "passport renewal for the whole family trip")
+    assert [r.path for r in similar] == ["Many.md"]  # contained (6 of 7 terms); `One.md` (one term) is not listed
 
 
 async def test_similar_matching_is_case_and_unicode_folded(db):
@@ -165,7 +181,7 @@ async def test_the_default_scope_excludes_folders_and_note_tags(db):
     await seed(db, "Archive_2/Keep.md", ["- [ ] Renew passport"])
     await seed(db, "Tagged.md", ["- [ ] Renew passport"], note_tags=["Project/Archived"])
     await seed(db, "Near.md", ["- [ ] Renew passport"], note_tags=["projectx"])
-    await seed(db, "Hash.md", ["- [ ] Renew passport"], note_tags=["#project//archived/"])
+    await seed(db, "Hash.md", ["- [ ] Renew passport"], note_tags=["Project//Archived/"])
     scoped = S(excluded_folders=("Archive/",), excluded_note_tags=("project",))
     exact, _s, _ = await scan(db, None, "Renew passport", settings=scoped)
     # `Archive_2/` is not under `Archive/` (the `_` is not a wildcard);

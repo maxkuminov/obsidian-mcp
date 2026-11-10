@@ -829,6 +829,10 @@ def test_terms_and_jaccard():
         "three", "seven", "eight", "four", "five", "nine", "one", "two")
     assert tw.jaccard(frozenset({"a", "b"}), frozenset({"a", "b", "c"})) == pytest.approx(2 / 3)
     assert tw.jaccard(frozenset(), frozenset()) == 0.0
+    a, b = frozenset({"renew", "passport"}), frozenset({"renew", "passport", "for", "the", "trip"})
+    assert tw.contains(a, b) and tw.contains(b, a)
+    assert not tw.contains(frozenset({"passport"}), b)
+    assert not tw.contains(frozenset({"renew", "visa"}), b)
 
 
 # ── verify (D5): injected corruptions ────────────────────────────────────────
