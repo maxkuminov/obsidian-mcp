@@ -1728,6 +1728,207 @@ content-security-policy: default-src 'self'; script-src 'nonce-<NONCE>'; style-s
 
     </div>
 
+    
+    
+<div class="card anim-3 u-margin-top-24px">
+    <div class="card-header">
+        <span class="card-title">Tasks</span>
+    </div>
+    <div class="card-body">
+        <div class="u-color-text-3 u-font-size-12px u-margin-bottom-14px">
+            How the task tools read and write checkbox tasks
+            (<code>- [ ] …</code>) in your notes.
+            These settings apply to your account only.
+        </div>
+        <form method="POST" action="/admin/account/tasks">
+            <input type="hidden" name="csrf_token" value="<CSRF>">
+
+            <div class="field">
+                <label class="field-label" for="task-timezone">Timezone</label>
+                <input type="text" name="timezone" id="task-timezone" class="field-input mono"
+                       list="task-timezone-names" maxlength="64" autocomplete="off" spellcheck="false"
+                       value=""
+                       placeholder="UTC (server default)">
+                <datalist id="task-timezone-names">
+                    <option value="UTC"></option>
+                    <option value="Africa/Cairo"></option>
+                    <option value="Africa/Casablanca"></option>
+                    <option value="Africa/Johannesburg"></option>
+                    <option value="Africa/Lagos"></option>
+                    <option value="Africa/Nairobi"></option>
+                    <option value="America/Anchorage"></option>
+                    <option value="America/Argentina/Buenos_Aires"></option>
+                    <option value="America/Bogota"></option>
+                    <option value="America/Caracas"></option>
+                    <option value="America/Chicago"></option>
+                    <option value="America/Denver"></option>
+                    <option value="America/Halifax"></option>
+                    <option value="America/Havana"></option>
+                    <option value="America/Lima"></option>
+                    <option value="America/Los_Angeles"></option>
+                    <option value="America/Mexico_City"></option>
+                    <option value="America/New_York"></option>
+                    <option value="America/Phoenix"></option>
+                    <option value="America/Santiago"></option>
+                    <option value="America/Sao_Paulo"></option>
+                    <option value="America/St_Johns"></option>
+                    <option value="America/Toronto"></option>
+                    <option value="America/Vancouver"></option>
+                    <option value="Asia/Almaty"></option>
+                    <option value="Asia/Bangkok"></option>
+                    <option value="Asia/Dhaka"></option>
+                    <option value="Asia/Dubai"></option>
+                    <option value="Asia/Ho_Chi_Minh"></option>
+                    <option value="Asia/Hong_Kong"></option>
+                    <option value="Asia/Jakarta"></option>
+                    <option value="Asia/Jerusalem"></option>
+                    <option value="Asia/Karachi"></option>
+                    <option value="Asia/Kathmandu"></option>
+                    <option value="Asia/Kolkata"></option>
+                    <option value="Asia/Manila"></option>
+                    <option value="Asia/Seoul"></option>
+                    <option value="Asia/Shanghai"></option>
+                    <option value="Asia/Singapore"></option>
+                    <option value="Asia/Taipei"></option>
+                    <option value="Asia/Tashkent"></option>
+                    <option value="Asia/Tbilisi"></option>
+                    <option value="Asia/Tehran"></option>
+                    <option value="Asia/Tokyo"></option>
+                    <option value="Asia/Yerevan"></option>
+                    <option value="Atlantic/Azores"></option>
+                    <option value="Atlantic/Reykjavik"></option>
+                    <option value="Australia/Adelaide"></option>
+                    <option value="Australia/Brisbane"></option>
+                    <option value="Australia/Darwin"></option>
+                    <option value="Australia/Melbourne"></option>
+                    <option value="Australia/Perth"></option>
+                    <option value="Australia/Sydney"></option>
+                    <option value="Europe/Amsterdam"></option>
+                    <option value="Europe/Athens"></option>
+                    <option value="Europe/Berlin"></option>
+                    <option value="Europe/Brussels"></option>
+                    <option value="Europe/Bucharest"></option>
+                    <option value="Europe/Dublin"></option>
+                    <option value="Europe/Helsinki"></option>
+                    <option value="Europe/Istanbul"></option>
+                    <option value="Europe/Kyiv"></option>
+                    <option value="Europe/Lisbon"></option>
+                    <option value="Europe/London"></option>
+                    <option value="Europe/Madrid"></option>
+                    <option value="Europe/Moscow"></option>
+                    <option value="Europe/Oslo"></option>
+                    <option value="Europe/Paris"></option>
+                    <option value="Europe/Prague"></option>
+                    <option value="Europe/Rome"></option>
+                    <option value="Europe/Stockholm"></option>
+                    <option value="Europe/Vienna"></option>
+                    <option value="Europe/Warsaw"></option>
+                    <option value="Europe/Zurich"></option>
+                    <option value="Pacific/Auckland"></option>
+                    <option value="Pacific/Honolulu"></option>
+                    
+                </datalist>
+                <div class="u-font-size-11px u-color-text-3 u-margin-top-6px">
+                    What “today” means for task dates: relative dates such as
+                    <code>today</code> or <code>+3d</code>, and the date written when a task
+                    is completed, cancelled or added. Any IANA timezone name
+                    (for example <code>Europe/Berlin</code>); leave blank to use the server
+                    default, <code>UTC</code>.
+                    In use now: <code>UTC</code>.
+                </div>
+                
+            </div>
+
+            <div class="field">
+                <label class="field-label" for="task-excluded-folders">Excluded folders</label>
+                <textarea name="excluded_folders" id="task-excluded-folders" rows="4"
+                          class="field-input mono" spellcheck="false"
+                          placeholder="Archive/"></textarea>
+                <div class="u-font-size-11px u-color-text-3 u-margin-top-6px">
+                    One folder per line, relative to the vault root. Tasks in these folders
+                    (and their subfolders) are left out of task listings by default;
+                    callers can still ask for everything. At most 32.
+                </div>
+            </div>
+
+            <div class="field">
+                <label class="field-label" for="task-excluded-tags">Excluded note tags</label>
+                <textarea name="excluded_note_tags" id="task-excluded-tags" rows="4"
+                          class="field-input mono" spellcheck="false"
+                          placeholder="template"></textarea>
+                <div class="u-font-size-11px u-color-text-3 u-margin-top-6px">
+                    One tag per line, with or without <code>#</code>. Tasks in notes carrying
+                    one of these tags, or a nested tag below it (<code>ticket/ops</code> under
+                    <code>ticket</code>), are left out of task listings by default; callers can
+                    still ask for everything. At most 32.
+                </div>
+            </div>
+
+            
+            <div class="field">
+                <label class="field-label" for="task-flag-set_done_date">Add a done date when a task is completed</label>
+                <select name="set_done_date" id="task-flag-set_done_date" class="field-select">
+                    <option value="default" selected>Server default (on)</option>
+                    <option value="on">On</option>
+                    <option value="off">Off</option>
+                </select>
+                <div class="u-font-size-11px u-color-text-3 u-margin-top-6px">
+                    Writes ✅ YYYY-MM-DD on the task when an agent marks it done. (The Tasks plugin calls this “Set done date on every completed task”.)
+                    In use now: on
+                    (server default).
+                </div>
+            </div>
+            
+            <div class="field">
+                <label class="field-label" for="task-flag-set_cancelled_date">Add a cancelled date when a task is cancelled</label>
+                <select name="set_cancelled_date" id="task-flag-set_cancelled_date" class="field-select">
+                    <option value="default" selected>Server default (on)</option>
+                    <option value="on">On</option>
+                    <option value="off">Off</option>
+                </select>
+                <div class="u-font-size-11px u-color-text-3 u-margin-top-6px">
+                    Writes ❌ YYYY-MM-DD on the task when an agent cancels it. (Tasks plugin: “Set cancelled date on every cancelled task”.)
+                    In use now: on
+                    (server default).
+                </div>
+            </div>
+            
+            <div class="field">
+                <label class="field-label" for="task-flag-set_created_date">Add a created date to new tasks</label>
+                <select name="set_created_date" id="task-flag-set_created_date" class="field-select">
+                    <option value="default" selected>Server default (off)</option>
+                    <option value="on">On</option>
+                    <option value="off">Off</option>
+                </select>
+                <div class="u-font-size-11px u-color-text-3 u-margin-top-6px">
+                    Writes ➕ YYYY-MM-DD on a task an agent adds, and on the next occurrence of a recurring task. (Tasks plugin: “Set created date on every added task”.)
+                    In use now: off
+                    (server default).
+                </div>
+            </div>
+            
+            <div class="field">
+                <label class="field-label" for="task-flag-next_recurrence_below">Put the next occurrence of a recurring task below it</label>
+                <select name="next_recurrence_below" id="task-flag-next_recurrence_below" class="field-select">
+                    <option value="default" selected>Server default (off)</option>
+                    <option value="on">On</option>
+                    <option value="off">Off</option>
+                </select>
+                <div class="u-font-size-11px u-color-text-3 u-margin-top-6px">
+                    When a recurring task is completed, its next occurrence is inserted on the line below the completed one instead of above it. (Tasks plugin: “Next recurrence appears on the line below”.)
+                    In use now: off
+                    (server default).
+                </div>
+            </div>
+            
+
+            <div class="u-display-flex u-gap-10px u-margin-top-18px">
+                <button type="submit" class="btn btn-primary">Save task settings</button>
+            </div>
+        </form>
+    </div>
+</div>
+
 </div>
 
 
