@@ -471,7 +471,7 @@ def normalise_list_args(
 
     path = args.path
     if path is not None:
-        from src.config import MAX_PATH_CHARS
+        from src.services.vault import MAX_PATH_CHARS
 
         if (not isinstance(path, str) or not path or len(path) > MAX_PATH_CHARS
                 or not _encodable(path)):
@@ -586,7 +586,7 @@ def decode_cursor(token: Any, *, owner: str, filters: str, order_by: str) -> dic
     """Validate a version-2 token. Returns `{"k", "l", "p" | "h"}` or a
     refusal (`invalid_argument`): undecodable, wrong version (a version-1
     cursor included) or shape, another owner, other filters, another order."""
-    from src.config import MAX_PATH_CHARS
+    from src.services.vault import MAX_PATH_CHARS
 
     if not isinstance(token, str) or len(token) > CURSOR_MAX_CHARS:
         return _refuse(CURSOR_FOREIGN)
