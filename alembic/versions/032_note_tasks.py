@@ -50,6 +50,7 @@ Revision ID: 032
 Revises: 031
 Create Date: 2026-10-29
 """
+import re
 from typing import Sequence, Union
 
 import sqlalchemy as sa
@@ -128,6 +129,20 @@ INDEXES = {
 NOTE_COLUMNS = {"tasks_truncated": TRUNCATED_MARKER, "tasks_failed": FAILED_MARKER}
 
 
+# A later revision that adds a unit to `note_tasks` marks it with a comment
+# ending `(<NNN>_<name>)`, NNN > 032 (039 is the first, #428). Such a unit is
+# that revision's to verify, so the complete comparison below leaves it out —
+# otherwise a stamp-back that re-runs 032 over a head database would refuse
+# the later revision's columns, CHECK and indexes as foreign. On a database
+# without such units (every database 032 itself meets) nothing changes.
+_LATER_MARKER_RE = re.compile(r"\((\d{3})_[a-z0-9_]+\)$")
+
+
+def _later_revision_unit(comment) -> bool:
+    match = _LATER_MARKER_RE.search(comment or "")
+    return match is not None and int(match.group(1)) > 32
+
+
 def _quote(value: str) -> str:
     """A single-quoted SQL string literal (`COMMENT ON` takes no bind)."""
     return "'" + value.replace("'", "''") + "'"
@@ -156,12 +171,14 @@ def _columns(bind):
         (r[0], r[1], r[2])
         for r in bind.execute(
             sa.text(
-                "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull "
+                "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, "
+                "       col_description(a.attrelid, a.attnum) "
                 "FROM pg_attribute a WHERE a.attrelid = CAST(:q AS regclass) "
                 "  AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum"
             ),
             {"q": QUALIFIED},
         ).fetchall()
+        if not _later_revision_unit(r[3])
     ]
 
 
@@ -204,17 +221,19 @@ def _primary_key(bind):
 def _other_constraints(bind):
     """Every CHECK, UNIQUE, EXCLUSION and FOREIGN KEY constraint on the table,
     resolved through `conrelid` — never by name (013's rule)."""
-    return bind.execute(
+    rows = bind.execute(
         sa.text(
             "SELECT c.conname, CAST(c.contype AS text) AS contype, "
             "       pg_get_constraintdef(c.oid) AS definition, c.convalidated, "
-            "       ic.relname AS index_name "
+            "       ic.relname AS index_name, "
+            "       obj_description(c.oid, 'pg_constraint') AS comment "
             "FROM pg_constraint c LEFT JOIN pg_class ic ON ic.oid = c.conindid "
             "WHERE c.conrelid = CAST(:q AS regclass) "
             "  AND c.contype IN ('c', 'u', 'x', 'f') ORDER BY c.conname"
         ),
         {"q": QUALIFIED},
     ).fetchall()
+    return [r for r in rows if not _later_revision_unit(r.comment)]
 
 
 def _index_definitions(bind) -> dict:
@@ -229,7 +248,8 @@ def _index_definitions(bind) -> dict:
             "                             AND a.attnum = CAST(k.attnum AS smallint)"
             "       ) AS columns, "
             "       i.indisunique, (i.indisvalid AND i.indisready) AS usable, "
-            "       (i.indpred IS NOT NULL OR i.indexprs IS NOT NULL) AS restricted "
+            "       (i.indpred IS NOT NULL OR i.indexprs IS NOT NULL) AS restricted, "
+            "       obj_description(ic.oid, 'pg_class') AS comment "
             "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
             "WHERE i.indrelid = CAST(:q AS regclass)"
         ),
@@ -238,6 +258,7 @@ def _index_definitions(bind) -> dict:
     return {
         r.name: (list(r.columns or []), r.indisunique, r.usable, r.restricted)
         for r in rows
+        if not _later_revision_unit(r.comment)
     }
 
 
