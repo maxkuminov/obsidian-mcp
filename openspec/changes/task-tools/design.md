@@ -562,7 +562,7 @@ Every existing argument keeps its name, position and default. All new arguments 
 
 - whitespace other than U+0020 (`\n`, `\r`, `\t`, `\uXXXX`);
 - the backslash (`\\`);
-- the backtick (`` \` ``), so a file name cannot close the backtick-delimited path field and forge a line or id (Codex impl r2 C-C6).
+- the backtick (as `\u0060`, the same `\uXXXX` form the other escapes use), so a file name cannot close the backtick-delimited path field and forge a line or id (Codex impl r2 C-C6).
 
 The write tools take the **original** path, not the escaped one.
 
@@ -796,7 +796,7 @@ Each item is deliberate and additive or necessary under the 1.0 tool-contract pr
 **Everything a #350-only call can observe** (no new arguments, empty settings):
 
 - a `tags` value outside the tag grammar (`["2024"]`, `["a.b"]`, a non-ASCII tag) used to return an empty page and is now refused `invalid_argument`;
-- a note path containing a backtick is now rendered with the backtick escaped as `` \` `` in every task row. It was printed raw, which let a file name forge a second path, line or id in one row;
+- a note path containing a backtick is now rendered with the backtick escaped as `\u0060` in every task row. It was printed raw, which let a file name forge a second path, line or id in one row;
 
 - the ` — id <id>` token on every row;
 - the `task ids pending` header token;
