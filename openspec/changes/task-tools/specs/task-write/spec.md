@@ -374,7 +374,7 @@ A file without a final terminator SHALL keep none.
 
 **Exact duplicates.** It SHALL refuse with `duplicate_task`, writing nothing, when an open task with the same normalised description exists among the target note's current bytes, or among the caller's indexed tasks under the default scope. The exception is `allow_duplicate=true`. The refusal SHALL name up to 5 matches.
 
-**Similar tasks.** It SHALL list, in the response and in the dry run, up to 5 similar open tasks from the caller's default scope. These are tasks whose term-set Jaccard similarity is at least 0.5, scanning at most 2,000 candidates and saying so when the bound stops the scan. A similar task SHALL never cause a refusal.
+**Similar tasks.** It SHALL list, in the response and in the dry run, up to 5 similar open tasks from the caller's default scope. These are tasks whose term-set Jaccard similarity is at least 0.5, or whose term set contains (or is contained in) the new task's with at least 2 terms in the smaller set, scanning at most 2,000 candidates and saying so when the bound stops the scan. A similar task SHALL never cause a refusal.
 
 #### Scenario: An exact duplicate elsewhere in scope is refused
 - **WHEN** `Projects/Alpha.md` holds `- [ ] Renew passport #admin 📅 2026-12-01`, and `add_task(path="Inbox.md", text="renew  Passport #admin")` runs

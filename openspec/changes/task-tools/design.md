@@ -356,7 +356,7 @@ The refusal names up to 5 matches as `path:line id`. The index side reflects the
 
 - Terms are the normalised description split on whitespace and Unicode punctuation, keeping terms of 2 or more code points that are not all digits. Take the up to 8 longest.
 - Candidates are open tasks in the default scope whose `text_fold` contains any term (`strpos`), ordered by `(file_path, line)`, at most `TASK_SIMILAR_SCAN_MAX = 2,000` rows.
-- The score is the Jaccard index of the term sets, using each candidate's terms from its stored `text`. Matches with score ≥ 0.5 that are not exact are listed, top 5, in the response and in the dry run.
+- The score is the Jaccard index of the term sets, using each candidate's terms from its stored `text`. A candidate that is not an exact duplicate is **similar** when its score is ≥ 0.5, **or** when one description's term set contains the other's and the smaller set has at least 2 terms (so `Renew passport` lists `Renew passport for the trip`, Jaccard 0.4). Similar tasks are ranked by containment first, then by score, then by `(file_path, line)`; the top 5 are listed in the response and in the dry run.
 - A scan stopped at the bound says so (`similar-task scan stopped at 2000 candidates`).
 - It is deterministic and language-agnostic. **Rejected:** `pg_trgm`, which is not installed. Adding an extension needs the init scripts (database least-privilege), and trigram similarity misbehaves on short multilingual strings.
 
