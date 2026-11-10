@@ -1496,8 +1496,10 @@ path. **Any change to the grammar or to these caps is an extraction-version
 bump.** Accepted divergences from the Tasks plugin: checkboxes inside HTML or
 `%% %%` comments and fences nested in callouts are listed (the flat fence
 grammar, L1); signifiers count anywhere on the line, not only trailing (L2);
-custom statuses, recurrence, created/cancelled dates and dependencies are not
-modelled (L6); nesting is visible only through line order (L7).
+custom statuses and dependencies are not modelled (L6); nesting is visible
+only through line order (L7). Version 5 (#428, below) adds the task id, the
+recurrence rule text, the created and cancelled dates and a capped context
+run to each row; the grammar above is unchanged.
 
 ### The seam: a second per-note derivation beside the link rebuild (D4)
 
@@ -1546,11 +1548,143 @@ not on membership in the changed set: the version-4 bump makes every row
 ### What `list_tasks` can and cannot see
 
 It reads only the index, so it is one pass behind an edit (L5,
-`INDEX_INTERVAL_SECONDS`). Rows stamped below version 4 have not been scanned
+`INDEX_INTERVAL_SECONDS`), except an edit made by a task tool, which
+refreshes that note's task rows at once (#428, the next section). `edit_note`
+and the other generic writers do not. Rows stamped below version 4 have not been scanned
 for tasks; the tool counts them in every header (`not yet scanned for tasks`)
 rather than reporting "no tasks", alongside `tasks could not be indexed`
 (`tasks_failed`) and `over the task cap` (`tasks_truncated`). The rendering and
 cursor rules are in [vault tools](vault-tools.md#list_tasks-rendering-and-the-cursor-350).
+
+## The write-time task refresh (#428)
+
+`complete_task`, `update_task` and `add_task` promise read-your-writes: a
+`list_tasks` right after the write sees it. #350's D9 declined re-deriving
+inside `edit_note`, because a derivation writer outside the pass would break
+"task rows are written only with the row" (task rows always describe the
+row's committed `content_hash`). #428 keeps that invariant in a weaker,
+checkable form. A task tool **does not index the note**: the row's hash,
+stat, keyword vector, links, embeddings, `derived_under` and
+`extraction_version` stay the pass's alone. It refreshes **only that note's
+`note_tasks` rows** and records which bytes they describe. A full single-note
+index from the tool was rejected as a second writer of the hottest,
+most-audited code in the server; leaving freshness to the pass was rejected
+because the tools promise read-your-writes.
+
+**Columns (migration 039).** `notes_metadata.tasks_source_hash` is the
+canonical note hash of the bytes the task rows were derived from;
+`tasks_refreshed_at` is set only by the tool refresh. **Invariant:** the task
+rows describe the bytes whose hash is `tasks_source_hash`. Either it equals
+`content_hash` (pass-derived, the #350 state), or a task tool published those
+bytes after the row's scan and the row is **task-dirty**. A NULL
+`tasks_source_hash`, which every row has until its first version-5
+derivation, is task-dirty too.
+
+**R1, the refresh** (`task_index.refresh_note_tasks`), after a confirmed
+publication. It derives the tasks from **the bytes this call published**, off
+the loop and **before** opening its transaction, so neither the row lock nor a
+pooled connection is held during the derivation; the result, or its failure,
+is applied only after step 3a. Then, in its own transaction:
+
+1. `SET LOCAL lock_timeout` to `TASK_REFRESH_LOCK_WAIT_MS` (2 s, a constant).
+2. Check that the caller is still bound to the root the tool ran under (the
+   check `change_feed.record_tool_events` makes).
+3. `SELECT id … FOR UPDATE` on the owner-scoped row at the path.
+4. **Still current?** (step 3a in the design.) Under that lock, re-read the
+   file through the call's anchored target and compare it byte for byte with
+   the published bytes. A difference, or a failed read, means another writer
+   published since: write nothing (`superseded`).
+5. Delete and re-insert the note's task rows with `tasks.note_task_row`, the
+   pass's own mapping, so the two writers agree column for column.
+6. Set `tasks_source_hash = canonical_note_hash(published)`,
+   `tasks_refreshed_at = clock_timestamp()`, and `tasks_truncated` /
+   `tasks_failed` from the result. **No other column is written.**
+
+Rows are never derived from the re-read, so a refresh cannot launder a
+concurrent writer's edit into "tool-refreshed" state. Any later edit changes
+the stat, and R3/R4 catch it.
+
+**No generation lock, ever** (an AST guard in
+`tests/test_note_tasks_extractor.py` pins it). Tasks do not depend on the
+index fingerprint, and the pass takes the generation lock *before* any row
+lock, so a writer that takes a single row lock with a bounded wait cannot form
+a cycle with it; at worst it waits 2 s and lags. The pass already holds the
+row lock of every note whose tasks it rewrites (its upsert or move took it),
+so the two writers of a note's `note_tasks` are serialised by that lock and no
+`(note_id, line)` unique-key race is possible.
+
+**R2.** The pass reads `scan_started_at` from the database clock (the
+snapshot statement's `statement_timestamp()`) **once per pass invocation**,
+before the walk's first file read, not once per attempt. An earlier instant is
+safe: it can only make R4 keep more, and a kept row stays task-dirty.
+
+**R3.** A task-dirty row is **never stat-shortcut**: the scan reads it, and
+its task derivation joins the changed list for the task stage only. It is not
+upserted when its hash is unchanged. Task-dirtiness is part of the C4
+comparison, so a row a refresh dirtied between the snapshot and the lock is
+re-read under the lock.
+
+**R4.** In `_update_tasks_for_changed`, per note, under the note's row lock
+(one `SELECT … FOR UPDATE` per derived note re-reads the two columns; the row
+is already locked by the pass's upsert or move, so this costs a round trip,
+not a wait): if `tasks_refreshed_at >= scan_started_at` and
+`tasks_source_hash` differs from the pass's buffered hash, **keep the task
+rows**. A tool wrote them from bytes published after this pass began reading,
+so they may be newer. This is not a skip and not a failure; it is logged at
+DEBUG. Otherwise the pass derives as before, sets `tasks_source_hash` to the
+buffered hash and clears `tasks_refreshed_at`.
+
+**Convergence, and why no state is stuck.** After the last write to a note at
+time W, the first pass whose `scan_started_at` is later than both W and the
+last refresh reads the note, through the stat change or R3. R4 cannot keep
+the rows then, because `tasks_refreshed_at < scan_started_at`, so that pass
+derives from current disk and `tasks_source_hash = content_hash` again. While
+a row is task-dirty, R3 forces a read on every pass, so no row stays stale.
+
+A superseded refresh writes nothing and leaves the rows as they were. The
+newer bytes came from a later publication P2: if P2 was a task tool, its own
+refresh queues on the same row lock; if it was a generic writer, it changed
+the stat, or the row is already task-dirty and R3 reads it regardless. A
+refresh that passes the still-current check and is then followed, before its
+commit, by another publication leaves the ordinary task-dirty state, which the
+same two rules cover. Integration tests interleave a pass's scan, a tool
+write, a refresh and a later edit in every order, and run two task writes
+whose refreshes finish out of order (the earlier one reports `superseded`,
+and the rows describe the later write).
+
+Cost: when only task-dirty notes changed, the task stage reads every id in
+the scope, and R4 adds one round trip per derived note, which matters only
+during the one-time backfill.
+
+**Failure mode: the write stands, the listing may lag.** Each of these leaves
+the publication standing and writes no task row (except where noted):
+
+| Code | When |
+| --- | --- |
+| `lock_timeout` | the row lock was not granted within 2 s |
+| `root_changed` | the account is no longer bound to the root the tool ran under |
+| `not_indexed` | no index row at the path for this owner (never indexed, or quarantined) |
+| `superseded` | the file no longer holds the published bytes |
+| `not_utf8` | the published bytes are not UTF-8 (the index would not index them either) |
+| `derivation_failed` | the extractor raised: the note's task rows are removed and `tasks_failed` is set, the pass's own failure mark |
+| `error` | anything else, such as a database error |
+
+The response says `index: may lag (<code>)`, the usage row records
+`task_refresh = lagged:<code>`, and the next pass converges regardless (L9).
+A success says `index: refreshed`. The refresh never changes the call's
+outcome classification. The order is publish → refresh → change-feed event,
+so a consumer reacting to the event sees the new state in `list_tasks`; the
+event is recorded whatever the refresh did.
+
+**What generic writers do not do (L5).** `edit_note`, `set_frontmatter`,
+`move_note`, `write_file` and transfer uploads do not refresh task rows, so
+their changes appear after the next pass. Adding the hook to one of them is a
+one-line follow-up, deliberately out of scope. Two residuals are accepted: the
+refresh's root re-check is not under a lock, so a reassignment between the
+check and the write stores rows under the old scope's row, which the
+provenance discard then purges (L21); and a clean row may keep a non-NULL
+`tasks_refreshed_at` when a pass read some bytes and then their refresh landed
+(L23, harmless).
 
 ## Non-finite frontmatter numbers, and the one title rule (#154)
 
@@ -2855,6 +2989,51 @@ clears every note's embedding certification; its embed pass then re-chunks
 every note with full vector reuse (#281) and no provider calls. It never
 reads or writes `note_tasks`, and the cascade still holds. Rolling forward
 again is one more re-derive.
+
+### Version 5 adds task ids (#428)
+
+The task tools need more per task than version 4 stored, and `content_hash`
+cannot see that, so the marker moves again. Version 5 derives, per task:
+
+- the id key over the uncut text, with its ordinal and count (`task_key`,
+  `key_ordinal`, `key_count`);
+- the duplicate-detection key (`description_key`) and the casefolded text
+  (`text_fold`);
+- the hierarchical tag prefixes (`tag_prefixes`);
+- the plugin-parsed recurrence rule (`recurrence`, cut at 256 characters with
+  `recurrence_cut`);
+- the created and cancelled dates (`➕`, `❌`);
+- the context run: at most 8 lines of at most 160 characters each, 600 in
+  total (`context`, `context_cut`).
+
+Migration 039 adds those columns nullable, so existing rows read NULL until
+re-derived. The pass and the refresh always write all of them, and
+`ck_note_tasks_key_shape` keeps the key triple all NULL, or all set with
+`1 ≤ key_ordinal ≤ key_count`. The checkbox grammar and the #350 caps did not
+change.
+
+`_EXTRACTION_CLEANERS[5] = clean_for_embedding`, so **nothing is
+re-embedded**: the cost is one re-derive pass, the same as the version 2–4
+bumps. Every row's NULL `tasks_source_hash` also makes it task-dirty until
+then (R3 above), so the stat shortcut cannot skip it either.
+
+- **Ids render from the row, not the note's version.** A row whose `task_key`
+  is populated renders its id even in a note still stamped 4 (a write-time
+  refresh wrote it). A row with a NULL key renders `id pending`, and the header
+  counts such rows as `task ids pending: N tasks`, even at 0.
+  `TASK_IDS_SINCE_EXTRACTION_VERSION = 5` in `src/services/tasks.py` is kept
+  only for the operator's backfill progress; no listing decision reads it.
+  The write tools work on any task meanwhile, because resolution re-derives
+  from the bytes.
+- During the window, `move_note(rewrite_links=True)` refuses with
+  `index_not_ready`, as after every bump, and `list_tasks`' `text` and
+  `recurring` filters fall back on rows not yet derived and say so.
+- **Rollback is roll-forward** (#350 L8's mechanism). A version-4 image
+  re-extracts every note (`5 != 4`) and never reads or writes the new columns;
+  its inserts leave them NULL, which the CHECK admits. Having no version-5
+  cleaner, it also clears every note's embedding certification, and its embed
+  pass then re-chunks every note with full vector reuse (#281) and no provider
+  calls. Rolling forward again is one more re-derive.
 
 ### The frozen v0 cleaner is a line scanner with the regexes as its oracle
 

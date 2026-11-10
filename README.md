@@ -263,17 +263,18 @@ looks the way it does.
 
 ## What's in the box
 
-The server exposes 28 MCP tools across five families, plus the auth
+The server exposes 32 MCP tools across six families, plus the auth
 and ops layer around them.
 
 Every tool is published with a `title` and MCP `ToolAnnotations`, all
-four hints set explicitly: `readOnlyHint` on the eighteen tools that only
-read (search, read, list, graph, `list_tasks`, `get_changes`, `check_upload`), `destructiveHint` on
-the eight that can replace or remove something (`edit_note`,
+four hints set explicitly: `readOnlyHint` on the nineteen tools that only
+read (search, read, list, graph, `list_tasks`, `task_agenda`, `get_changes`, `check_upload`), `destructiveHint` on
+the ten that can replace or remove something (`edit_note`,
 `move_note`, `delete_note`, `set_frontmatter`, `write_file`,
-`delete_file`, `import_from_url`, and `request_upload`, whose link can
-overwrite on redemption), `openWorldHint` on `import_from_url` only.
-`create_note` and `request_download` are additive. Clients that honour
+`delete_file`, `import_from_url`, `complete_task`, `update_task`, and
+`request_upload`, whose link can overwrite on redemption),
+`openWorldHint` on `import_from_url` only. `create_note`, `add_task`
+and `request_download` are additive. Clients that honour
 annotations run read-only tools without a per-call confirmation (Claude
 Code also runs them in parallel) and keep prompting on destructive ones.
 They are hints: the server enforces read-only credentials itself,
@@ -358,15 +359,8 @@ the wire, so none is cut off by a client's description limit.
   why (`removed`, `not_indexable`, `quarantined`); `gap` and `reset` lines
   say when the view is incomplete
 - `get_tags(limit=50)`, tag and count
-- `list_tasks(folder?, status="open", due_by?, scheduled_by?, tags?, limit=100, cursor?)`,
-  checkbox tasks (`- [ ]`, `- [x]`, `- [-]`, `- [/]`, …) across the vault
-  from the index, never reading a note: one line per task with its path
-  and line, Tasks-plugin dates (📅 ⏳ 🛫 ✅), priority, the task's own
-  `#tags`, its heading path and its text. Ordered by due date (undated
-  last), paged with a `next` cursor; `due_by` / `scheduled_by` mean "on
-  or before". Tasks-plugin query blocks are not evaluated. The header
-  always counts notes not yet scanned for tasks and notes whose tasks
-  could not be indexed, so an empty list is never a silent "nothing open"
+- `list_tasks` and `task_agenda` list checkbox tasks across the vault
+  from the index; see [Tasks (optional)](#tasks-optional)
 - `get_vault_guide()`, the Obsidian primer plus this vault's
   `CLAUDE.md`, served live
 - Retrieval changes are measured with `make search-eval` against
@@ -403,6 +397,156 @@ the wire, so none is cut off by a client's description limit.
   with a named error rather than fall back). `permanent=True` unlinks.
 - `set_frontmatter(path, updates, remove?)`, structured YAML
   mutation. Body is byte-identical when only frontmatter changes.
+
+### Tasks (optional)
+
+An agent that keeps notes usually also keeps commitments: a follow-up it
+promised, a next action, something to check again on Friday. These five
+tools let it keep them as checkbox lines in the same vault as its notes,
+and find, add and close them without reading files. Nobody has to use
+them. A vault without checkboxes behaves exactly as before, and no other
+tool depends on them.
+
+**What counts as a task.** Any markdown checkbox list item: `- [ ] Renew
+the certificate`, `* [x] …`, `1. [/] …`, including one inside a blockquote
+or callout, or indented under another item. A plain checkbox is a
+complete task, and Obsidian does not have to be installed. The optional
+fields use the [Obsidian Tasks plugin](https://publish.obsidian.md/tasks/)'s
+emoji format, so the same notes also work in Obsidian, with or without
+that plugin:
+
+| Field | Written as |
+| --- | --- |
+| due | `📅 2026-11-20` |
+| scheduled | `⏳ 2026-11-18` |
+| start | `🛫 2026-11-15` |
+| priority | `🔺` highest, `⏫` high, `🔼` medium, `🔽` low, `⏬` lowest |
+| recurrence | `🔁 every week` |
+| done | `✅ 2026-11-10` |
+| cancelled | `❌ 2026-11-10` |
+| created | `➕ 2026-11-01` |
+
+`[ ]`, `[/]` and every other marker are open, `[x]` and `[X]` are done,
+and `[-]` is cancelled. A checkbox inside a code block is not a task, and
+a Tasks-plugin query block (```` ```tasks ````) is text the server does
+not evaluate. The server supplies the mechanics (listing, one-line
+edits, and recurrence for the rules listed below) and no policy: where
+tasks live, what a tag means and what is due when are up to you, your
+agents and your vault guide.
+
+| Tool | What it does |
+| --- | --- |
+| `list_tasks` | Lists tasks from the index without reading a note. Filters: status, folder, path, tags and excluded tags, due / scheduled / done date ranges, undated, priority, words in the text, recurring. Ordered by due date, priority, scheduled date, done date or path, and paged with a cursor. Every row carries the task's id. |
+| `task_agenda` | A dated overview from the index: overdue, due today, scheduled and now due, and due in the next `days` days (default 7). Every section states its count, and a section that is cut short ends with the exact `list_tasks` call that continues it. |
+| `complete_task` | Marks one task done (`[x]`, plus `✅ <date>` by default) and, for a recurring task, writes its next occurrence in the same edit. |
+| `update_task` | Changes one task's dates, priority, tags, recurrence, status (open, in progress, cancelled) or description, or adds one context line under it. |
+| `add_task` | Inserts one new `- [ ]` line into an existing note, after the last top-level task of the note or of a named section and everything indented under it. |
+
+The three write tools need write permission, like every other write.
+`list_tasks` and `task_agenda` read the same index as the search tools,
+and the header of every response counts what the index could not show
+(notes not yet scanned, tasks that could not be indexed, notes over the
+5,000-task cap), so an empty list never silently means "nothing open".
+
+**Task ids.** Every listing row prints the task's id, a 12-character
+key computed from the task's text. To change a task, pass the note's
+`path` and that id. The server finds the line by recomputing the ids
+from the note's current text, never from a stored line number, and
+because a write changes the line's text, the response returns the task's
+new id. Nothing is ever written into a note to identify a task. Pass the
+path as it is on disk: a row escapes unusual characters in a path (a tab
+as `\t`, a backtick as `\u0060`, a backslash doubled), so undo those
+escapes if the row shows any. When a
+note holds several identical task lines, their ids carry an occurrence
+suffix (`3f9a0c1b2d4e.2of3`), and a write with such an id also needs
+the note's `content_hash` from `read_note` as `expected_hash`.
+
+**What a write guarantees.**
+
+- **One line changes.** Only the characters of the field being changed
+  are touched. The rest of the line (indentation, list marker, field
+  order, spacing) and every other line stay byte for byte. The only
+  extra lines are the ones the call asks for: a recurring task's next
+  occurrence, the new line from `add_task`, or one context line. Each
+  planned edit is re-parsed and checked before it is written.
+- **Refused rather than guessed.** Each of these is refused with
+  nothing written, and the refusal ends with one `MCP-REFUSAL` line
+  carrying its code: an id that no longer matches any line
+  (`task_not_found`: list again), a bare id that matches several lines
+  (`task_ambiguous`), a field the call changes that appears twice on
+  the line (`task_malformed`), an unsupported recurrence rule
+  (`recurrence_unsupported`), and on `add_task` an open task with the
+  same description (`duplicate_task`; `allow_duplicate=true` adds it
+  anyway). `add_task` also lists up to five similar open tasks, which
+  never block.
+- **`dry_run=true`** returns the diff and the new line(s), and writes
+  nothing. `expected_hash` is optional and binds the whole note, as on
+  `edit_note`. Without it, a change made by someone else during the call
+  is retried from a fresh read, at most 3 attempts in total.
+- **Listings see the write at once.** A successful write refreshes that
+  note's task rows in the index (`index: refreshed`). If the refresh
+  cannot run, the write still stands and the response says
+  `index: may lag (<reason>)` until the next index pass. `edit_note` and
+  the other generic write tools do not refresh task rows, so their
+  changes show up after the next pass (every 300 s by default).
+
+<a id="supported-recurrence-rules"></a>
+
+**Recurrence: the supported rules.** `N` is a whole number from 2 to
+999, weekday and month names are written out in full English, and any
+rule may end in `when done`, which counts the next date from the
+completion date instead of the task's own date:
+
+- `every day`, `every N days`
+- `every weekday` (Monday to Friday)
+- `every week`, `every N weeks`
+- `every week on Monday, Thursday` or `every Monday, Thursday`
+- `every month`, `every N months` (a day the month lacks becomes its
+  last day: January 31 → February 28)
+- `every month on the 15th` (for the 29th to 31st, a month without
+  that day is skipped), `every month on the last`
+- `every year`, `every N years`
+- `every March on the 3rd`
+
+**Every other rule is refused** with `recurrence_unsupported` and
+nothing written, wherever it appears: completing the task,
+`update_task(recurrence=…)` or `add_task(recurrence=…)`. That includes
+`every weekend`, `every 2 weeks on Monday`, `every month on the last
+Friday`, `every 1 day`, abbreviated names, `until …`, `for N times`, and
+a yearly rule on a task dated February 29. A recurring task is never
+completed without its next occurrence. To complete one whose rule is
+refused, clear the rule first (`update_task(clear=["recurrence"])`).
+The next occurrence keeps the task's text, tags and priority. Its due
+date (or scheduled, or start date, if it has no due date) moves by the
+rule, and its other dates keep their distance from it. As in the Tasks
+plugin, missed occurrences are not skipped: a weekly task completed
+three weeks late gets its old date plus 7 days, which may already be
+past.
+
+**Dates and the timezone.** Every date argument accepts `YYYY-MM-DD` and
+relative forms such as `today`, `tomorrow`, `yesterday`, `+7d` or `-1d`
+(up to 3,660 days either way). "Today" is the current date in the
+caller's task timezone: `TASKS_DEFAULT_TIMEZONE` (default `UTC`), or the
+timezone saved on the panel's Tasks card. Every response that resolved a
+relative date states the timezone and the dates it used. A `list_tasks`
+cursor from a relative-date query is refused after midnight in that
+timezone, because the dates moved; list again.
+
+**The default scope.** `list_tasks`, `task_agenda` and `add_task`'s
+duplicate check across other notes work in the caller's *default scope*: the whole vault
+minus the excluded folders and excluded note tags saved on the panel's
+Tasks card. With nothing saved, which is the default, nothing is
+excluded. `scope="all"` ignores the exclusions, and every listing states
+its scope and how many tasks the scope left out, so an exclusion is
+never silent.
+
+Not modelled: custom status cycles (completing a task with any open
+marker writes `[x]`), the plugin's global filter, task dependencies, and
+its "remove scheduled date on recurrence" setting. A task with
+`🏁 delete` is refused on completion (`on_completion_unsupported`)
+rather than deleted. The settings are under
+[Configuration](#configuration) and the panel card under
+[Tasks settings](#tasks-settings).
 
 ### File access (non-markdown)
 Raw read/write/browse of arbitrary vault files (PDFs, images, skill
@@ -455,6 +599,14 @@ requires it on the supported destructive calls; enable this only after
 clients supply tokens. Creation is exempt and refuses a supplied token
 as `no_incumbent`. Files above their read cap cannot be guarded.
 
+The task write tools take the same optional `expected_hash`. In required
+mode, `complete_task` and `update_task` with a plain task id need no
+hash: the id names exactly one line in the bytes the write replaces,
+and the rest of the note is spliced from the current file, so the write
+cannot carry a stale copy of the note back. `add_task` removes nothing
+and is exempt. An id with an occurrence suffix (`<key>.2of3`) needs
+`expected_hash` in every mode.
+
 ### File transfer
 No MCP client can hand a tool the bytes of a file the user is looking
 at, so `write_file` is only usable when the agent already has the
@@ -503,9 +655,9 @@ origin the mint tools refuse rather than emit a localhost link.
 - OAuth 2.0 PKCE (S256) flow for public and confidential clients,
   including ChatGPT, Claude Desktop, and claude.ai. Dynamic registration
   defaults to both vault permission levels; the user chooses the actual
-  grant on the consent screen. A read-only grant lists 19 tools — the
-  nine write tools are left out of `tools/list` (and still refused if
-  called by name); choose read + write at consent for all 28, and
+  grant on the consent screen. A read-only grant lists 20 tools — the
+  twelve write tools are left out of `tools/list` (and still refused if
+  called by name); choose read + write at consent for all 32, and
   reconnect the client after changing a grant's scope.
 - Control panel (Jinja2, hand-written CSS, vendored Chart.js, nonce-based
   CSP) for keys, usage logs,
@@ -832,6 +984,36 @@ old while the indexer is perfectly healthy.
 
 ![Settings](https://raw.githubusercontent.com/maxkuminov/obsidian-mcp/main/screenshots/settings.png)
 
+### Tasks settings
+
+A **Tasks** card holds the settings of the
+[task tools](#tasks-optional). In multi-user mode it is on each user's
+**Account** page and applies to that user's own calls only. In
+single-user mode it is on the **Settings** page and applies to every MCP
+caller of the server. Nothing is stored until the card is saved, and an
+unsaved card means the server defaults from
+[Configuration](#configuration).
+
+- **Timezone.** What "today" means for task dates: relative dates such
+  as `today` or `+3d`, and the date written when a task is completed,
+  cancelled or added. Any IANA timezone name (the field suggests common
+  ones); blank uses `TASKS_DEFAULT_TIMEZONE`. The card shows the zone in
+  use. A saved zone this server cannot load falls back to UTC, and both
+  the card and every task response say so.
+- **Excluded folders** and **excluded note tags**, one per line, at most
+  32 of each. Tasks in those folders (and their subfolders), or in notes
+  carrying one of those tags or a tag nested under it (`ticket/ops`
+  under `ticket`), are left out of the default scope: listings, the
+  agenda and `add_task`'s duplicate check. A caller can still pass
+  `scope="all"`, and every listing counts what was excluded.
+- **Four write behaviours**, each a choice of *Server default* (which
+  shows the current default), *On* or *Off*: add a done date when a task
+  is completed, add a cancelled date when it is cancelled, add a created
+  date to new tasks (and to a recurring task's next occurrence), and put
+  a recurring task's next occurrence below it instead of above. Each
+  names the Tasks plugin setting it matches, so a vault that also uses
+  the plugin can keep the two in step.
+
 ## Quick start
 
 > Deploying on a VPS from scratch? See [`DEPLOYMENT.md`](./DEPLOYMENT.md)
@@ -1046,15 +1228,18 @@ naming conventions, and YAML schema before it writes anything.
 ## Versioning and compatibility
 
 From 1.0 the version number is a promise about the MCP tool contract:
-the 28 tools' names, their argument schemas, the shape of their result
-lines, and the `MCP-REFUSAL` codes. An agent written against 1.0 keeps
-working against every 1.x.
+the tools' names (28 at 1.0, 32 since the task tools), their argument
+schemas, the shape of their result lines, and the `MCP-REFUSAL` codes.
+An agent written against 1.0 keeps working against every 1.x.
 
-- **The wire form is pinned.** `tests/fixtures/tools_list_full_v1.json`
+- **The wire form is pinned.** `tests/fixtures/tools_list_full_v2.json`
   is the complete `tools/list` result an API key or a `readwrite` OAuth
-  grant sees (every field of all 28 tools), and
-  `tests/fixtures/tools_list_readonly_oauth.json` pins the 19 names a
-  read-only OAuth grant lists. CI fails on any drift; a deliberate change
+  grant sees (every field of all 32 tools), and
+  `tests/fixtures/tools_list_readonly_oauth.json` pins the 20 names a
+  read-only OAuth grant lists. `tools_list_full_v1.json` keeps the 1.0
+  surface, and a test derives it from v2: the four task tools removed,
+  and `list_tasks` differing only by its description and its added
+  optional arguments. CI fails on any drift; a deliberate change
   regenerates the fixture and says so in its spec. Result line shapes
   are specified in `openspec/specs/` and pinned by each tool's tests,
   not by one fixture.
@@ -1092,6 +1277,63 @@ too.
 
 Pull, then `make deploy` (or rebuild your compose stack); migrations
 run on start.
+
+Across the task-tools release (migration 039, #428):
+
+- **New boot refusal: `TASKS_DEFAULT_TIMEZONE`.** Unset, it is `UTC` and
+  nothing changes. If you set it, it must be an IANA timezone this build
+  knows (`Europe/Berlin`, `America/New_York`); a misspelt name, or a
+  host-only name such as `localtime`, stops the app **and the migration
+  step**, since both load the same settings. On Kubernetes, put it in the
+  ConfigMap that the `migrate` initContainer also loads, not on the app
+  container alone.
+- **Migration 039** adds nullable columns to `note_tasks` and
+  `notes_metadata`, a constraint, two indexes and one new table,
+  `task_settings`. It writes no row and rewrites no table, and runs as the
+  database's non-superuser owner.
+- **One re-derive pass, nothing re-embedded.** The extraction version
+  moves to 5, so the first index pass after the upgrade parses every note
+  once to give each task its id. No embedding provider call is made.
+  Until that pass finishes, `list_tasks` rows show `id pending` and the
+  header counts `task ids pending`, the `text` and `recurring` filters
+  are approximate and say so, and `move_note(rewrite_links=True)` answers
+  `index_not_ready`. The task write tools work throughout: they read the
+  note itself, not the index.
+- **What an existing `list_tasks` caller now sees.** Rows gain
+  ` — id <id>`; `tags=` matches nested tags and ignores case (`work` now
+  also matches `#Work/admin`; everything that matched before still does),
+  and the header's `tags:` echo is lower-cased; a `tags` value outside the
+  tag grammar (`["2024"]`, `["a.b"]`, a non-ASCII tag), which used to
+  return an empty page, is now refused `invalid_argument`; `due_by` and
+  `scheduled_by` also accept relative dates, so the wording of the
+  malformed-date refusal changed; a path containing a backtick is now
+  shown with the backtick escaped as `\u0060` (it was printed raw); and
+  the header gains `task ids pending`. A `list_tasks` cursor issued before the upgrade is
+  refused once (`invalid_argument`): list again without it.
+- **Four new tools and the counts that follow.** `task_agenda`,
+  `complete_task`, `update_task` and `add_task` bring the tool list to 32.
+  A read-only OAuth grant now lists 20 (the three task write tools are
+  hidden from it). Connectors pick the new tools up when they next list.
+- **A new concurrency-readiness epoch.** The three write tools join the
+  `write` class and `task_agenda` the `scan` class, so
+  `CLASS_MAPPING_VERSION` moves to 6 and `make concurrency-report`
+  evidence gathered before the upgrade does not carry over.
+- **Five new settings**, all with defaults that match the Tasks plugin's
+  own: `TASKS_DEFAULT_TIMEZONE`, `TASKS_SET_DONE_DATE`,
+  `TASKS_SET_CANCELLED_DATE`, `TASKS_SET_CREATED_DATE`,
+  `TASKS_NEXT_RECURRENCE_BELOW` (see [Configuration](#configuration)).
+  Per-user values are saved on the panel's [Tasks card](#tasks-settings).
+  The image gains a pinned `tzdata` package, so timezone names no longer
+  depend on the operating system's zone files.
+- **Backups.** `task_settings` is durable and is dumped with its rows;
+  `note_tasks` stays derived (schema only).
+- **Rollback is roll-forward.** The previous image runs against the 039
+  schema: it ignores the new columns and table and writes NULL into the
+  new task columns. It also re-derives every note once (it does not know
+  extraction version 5) and, as after #350's rollback, re-chunks every
+  note while reusing every stored vector, with no provider calls.
+  `alembic downgrade 038` drops 039's objects, **including every saved
+  task setting**. Details in [`DEPLOYMENT.md`](./DEPLOYMENT.md#upgrading-across-migration-039-task-tools-428).
 
 Across the ChatGPT `private_key_jwt` release (migration 038, #420):
 
@@ -1664,7 +1906,12 @@ reason.
 | `TRANSFER_MAX_CONCURRENT_UPLOADS` | `4` | Simultaneous upload streams |
 | `IMPORT_ALLOW_HTTP` | `false` | Let `import_from_url` fetch plain http. Off by default. |
 | `VAULT_ALLOW_NAMED_STAGING_FALLBACK` | `false` | Accept named staging on filesystems without `O_TMPFILE`. One flag, both write paths. See [System requirements](#system-requirements). |
-| `WRITE_PRECONDITION_REQUIRED` | `false` | Require `expected_hash` on supported destructive calls. Creation is exempt; enable after clients adopt read hashes. |
+| `WRITE_PRECONDITION_REQUIRED` | `false` | Require `expected_hash` on supported destructive calls. Creation is exempt; enable after clients adopt read hashes. A task write with a plain task id satisfies it, and `add_task` is exempt (see [Guarding edits against stale reads](#guarding-edits-against-stale-reads)). |
+| `TASKS_DEFAULT_TIMEZONE` | `UTC` | The timezone in which the task tools resolve `today` and relative dates (`+7d`), and date a completion, cancellation or created field, for every caller who has not saved one on the panel's Tasks card. An IANA name such as `Europe/Berlin`. A name this build does not know, or a host-only name such as `localtime`, **refuses startup**, and refuses the migration step too, since it loads the same settings. |
+| `TASKS_SET_DONE_DATE` | `true` | `complete_task` adds `✅ <date>`. The Tasks plugin's "Set done date on every completed task", with its default. |
+| `TASKS_SET_CANCELLED_DATE` | `true` | `update_task(status="cancelled")` adds `❌ <date>`. The plugin's "Set cancelled date on every cancelled task". |
+| `TASKS_SET_CREATED_DATE` | `false` | `add_task` and a recurring task's next occurrence get `➕ <date>`. The plugin's "Set created date on every added task". |
+| `TASKS_NEXT_RECURRENCE_BELOW` | `false` | Where a recurring task's next occurrence goes: `false` above the completed line, `true` below it, after any lines indented under the completed task. The plugin's "Next recurrence appears on the line below". |
 | `EMBEDDING_PROVIDER` | `ollama` | `ollama`, `openai`, or `tei` (TEI native `/embed`) |
 | `EMBEDDING_DIMENSIONS` | `1024` | pgvector column width |
 | `OLLAMA_URL` | `http://ollama:11434` | Used when provider is Ollama. Must be `https`, loopback `http`, or covered by `EMBEDDING_ALLOW_PLAINTEXT`. |
@@ -1692,7 +1939,7 @@ reason.
 | `MCP_AUTH_FAILURE_TABLE_SIZE` | `4096` | Counter slots in the fixed-size, per-process-salted address table. Memory is O(size); collisions only make the control stricter. |
 | `MCP_RATE_LIMIT_PER_MINUTE` | `600` | Sustained tool calls per minute per principal (an API key, or an OAuth *grant*). Null — with the burst — disables the general bucket. |
 | `MCP_RATE_LIMIT_BURST` | `120` | Capacity of the general bucket. Must be set together with its rate or nulled together with it. |
-| `MCP_WRITE_RATE_LIMIT_PER_MINUTE` | `120` | Sustained vault-mutating calls per minute per principal — the eight write tools, plus `PUT /transfer/upload` charged to the principal that minted the capability. |
+| `MCP_WRITE_RATE_LIMIT_PER_MINUTE` | `120` | Sustained vault-mutating calls per minute per principal — the eleven write tools, plus `PUT /transfer/upload` charged to the principal that minted the capability. |
 | `MCP_WRITE_RATE_LIMIT_BURST` | `30` | Capacity of the write bucket. |
 | `MCP_LIMITER_MAX_TRACKED_PRINCIPALS` | `10000` | Principals holding their own limiter entry before further ones share one overflow entry. |
 | `MCP_REFUSAL_LOG_INTERVAL_SECONDS` | `10` | How long one rate/slot-refusal coalescing window stays open. Inside it a refusal writes nothing; the row that lands stands for `1 + suppressed` refusals. |
@@ -2098,7 +2345,7 @@ fast one credential can create work.
 
 - **A general bucket** — `MCP_RATE_LIMIT_PER_MINUTE` (600) sustained,
   `MCP_RATE_LIMIT_BURST` (120) capacity — on every tool call.
-- **A write bucket** — 120/min, burst 30 — that the eight vault-mutating
+- **A write bucket** — 120/min, burst 30 — that the eleven vault-mutating
   tools must pass in addition, and that `PUT /transfer/upload` consumes
   too, charged to the principal that **minted** the capability so the
   write rate cannot be escaped by minting links and redeeming them.
@@ -2183,12 +2430,23 @@ spending daily quota. Zero wait means immediate admission or refusal; a positive
 wait uses a bounded queue and one deadline. A retry hint is not a promise that
 a running call will finish by that time.
 
-The four tool classes each default to one concurrent call: `semantic_search`
-uses embedding, `find_related` uses vector, the eight vault-mutating tools use
-write, and the remaining tools use other. Global, tenant and principal ceilings
-default to 4, 3 and 2. OAuth refresh keeps the same principal. Full request and
-per-bearer ceilings default to 32 and 4, authentication to 2, and usage writers
-to 1. All settings and queue limits are listed in `.env.example`.
+Every tool belongs to one of five classes (`src/services/concurrency.py`,
+`CLASS_MAPPING_VERSION` 6), each with its own ceiling:
+
+| Class | Tools | Default ceiling |
+| --- | --- | --- |
+| `embedding` | `semantic_search`, `hybrid_search` | 1 |
+| `vector` | `find_related` | 1 |
+| `write` | the eleven vault-mutating tools, including `complete_task`, `update_task` and `add_task` | 1 |
+| `scan` | `keyword_search`, `list_notes`, `get_tags`, `get_neighborhood`, `find_orphans`, `list_files`, `list_tasks`, `get_changes`, `task_agenda` | 2 |
+| `light` | `read_note`, `read_file`, `get_recent`, `get_vault_guide`, `get_backlinks`, `get_links`, `request_upload`, `check_upload`, `request_download` | 4 |
+
+Global, tenant and principal ceilings default to 6, 4 and 3. OAuth refresh
+keeps the same principal. Full request and per-bearer ceilings default to 64
+and 20, authentication to 2, and usage writers to 1. The mapping version is
+part of the readiness epoch, so a change to the classes (such as #428's) starts
+a fresh window for `make concurrency-report`. All settings and queue limits
+are listed in `.env.example`.
 
 Startup validates the pool budget as `auth + 2 × tools + writers + 4 ≤ 15`.
 The four connections of headroom are shared with panel, OAuth, indexing and
@@ -2208,7 +2466,7 @@ adds a writer wait or drops a usage row because of its observed pressure.
 │ MCP clients  │   HTTP + Bearer key   │   FastAPI app        │
 │  Claude Desk │ ────────────────────▶ │  ┌────────────────┐  │
 │  Claude Code │                       │  │  MCP server    │  │
-│  n8n agents  │                       │  │  (28 tools)    │  │
+│  n8n agents  │                       │  │  (32 tools)    │  │
 │  OpenWebUI   │                       │  └─────┬──────────┘  │
 └──────────────┘                       │        ▼             │
                                        │  ┌────────────────┐  │
@@ -2266,6 +2524,8 @@ ignores mtime jitter. Stale embeddings are caught by the
 | `notes_metadata` | Path, title, tags, frontmatter, content hash, embedded hash, tsvector, modified time |
 | `note_embeddings` | One row per chunk. `embedding` is `vector(EMBEDDING_DIMENSIONS)`. |
 | `note_links` | Wikilink graph: source/target IDs, target_path, kind (`link`, `embed`, `markdown`) |
+| `note_tasks` | One row per checkbox task, derived from the note by the index pass (and refreshed by a task write): status, dates, priority, tags, text, task id |
+| `task_settings` | One row per user (one in single-user mode) holding the panel's Tasks card: timezone, excluded folders and note tags, the four write behaviours |
 | `api_keys` | Hashed bearer tokens, prefix for display, permission, expiry |
 | `usage_logs` | Per-tool-call audit |
 | `oauth_clients`, `oauth_codes`, `oauth_tokens` | OAuth 2.0 PKCE state, including the grant id that ties a consent's tokens together |

@@ -661,6 +661,9 @@ after each.
 - `note_tasks` is **derived** for backups (#348): schema-only in `make
   db-backup` and the Kubernetes backup Job.
 - `change-feed` (#351) owns 033.
+- **Since 039, 032 carries an allow-list** (see "039" below): its complete
+  comparison of `note_tasks` leaves out exactly 039's named units with their
+  exact markers.
 
 ## The session TimeZone is UTC
 
@@ -937,7 +940,7 @@ the backup stops being a backup.
 
 ### Derived vs durable tables (#348)
 
-Twenty-one tables, two kinds. **Six are a cache of the vault plus
+Twenty-two tables, two kinds. **Six are a cache of the vault plus
 settings** and are dumped schema-only by `make db-backup` and the Kubernetes
 backup Job (`pg_dump --exclude-table-data=<table>` for each; `BACKUP_FULL=1`
 dumps their rows too):
@@ -955,7 +958,7 @@ The schema (DDL, the `halfvec` expression index, `alembic_version`) is still
 in the dump, so a restore followed by `alembic check` is clean, and an empty
 index over a non-empty vault is the ordinary first-start case — the #309
 guard refuses the *inverse* (an empty root over a populated index). The
-other **fifteen are durable and are why backups and alembic cannot go away**:
+other **sixteen are durable and are why backups and alembic cannot go away**:
 `users` (including the index-provenance columns, which survive a restore and
 let the first pass classify the root), `api_keys`, `oauth_clients`,
 `oauth_codes`, `oauth_tokens`, `transfer_tokens`, `user_sessions`,
@@ -966,7 +969,8 @@ never reads `indexer_runs`, which is why the pass history can be derived), and
 the change feed's `note_events`, `note_event_scopes` and `note_event_gaps`
 (#351: history, sequence counters and retention watermarks are not in the
 vault, and a cursor survives a restore only if events and counters return
-together). `tests/test_backup_derived_tables.py` pins both lists against
+together), and `task_settings` (#428: a user's saved timezone, exclusions
+and write behaviours exist nowhere else). `tests/test_backup_derived_tables.py` pins both lists against
 `src/models/db.py`; a new table fails it until classified. The restore
 runbook is in `DEPLOYMENT.md` (compose) and `docs/deployment-kubernetes.md`.
 
@@ -1286,3 +1290,66 @@ Every existing `none` / `client_secret_post` enforcement case is kept.
 - foreign or unmarked columns and constraints of our names are refused;
 - the CHECK matrix;
 - the downgrade refusing with a `private_key_jwt` row present.
+
+## 039: task ids, the refresh columns and `task_settings` (#428)
+
+039 creates exactly what the task tools need and writes no row.
+
+- **`note_tasks`** (derived) gains `task_key char(12)`, `key_ordinal` and
+  `key_count` (`integer`), `description_key char(16)`, `text_fold text`,
+  `tag_prefixes varchar(128)[]`, `recurrence varchar(256)`, `created` and
+  `cancelled` (`date`), `context text`, all NULL until the version-5 pass
+  re-derives the row, plus `recurrence_cut` and `context_cut`
+  (`BOOLEAN NOT NULL DEFAULT false`). `ck_note_tasks_key_shape`: the key
+  triple is all NULL, or all set with `1 ≤ key_ordinal ≤ key_count`. Indexes:
+  `ix_note_tasks_tag_prefixes` (GIN, the hierarchical tag filters) and
+  `ix_note_tasks_open_desc` (`description_key WHERE state = 'open'`, the
+  duplicate lookup). The columns are nullable so a rolling deploy with the
+  previous image keeps working: its inserts write NULLs, which the CHECK
+  admits, and it never reads them.
+- **`notes_metadata.tasks_source_hash varchar(64)`** and
+  **`tasks_refreshed_at timestamptz`**, nullable: which bytes a note's task
+  rows describe, and when a task tool last refreshed them (the invariant and
+  R1–R4 are in [indexing and embeddings](indexing-and-embeddings.md#the-write-time-task-refresh-428)).
+- **`task_settings`** (durable): `id`, `user_id` (FK `users.id`
+  `ON DELETE CASCADE`, `UNIQUE NULLS NOT DISTINCT`, NULL being the
+  single-user scope), `timezone varchar(64)` (NULL: the server default),
+  `excluded_folders varchar(1024)[]` and `excluded_note_tags varchar(128)[]`
+  (`NOT NULL DEFAULT '{}'`, at most 32 each, enforced by the service), four
+  nullable booleans (`set_done_date`, `set_cancelled_date`,
+  `set_created_date`, `next_recurrence_below`; NULL means the environment
+  default) and `updated_at`. No row means every value is the default, so a
+  deployment that never saves the panel card behaves as before. It is dumped
+  with its rows (see "Derived vs durable tables").
+- **No table rewrite.** Every new column is nullable or has a constant
+  default; the CHECK's validation and the two index builds scan
+  `note_tasks` once. `lock_timeout` 10 s and `statement_timeout` 60 s are
+  set and `RESET`, `search_path` is pinned, no extension is created, and
+  nothing needs superuser (`test_nonsuperuser_migrations_pg.py`).
+- **Reconcile or refuse**, 032/038's shape. Every unit carries a
+  `… (039_task_tools)` comment marker, mirrored byte-identically in
+  `src/models/db.py` so `alembic check` stays clean (the partial and GIN
+  indexes are declared with `postgresql_where` / `postgresql_using`). Each
+  column is verified by type, nullability, default and marker; the CHECK by
+  its validated definition against a scratch probe; each index by its full
+  `pg_get_indexdef` against a probe; the table against a TEMP twin of its own
+  DDL plus the foreign key's printed definition. Any other same-named object
+  is refused by name before anything is created.
+- **032's allow-list.** 032 compares `note_tasks` completely, so a stamp-back
+  that re-runs 032 over a head database would refuse 039's units as foreign.
+  032 therefore leaves out **exactly** 039's named columns, CHECK and two
+  indexes, each only with its exact 039 marker (`LATER_COLUMNS`,
+  `LATER_CONSTRAINTS`, `LATER_INDEXES`, byte-identical to 039's literals). Any
+  other name, or the right name with any other comment, is still compared and
+  refused; nothing is inferred from a comment's shape. **A future revision
+  that adds a unit to `note_tasks` must extend those lists on purpose**, or
+  the stamp-back re-run of 032 will refuse it.
+- **Downgrade** drops only marked units, each decided on its own, printing
+  what it leaves and why. It drops `task_settings` **with its rows**,
+  printing the count: the saved task settings are lost, and the previous
+  build does not read them. A column read by a surviving unmarked CHECK or
+  index is kept; but PostgreSQL drops a foreign, unmarked index on a dropped
+  039 column along with it (L20).
+- **The gate.** `HEAD_REVISION` in `tests/integration/test_schema_check.py` is
+  `"039"`; its 039 cases cover a fresh upgrade, the stamp-back to 038 and
+  re-upgrade, and an impostor of each unit.

@@ -56,7 +56,7 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
   - docstring: the composition rule gains the write-time refresh exception (D10).
 - [x] 3.2 `src/services/indexer.py`:
   - `CURRENT_EXTRACTION_VERSION = 5`, with a "Version 5 adds task ids (#428)" paragraph;
-  - R2: `scan_started_at` from the database before the first file read of each attempt;
+  - R2: `scan_started_at` from the database before the first file read, once per pass invocation;
   - R3: task-dirty rows are ineligible for the stat shortcut and join the task stage's list;
   - R4: the keep-or-derive rule, setting `tasks_source_hash` and clearing `tasks_refreshed_at`;
   - insert the new columns.
@@ -84,7 +84,7 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
   - header line 1 (the #350 tokens plus `task ids pending: N tasks`, counting rows with a NULL `task_key`) and the query line (≤ 600);
   - an id rendered whenever `task_key` is populated, else `id pending`;
   - full rows with ids, brief rows (≤ 260 plus the path), context lines (`    ┆ `);
-  - the abbreviated row (structure ≤ 100, plus id ≤ 24);
+  - the abbreviated row (measured structure 86, plus the 29-character id token);
   - the agenda layout;
   - `response_cap_too_small`.
   
@@ -182,9 +182,9 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
 
 ## 9. S8: docs (same PR)
 
-- [ ] 9.1 `README.md`: the tasks section per the `readme-positioning` delta (optional capability, plain checkboxes, the five tools, the `TASKS_*` table, the panel card, the supported recurrence shapes and the refusal of everything else), and every tool count (32).
-- [ ] 9.2 `.env.example`: each `TASKS_*` variable with its default and a one-line comment.
-- [ ] 9.3 `DEPLOYMENT.md` and `docs/deployment-kubernetes.md`: upgrade notes covering:
+- [x] 9.1 `README.md`: the tasks section per the `readme-positioning` delta (optional capability, plain checkboxes, the five tools, the `TASKS_*` table, the panel card, the supported recurrence shapes and the refusal of everything else), and every tool count (32).
+- [x] 9.2 `.env.example`: each `TASKS_*` variable with its default and a one-line comment.
+- [x] 9.3 `DEPLOYMENT.md` and `docs/deployment-kubernetes.md`: upgrade notes covering:
   - migration 039;
   - the one-pass version-5 re-derive (no re-embed), with `move_note(rewrite_links=True)` returning `index_not_ready` until it ends;
   - `list_tasks` cursors issued before the deploy refused once;
@@ -192,17 +192,17 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
   - the `CLASS_MAPPING_VERSION` 6 epoch;
   - `tzdata`;
   - rollback as roll-forward.
-- [ ] 9.4 `docs/architecture/vault-tools.md`: a "Task write tools (#428)" section (D1–D9, D16), the tool-metadata counts and the destructive rule, the `list_tasks` arguments and cursor version 2, and `task_agenda`.
-- [ ] 9.5 `docs/architecture/indexing-and-embeddings.md`: "Version 5 adds task ids" and "The write-time task refresh" (D10 R1–R4, convergence, why no generation lock).
-- [ ] 9.6 `docs/architecture/schema-and-migrations.md`: migration 039, `task_settings` durable. `docs/architecture/control-panel.md`: the Tasks card in both modes. `docs/architecture/rate-limits.md`: the write-bucket and class tables, version 6. `docs/architecture/usage-attribution.md`: the task-tool params and `task_refresh`.
-- [ ] 9.7 `CLAUDE.md`: the MCP tools section (32, a read-only grant sees 20, the Tasks line with the five tools), the #343 bullet (19 read-only, the destructive rule), and a key-decisions bullet:
+- [x] 9.4 `docs/architecture/vault-tools.md`: a "Task write tools (#428)" section (D1–D9, D16), the tool-metadata counts and the destructive rule, the `list_tasks` arguments and cursor version 2, and `task_agenda`.
+- [x] 9.5 `docs/architecture/indexing-and-embeddings.md`: "Version 5 adds task ids" and "The write-time task refresh" (D10 R1–R4, convergence, why no generation lock).
+- [x] 9.6 `docs/architecture/schema-and-migrations.md`: migration 039, `task_settings` durable. `docs/architecture/control-panel.md`: the Tasks card in both modes. `docs/architecture/rate-limits.md`: the write-bucket and class tables, version 6. `docs/architecture/usage-attribution.md`: the task-tool params and `task_refresh`.
+- [x] 9.7 `CLAUDE.md`: the MCP tools section (32, a read-only grant sees 20, the Tasks line with the five tools), the #343 bullet (19 read-only, the destructive rule), and a key-decisions bullet:
   - the task id over the uncut text with an ordinal suffix;
   - resolution bound to bytes;
   - minimal edits;
   - the closed recurrence grammar;
   - the write-time refresh with no generation lock and the R4 convergence;
   - per-scope `task_settings`.
-- [ ] 9.8 Grep-check that every new setting appears in README and `.env.example`.
+- [x] 9.8 Grep-check that every new setting appears in README and `.env.example`.
 
 ## 10. Gates
 

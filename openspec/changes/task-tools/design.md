@@ -488,7 +488,7 @@ list_tasks(folder=None, status="open", due_by=None, scheduled_by=None, tags=None
 
 Every existing argument keeps its name, position and default. All new arguments are optional.
 
-**Dates.** Every date argument accepts `YYYY-MM-DD`, `today`, `tomorrow`, `yesterday`, `+Nd` or `-Nd` (N from 0 to 3660), case-insensitive. Relative dates are resolved by `task_dates.resolve(value, tz, now=…)` against the current date in the caller's effective timezone (D14). The clock is read **once per call** (`snapshot_now`), and every relative date, the echoed "today", and the agenda's date use that one instant. A malformed date is refused `invalid_argument` with the wording "must be a YYYY-MM-DD date or one of today, tomorrow, …". This replaces #350's YYYY-MM-DD-only message, because `due_by` and `scheduled_by` now also accept relative forms.
+**Dates.** Every date argument accepts `YYYY-MM-DD`, `today`, `tomorrow`, `yesterday`, `+Nd` or `-Nd` (N from 0 to 3660), case-insensitive. Date arguments are validated against the **caller's effective settings** and the call's one clock snapshot, so a `from > by` check is evaluated in the caller's timezone. Relative dates are resolved by `task_dates.resolve(value, tz, now=…)` against the current date in the caller's effective timezone (D14). The clock is read **once per call** (`snapshot_now`), and every relative date, the echoed "today", and the agenda's date use that one instant. A malformed date is refused `invalid_argument` with the wording "must be a YYYY-MM-DD date or one of today, tomorrow, …". This replaces #350's YYYY-MM-DD-only message, because `due_by` and `scheduled_by` now also accept relative forms.
 
 - `*_from` is inclusive (`>=`), and `*_by` is inclusive (`<=`).
 - A task without that date is excluded when either bound is given.
@@ -557,6 +557,14 @@ Every existing argument keeps its name, position and default. All new arguments 
   - `<desc>` is the D4 description region of the stored text, `_one_line`d and cut to 80 characters with `…`.
   
   **A brief row is at most 260 characters plus its escaped path**, pinned by a test. The path is never cut in a brief row, because write tools need it exactly; the abbreviated-row rule still applies to a first row that does not fit.
+
+**Paths.** Every note-controlled path the task tools print goes through one escaping helper, `_escape_task_path`, in rows, echoes, refusals and responses. It escapes, injectively:
+
+- whitespace other than U+0020 (`\n`, `\r`, `\t`, `\uXXXX`);
+- the backslash (`\\`);
+- the backtick (as `\u0060`, the same `\uXXXX` form the other escapes use), so a file name cannot close the backtick-delimited path field and forge a line or id (Codex impl r2 C-C6).
+
+The write tools take the **original** path, not the escaped one.
 
 **`context=true`.**
 
@@ -659,7 +667,7 @@ It upserts under `FOR UPDATE`. Each write-behaviour field takes `"on"`, `"off"` 
 **Panel.**
 
 - **The card** is one shared template, `templates/_task_settings_card.html`. It has:
-  - a timezone `<input list>` backed by a `<datalist>` of a fixed list of 79 common IANA names (`TASK_TIMEZONE_SUGGESTIONS`). Any IANA name the validator accepts may still be typed;
+  - a timezone `<input list>` backed by a `<datalist>` of a fixed list of 76 common IANA names (`TASK_TIMEZONE_SUGGESTIONS`). Any IANA name the validator accepts may still be typed;
   - two textareas, one item per line;
   - four **three-option selects** (server default with its current value / on / off), each labelled with the plugin's own setting name.
 - **Multi-user mode:** on the account page, editing the signed-in user's own row (`POST /admin/account/tasks`; 404 in single-user mode).
@@ -698,7 +706,12 @@ It upserts under `FOR UPDATE`. Each write-behaviour field takes `"on"`, `"off"` 
 
 ### D16. Refusal codes and responses
 
-Every refusal ends with `MCP-REFUSAL {"code":…}` and carries `nothing_written: true` (`disposition = refused`), except the existing partial-publication shapes, which these tools never produce: each publishes exactly once.
+Every refusal ends with `MCP-REFUSAL {"code":…}`, and every refusal writes nothing.
+
+- **Task-specific codes** (`refusals.TASK_CODES`, listed below) carry the explicit `nothing_written: true` marker (`disposition = refused`).
+- **Generic codes** the write tools reuse from `edit_note` (`not_found`, `validation_failed`, `size_limit`, `io_failure`, and the `content_unsafe` payload) keep their existing payloads, exactly as in `edit_note`. Nothing is written in those cases either.
+
+The existing partial-publication shapes are never produced, because each task tool publishes exactly once.
 
 **New codes** (added to `src/services/refusals.py`):
 
@@ -782,6 +795,9 @@ Each item is deliberate and additive or necessary under the 1.0 tool-contract pr
 
 **Everything a #350-only call can observe** (no new arguments, empty settings):
 
+- a `tags` value outside the tag grammar (`["2024"]`, `["a.b"]`, a non-ASCII tag) used to return an empty page and is now refused `invalid_argument`;
+- a note path containing a backtick is now rendered with the backtick escaped as `\u0060` in every task row. It was printed raw, which let a file name forge a second path, line or id in one row;
+
 - the ` — id <id>` token on every row;
 - the `task ids pending` header token;
 - the line-1 `tags:` echo is the normalised value, so `#Work` shows as `#work`;
@@ -825,6 +841,9 @@ Each item is deliberate and additive or necessary under the 1.0 tool-contract pr
 - **L23**: A clean row (`tasks_source_hash = content_hash`) may keep a non-NULL `tasks_refreshed_at`, when a pass read B and then the refresh of B landed. It is harmless.
 - **L24**: A note whose line 1 is a `---` thematic break with no closing `---` reads as a defective frontmatter block, so no task in it can be written (`content_unsafe`).
 - **L25**: A lone-CR-terminated task with below-placement is refused by `verify`. An ordered anchor `007)` gives `8)`, losing the zero padding. `<key>.1of1` on a line that has since been duplicated answers `task_ambiguous`.
+- **L26**: The three task write tools share the declared residual of the shared publish path. `expected=` compares the current bytes immediately before the rename, so a non-cooperating writer landing inside that window is overwritten, the same as with `edit_note`. Hardening the shared path is a follow-up. The conflict retry handles only a conflict the comparison saw.
+- **L27**: Migration 039 validates its CHECK and builds two indexes inside its transaction. That is fine at the table sizes this server sees; a deployment with tens of millions of task rows would need a staged migration.
+- **L28**: During the version-5 backfill, rows with a NULL `description_key` / `text_fold` are missed by `add_task`'s duplicate and similar scans.
 
 ## Test plan
 
@@ -966,6 +985,18 @@ Round 3 is verification only, per the review budget.
 | S3 (indexer, refresh) | no BLOCKER or MAJOR; 1 fixed (derive before the row lock), 2 accepted (L21, L23) |
 | S4 (query, render) | 1 MAJOR (transient), 4 fixed (incomplete notice during the backfill, one clock read per call, empty result never refused, `#`-prefixed note tags in scope), 2 spec-text corrections (bounds, trailing slash) |
 | S5 (write planning) | 1 MAJOR and 4 MINOR fixed (frontmatter-defect refusal in every planner, a stronger `verify`, caller-text structure refusals, context-line indentation, the similar-task rule), 3 accepted (L25) |
+
+**Implementation review (2026-11-10).**
+
+- **Whole-change `openspec-verifier`:** 0 BLOCKER, 0 MAJOR, 3 MINOR and 3 NIT.
+  - Fixed: the date pre-check timezone, the refusal codes in the descriptions, the guard-rail enumerations, and the shared owner predicate.
+  - Recorded: the generic-refusal payloads (D16) and the tag-grammar change.
+- **Adversarial Codex, round 1:** PASS in three minutes with no trace, so it is not relied on.
+- **Adversarial Codex, round 2:** three focused passes (write path; index, refresh and migration; listing, gates and surface), 38 scenarios traced with file-and-line evidence, 35 SAFE.
+  - **Accepted and fixed (MAJOR):** a backtick in a path could forge a row.
+  - **Declined:** the publish-path window (L26). It is an owner-declared residual, needs an external writer at one exact instant, and is shared with `edit_note`.
+  - **Declined:** migration 039 on a multi-million-row table (L27). The size is implausible for this server.
+- **Full gates on the merged result at 3145320:** the offline suite passed (10,093 tests). The supervisor appends the integration-suite and schema-gate results.
 
 **Supervisor additions** (round 1).
 
