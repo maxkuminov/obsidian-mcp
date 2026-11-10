@@ -161,11 +161,11 @@ def _refused(form):
     return errors
 
 
-def test_an_empty_form_stores_no_timezone_no_exclusions_and_unchecked_boxes():
+def test_an_empty_form_stores_no_timezone_no_exclusions_and_leaves_the_flags():
     values = _ok({})
     assert values.timezone is None
     assert values.excluded_folders == [] and values.excluded_note_tags == []
-    assert all(getattr(values, f) is False for f in BOOLEAN_FIELDS)
+    assert values.unchanged == frozenset(BOOLEAN_FIELDS)
 
 
 @pytest.mark.parametrize("value", ["Europe/Berlin", " America/New_York ", "UTC"])
@@ -266,8 +266,48 @@ def test_checkbox_values(value, stored):
     assert _ok({"set_done_date": value}).set_done_date is stored
 
 
-def test_an_absent_checkbox_is_unchecked():
-    assert _ok({"set_done_date": "on"}).set_cancelled_date is False
+def test_an_absent_flag_is_left_unchanged_not_switched_off():
+    """Regression: an absent key used to store False, so a caller posting only
+    `timezone` silently turned the done and cancelled dates off."""
+    values = _ok({"timezone": "Europe/Berlin", "set_done_date": "on"})
+    assert values.unchanged == frozenset(
+        {"set_cancelled_date", "set_created_date", "next_recurrence_below"}
+    )
+    assert values.set_done_date is True
+
+
+def test_the_panel_cards_three_options_are_all_explicit():
+    values = _ok({"set_done_date": "default", "set_cancelled_date": "on",
+                  "set_created_date": "off", "next_recurrence_below": "default"})
+    assert values.unchanged == frozenset()
+    assert (values.set_done_date, values.set_cancelled_date, values.set_created_date,
+            values.next_recurrence_below) == (None, True, False, None)
+
+
+@pytest.mark.parametrize("sep", ["\x1c", "\x1d", "\x1e", "\x85", " ", " ", "\x0b", "\x0c"])
+def test_a_separator_character_refuses_the_entry_instead_of_splitting_it(sep):
+    """Regression: `splitlines()` used to turn `Arch<sep>ive` into two
+    valid-looking entries `Arch/` and `ive/`."""
+    for raw in (f"Arch{sep}ive", f"Archive{sep}", f"{sep}Archive"):
+        errors = _refused({"excluded_folders": raw})
+        assert len(errors) == 1 and "control character" in errors[0], (raw, errors)
+    for raw in (f"tic{sep}ket", f"ticket{sep}", f"{sep}ticket"):
+        errors = _refused({"excluded_note_tags": raw})
+        assert len(errors) == 1 and "Excluded note tag" in errors[0], (raw, errors)
+
+
+def test_lines_break_only_at_newlines_of_any_convention():
+    values = _ok({"excluded_folders": "A\r\nB\rC\nD"})
+    assert values.excluded_folders == ["A/", "B/", "C/", "D/"]
+
+
+@pytest.mark.parametrize("name", ["localtime", "Factory", "posixrules", "posix/Europe/Berlin",
+                                  "right/UTC"])
+def test_host_only_pseudo_zones_are_refused_everywhere(name):
+    assert any("Timezone" in e for e in _refused({"timezone": name}))
+    with pytest.raises(ValidationError) as err:
+        make_settings(tasks_default_timezone=name)
+    assert "TASKS_DEFAULT_TIMEZONE" in str(err.value)
 
 
 def test_an_unrecognised_checkbox_value_is_refused():

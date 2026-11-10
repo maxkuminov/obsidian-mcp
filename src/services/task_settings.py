@@ -30,7 +30,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from src.config import settings
+from src.config import is_portable_zone_name, settings
 from src.models.db import TaskSettings
 
 #: Entries each exclusion list may hold (D14).
@@ -150,12 +150,20 @@ async def effective(session, uid: int | None) -> EffectiveTaskSettings:
 
 
 def _lines(value: Any) -> list[str]:
-    """A textarea (one item per line) or a list of strings, as stripped,
-    non-blank items. Anything else is treated as one item."""
+    """A textarea (one item per line) or a list of strings, as non-blank
+    items with spaces and tabs stripped. Anything else is one item.
+
+    Lines break only at `\\n` (after `\\r\\n` and a lone `\\r` are normalised
+    to it), never at the other characters `str.splitlines` honours (`\\x1c`–
+    `\\x1e`, `\\x85`, U+2028, U+2029), and only space and tab are stripped:
+    such a character stays inside its entry, where the entry's own check
+    refuses it, instead of quietly turning one entry into two valid-looking
+    ones (or vanishing at an edge).
+    """
     if value is None:
         return []
     if isinstance(value, str):
-        items: Iterable[Any] = value.splitlines()
+        items: Iterable[Any] = value.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     elif isinstance(value, (list, tuple)):
         items = value
     else:
@@ -163,7 +171,7 @@ def _lines(value: Any) -> list[str]:
     out = []
     for item in items:
         text = item if isinstance(item, str) else str(item)
-        text = text.strip()
+        text = text.strip(" \t")
         if text:
             out.append(text)
     return out
@@ -176,7 +184,11 @@ def normalise_timezone(value: Any) -> tuple[str | None, str | None]:
     name = (value if isinstance(value, str) else str(value)).strip()
     if not name:
         return None, None
-    if len(name) > TIMEZONE_MAX_CHARS or name not in zoneinfo.available_timezones():
+    if (
+        len(name) > TIMEZONE_MAX_CHARS
+        or not is_portable_zone_name(name)
+        or name not in zoneinfo.available_timezones()
+    ):
         return None, (
             f"Timezone {name[:TIMEZONE_MAX_CHARS]!r} is not an available IANA "
             "timezone (for example UTC, Europe/Berlin or America/New_York)."
@@ -244,10 +256,12 @@ def _normalise_list(raw: Any, normalise, label: str) -> tuple[list[str], list[st
 
 
 def _normalise_flag(form: Mapping[str, Any], field: str) -> tuple[bool | None, str | None]:
-    """An HTML checkbox: absent means unchecked (False). `"default"` stores
-    NULL (the environment default). Anything unrecognised is an error."""
-    if field not in form:
-        return False, None
+    """One write-behaviour field: `"on"`/`"true"` (and `1`, `yes`, `True`),
+    `"off"`/`"false"` (and `0`, `no`, `False`), or `"default"` (store NULL,
+    the environment default). An absent key is not a value: `validate` lists
+    it in `unchanged` and `save` leaves the stored field as it is (NULL for a
+    scope with no row) — a caller posting only `timezone` must not switch the
+    done date off. Anything unrecognised is an error."""
     value = form[field]
     if isinstance(value, bool):
         return value, None
@@ -270,6 +284,9 @@ class ValidatedForm:
     set_cancelled_date: bool | None
     set_created_date: bool | None
     next_recurrence_below: bool | None
+    #: The boolean fields absent from the form: left as stored by `save`
+    #: (their value above is None and is not written).
+    unchanged: frozenset = frozenset()
 
 
 def validate(form: Mapping[str, Any]) -> tuple[ValidatedForm | None, list[str]]:
@@ -286,7 +303,11 @@ def validate(form: Mapping[str, Any]) -> tuple[ValidatedForm | None, list[str]]:
     )
     errors += folder_errors + tag_errors
     flags: dict[str, bool | None] = {}
+    unchanged = frozenset(f for f in BOOLEAN_FIELDS if f not in form)
     for field in BOOLEAN_FIELDS:
+        if field in unchanged:
+            flags[field] = None
+            continue
         value, error = _normalise_flag(form, field)
         if error:
             errors.append(error)
@@ -297,6 +318,7 @@ def validate(form: Mapping[str, Any]) -> tuple[ValidatedForm | None, list[str]]:
         timezone=timezone,
         excluded_folders=folders,
         excluded_note_tags=tags,
+        unchanged=unchanged,
         **flags,
     ), []
 
@@ -306,8 +328,9 @@ async def save(session, uid: int | None, form: Mapping[str, Any]) -> list[str]:
 
     `form` keys: `timezone` (blank = server default), `excluded_folders` and
     `excluded_note_tags` (one per line, or a list), and the four checkbox
-    fields in `BOOLEAN_FIELDS` (absent = unchecked = False; `"default"` =
-    NULL, the environment default). Any error refuses the whole save with
+    fields in `BOOLEAN_FIELDS` (`"on"` / `"off"` / `"default"` = NULL, the
+    environment default; an absent key leaves the stored value, or NULL for
+    a scope with no row). Any error refuses the whole save with
     nothing written. Otherwise the scope's row is locked (`FOR UPDATE`) and
     updated, or inserted (`ON CONFLICT` on the scope's unique key, so two
     first saves cannot both insert). Does not commit.
@@ -325,6 +348,8 @@ async def save(session, uid: int | None, form: Mapping[str, Any]) -> list[str]:
         "set_created_date": values.set_created_date,
         "next_recurrence_below": values.next_recurrence_below,
     }
+    for name in values.unchanged:
+        del fields[name]
     existing = (
         await session.execute(
             select(TaskSettings.id).where(_owner_predicate(uid)).with_for_update()

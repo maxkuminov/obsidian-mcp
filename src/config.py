@@ -159,6 +159,21 @@ TASK_SIMILAR_SCAN_MAX = 2_000
 TASK_CONTEXT_MAX_LINES = 8
 
 
+#: Names `zoneinfo.available_timezones()` can pick up from a host's OS zone
+#: directory that are not portable IANA zones: `localtime` is whatever the
+#: host is set to, `Factory` is a placeholder, `posixrules` a tzcode
+#: internal, and `posix/` / `right/` are alternative trees. A task setting must
+#: mean the same thing on every host, so these are refused everywhere.
+HOST_ONLY_ZONE_NAMES = frozenset({"localtime", "Factory", "posixrules"})
+_HOST_ONLY_ZONE_PREFIXES = ("posix/", "right/")
+
+
+def is_portable_zone_name(name: str) -> bool:
+    """True for a name that is neither a host-only pseudo-zone nor under one
+    of the alternative trees. Membership in the available set is separate."""
+    return name not in HOST_ONLY_ZONE_NAMES and not name.startswith(_HOST_ONLY_ZONE_PREFIXES)
+
+
 def _validate_timezone_name(value: str, *, variable: str) -> str:
     """A zone name this build can load, or a ValueError naming `variable`.
 
@@ -172,7 +187,7 @@ def _validate_timezone_name(value: str, *, variable: str) -> str:
     if not isinstance(name, str) or not name:
         raise ValueError(f"{variable} must name an IANA timezone, e.g. UTC or Europe/Berlin")
     try:
-        if name not in zoneinfo.available_timezones():
+        if not is_portable_zone_name(name) or name not in zoneinfo.available_timezones():
             raise KeyError(name)
         zoneinfo.ZoneInfo(name)
     except (KeyError, ValueError, OSError, zoneinfo.ZoneInfoNotFoundError):

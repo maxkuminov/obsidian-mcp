@@ -9109,6 +9109,70 @@ def test_032_still_refuses_an_unmarked_extra_column_at_head():
     "label,ddl,fragment",
     [
         (
+            # Regression: any `(NNN_name)` comment with NNN > 032 used to pass.
+            "foreign_marker_column",
+            [
+                "ALTER TABLE note_tasks ADD COLUMN squat integer",
+                "COMMENT ON COLUMN note_tasks.squat IS 'anything (099_whatever)'",
+            ],
+            "its columns are",
+        ),
+        (
+            "foreign_marker_not_valid_check",
+            [
+                "ALTER TABLE note_tasks ADD CONSTRAINT ck_squat CHECK (line > 0) NOT VALID",
+                "COMMENT ON CONSTRAINT ck_squat ON note_tasks IS 'x (040_y)'",
+            ],
+            "ck_squat",
+        ),
+        (
+            "foreign_marker_index",
+            [
+                "CREATE INDEX ix_squat ON note_tasks (line)",
+                "COMMENT ON INDEX ix_squat IS 'x (040_y)'",
+            ],
+            "unexpected index 'ix_squat'",
+        ),
+        (
+            # A 039 name with another comment is not 039's unit either.
+            "039_name_other_marker",
+            ["COMMENT ON COLUMN note_tasks.text_fold IS 'anything (099_whatever)'"],
+            "its columns are",
+        ),
+    ],
+)
+def test_032_leaves_only_039s_exact_units_to_039(label, ddl, fragment):
+    with throwaway_db(f"schema_039_032_allow_{label}") as url:
+        for statement in ddl:
+            sql(url, statement)
+        refuse_032(url, must_mention=[fragment, "Nothing has been changed"])
+
+
+def test_032s_allow_list_is_exactly_039s_units():
+    import importlib.util
+
+    def load(name):
+        path = _harness.ROOT / "alembic" / "versions" / name
+        spec = importlib.util.spec_from_file_location(path.stem, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    m032, m039 = load("032_note_tasks.py"), load("039_task_tools.py")
+    assert m032.LATER_COLUMNS == {
+        column: marker for table, _q, column, *_rest, marker in m039.COLUMNS
+        if table == "note_tasks"
+    }
+    assert m032.LATER_CONSTRAINTS == {m039.KEY_SHAPE: m039.KEY_SHAPE_MARKER}
+    assert m032.LATER_INDEXES == {
+        name: marker for name, (_ddl, marker) in m039._index_ddl("note_tasks").items()
+    }
+
+
+@pytest.mark.parametrize(
+    "label,ddl,fragment",
+    [
+        (
             "unmarked_settings_table",
             ["COMMENT ON TABLE task_settings IS NULL"],
             "task_settings already exists but it does not carry 039's comment marker",
