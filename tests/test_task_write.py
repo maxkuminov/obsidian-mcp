@@ -18,6 +18,7 @@ from src.services import refusals
 from src.services import task_line as tl
 from src.services import task_write as tw
 from src.services.task_settings import EffectiveTaskSettings
+from src.services.tasks import tasks_from_note_text
 
 D = dt.date
 TODAY = D(2026, 11, 10)
@@ -109,7 +110,7 @@ def test_refusal_type_rejects_undeclared_codes():
 
 
 def tasks_of(note):
-    got, truncated = tw._tasks_from_note_text(note)
+    got, truncated = tasks_from_note_text(note)
     assert not truncated
     return got
 
@@ -437,6 +438,54 @@ def test_prefix_hard_break_and_crlf_are_preserved():
     note = "top\n> \t1. [ ] Ship it  \r\nbottom\n"
     p = ok(complete(note, "> \t1. [ ] Ship it  "))
     assert p.new_text == f"top\n> \t1. [x] Ship it ✅ {TODAY}  \r\nbottom\n"
+
+
+# ── the shared extraction reads canonical text; plans edit the original ─────
+
+_TERMINATOR_NOTES = [
+    "a\r\n- [ ] Call\r\n    ctx one\r\n- [ ] Call\r\n    ctx two\r\n",
+    "a\r- [ ] Call\r    ctx one\r- [ ] Call\r    ctx two",
+    "---\r\nx: 1\r---\n# H\r- [ ] Call\n    ctx one\r\n- [ ] Call\r    ctx two\n",
+    "```\r- [ ] fenced\r\n```\n- [ ] Call\r\n\r\n- [ ] Call\r",
+]
+
+
+@pytest.mark.parametrize("note", _TERMINATOR_NOTES)
+def test_shared_extraction_lines_and_keys_match_the_original_lines(note):
+    """Canonicalisation rewrites only terminators, so every extracted line
+    number names the same ORIGINAL line, and the key the shared function
+    computes equals the key of that original line as the planner parses it."""
+    view = tw._NoteView(note)
+    ts = tasks_of(note)
+    assert ts
+    for t in ts:
+        parsed = view.parse(t.line - 1)
+        assert parsed is not None
+        assert tl.task_key(parsed.full_text) == t.task_key
+        assert parsed.status == t.status_char
+
+
+@pytest.mark.parametrize("note", _TERMINATOR_NOTES)
+def test_an_ordinal_resolves_to_the_same_original_line_under_any_terminators(note):
+    k = key("- [ ] Call")
+    p = ok(complete(note, f"{k}.2of2", hash_supplied=True))
+    view_old, view_new = tw._NoteView(note), tw._NoteView(p.new_text)
+    calls = [i for i, c in enumerate(view_old.contents()) if c == "- [ ] Call"]
+    second = calls[1]
+    assert view_new.content(second) == f"- [x] Call ✅ {TODAY}"
+    assert view_new.content(calls[0]) == "- [ ] Call"
+    # Every terminator byte is the original one.
+    assert [ln.term for ln in view_new.lines] == [ln.term for ln in view_old.lines]
+
+
+@pytest.mark.parametrize("note", _TERMINATOR_NOTES)
+@pytest.mark.parametrize("below", [False, True])
+def test_recurring_and_added_lines_under_any_terminators(note, below):
+    rec = note.replace("- [ ] Call", "- [ ] Call 🔁 every day 📅 2026-11-10", 1)
+    p = ok(complete(rec, "- [ ] Call 🔁 every day 📅 2026-11-10", next_recurrence_below=below))
+    assert "- [ ] Call 🔁 every day 📅 2026-11-11" in p.new_text
+    ok(add(note, "fresh", context="why"))
+    ok(update(note, key("- [ ] Call") + ".1of2", hash_supplied=True, append_context="later"))
 
 
 def test_lone_cr_notes():
