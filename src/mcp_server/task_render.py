@@ -28,13 +28,14 @@ from __future__ import annotations
 import datetime
 import json
 
-from src.services import task_line
+from src.services import task_line, task_rule
 from src.services.task_query import (
     AGENDA_SECTIONS,
     DATE_ARGS,
     AgendaPage,
     AgendaSection,
     QueryRefusal,
+    RuleCounts,
     TaskPage,
     encode_cursor,
     pending_v5_filters,
@@ -77,6 +78,24 @@ LIST_ABBREVIATED_FULL_BUDGET = 1031
 LIST_WITH_QUERY_FULL_BUDGET = 1641
 #: D13: below this the agenda is refused.
 AGENDA_MIN_BUDGET = 2800
+#: #434 D5: the rule line. Every part but the task-tag names is mandatory and
+#: never cut; with ten-digit counts the measured worst cases are
+#: `RULE_LINE_FIELDS_MANDATORY` (names fill the rest) and
+#: `RULE_LINE_FILTER_MAX` (a 64-character filter of characters JSON escapes
+#: to two), both pinned by `tests/test_task_render.py`.
+RULE_LINE_MAX = 320
+RULE_LINE_FIELDS_MANDATORY = 235
+RULE_LINE_FILTER_MAX = 284
+#: #434 D5 guarantees with the rule line (the #428 figures plus at most
+#: `RULE_LINE_MAX` + 1): one row always renders, never refused, from
+#: `LIST_WITH_RULE_MIN_BUDGET`; 40 + 40 characters of path and text, with the
+#: incomplete notice, from `LIST_WITH_RULE_FULL_BUDGET`. Pinned by
+#: `test_rule_line_min_budget` / `test_rule_line_full_budget`.
+LIST_WITH_RULE_MIN_BUDGET = LIST_WITH_QUERY_MIN_BUDGET + RULE_LINE_MAX + 1
+LIST_WITH_RULE_FULL_BUDGET = LIST_WITH_QUERY_FULL_BUDGET + RULE_LINE_MAX + 1
+#: #434 D5: the agenda with its rule line is refused below this.
+AGENDA_WITH_RULE_MIN_BUDGET = AGENDA_MIN_BUDGET + RULE_LINE_MAX + 1
+RULE_SCOPE_ALL = 'pass scope="all" to list every checkbox'
 CONTEXT_PREFIX = "    ┆ "
 CONTEXT_CUT_LINE = CONTEXT_PREFIX + "(context cut)"
 CAP_SETTING = "MAX_READ_RESPONSE_CHARS"
@@ -349,6 +368,39 @@ def _query_line(page: TaskPage, *, line_max: int = QUERY_LINE_MAX,
     return " — ".join(parts + [folders, tags])
 
 
+# ── the rule line (#434, D5) ─────────────────────────────────────────────────
+
+
+def render_rule_line(rule: RuleCounts, *, line_max: int = RULE_LINE_MAX) -> str:
+    """The rule line, at most `line_max` characters (default
+    `RULE_LINE_MAX`). Every count is stated, even at zero; the filter text is
+    one JSON string literal (`task_rule.quote`), so it cannot forge a token,
+    a row, an id or a cursor; task-tag names (grammar text) are listed,
+    each cut at 32, only while the line stays within `line_max` — a smaller
+    `line_max` makes them give way first (an empty page's header)."""
+    tail = RULE_SCOPE_ALL
+    if rule.unusable:
+        return (f"Rule — task rule: all (the configured rule cannot be applied: "
+                f"{rule.unusable}) — {tail}")
+    if rule.kind == task_rule.RULE_FILTER:
+        return (f"Rule — task rule: filter {task_rule.quote(rule.global_filter or '')} — "
+                f"excluded by rule: {rule.excluded} tasks — kept though unsure (text cut): "
+                f"{rule.unsure} tasks — {tail}")
+    approx = (f" — rule approximate for {rule.pending} tasks until the next index pass"
+              if rule.pending else "")
+    head = "Rule — task rule: fields"
+    rest = (f"excluded by rule: {rule.excluded} tasks — kept though unsure (tags cut): "
+            f"{rule.unsure} tasks{approx} — {tail}")
+    count = f"task tags: {len(rule.tags)}"
+    room = line_max - len(f"{head} —  — {rest}")
+    names = _names_part("task tags", tuple(rule.tags), max(room, len(count)))
+    return f"{head} — {names} — {rest}"
+
+
+def _rule_cost(rule: RuleCounts | None) -> int:
+    return len(render_rule_line(rule)) + 1 if rule is not None else 0
+
+
 # ── list_tasks response ──────────────────────────────────────────────────────
 
 
@@ -401,8 +453,10 @@ def render_list_tasks(page: TaskPage, *, budget: int) -> str | QueryRefusal:
     n = page.args
     worst_header = render_header_line1(page, shown=999, more=True)
     qline = render_query_line(page) if page.query_line else None
+    rline = render_rule_line(page.rule) if page.rule is not None else None
     notice = render_task_notice(page)
     fixed = len(worst_header) + (len(qline) + 1 if qline else 0) + (len(notice) + 1 if notice else 0)
+    fixed += len(rline) + 1 if rline else 0
     room = budget - fixed - 1 - FOOTER_MAX - 1
 
     rendered: list[list[str]] = []
@@ -424,6 +478,7 @@ def render_list_tasks(page: TaskPage, *, budget: int) -> str | QueryRefusal:
             more_after = page.more_rows or i < len(page.rows) - 1
             exact = len(render_header_line1(page, shown=1, more=more_after)) + 1
             exact += (len(qline) + 1 if qline else 0) + (len(notice) + 1 if notice else 0)
+            exact += len(rline) + 1 if rline else 0
             if more_after:
                 exact += len("next: " + encode_cursor(page.cursor, row, compact=True)) + 1
             row_room = budget - exact
@@ -441,6 +496,8 @@ def render_list_tasks(page: TaskPage, *, budget: int) -> str | QueryRefusal:
     lines = [render_header_line1(page, shown=len(rendered), more=more)]
     if qline:
         lines.append(qline)
+    if rline:
+        lines.append(rline)
     for unit in rendered:
         lines.extend(unit)
     if notice:
@@ -460,16 +517,22 @@ def _render_empty(page: TaskPage, *, budget: int, qline: str | None,
     result"). When it does not fit the cap, the echoes give way step by
     step: the query line's free-text echoes and exclusion names, then line
     1's folder echo. The mandatory parts (timezone, today, every resolved
-    date, every count) are never cut."""
+    date, every count) are never cut. A rule line (#434) gives way first:
+    its task-tag names go before any other echo."""
     tail = [notice] if notice else []
-    steps = [(HEADER_MAX, None, QUERY_LINE_MAX), (HEADER_MAX, 8, 0), (HEADER_MAX, 1, 0),
-             (0, 1, 0)]
+    steps = [(HEADER_MAX, None, QUERY_LINE_MAX, RULE_LINE_MAX),
+             (HEADER_MAX, None, QUERY_LINE_MAX, 0),
+             (HEADER_MAX, 8, 0, 0), (HEADER_MAX, 1, 0, 0), (0, 1, 0, 0)]
+    if page.rule is None:
+        steps = steps[:1] + steps[2:]
     out = ""
-    for header_max, echo_max, line_max in steps:
+    for header_max, echo_max, line_max, rule_max in steps:
         lines = [_header_line1(page, shown=0, more=False, line_max=header_max)]
         if page.query_line:
             lines.append(qline if echo_max is None and qline else
                          _query_line(page, line_max=line_max, echo_max=echo_max))
+        if page.rule is not None:
+            lines.append(render_rule_line(page.rule, line_max=rule_max))
         out = "\n".join(lines + tail)
         if len(out) <= budget:
             return out
@@ -551,10 +614,12 @@ def render_task_agenda(page: AgendaPage, *, budget: int) -> str | QueryRefusal:
     cursor-less continuation is reserved before a section's rows, so every
     section always states its total and, when not complete, its exact
     continuation — with a cursor only when it showed at least one row."""
-    if budget < AGENDA_MIN_BUDGET:
-        return cap_refusal(budget, AGENDA_MIN_BUDGET, what="task_agenda")
+    minimum = AGENDA_MIN_BUDGET if page.rule is None else AGENDA_WITH_RULE_MIN_BUDGET
+    if budget < minimum:
+        return cap_refusal(budget, minimum, what="task_agenda")
     tools = _t()
     header = render_agenda_header(page)
+    rline = render_rule_line(page.rule) if page.rule is not None else None
     notice = tools.render_incomplete_notice(page.not_scanned, page.failed)
     d, days = page.date, page.days
 
@@ -566,6 +631,9 @@ def render_task_agenda(page: AgendaPage, *, budget: int) -> str | QueryRefusal:
 
     used = len(header) + 1 + (len(notice) + 1 if notice else 0)
     out: list[str] = [header]
+    if rline:
+        out.append(rline)
+        used += len(rline) + 1
     for idx, section in enumerate(page.sections):
         future = sum(minimal(s) for s in page.sections[idx + 1:])
         head_worst = len(render_section_header(section, d, days, max(section.total - 1, 1))) + 1
@@ -611,6 +679,8 @@ def render_task_agenda(page: AgendaPage, *, budget: int) -> str | QueryRefusal:
 
 __all__ = [
     "ABBREVIATED_ID_TOKEN_MAX", "ABBREVIATED_STRUCTURE_MAX", "AGENDA_MIN_BUDGET",
+    "AGENDA_WITH_RULE_MIN_BUDGET", "LIST_WITH_RULE_FULL_BUDGET", "LIST_WITH_RULE_MIN_BUDGET",
+    "RULE_LINE_MAX", "render_rule_line",
     "AGENDA_SECTIONS", "BRIEF_ROW_MAX", "COMPACT_CURSOR_MAX", "FOOTER_MAX", "HEADER_MAX",
     "ID_MAX", "LIST_MIN_BUDGET", "LIST_WITH_QUERY_MIN_BUDGET", "QUERY_LINE_MAX",
     "cap_refusal", "render_abbreviated_row", "render_agenda_header",
