@@ -22,7 +22,7 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
 - [ ] 1.4 `tests/test_task_line.py`, `tests/test_task_recurrence.py` and `tests/test_task_dates.py`:
   - every case in the design §Test plan "Unit, pure";
   - the R§2b/2c table;
-  - `tag_prefixes` at the bound: 64 tags of 64 segments give 4,096 prefixes, uncapped;
+  - `tag_prefixes` normalisation (slash runs collapsed, trailing `/` stripped, the same on filter values), plus the largest buildable case: 64 distinct 127-character tags of a 3-character first segment and 62 one-character segments give 4,032 prefixes, uncapped;
   - every tier-2 text refused;
   - the CRLF, lone CR, hard break, VS16 and variant-signifier cases;
   - the property test "bytes outside the declared spans are identical".

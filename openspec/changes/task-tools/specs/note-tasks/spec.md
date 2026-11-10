@@ -15,7 +15,7 @@ It SHALL also parse:
 
 - **Priority**: 🔺 highest, ⏫ high, 🔼 medium, 🔽 low, ⏬ lowest, with an optional U+FE0F.
 - **Inline tags** (the shared inline-tag rule). A tag longer than 128 characters SHALL NOT be stored. The first 64 distinct remaining tags in document order SHALL be stored in document order. The row's `tags_cut` SHALL be true exactly when any tag on the line was not stored for either reason.
-- **Tag prefixes**: each stored tag, lower-cased, with every `/`-segment prefix, deduplicated and never capped. It is bounded by construction at 4,096 entries, and holds every prefix of every stored tag.
+- **Tag prefixes**: each stored tag is lower-cased, has every run of `/` collapsed to one, and has a trailing `/` stripped. Its prefixes are that normalised tag cut immediately before each `/`, plus the whole normalised tag. The array is deduplicated and never capped. A tag of at most 128 characters has at most 64 non-empty segments, since 2k − 1 ≤ 128, so the array holds at most 64 × 64 = 4,096 entries.
 - **Recurrence rule**: the value of a `🔁` field in the line's trailing field run, identified as the Tasks plugin parses it, cut at 256 characters with `recurrence_cut`.
 - **Description key**: the 16-hex normalised-description key of the `task-write` capability.
 - **Folded text**: the stored text with Unicode case folding applied.
@@ -40,9 +40,13 @@ Dates and priority SHALL be read from the masked text of the line, so a signifie
 - **WHEN** a task carries `#Waiting-For/Chase`
 - **THEN** its stored tags SHALL be `Waiting-For/Chase`, and its tag prefixes SHALL be `waiting-for` and `waiting-for/chase`
 
-#### Scenario: Tag prefixes are lossless at the bound
-- **WHEN** a task carries 64 distinct tags of 128 characters, each made of 64 one-character `/`-segments
-- **THEN** its tag prefixes SHALL hold all 4,096 prefixes, `tags_cut` SHALL be false, and `list_tasks(tags=[<any stored tag>])` and `list_tasks(exclude_tags=[<its first segment>])` SHALL agree with the stored tags
+#### Scenario: Tag prefixes are lossless at the largest buildable case
+- **WHEN** a task carries the 64 distinct tags `#t00/b/b/…/b` … `#t63/b/b/…/b`, each 127 characters long, made of a 3-character first segment and 62 one-character segments
+- **THEN** its tag prefixes SHALL hold 64 × 63 = 4,032 entries, `tags_cut` SHALL be false, and `list_tasks(tags=[<any stored tag>])` and `list_tasks(exclude_tags=["t05"])` SHALL agree with the stored tags
+
+#### Scenario: Empty segments are normalised identically on both sides
+- **WHEN** a task carries `#Waiting-For//Chase/`, and `list_tasks(tags=["waiting-for//chase"])` and `list_tasks(tags=["waiting-for"])` are called
+- **THEN** its tag prefixes SHALL be exactly `waiting-for` and `waiting-for/chase`, and both calls SHALL return the task
 
 #### Scenario: Context lines are captured
 - **WHEN** `- [ ] Call bank` is followed by `    - ref 1234`, `    more notes`, a blank line and `- [ ] next`
@@ -138,7 +142,7 @@ The MCP server SHALL expose a read tool `list_tasks`, registered with a title an
 
 **`text`.** `text` SHALL be 1–256 characters and at most 8 whitespace-separated terms. Every term, after NFC and Unicode case folding, SHALL occur in the task's folded text.
 
-**`tags` and `exclude_tags`.** Each entry is stripped of one leading `#`, lower-cased, and SHALL match `[a-z][a-z0-9_/-]*` without a trailing `/`; there are at most 32 entries of at most 128 characters. `tags` SHALL require every entry and `exclude_tags` SHALL reject every entry. Both match hierarchically by `/` segment and case-insensitively against the task's own tags, so `waiting-for` matches `waiting-for` and `Waiting-For/x` but not `waiting-forever`. Note-level tags are not consulted.
+**`tags` and `exclude_tags`.** Each entry is stripped of one leading `#`, lower-cased, and SHALL match `[a-z][a-z0-9_/-]*` without a trailing `/`; there are at most 32 entries of at most 128 characters. Runs of `/` in an entry are then collapsed, exactly as for stored tag prefixes. `tags` SHALL require every entry and `exclude_tags` SHALL reject every entry. Both match hierarchically by `/` segment and case-insensitively against the task's own tags, so `waiting-for` matches `waiting-for` and `Waiting-For/x` but not `waiting-forever`. Note-level tags are not consulted.
 
 **`scope`.** `scope="default"` SHALL exclude tasks in notes under the caller's excluded folders, or whose note tags hierarchically match an excluded note tag. `scope="all"` SHALL exclude nothing.
 

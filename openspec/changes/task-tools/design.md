@@ -446,7 +446,9 @@ The pass already holds the row lock of every note whose tasks it rewrites (D-con
 
 **Columns are nullable** because existing rows have no value until the version-5 pass re-derives them. Pass and refresh always write all of them. `ck_note_tasks_key_shape` keeps the triple coherent. The models mirror this byte for byte, so `alembic check` stays clean. Partial and GIN indexes are declared with `postgresql_where` / `postgresql_using`.
 
-**`tag_prefixes`.** For each stored tag, lower-cased (the tag grammar is ASCII), every `/`-segment prefix: `waiting-for/Chase` gives `waiting-for` and `waiting-for/chase`. The array is deduplicated and **not capped** (Codex r2 #2). It is bounded by construction: at most 64 stored tags, each at most 128 characters and so at most 64 segments, which gives at most 4,096 entries. It is therefore lossless for every stored tag, and `tags` / `exclude_tags` can never disagree with the stored `tags`. `tags_cut` keeps exactly its #350 meaning: a tag dropped from the stored list (over 128 characters, or past the 64th).
+**`tag_prefixes`.** **Normalisation and prefixes** (Codex r3 NIT). The shared tag grammar allows empty `/` segments, so a tag is normalised before its prefixes are taken, in three steps: lower-case it (the grammar is ASCII), collapse every run of `/` to one `/`, and strip a trailing `/`. Its prefixes are then the normalised tag cut immediately before each `/`, plus the whole normalised tag. Every segment is non-empty, so no prefix is empty or ends with `/`. A `tags` / `exclude_tags` value is normalised the same way before matching (a trailing `/` is still refused, as before), so `a//b` and `a/b` match each other. Matching is therefore lossless for every stored tag under this one rule, and agrees with the stored `tags` up to that normalisation. Example: `Waiting-For//Chase/` → `waiting-for/chase` → `waiting-for`, `waiting-for/chase`.
+
+The array is deduplicated and **not capped** (Codex r2 #2). **The bound, derived.** A normalised tag with k segments needs at least 2k − 1 characters (k non-empty segments and k − 1 slashes). The 128-character limit applies to the tag as written, and normalisation only shortens it, so 2k − 1 ≤ 128, which gives k ≤ 64 prefixes per tag. With at most 64 stored tags, the array holds at most 64 × 64 = 4,096 entries. That is an upper bound. Lower-casing and the letter-first rule keep it from being reached exactly; the largest case built below is 4,032. `tags` / `exclude_tags` can therefore never disagree with the stored `tags`. `tags_cut` keeps exactly its #350 meaning: a tag dropped from the stored list (over 128 characters, or past the 64th).
 
 **Version 5.** The extraction gains the D1 key, ordinal and count, the D9 description key, `text_fold`, `tag_prefixes`, the run-based `recurrence` (plugin rule, R§1.4), `created`, `cancelled` and `context`.
 
@@ -494,7 +496,7 @@ Every existing argument keeps its name, position and default. All new arguments 
 
 **`tags`, amended, and `exclude_tags`.**
 
-- Each argument is stripped of one leading `#`, lower-cased, and must match `[a-z][a-z0-9_/-]*` without a trailing `/`. Up to 32 entries of up to 128 characters.
+- Each argument is stripped of one leading `#`, lower-cased, and must match `[a-z][a-z0-9_/-]*` without a trailing `/`. Up to 32 entries of up to 128 characters. Runs of `/` are then collapsed, exactly as for stored tags (D11).
 - `tags` is `tag_prefixes @> ARRAY[…]` (AND). `exclude_tags` is `NOT (tag_prefixes && ARRAY[…])`.
 - Hierarchical by segment and case-insensitive: `waiting-for` matches `waiting-for` and `Waiting-For/x`, never `waiting-forever` (supervisor ruling 5).
 - **Rejected: the plugin's per-tag substring match** (`#home` matches `#homework`, R§4).
@@ -898,7 +900,7 @@ Then run the full offline suite, `make test-integration`, `make test-schema` and
 **Codex spec review, round 2 (2026-11-10).** All six round-1 items were verified, and additions A and B were accepted. The verdict was FAIL on three new findings, all accepted:
 
 1. **MAJOR.** `update_task(text=…)` could erase tags. Tags in the old description now survive by re-append, and D5 check 6 conserves the tag set.
-2. **MAJOR, implausible input but cheaper to fix.** The 256-entry `tag_prefixes` cap could make tag filters disagree with the stored tags. The cap is removed; the array is bounded by construction at 4,096 entries.
+2. **MAJOR, implausible input but cheaper to fix.** The 256-entry `tag_prefixes` cap could make tag filters disagree with the stored tags. The cap is removed, and the array is bounded by construction.
 3. **MINOR.** The next-occurrence terminator rule differed between placements. One rule now applies: the original task line's terminator.
 
 Round 3 is verification only, per the review budget.
@@ -907,3 +909,5 @@ Round 3 is verification only, per the review budget.
 
 - **A.** With `next_recurrence_below`, the next line goes after the completed task's full continuation block (D7, L17).
 - **B.** A bounded internal retry, at most 3 attempts with full re-resolution, on an in-call conflict when no `expected_hash` was supplied (D2).
+
+**Codex spec review, round 3 (2026-11-10, verification only): PASS.** All three round-2 fixes were verified. One NIT was fixed: the stated 4,096 bound ignored the empty `/` segments the tag grammar allows, and its scenario could not be built. The prefix rule now normalises slash runs first, and the bound is derived from it (≤ 64 per tag, ≤ 4,096 in total). The scenario uses a buildable 4,032-prefix case.
