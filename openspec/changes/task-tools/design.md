@@ -667,7 +667,7 @@ It upserts under `FOR UPDATE`. Each write-behaviour field takes `"on"`, `"off"` 
 **Panel.**
 
 - **The card** is one shared template, `templates/_task_settings_card.html`. It has:
-  - a timezone `<input list>` backed by a `<datalist>` of a fixed list of 79 common IANA names (`TASK_TIMEZONE_SUGGESTIONS`). Any IANA name the validator accepts may still be typed;
+  - a timezone `<input list>` backed by a `<datalist>` of a fixed list of 76 common IANA names (`TASK_TIMEZONE_SUGGESTIONS`). Any IANA name the validator accepts may still be typed;
   - two textareas, one item per line;
   - four **three-option selects** (server default with its current value / on / off), each labelled with the plugin's own setting name.
 - **Multi-user mode:** on the account page, editing the signed-in user's own row (`POST /admin/account/tasks`; 404 in single-user mode).
