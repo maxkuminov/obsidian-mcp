@@ -1857,7 +1857,7 @@ Every note path the task tools print — `list_tasks` full and brief rows,
 (`task_ambiguous`, `duplicate_task`) and the write responses — goes through
 one helper, `_escape_task_path` in `src/mcp_server/tools.py`. Whitespace
 other than U+0020 is shown as an escape (`\n`, `\r`, `\t`, `\uXXXX`), a
-literal backslash is doubled, and a **backtick is escaped too** (```), so
+literal backslash is doubled, and a **backtick is escaped too** (as `\u0060`), so
 the rendering is injective and stays on one line. **The backtick rule is
 load-bearing.** The path sits in a backtick-delimited field, and a file name
 can contain backticks (a web-clipped title is enough); printed raw, one could
@@ -1924,7 +1924,7 @@ optional: `due_from`, `scheduled_from`, `done_from`, `done_by`, `undated`,
   tag grammar (`2024`, `a.b`, a non-ASCII tag), which under #350 returned an
   empty page, is now `invalid_argument`; the `tags:` echo is the normalised,
   lower-cased value. A path containing a backtick is now shown with the
-  backtick escaped (```, see "Every printed path goes through one
+  backtick escaped (as `\u0060`, see "Every printed path goes through one
   escaper"); #350 printed it raw.
   `tag_prefixes` is uncapped and lossless (at most 64 prefixes per tag and
   4,096 per task, by construction), so a filter can never disagree with the

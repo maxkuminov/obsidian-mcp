@@ -455,7 +455,7 @@ from the note's current text, never from a stored line number, and
 because a write changes the line's text, the response returns the task's
 new id. Nothing is ever written into a note to identify a task. Pass the
 path as it is on disk: a row escapes unusual characters in a path (a tab
-as `\t`, a backtick as ```, a backslash doubled), so undo those
+as `\t`, a backtick as `\u0060`, a backslash doubled), so undo those
 escapes if the row shows any. When a
 note holds several identical task lines, their ids carry an occurrence
 suffix (`3f9a0c1b2d4e.2of3`), and a write with such an id also needs
@@ -1307,7 +1307,7 @@ Across the task-tools release (migration 039, #428):
   return an empty page, is now refused `invalid_argument`; `due_by` and
   `scheduled_by` also accept relative dates, so the wording of the
   malformed-date refusal changed; a path containing a backtick is now
-  shown with the backtick escaped as ``` (it was printed raw); and
+  shown with the backtick escaped as `\u0060` (it was printed raw); and
   the header gains `task ids pending`. A `list_tasks` cursor issued before the upgrade is
   refused once (`invalid_argument`): list again without it.
 - **Four new tools and the counts that follow.** `task_agenda`,
