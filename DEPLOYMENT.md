@@ -758,6 +758,12 @@ deployment; on a compose-file deployment the equivalents are plain
   `docker compose -f docker-compose.simple.yml exec obsidian-mcp alembic check`
   should print "No new upgrade operations detected."
 
+  **Upgrading across migration 039 (task tools, #428)** has its own
+  section, [below](#upgrading-across-migration-039-task-tools-428): a new
+  boot refusal for an invalid `TASKS_DEFAULT_TIMEZONE` (it stops the
+  migration step too), one re-derive pass with nothing re-embedded, and a
+  new concurrency-readiness epoch.
+
   **Upgrading to `hybrid_search` (#354).** No migration and nothing
   re-derived or re-embedded. The release adds a 28th tool, `hybrid_search`,
   and one optional setting, `HYBRID_RRF_K` (default 60, 1–1000; an
@@ -842,16 +848,17 @@ deployment; on a compose-file deployment the equivalents are plain
   container — `make deploy` and `make status` fail if a mount at
   `/app/backups` exists — and `.env` should be `0600` (`make init` sets it).
 
-  **What a dump contains.** Of the eighteen tables, six are a cache of the
+  **What a dump contains.** Of the twenty-two tables, six are a cache of the
   vault plus settings — `notes_metadata`, `note_embeddings`, `note_links`,
   `note_tasks`, `indexer_runs`, `indexer_state` — and their rows are the bulk of every
   dump (one 1024-dimension vector per chunk). `make db-backup` dumps their
   *schema only* (`pg_dump --exclude-table-data=<table>` for each), so a
   restore followed by `alembic check` is clean and the first indexer pass
-  rebuilds the rows from the vault. The other twelve — users, API keys,
+  rebuilds the rows from the vault. The other sixteen — users, API keys,
   OAuth clients, codes and tokens, transfer tokens, panel sessions, usage,
-  quotas, `backups_log`, the concurrency counters and runs — are not
-  derivable from anything and are always dumped. `BACKUP_FULL=1 make
+  quotas, `backups_log`, the concurrency counters and runs, the three
+  change-feed tables, and `task_settings` (#428) — are not derivable from
+  anything and are always dumped. `BACKUP_FULL=1 make
   db-backup` dumps everything; a weekly line of that beside the daily
   default is worth it when restore *time* matters more than dump size, since
   a full dump restores a warm index instead of rebuilding one. The
@@ -1293,6 +1300,107 @@ authentication header.
 argument is new and optional. Rolling back is a redeploy of the previous
 image; a client still sending `rerank` is then refused by the
 unknown-argument rule.
+
+## Upgrading across migration 039 (task tools, #428)
+
+This release adds four tools (`task_agenda`, `complete_task`,
+`update_task`, `add_task`) and new `list_tasks` arguments, for checkbox
+tasks in the vault. A vault without checkboxes is unaffected, and so is
+every other tool. What an operator has to know:
+
+- **Check `TASKS_DEFAULT_TIMEZONE` before deploying: it is a new boot
+  refusal.** Unset, it defaults to `UTC`. When set, it must be an IANA
+  timezone the image knows (`Europe/Berlin`, `America/New_York`).
+  Anything else stops the app with a message naming the variable. That
+  includes a misspelling, a path, and host-only names that only some
+  systems carry: `localtime`, `Factory`, `posixrules`, and anything under
+  `posix/` or `right/`. The validation runs wherever the settings are
+  loaded, so the same value also stops `alembic upgrade head` (the
+  compose `run --rm … alembic` step, `make deploy`'s migrate step, the
+  Kubernetes `migrate` initContainer). Set it in `.env` (or the ConfigMap)
+  that every one of those reads, or leave it unset.
+- **`tzdata` is now pinned in `requirements.txt`.** Timezone names come
+  from that package rather than the image's OS zone files, so the set of
+  valid names is the same on every host. `make audit` covers it.
+- **Migration 039.** It adds to `note_tasks` the nullable columns
+  `task_key`, `key_ordinal`, `key_count`, `description_key`,
+  `text_fold`, `tag_prefixes`, `recurrence`, `created`, `cancelled` and
+  `context`, plus `recurrence_cut` and `context_cut` (`NOT NULL DEFAULT
+  false`), the CHECK `ck_note_tasks_key_shape`, and two indexes
+  (`ix_note_tasks_tag_prefixes`, GIN; `ix_note_tasks_open_desc`, partial).
+  It adds `notes_metadata.tasks_source_hash` and `tasks_refreshed_at`
+  (nullable), and creates the table `task_settings`. It writes no row,
+  and nothing rewrites a table: every new column is nullable or has a
+  constant default, and only the CHECK and the two indexes scan
+  `note_tasks` once. It runs as the database's owning role, needs no
+  superuser and creates no extension. It sets `lock_timeout = 10s` and
+  `statement_timeout = 60s` for itself. Run `make test-schema` before
+  merging; afterwards `alembic check` must print "No new upgrade
+  operations detected."
+- **One re-derive pass, nothing re-embedded.** The extraction version
+  moves to 5, so the first index pass after the upgrade (the startup
+  full-hash pass) parses every note once, at the cost of the earlier
+  version bumps, and fills the new columns. Version 5 shares version 4's
+  embedding cleaner, so no note is re-embedded and no provider call is
+  made. Until that pass finishes:
+  - `list_tasks` rows not yet re-derived show `id pending`, and the
+    header counts them as `task ids pending: N tasks`;
+  - the `text` and `recurring` filters fall back to the older columns
+    and add an `Incomplete list: … approximate until the next index
+    pass` notice; every other filter is exact;
+  - `move_note(rewrite_links=True)` answers `index_not_ready`, as after
+    every extraction-version bump.
+
+  The task write tools work during the window, because they read the
+  note itself.
+- **`list_tasks` cursors issued before the upgrade are refused once**,
+  with `invalid_argument` (the cursor format is now version 2). The
+  caller lists again without a cursor. Other visible changes for an
+  existing `list_tasks` caller: rows gain ` — id <id>`, the header gains
+  `task ids pending`, `tags=` matches nested tags case-insensitively
+  (every row that matched before still matches) and the `tags:` header
+  echo is lower-cased, a `tags` value outside the tag grammar (`["2024"]`,
+  `["a.b"]`, a non-ASCII tag) that used to return an empty page is now
+  refused `invalid_argument`, and `due_by` /
+  `scheduled_by` also accept relative dates, which changes the wording of
+  the malformed-date refusal.
+- **A new concurrency-readiness epoch.** `complete_task`, `update_task`
+  and `add_task` join the `write` class and `task_agenda` the `scan`
+  class, so `CLASS_MAPPING_VERSION` moves from 5 to 6. The mapping
+  version is part of the readiness epoch, and `make concurrency-report`
+  evaluates only the configured epoch: evidence gathered before the
+  upgrade does not count, and a window that spans the upgrade reads
+  `INSUFFICIENT_DATA`. Collect a fresh window before promoting
+  `MCP_CONCURRENCY_MODE`. The tool ceilings and their defaults are
+  unchanged.
+- **The write bucket now covers eleven tools.** The three task write
+  tools pass the same per-principal write bucket as `edit_note`
+  (`MCP_WRITE_RATE_LIMIT_*`). A read-only OAuth grant lists 20 tools
+  instead of 19, and API keys and `readwrite` grants list 32.
+- **Five new settings**, all optional: `TASKS_DEFAULT_TIMEZONE` (`UTC`),
+  `TASKS_SET_DONE_DATE` (`true`), `TASKS_SET_CANCELLED_DATE` (`true`),
+  `TASKS_SET_CREATED_DATE` (`false`), `TASKS_NEXT_RECURRENCE_BELOW`
+  (`false`). They are the server defaults. Each user overrides them on
+  the panel's Tasks card (the Account page in multi-user mode, the
+  Settings page in single-user mode). See the README's Configuration
+  table and `.env.example`.
+- **Backups.** `task_settings` is durable user data and is dumped with
+  its rows by `make db-backup` and the Kubernetes backup Job.
+  `note_tasks` stays derived and schema-only; the first pass after a
+  restore rebuilds it.
+- **Rollback is roll-forward.** The previous image runs against the 039
+  schema. It never reads the new columns or `task_settings`, and its task
+  rows are inserted with the new columns NULL, which the CHECK allows.
+  Because it does not know extraction version 5, it re-derives every note
+  once and, having no version-5 embedding cleaner, clears every note's
+  embedding certification. Its embed pass then re-chunks every note and
+  reuses every stored vector (#281), so no provider call is made, while
+  `semantic_search` marks those notes stale until it catches up. Rolling
+  forward again is one more re-derive pass. `alembic downgrade 038` drops
+  only objects carrying 039's marker: the new columns, the CHECK, the two
+  indexes and the `task_settings` table **with every saved task
+  setting** (it prints how many rows it dropped). Note that PostgreSQL
+  drops any other index built on a dropped column along with it.
 
 ## OAuth CIMD `private_key_jwt` clients: ChatGPT (#420)
 

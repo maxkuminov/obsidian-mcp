@@ -1280,6 +1280,60 @@ The lifecycle, in one table — one implementation per phase:
   actually passes the key — a template reading it off a context that has none
   renders `minlength=""`, which is silently no minimum at all.
 
+## The Tasks card (#428)
+
+One shared template, `templates/_task_settings_card.html`, edits one
+`task_settings` row (the per-owner-scope settings of the task tools). It has
+two homes, because the scopes differ by mode:
+
+- **Multi-user mode:** on the account page, editing the signed-in user's own
+  row. `GET /admin/account` renders it; `POST /admin/account/tasks` saves it,
+  behind `require_user_panel`, and 404s in single-user mode like every
+  `/account` route (`_require_account_route`).
+- **Single-user mode:** on the Settings page, editing the NULL-scope row that
+  every MCP caller there uses. `POST /admin/settings/tasks` saves it, behind
+  `require_admin_panel`, and 404s in multi-user mode, where nobody reads the
+  NULL row and a route that wrote it would be a control with no effect. A card
+  on `/account` in single-user mode was rejected: that page 404s there by
+  design (#197).
+
+**Neither route takes a scope from the request.** The scope is the session's
+own user id (multi-user) or NULL (single-user), and only the card's own field
+names are passed to `task_settings.save`, so an extra `user_id` field never
+reaches the service. Validation and the upsert (under `FOR UPDATE`) live in
+the service; the route owns the transaction, the flash and the 303. A refused
+save rolls back, writes nothing and flashes every problem; the redirected GET
+shows the values still stored. Both routes take the router-wide CSRF check.
+
+**The controls.**
+
+- A timezone `<input list>` with a `<datalist>` of a **fixed** list of 76
+  common IANA names (`TASK_TIMEZONE_SUGGESTIONS` in `routes.py`). The list is
+  fixed rather than `zoneinfo.available_timezones()` because that set is the
+  union of the system zone files and the `tzdata` wheel and differs between
+  hosts, while the account page is pinned byte for byte by
+  `tests/golden/oidc_off/`. Any name the validator accepts may be typed; the
+  validator refuses host-only pseudo-zones (`localtime`, `Factory`,
+  `posixrules`, `posix/…`, `right/…`). A stored zone this build cannot load is
+  shown with a warning and the tools use UTC.
+- Two textareas, one entry per line, at most 32 each: excluded folders
+  (vault-relative, no `..`, `.` or empty segments, no leading `/`, normalised
+  to end in `/`) and excluded note tags (a leading `#` stripped, lower-cased,
+  the tag grammar, no trailing `/`).
+- Four **three-option selects** — *Server default (on/off)*, *On*, *Off* —
+  for the write behaviours, labelled by what they do, with the Tasks plugin's
+  own setting name in the help text. They are not checkboxes because "server
+  default" (stored NULL, following the environment) must stay expressible;
+  `save` reads the literal `default` as exactly that, and a boolean field
+  absent from the form leaves the stored value unchanged.
+
+**CSP posture** (#195, #289): the card has no script, no inline handler, no
+`style=` and no `javascript:` URL; every control is a plain form field, so
+`panel.js` gains nothing. Classes are existing components and generated
+utilities. The `page_account_*` goldens were regenerated deliberately; the
+settings page has no golden. The owner walks the card by hand in both modes
+with devtools open, and zero CSP violations is part of the bar.
+
 ## Optional native OIDC (#414, #416)
 
 `src/auth/oidc.py` is the protocol half: discovery, PKCE S256 authorization,
