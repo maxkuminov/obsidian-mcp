@@ -50,7 +50,6 @@ Revision ID: 032
 Revises: 031
 Create Date: 2026-10-29
 """
-import re
 from typing import Sequence, Union
 
 import sqlalchemy as sa
@@ -129,18 +128,47 @@ INDEXES = {
 NOTE_COLUMNS = {"tasks_truncated": TRUNCATED_MARKER, "tasks_failed": FAILED_MARKER}
 
 
-# A later revision that adds a unit to `note_tasks` marks it with a comment
-# ending `(<NNN>_<name>)`, NNN > 032 (039 is the first, #428). Such a unit is
-# that revision's to verify, so the complete comparison below leaves it out —
-# otherwise a stamp-back that re-runs 032 over a head database would refuse
-# the later revision's columns, CHECK and indexes as foreign. On a database
-# without such units (every database 032 itself meets) nothing changes.
-_LATER_MARKER_RE = re.compile(r"\((\d{3})_[a-z0-9_]+\)$")
+# Units a later revision adds to `note_tasks`, by kind and exact name, each
+# with the exact marker comment that revision writes. The complete comparison
+# below leaves out exactly these — a unit of one of these names *and* this
+# comment — because that revision verifies them; otherwise a stamp-back that
+# re-runs 032 over a head database would refuse them as foreign. Anything
+# else (another name, the right name with another comment, any other marker)
+# is compared and refused as before. On a database without these units
+# (every database 032 itself meets) nothing changes.
+#
+# **A future revision that adds a unit to `note_tasks` must extend these
+# lists on purpose**, with its literal names and markers; nothing is inferred
+# from a comment's shape. Byte identical to 039's literals (#428).
+_039_TASK_KEY = "task id key and occurrence (039_task_tools)"
+_039_RECURRENCE = "task recurrence rule (039_task_tools)"
+_039_DATES = "task created and cancelled dates (039_task_tools)"
+_039_CONTEXT = "task context lines (039_task_tools)"
+LATER_COLUMNS = {
+    "task_key": _039_TASK_KEY,
+    "key_ordinal": _039_TASK_KEY,
+    "key_count": _039_TASK_KEY,
+    "description_key": "task duplicate-detection key (039_task_tools)",
+    "text_fold": "case-folded task text (039_task_tools)",
+    "tag_prefixes": "hierarchical task tag prefixes (039_task_tools)",
+    "recurrence": _039_RECURRENCE,
+    "recurrence_cut": _039_RECURRENCE,
+    "created": _039_DATES,
+    "cancelled": _039_DATES,
+    "context": _039_CONTEXT,
+    "context_cut": _039_CONTEXT,
+}
+LATER_CONSTRAINTS = {
+    "ck_note_tasks_key_shape": "task id key shape (039_task_tools)",
+}
+LATER_INDEXES = {
+    "ix_note_tasks_tag_prefixes": "task tag-prefix filter index (039_task_tools)",
+    "ix_note_tasks_open_desc": "open-task duplicate lookup index (039_task_tools)",
+}
 
 
-def _later_revision_unit(comment) -> bool:
-    match = _LATER_MARKER_RE.search(comment or "")
-    return match is not None and int(match.group(1)) > 32
+def _later_revision_unit(allow_list: dict, name, comment) -> bool:
+    return comment is not None and allow_list.get(name) == comment
 
 
 def _quote(value: str) -> str:
@@ -178,7 +206,7 @@ def _columns(bind):
             ),
             {"q": QUALIFIED},
         ).fetchall()
-        if not _later_revision_unit(r[3])
+        if not _later_revision_unit(LATER_COLUMNS, r[0], r[3])
     ]
 
 
@@ -233,7 +261,11 @@ def _other_constraints(bind):
         ),
         {"q": QUALIFIED},
     ).fetchall()
-    return [r for r in rows if not _later_revision_unit(r.comment)]
+    return [
+        r for r in rows
+        if not (r.contype == "c"
+                and _later_revision_unit(LATER_CONSTRAINTS, r.conname, r.comment))
+    ]
 
 
 def _index_definitions(bind) -> dict:
@@ -258,7 +290,7 @@ def _index_definitions(bind) -> dict:
     return {
         r.name: (list(r.columns or []), r.indisunique, r.usable, r.restricted)
         for r in rows
-        if not _later_revision_unit(r.comment)
+        if not _later_revision_unit(LATER_INDEXES, r.name, r.comment)
     }
 
 

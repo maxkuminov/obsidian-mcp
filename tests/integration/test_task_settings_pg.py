@@ -113,8 +113,30 @@ async def test_single_user_scope_is_the_null_row(db):
     eff = await effective(db, None)
     assert eff.timezone == "UTC" and eff.configured_timezone is None
     assert eff.excluded_folders == ()
-    assert eff.set_done_date is False  # an unchecked box is an explicit False
+    assert eff.set_done_date is True  # absent: the stored True is kept
     assert eff.set_created_date is False  # "default": NULL, the env default
+    async with db() as session:
+        row = (await session.execute(select(TaskSettings))).scalar_one()
+    assert (row.set_done_date, row.set_cancelled_date, row.set_created_date,
+            row.next_recurrence_below) == (True, True, None, False)
+
+
+async def test_a_save_without_flags_never_switches_a_default_off(db):
+    """Regression: posting only `timezone` used to store False for all four
+    flags, turning the done and cancelled dates off for the scope."""
+    seven = await make_user(db, "seven")
+    assert await save(db, seven, {"timezone": "Asia/Tokyo"}) == []
+    async with db() as session:
+        row = (await session.execute(select(TaskSettings))).scalar_one()
+    assert (row.set_done_date, row.set_cancelled_date, row.set_created_date,
+            row.next_recurrence_below) == (None, None, None, None)
+    eff = await effective(db, seven)
+    assert (eff.set_done_date, eff.set_cancelled_date) == (True, True)
+    # An explicit value sticks; a later flag-less save leaves it alone.
+    assert await save(db, seven, {"set_done_date": "off"}) == []
+    assert await save(db, seven, {"timezone": "Europe/Berlin"}) == []
+    eff = await effective(db, seven)
+    assert eff.set_done_date is False and eff.timezone == "Europe/Berlin"
 
 
 async def test_scopes_never_see_each_other(db):
