@@ -953,3 +953,179 @@ def test_property_over_the_corpus(line):
         successes += 1
         _check_success(line, tl, changes, result)
     assert successes >= 7, line
+
+
+
+# ── linear trailing-run parse (#428): differential against the frozen old
+#    algorithm, and a linearity bound ─────────────────────────────────────────
+
+
+def _frozen_parse_run(text, *, offset=0, floor=None):
+    """The pre-optimisation `parse_run`, frozen verbatim: it rescanned the
+    text from its start on every pass. The oracle for the linear version."""
+
+    def ws_start(pos, lo):
+        while pos > lo and text[pos - 1].isspace():
+            pos -= 1
+        return pos
+
+    floor = offset if floor is None else floor
+    end = len(text.rstrip())
+    block = None
+    m = T._BLOCK_LINK_RE.search(text, 0, end)
+    if m is not None:
+        b_start = m.start("val")
+        block = T.Token(
+            kind="block", family=None,
+            start=offset + b_start, end=offset + m.end(),
+            value_start=offset + b_start, value_end=offset + m.end(),
+            value=m.group("val"), symbol="^",
+            sep_start=offset + ws_start(b_start, floor - offset),
+        )
+        end = len(text[: m.start()].rstrip())
+    found = []
+    for _ in range(T._MAX_PASSES):
+        matched = False
+        for family, pattern in T._PLUGIN_PATTERNS:
+            m = pattern.search(text, 0, end)
+            if m is None:
+                continue
+            matched = True
+            if family == "#tag":
+                start = m.start("val")
+                found.append(T.Token(
+                    kind="tag", family=None, start=start, end=m.end(),
+                    value_start=start, value_end=m.end(), value=m.group("val"),
+                    symbol="#", sep_start=start,
+                ))
+            else:
+                start = m.start("sym")
+                if family == T.PRIORITY:
+                    v_start, v_end = start, m.end("sym")
+                    value = T.PRIORITY_NAMES[m.group("sym")]
+                else:
+                    v_start, v_end = m.start("val"), m.end("val")
+                    value = m.group("val")
+                symbol_end = m.end("sym")
+                if text.startswith(T.VS16, symbol_end):
+                    symbol_end += 1
+                found.append(T.Token(
+                    kind="field", family=family, start=start, end=m.end(),
+                    value_start=v_start, value_end=v_end, value=value,
+                    symbol=text[start:symbol_end], sep_start=start,
+                ))
+            end = len(text[: m.start()].rstrip())
+        if not matched:
+            break
+    tokens = []
+    for t in sorted(found, key=lambda t: t.start):
+        sep = ws_start(t.start, floor - offset)
+        tokens.append(T.Token(
+            kind=t.kind, family=t.family,
+            start=offset + t.start, end=offset + t.end,
+            value_start=offset + t.value_start, value_end=offset + t.value_end,
+            value=t.value, symbol=t.symbol, sep_start=offset + sep,
+        ))
+    return T.RunParse(text=text, description_end=end, tokens=tuple(tokens), block=block)
+
+
+_DIFF_ATOMS = [
+    "📅", "📆", "🗓", "⏳", "⌛", "🛫", "➕", "✅", "❌", "🔁", "🏁", "🆔", "⛔",
+    "🔺", "⏫", "🔼", "🔽", "⏬", "\ufe0f", "#", "^", " ", "  ", "\t", "\u00a0",
+    "　", "\x1c", "\x85", "\u2028", "​", ",", "!", "-", "_", ".", "'",
+    "`", "[[", "]]", "a", "Z", "b1", "2026-01-01", "2026-02-30", "1234-56-78",
+    "every", "day", "when done", "keep", "delete", "abc-1", "x_2", "é", "Ω",
+]
+_DIFF_TOKENS = [
+    "📅 2026-01-01", "📅\ufe0f2026-01-01", "📆  2026-02-30", "⌛ 2026-01-01", "🛫2026-01-01",
+    "➕ 2026-01-01", "✅ 2026-01-01", "❌ 2026-01-01", "🔁 every week", "🔁every 2 days when done",
+    "🔁 every day!", "🏁 keep", "🏁\ufe0f Delete", "🆔 abc-1", "⛔ a1, b_2", "⛔a , b ,c",
+    "⏫", "🔼\ufe0f", "#tag", "#Tag/sub", "#q'x", "#a]]", "#1234", "#", "^blk-1", "^b_1",
+]
+
+
+def _random_text(rng):
+    parts = []
+    for _ in range(rng.randint(0, 6)):
+        parts.append(rng.choice(_DIFF_ATOMS))
+    for _ in range(rng.randint(0, 6)):
+        parts.append(rng.choice([" ", "", "  ", "\t"]) + rng.choice(_DIFF_TOKENS + _DIFF_ATOMS))
+    if rng.random() < 0.3:
+        parts.append(" ^" + rng.choice(["b1", "blk-2", "x_y", ""]))
+    parts.append(rng.choice(["", " ", "  ", "\t", "\u00a0", "　"]))
+    return "".join(parts)
+
+
+def test_linear_parse_run_is_the_old_parse_byte_for_byte():
+    rng = random.Random(4282)
+    for i in range(25000):
+        text = _random_text(rng)
+        offset = rng.choice([0, 0, 6, 11])
+        # A floor below the offset is outside the contract: the old walk
+        # indexed text[-1] there (a wrap-around), the new one stops at 0.
+        floor = rng.choice([None, None, offset, offset + 2])
+        assert T.parse_run(text, offset=offset, floor=floor) == \
+            _frozen_parse_run(text, offset=offset, floor=floor), repr(text)
+
+
+@pytest.mark.parametrize("line", ANATOMY + CORPUS)
+def test_linear_parse_run_matches_on_the_corpus(line):
+    tl = parse(line)
+    if tl is None:
+        return
+    text = line[tl.text_start : tl.text_end]
+    assert T.parse_run(text, offset=tl.text_start) == _frozen_parse_run(text, offset=tl.text_start)
+
+
+TEN_MIB = 10 * 1024 * 1024
+# The old rescan-per-pass parse took ~25 s on the dates shape and ~22 s on the
+# spaces shape at 10 MiB; the linear one takes well under half a second on the
+# development host. 2 s is generous headroom for a shared runner and still
+# fails at once on a return to the old algorithm.
+LINEAR_BOUND_SECONDS = 2.0
+
+
+def _tile(unit, size):
+    return (unit * (size // len(unit) + 1))[:size]
+
+
+LINEAR_SHAPES = {
+    "plain": lambda n: _tile("word ", n),
+    "desc+run": lambda n: _tile("word ", n - 40) + " 📅 2026-01-01 ⏫ #t ^b",
+    "tags": lambda n: "x " + _tile("#a ", n),
+    "dates": lambda n: "x " + _tile("📅 2026-01-01 ", n),
+    "recurrence": lambda n: "x 🔁 " + _tile("every day ", n),
+    "hashes": lambda n: _tile("#", n),
+    "due emoji": lambda n: _tile("📅", n),
+    "recurrence emoji": lambda n: _tile("🔁", n),
+    "spaces then priorities": lambda n: "x" + _tile(" ", n) + " ⏫" * 30,
+    "spaces before a date": lambda n: "x 📅" + _tile(" ", n) + "2026-01-01",
+    "depends list": lambda n: "x ⛔ " + _tile("a , ", n),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(LINEAR_SHAPES))
+def test_parse_is_linear_on_adversarial_lines(shape):
+    import time
+
+    make = LINEAR_SHAPES[shape]
+    text = make(TEN_MIB).rstrip() or "x"
+    line = "- [ ] " + text
+    started = time.perf_counter()
+    T.parse_run(text)
+    parse(line, masked=line)  # the mask is the caller's; time the parse
+    elapsed = time.perf_counter() - started
+    assert elapsed < LINEAR_BOUND_SECONDS, f"{elapsed:.2f}s on {shape}"
+    # Doubling the input must not much more than double the time.
+    small = make(TEN_MIB // 8).rstrip() or "x"
+    large = make(TEN_MIB // 4).rstrip() or "x"
+    t = []
+    for sample in (small, large):
+        best = None
+        for _ in range(3):
+            s0 = time.perf_counter()
+            T.parse_run(sample)
+            d = time.perf_counter() - s0
+            best = d if best is None else min(best, d)
+        t.append(best)
+    assert t[1] / max(t[0], 1e-4) < 4, f"{shape}: n={t[0]:.4f}s 2n={t[1]:.4f}s — superlinear"
