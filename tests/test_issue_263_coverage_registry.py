@@ -34,22 +34,27 @@ COVERAGE = {
     'request_download': [('success', 'test_transfer_tools.py::test_request_download_mints_a_fingerprinted_link')],
     'import_from_url': [('partial', 'test_transfer_tools.py::test_import_reports_a_post_publish_failure_as_written')],
     'delete_file': [('refused', 'test_transfer_tools.py::test_delete_file_reports_a_missing_file')],
-    'list_tasks': [('refused', 'test_list_tasks_render.py::test_the_tags_argument_bounds'), ('success', 'test_list_tasks_render.py::test_an_empty_result_is_a_header_and_not_a_refusal')],
+    'list_tasks': [('refused', 'test_list_tasks_render.py::test_invalid_arguments_are_refused_before_any_statement'), ('success', 'test_list_tasks_render.py::test_the_query_runs_in_one_read_only_snapshot')],
     'get_changes': [('refused', 'test_change_feed_offline.py::test_get_changes_refuses_bad_arguments_before_any_query'), ('success', 'test_change_feed_offline.py::test_render_changes_page_shape')],
     'hybrid_search': [('refused', 'test_hybrid_search_offline.py::test_the_query_cap_is_pre_body'), ('success', 'test_hybrid_search_offline.py::test_provider_down_returns_the_keyword_arm_marked')],
+    'task_agenda': [('refused', 'test_task_tools_e2e.py::test_task_agenda_refuses_a_small_response_cap_before_any_statement'), ('success', 'test_task_tools_e2e.py::test_task_agenda_renders_through_the_query')],
+    'complete_task': [('refused', 'test_task_tools_e2e.py::test_a_suffixed_id_without_a_hash_is_refused_before_any_read'), ('success', 'test_task_tools_e2e.py::test_complete_task_writes_refreshes_then_records_the_event')],
+    'update_task': [('refused', 'test_task_tools_e2e.py::test_update_task_status_done_names_complete_task'), ('success', 'test_task_tools_e2e.py::test_update_task_sets_a_relative_due_date_and_echoes_it')],
+    'add_task': [('refused', 'test_task_tools_e2e.py::test_add_task_refuses_a_missing_note_and_creates_nothing'), ('success', 'test_task_tools_e2e.py::test_add_task_inserts_after_the_task_list_and_lists_similar_tasks')],
 }
 
 # Tools registered after the typed-tool-outcomes inventory was archived. Their
 # outcome contract lives in their own change's spec rather than in that
 # inventory, which is a historical record and is not edited.
-ADDED_AFTER_INVENTORY = {'list_tasks', 'get_changes', 'hybrid_search'}  # #350, #351, #354
+ADDED_AFTER_INVENTORY = {'list_tasks', 'get_changes', 'hybrid_search',  # #350, #351, #354
+                         'task_agenda', 'complete_task', 'update_task', 'add_task'}  # #428
 
 
 def test_every_registered_tool_has_inventory_and_live_behavioral_references():
     from src.mcp_server.server import mcp
     registered = {tool.name for tool in mcp._tool_manager.list_tools()}
     assert set(COVERAGE) == registered
-    assert len(registered) == 28  # 25 → 28: `list_tasks` (#350), `get_changes` (#351), `hybrid_search` (#354)
+    assert len(registered) == 32  # 25 → 28: `list_tasks` (#350), `get_changes` (#351), `hybrid_search` (#354); 28 → 32: the task tools (#428)
     root = Path(__file__).resolve().parents[1]
     inventory = (root / 'openspec/changes/archive/2026-09-06-typed-tool-outcomes/inventory.md').read_text()
     for tool, references in COVERAGE.items():

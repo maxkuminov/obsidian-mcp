@@ -79,7 +79,7 @@ from mcp.types import ToolAnnotations  # noqa: E402
 import src.mcp_server.tools as tools  # noqa: E402
 from src.mcp_server import server  # noqa: E402
 from src.mcp_server.server import mcp  # noqa: E402
-from src.services import concurrency  # noqa: E402
+from src.services import concurrency, refusals  # noqa: E402
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "tools_list_schema_5a391ca.json"
 ADDITIONS = Path(__file__).resolve().parent / "fixtures" / "tools_list_schema_additions.json"
@@ -93,7 +93,7 @@ LEAD_CHARS = 1_500
 INSTRUCTIONS_CAP = 2_000
 INSTRUCTIONS_LEAD = 512
 
-# The eighteen tools that neither change vault bytes nor mint a capability. Named
+# The nineteen tools that neither change vault bytes nor mint a capability. Named
 # explicitly so a read tool added without annotations fails on its name, not
 # only on a count.
 READ_TOOLS = frozenset({
@@ -103,12 +103,16 @@ READ_TOOLS = frozenset({
     "list_tasks",  # #350
     "get_changes",  # #351
     "hybrid_search",  # #354
+    "task_agenda",  # #428
 })
+#: The task write tools (#428 D15): in the write bucket; `add_task` is
+#: additive (it removes no byte), the other two destructive.
+TASK_WRITE_TOOLS = ("complete_task", "update_task", "add_task")
 RESTRUCTURED_WRITE_TOOLS = ("edit_note", "move_note", "set_frontmatter")
 # The refusal statement is qualified in every description that makes one: the
 # three restructured tools plus `create_note` and `delete_note`, whose
 # pre-existing sentence had the same inaccuracy (truth fix found in review).
-REFUSAL_QUALIFIED_TOOLS = RESTRUCTURED_WRITE_TOOLS + ("create_note", "delete_note")
+REFUSAL_QUALIFIED_TOOLS = RESTRUCTURED_WRITE_TOOLS + ("create_note", "delete_note") + TASK_WRITE_TOOLS
 
 
 # ── pollution probes ─────────────────────────────────────────────────────────
@@ -175,6 +179,9 @@ def tool_shaped_references(text: str, words: frozenset[str]) -> set[str]:
     names (`content`, `expected_hash`, `find`) are not counted: none begins
     with a registered first word *and* contains an underscore — the underscore
     rule exists for `find`, which shares its first word with `find_orphans`.
+    A bare span that is a declared `MCP-REFUSAL` code (`task_not_found`,
+    `task_malformed`, … since #428 gave `task_` a registered first word) is a
+    code, not a tool reference.
     """
     found: set[str] = set()
     for span in _SPAN.findall(text):
@@ -185,6 +192,8 @@ def tool_shaped_references(text: str, words: frozenset[str]) -> set[str]:
         dotted = _DOTTED.match(span)
         bare = _BARE.match(span)
         head = (dotted or bare).group(1) if (dotted or bare) else None
+        if bare and head in refusals.CODES:
+            continue
         if head and "_" in head and head.split("_")[0] in words:
             found.add(head)
     return found
@@ -193,10 +202,11 @@ def tool_shaped_references(text: str, words: frozenset[str]) -> set[str]:
 # ── 1. completeness ──────────────────────────────────────────────────────────
 
 
-def test_exactly_28_tools():
+def test_exactly_32_tools():
     # 25 → 26: `list_tasks` (#350); 26 → 27: `get_changes` (#351);
-    # 27 → 28: `hybrid_search` (#354).
-    assert len(listed()) == 28
+    # 27 → 28: `hybrid_search` (#354); 28 → 32: `task_agenda`,
+    # `complete_task`, `update_task`, `add_task` (#428).
+    assert len(listed()) == 32
 
 
 @pytest.mark.parametrize("tool", listed(), ids=lambda t: t.name)
@@ -234,16 +244,22 @@ def test_the_write_bucket_set_is_the_production_one():
     w = tools.production_write_bucket_tools()
     assert w == frozenset(t for t, c in concurrency.TOOL_CLASSES.items() if c == "write")
     assert w <= registered_names()
-    assert len(w) == 8
+    assert len(w) == 11
 
 
-def test_destructive_is_the_write_bucket_minus_create_note_plus_request_upload():
+def test_destructive_is_the_write_bucket_minus_the_additive_writers_plus_request_upload():
+    """#428 D15: `add_task` joins `create_note` as an additive writer — it
+    inserts one line and removes no byte."""
     w = tools.production_write_bucket_tools()
-    assert _set(lambda a: a.destructiveHint) == (w - {"create_note"}) | {"request_upload"}
+    assert _set(lambda a: a.destructiveHint) == (w - {"create_note", "add_task"}) | {"request_upload"}
+    assert _set(lambda a: a.destructiveHint) == {
+        "edit_note", "move_note", "delete_note", "set_frontmatter", "write_file",
+        "delete_file", "import_from_url", "complete_task", "update_task", "request_upload",
+    }
     assert _set(lambda a: not a.readOnlyHint) == w | {"request_upload", "request_download"}
     assert _set(lambda a: a.openWorldHint) == {"import_from_url"}
     assert _set(lambda a: a.idempotentHint) == _set(lambda a: a.readOnlyHint)
-    for name in ("create_note", "request_download"):
+    for name in ("create_note", "add_task", "request_download"):
         a = registered(name).annotations
         assert (a.readOnlyHint, a.destructiveHint) == (False, False), name
     a = registered("import_from_url").annotations
@@ -263,6 +279,7 @@ def test_a_test_probe_cannot_pollute_the_write_bucket_set():
     assert w == frozenset({
         "create_note", "edit_note", "move_note", "delete_note", "set_frontmatter",
         "write_file", "delete_file", "import_from_url",
+        "complete_task", "update_task", "add_task",  # #428
     })
 
 
@@ -296,13 +313,39 @@ def test_the_instructions_state_the_round_trip_with_its_conditions():
     assert "back to `edit_note` unchanged" not in text
 
 
-def test_the_instructions_name_list_tasks_outside_the_lead():
-    """`vault-guide` delta (#350): one sentence names `list_tasks`, after the
-    512-character lead, within the 2,000 cap."""
+#: The instructions' lead as it stood before #428, which must not move: only
+#: the `list_tasks` sentence after it is replaced (D15).
+LEAD_BEFORE_428 = (
+    "Agent memory in a markdown Obsidian vault. Search with `keyword_search` "
+    "(identifiers), `semantic_search` (paraphrase) or `hybrid_search` "
+    "(unsure); read with `read_note`; write with `create_note` or "
+    "`edit_note` (`dry_run=true` first). `get_vault_guide` describes this "
+    "vault's conventions (one call per session). `create_note` never "
+    "overwrites. Edits take `expected_hash` and refuse, writing nothing, if "
+    "it changed; optional by default (an unguarded stale edit overwrites) "
+    "unless the deployment requires it."
+    "\n\n"
+    "`expected_hash` is a read's `content_hash`; a deployment that requires "
+    "it refuses an unguarded edit (`precondition_required`). Round trips: only `content` from a complete whole-note `read_note` "
+)
+TASK_TOOL_NAMES = ("list_tasks", "task_agenda", "complete_task", "update_task", "add_task")
+
+
+def test_the_instructions_name_the_task_tools_in_one_sentence_outside_the_lead():
+    """`vault-guide` delta (#350, #428 D15): one sentence names the five task
+    tools and says task writes take a path plus a task id, after the
+    512-character lead — which is byte-identical to before — within the cap."""
     text = server.SERVER_INSTRUCTIONS
-    assert "`list_tasks`" in text
-    assert "list_tasks" not in text[:INSTRUCTIONS_LEAD]
-    assert text.index("`list_tasks`") >= INSTRUCTIONS_LEAD
+    assert text[:INSTRUCTIONS_LEAD] == LEAD_BEFORE_428[:INSTRUCTIONS_LEAD]
+    start = text.index("`list_tasks`")
+    assert start >= INSTRUCTIONS_LEAD
+    sentence = text[start:]
+    assert sentence.endswith(".") and sentence.count(". ") == 0, sentence
+    for name in TASK_TOOL_NAMES:
+        assert f"`{name}`" in sentence, name
+        assert name not in text[:INSTRUCTIONS_LEAD], name
+    assert "`path`" in sentence and "task id" in sentence
+    assert "query blocks are text" in sentence
     assert len(text) <= INSTRUCTIONS_CAP
 
 
@@ -329,7 +372,7 @@ def test_no_description_exceeds_the_cap(tool):
     )
 
 
-@pytest.mark.parametrize("name", RESTRUCTURED_WRITE_TOOLS)
+@pytest.mark.parametrize("name", RESTRUCTURED_WRITE_TOOLS + TASK_WRITE_TOOLS)
 def test_the_write_tools_lead_with_their_contract(name):
     tool = registered(name)
     lead = (tool.description or "")[:LEAD_CHARS]
@@ -385,11 +428,30 @@ def test_the_refusal_statement_is_qualified(name):
 
 def test_the_guardable_set_is_every_expected_hash_tool_but_create_note():
     """Guard the parametrisation: a tool that gains `expected_hash` later must
-    join the list (or be argued out of it here), not slip past unqualified."""
+    join the list (or be argued out of it here), not slip past unqualified.
+
+    The task write tools (#428) are argued out: under required mode the
+    `(path, id)` pair satisfies the precondition (`add_task` is exempt), so
+    "optional by default … unless the deployment requires it" would be false
+    for them; their own rule is pinned below."""
     accepting = {
         t.name for t in listed() if "expected_hash" in t.parameters["properties"]
     }
-    assert accepting == set(GUARDABLE_WRITE_TOOLS) | {"create_note"}
+    assert accepting == set(GUARDABLE_WRITE_TOOLS) | {"create_note"} | set(TASK_WRITE_TOOLS)
+
+
+@pytest.mark.parametrize("name", TASK_WRITE_TOOLS)
+def test_the_task_write_tools_state_their_precondition_rule(name):
+    """D3: a suffixed id needs `expected_hash` in every mode; `add_task` takes
+    one optionally even where the deployment requires preconditions."""
+    text = _normalised(description(name))
+    assert not _OPTIONAL_CLAUSE.search(text)
+    if name == "add_task":
+        assert "optional, even where the deployment requires preconditions" in text
+    else:
+        assert "accepted only with `expected_hash`" in text
+        assert "`precondition_required`" in text
+        assert "`read_note`" in text
 
 
 @pytest.mark.parametrize("name", GUARDABLE_WRITE_TOOLS)
@@ -467,7 +529,10 @@ async def test_names_order_and_schemas_match_the_5a391ca_fixture():
     additions = json.loads(ADDITIONS.read_text(encoding="utf-8"))
     amendments = {row["name"]: row for row in json.loads(AMENDMENTS.read_text(encoding="utf-8"))}
     assert len(frozen) == 25
-    assert [row["name"] for row in additions] == ["list_tasks", "get_changes", "hybrid_search"]
+    assert [row["name"] for row in additions] == [
+        "list_tasks", "get_changes", "hybrid_search",
+        "task_agenda", "complete_task", "update_task", "add_task",  # #428
+    ]
     fixture = [amendments.get(row["name"], row) for row in frozen] + additions
     live = await mcp.list_tools()
     # The first 25 are the frozen surface, in order; the rest the additions.
@@ -492,7 +557,9 @@ async def test_names_order_and_schemas_match_the_5a391ca_fixture():
 @pytest.mark.parametrize("tool", listed(), ids=lambda t: t.name)
 def test_every_description_names_only_registered_tools(tool):
     found = tool_shaped_references(tool.description or "", first_words())
-    unknown = found - registered_names()
+    # The tool's own argument names are not tool references (`add_tags`
+    # shares its first word with `add_task`, #428).
+    unknown = found - registered_names() - set(tool.parameters["properties"])
     assert not unknown, f"{tool.name} names unregistered tool(s): {sorted(unknown)}"
 
 
@@ -505,6 +572,9 @@ def test_the_extractor_recognises_each_form_and_skips_arguments():
     # A dotted typo is caught: its head is extracted and is not registered.
     typo = tool_shaped_references("the `read_notes.frontmatter_yaml` field", words)
     assert typo == {"read_notes"} and not typo <= registered_names()
+    # A refusal code is not a tool; a near-miss tool name still is.
+    assert tool_shaped_references("refused `task_not_found`", words) == set()
+    assert tool_shaped_references("call `task_agendas`", words) == {"task_agendas"}
 
 
 def test_the_live_dotted_reference_is_covered():
@@ -577,3 +647,63 @@ def test_the_two_locator_paragraphs_are_identical():
         return " ".join(text[start:text.index("Previews are one line.", start)].split())
 
     assert paragraph("semantic_search") == paragraph("find_related")
+
+
+# ── 7. the task tools (#428, design D15) ─────────────────────────────────────
+
+FULL_V1 = Path(__file__).resolve().parent / "fixtures" / "tools_list_full_v1.json"
+LIST_TASKS_ADDED = {
+    "due_from", "scheduled_from", "done_from", "done_by", "undated", "has_due",
+    "text", "priority", "recurring", "exclude_tags", "path", "order_by", "detail",
+    "context", "scope",
+}
+
+
+def test_the_list_tasks_amendment_is_additive():
+    """The regenerated `list_tasks` additions entry against its committed
+    predecessor (the #350 schema, kept verbatim in the unedited 1.0 oracle):
+    every predecessor property present with an identical schema, every new
+    property optional, `required` unchanged, the output schema unchanged."""
+    before = next(t for t in json.loads(FULL_V1.read_text(encoding="utf-8"))["tools"]
+                  if t["name"] == "list_tasks")
+    after = next(row for row in json.loads(ADDITIONS.read_text(encoding="utf-8"))
+                 if row["name"] == "list_tasks")
+    old, new = before["inputSchema"], after["inputSchema"]
+    for name, schema in old["properties"].items():
+        assert new["properties"][name] == schema, name
+    assert set(new["properties"]) - set(old["properties"]) == LIST_TASKS_ADDED
+    assert new.get("required", []) == old.get("required", [])
+    assert after["outputSchema"] == before["outputSchema"]
+
+
+def test_every_new_task_tool_returns_str_with_the_sdk_wrapper():
+    additions = {row["name"]: row for row in json.loads(ADDITIONS.read_text(encoding="utf-8"))}
+    for name in ("task_agenda", "complete_task", "update_task", "add_task"):
+        out = additions[name]["outputSchema"]
+        assert out["properties"] == {"result": {"title": "Result", "type": "string"}}, name
+
+
+@pytest.mark.parametrize("name", TASK_TOOL_NAMES)
+def test_the_task_descriptions_are_written_for_a_cold_public_reader(name):
+    """D15: plain checkboxes work and the plugin fields are optional, said in
+    every task tool's description; the ids round trip is stated; no tool is
+    ranked above another."""
+    text = _normalised(description(name))
+    assert "plain checkboxes work" in text, name
+    assert "optional" in text, name
+    assert "primary" not in text and "must call" not in text and "important" not in text
+    if name != "add_task":
+        assert "id" in text and ("`list_tasks`" in text or name == "list_tasks")
+
+
+def test_list_tasks_and_task_agenda_point_at_each_other():
+    assert "`task_agenda`" in description("list_tasks")
+    assert "`list_tasks`" in description("task_agenda")
+
+
+@pytest.mark.parametrize("name", ("complete_task", "update_task"))
+def test_the_id_round_trip_is_stated(name):
+    text = _normalised(description(name))
+    assert "the response returns the new one" in text
+    assert "`dry_run=true`" in text
+    assert "index: refreshed" in text and "index: may lag" in text

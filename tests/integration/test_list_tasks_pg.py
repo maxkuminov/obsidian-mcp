@@ -184,7 +184,9 @@ async def test_paging_1234_tasks_returns_each_exactly_once(seed):
 async def test_a_page_boundary_between_two_undated_tasks(seed):
     await seed.note("u.md", [{"text": "a"}, {"text": "b"}, {"text": "c"}])
     first = await call(limit=1)
-    assert decoded(next_of(first))["d"] == "infinity"
+    # The #428 version-2 cursor: the order's leading key is `k`.
+    assert decoded(next_of(first))["v"] == 2
+    assert decoded(next_of(first))["k"] == ["infinity"]
     second = await call(limit=1, cursor=next_of(first))
     third = await call(limit=1, cursor=next_of(second))
     assert [lines(p)[0].rsplit(": ", 1)[1] for p in (first, second, third)] == ["a", "b", "c"]
@@ -216,7 +218,8 @@ async def test_status_folder_tag_and_date_filters(seed):
 
     assert texts(await call(status="open", folder="Projects/")) == ["a", "b", "e"]
     cancelled = await call(status="cancelled")
-    assert lines(cancelled) == ["- [-] `Projects/p.md`:3 — due 2026-10-30 — text: c"]
+    # Rows seeded without a key render `id pending` (#428 D12).
+    assert lines(cancelled) == ["- [-] `Projects/p.md`:3 — id pending — due 2026-10-30 — text: c"]
     every = await call(status="all", folder="Projects/")
     assert [ln[:5] for ln in lines(every)] == ["- [ ]", "- [/]", "- [-]", "- [x]", "- [ ]"]
     assert texts(await call(due_by="2026-10-29")) == ["a", "b"]
@@ -381,13 +384,17 @@ async def test_the_not_yet_scanned_count_before_and_after_a_pass(db, sessionmake
     await indexer.index_vault()
     after = await call()
     assert "not yet scanned for tasks: 0 notes" in after
-    assert lines(after) == ["- [ ] `n.md`:1 — text: real"]
+    from src.services import task_line
+
+    real = task_line.task_key("real")
+    assert lines(after) == [f"- [ ] `n.md`:1 — id {real} — text: real"]
     assert "Incomplete list:" not in after
 
 
 async def test_invalid_arguments_are_refused(seed):
     assert refused(await call(status="pending"))
-    assert refused(await call(due_by="tomorrow"))
+    # `tomorrow` is a relative date since #428 (D12); free text is not.
+    assert refused(await call(due_by="next week"))
     assert refused(await call(tags=["t"] * 33), "at most 32")
     out = await call(tags=["a" * 128] * 32)
     assert "MCP-REFUSAL" not in out

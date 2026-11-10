@@ -199,8 +199,13 @@ wikilink to a vault note titled `NodeName`.
 
 `list_tasks` lists checkbox tasks across the vault (open, done or
 cancelled, with Tasks-plugin dates such as `📅 2026-11-01`) from the index,
-without reading notes. Tasks-plugin query blocks (` ```tasks ... ``` `) are
-literal text this server does not evaluate.
+without reading notes, and `task_agenda` returns a dated overview (overdue,
+due today, scheduled, upcoming). `complete_task`, `update_task` and
+`add_task` change one task line: the first two address it by the note path
+plus the task id a listing prints, and `add_task` inserts a new line into an
+existing note. Plain checkboxes work without the Tasks plugin; its emoji
+fields (dates, priority, recurrence) are optional. Tasks-plugin query blocks
+(` ```tasks ... ``` `) are literal text this server does not evaluate.
 
 ## Plugin syntax (Dataview, Templater, etc.)
 
@@ -266,7 +271,8 @@ Once a file is stored, embed it in a note the usual way — `![[path]]` via
 - Plugin syntax (Dataview, Templater) is literal text, not code to run.
 - Backlinks are computed from the link graph; query them via tools, do
   not edit source notes to "create" a backlink.
-- Checkbox tasks are indexed; `list_tasks` lists them across the vault.
+- Checkbox tasks are indexed; `list_tasks` and `task_agenda` list them
+  across the vault.
 - Changes since a previous session are listed by
   `get_changes(since=<stored cursor>)`; the `next_since` it returns is the
   cursor to keep in your own notes for next time. Notes whose content
