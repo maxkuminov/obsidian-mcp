@@ -29,23 +29,23 @@ The slices are design §"Slice plan". Each group below is one worktree. Touch on
 
 ## 2. S2: schema, models, settings (wave 1, owns migration 039)
 
-- [ ] 2.1 `alembic/versions/039_task_tools.py` (`revision="039"`, `down_revision="038"`), exactly as D11/D14 and the `schema-integrity` delta define it:
+- [x] 2.1 `alembic/versions/039_task_tools.py` (`revision="039"`, `down_revision="038"`), exactly as D11/D14 and the `schema-integrity` delta define it:
   - markers `… (039_task_tools)`;
   - reconcile-or-refuse shape;
   - timeouts set and `RESET`;
   - no data written;
   - marked-only downgrade.
-- [ ] 2.2 `src/models/db.py`: mirror every column, CHECK, index (`postgresql_where` / `postgresql_using`) and marker byte for byte. Add `class TaskSettings`. Add no ORM relationship that loads tasks or settings implicitly.
-- [ ] 2.3 `src/config.py`:
+- [x] 2.2 `src/models/db.py`: mirror every column, CHECK, index (`postgresql_where` / `postgresql_using`) and marker byte for byte. Add `class TaskSettings`. Add no ORM relationship that loads tasks or settings implicitly.
+- [x] 2.3 `src/config.py`:
   - `TASKS_DEFAULT_TIMEZONE` (validated with `zoneinfo.ZoneInfo`; startup refusal naming the variable);
   - `TASKS_SET_DONE_DATE=true`, `TASKS_SET_CANCELLED_DATE=true`, `TASKS_SET_CREATED_DATE=false`, `TASKS_NEXT_RECURRENCE_BELOW=false`;
   - the constants `TASK_REFRESH_LOCK_WAIT_MS=2000`, `TASK_SIMILAR_SCAN_MAX=2000` and `TASK_CONTEXT_MAX_LINES=8`.
   
   Add `tzdata` (pinned) to `requirements.txt`.
-- [ ] 2.4 `src/services/task_settings.py`: `EffectiveTaskSettings` (frozen), `effective(session, uid)` and `save(session, uid, form) -> list[str] errors` (D14 validation, upsert under `FOR UPDATE`). Owner-scoped.
-- [ ] 2.5 Backup classification: `task_settings` durable (data dumped), `note_tasks` stays derived. Update `Makefile`, `deploy/kubernetes/components/db-backup/configmap.yaml` and `tests/test_backup_derived_tables.py`.
-- [ ] 2.6 Extend the schema gate's per-migration cases for 039 (fresh run, stamp-back to 038, impostor table, impostor column, key-shape CHECK). Run `make test-schema` with `SCHEMA_TEST_CONTAINER=omcp-tt-s2 SCHEMA_TEST_PORT=55452`. Confirm `test_nonsuperuser_migrations_pg.py` passes.
-- [ ] 2.7 `tests/test_task_settings.py`: validation, defaults merge, NULL-scope row, cascade on user delete (integration-guarded).
+- [x] 2.4 `src/services/task_settings.py`: `EffectiveTaskSettings` (frozen), `effective(session, uid)` and `save(session, uid, form) -> list[str] errors` (D14 validation, upsert under `FOR UPDATE`). Owner-scoped.
+- [x] 2.5 Backup classification: `task_settings` durable (data dumped), `note_tasks` stays derived. Update `Makefile`, `deploy/kubernetes/components/db-backup/configmap.yaml` and `tests/test_backup_derived_tables.py`.
+- [x] 2.6 Extend the schema gate's per-migration cases for 039 (fresh run, stamp-back to 038, impostor table, impostor column, key-shape CHECK). Run `make test-schema` with `SCHEMA_TEST_CONTAINER=omcp-tt-s2 SCHEMA_TEST_PORT=55452`. Confirm `test_nonsuperuser_migrations_pg.py` passes.
+- [x] 2.7 `tests/test_task_settings.py`: validation, defaults merge, NULL-scope row, cascade on user delete (integration-guarded).
 
 ## 3. S3: extractor version 5, indexer guard, write-time refresh (wave 2)
 
