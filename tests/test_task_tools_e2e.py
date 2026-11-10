@@ -635,9 +635,9 @@ FORGING_PATHS = [
 
 
 def unescape_path(shown: str) -> str:
-    """The documented rule: backslash-backslash, backslash-backtick, \\n \\r \\t, \\uXXXX."""
+    """The documented rule: a doubled backslash, \\n \\r \\t, \\uXXXX (no other)."""
     out, i = [], 0
-    simple = {"\\": "\\", "`": "`", "n": "\n", "r": "\r", "t": "\t"}
+    simple = {"\\": "\\", "n": "\n", "r": "\r", "t": "\t"}
     while i < len(shown):
         ch = shown[i]
         if ch != "\\":
@@ -720,7 +720,7 @@ def test_the_header_echo_escapes_the_folder():
     header = tools.render_task_header(
         status="open", folder="F`older/", due_by=None, scheduled_by=None, tags=None,
         shown=0, more=False, not_scanned=0, failed=0, capped=0, cut_tags=None)
-    assert "folder: F\\`older/" in header and bare_backticks(header) == 0
+    assert "folder: F\\u0060older/" in header and "`" not in header
 
 
 @pytest.mark.parametrize("path", FORGING_PATHS[:3])
@@ -763,9 +763,46 @@ def test_write_responses_refusals_and_similar_lists_escape_the_path(world, path)
 
 
 def test_a_backslash_before_a_backtick_stays_distinguishable():
-    assert tools._escape_task_path("a\\`b") == "a\\\\\\`b"
-    assert tools._escape_task_path("a`b") == "a\\`b"
+    assert tools._escape_task_path("a\\`b") == "a\\\\\\u0060b"
+    assert tools._escape_task_path("a`b") == "a\\u0060b"
+    assert tools._escape_task_path("a\\u0060b") == "a\\\\u0060b"
     assert unescape_path(tools._escape_task_path("a\\`b")) == "a\\`b"
+    assert unescape_path(tools._escape_task_path("a\\u0060b")) == "a\\u0060b"
+
+
+#: Characters a hostile path is built from: every row delimiter and escape.
+_HOSTILE = ["`", "\\", " — ", "id ", ":7", "\n", "\r", "\t", "\u2028", "\u0085",
+            "u0060", "a", "é", "/", ".md", " ", "0123456789ab", "`:7 — id 0123456789ab — `"]
+
+
+def test_no_backtick_ever_reaches_the_output_and_the_rule_round_trips():
+    """Property: for random and hostile paths, the escaped rendering holds NO
+    backtick character, unescapes to the original by the documented rule, and
+    no echo or cut splits an escape (#428 Codex round 2)."""
+    import random
+
+    from src.mcp_server import task_render
+
+    rng = random.Random(428)
+    paths = ["a.md`:7", "a.md`:7 — id 01b4dc203544 — `x.md", "\\`", "``", "\\u0060"]
+    paths += ["".join(rng.choice(_HOSTILE) for _ in range(rng.randint(1, 12)))
+              for _ in range(400)]
+    for path in paths:
+        shown = tools._escape_task_path(path)
+        assert "`" not in shown, (path, shown)
+        assert unescape_path(shown) == path, (path, shown)
+        for line in (task_render.render_full_row(_row(path)),
+                     task_render.render_brief_row(_row(path))):
+            assert line.count("`") == 2, line
+            assert unescape_path(first_path_field(line)) == path
+        for room in (3, 7, 12, 33, 64):
+            cut = tools._cut_escaped_path(path, room)
+            assert "`" not in cut and len(cut) <= max(room, 3)
+            # Every escape in the cut is whole: it unescapes without error.
+            for piece in cut.split("…"):
+                unescape_path(piece)
+        echo = tools._echo_path(path, 32)
+        assert "`" not in echo and len(echo) <= 32
 
 
 # ── one clock, the caller's zone (#428 verifier) ─────────────────────────────
@@ -845,7 +882,7 @@ def test_the_write_descriptions_list_content_unsafe_and_malformed_precondition(n
 def test_the_list_tasks_description_states_the_path_escapes():
     listed = {t.name: t for t in server.mcp._tool_manager.list_tools()}
     text = " ".join(listed["list_tasks"].description.split())
-    assert "shown as `\\`-escapes" in text and "a backtick" in text
+    assert "a backtick is `\\u0060`" in text
     assert "the write tools take the unescaped path" in text
 
 

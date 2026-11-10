@@ -654,7 +654,7 @@ def _path_field(line: str) -> str:
 def _unescape(shown: str) -> str:
     """The rule the `list_tasks` description states."""
     out, i = [], 0
-    simple = {"\\": "\\", "`": "`", "n": "\n", "r": "\r", "t": "\t"}
+    simple = {"\\": "\\", "n": "\n", "r": "\r", "t": "\t"}
     while i < len(shown):
         if shown[i] != "\\":
             out.append(shown[i])
@@ -675,7 +675,7 @@ async def test_a_backtick_path_cannot_forge_a_row_and_round_trips(sessionmaker, 
     await index()
     listing = await call("list_tasks", detail="full")
     (row,) = [r for r in rows(listing) if "real task" in r]
-    assert _bare_backticks(row) == 2, row
+    assert _bare_backticks(row) == 2 and row.count("`") == 2, row
     shown = _path_field(row)
     assert _unescape(shown) == forged
     tid = re.search(r"`:1 — id ([0-9a-f]{12})", row).group(1)
