@@ -334,6 +334,7 @@ _CLEARABLE = {"due": DUE, "scheduled": SCHEDULED, "start": START, "priority": PR
 _STATUS_CHARS = {"open": " ", "in_progress": "/", "cancelled": "-"}
 _DUPLICATE_LIST_MAX = 5
 SIMILAR_MIN_SCORE = 0.5
+SIMILAR_CONTAINMENT_MIN_TERMS = 2
 SIMILAR_LIST_MAX = 5
 SIMILAR_TERMS_MAX = 8
 
@@ -1101,6 +1102,13 @@ def similarity_terms(norm: str) -> tuple[str, ...]:
     return tuple(ordered[:SIMILAR_TERMS_MAX])
 
 
+def contains(a: frozenset[str], b: frozenset[str]) -> bool:
+    """D9 containment: one term set holds the other, and the smaller set has
+    at least 2 terms (a one-term description never matches this way)."""
+    small, big = (a, b) if len(a) <= len(b) else (b, a)
+    return len(small) >= SIMILAR_CONTAINMENT_MIN_TERMS and small <= big
+
+
 def jaccard(a: frozenset[str], b: frozenset[str]) -> float:
     union = a | b
     return len(a & b) / len(union) if union else 0.0
@@ -1441,40 +1449,6 @@ def _heading_lines(v: _NoteView) -> list[tuple[int, int, str]]:
 # ── duplicate scan (D9) ──────────────────────────────────────────────────────
 
 
-def _norm_tag_sql(col):
-    from sqlalchemy import func
-
-    lowered = func.lower(func.regexp_replace(col, "^#", ""))
-    return func.rtrim(func.regexp_replace(lowered, "/+", "/", "g"), "/")
-
-
-def scope_exclusion_clause(settings):
-    """The default scope (D12/D14) as one predicate over `NoteMetadata`:
-    TRUE for notes the scope keeps. A note is excluded when its path starts
-    with an excluded folder (`folder_prefix_clause`) or when any of its
-    `notes_metadata.tags`, normalised like a task tag, equals an excluded
-    note tag or lies beneath it (segment rule, never substring).
-
-    TODO(#428): share with `task_query`'s scope clause once S4 merges, so the
-    listing and the duplicate scan read the scope one way."""
-    from sqlalchemy import and_, exists, func, literal, not_, or_, select, true
-
-    from src.models.db import NoteMetadata
-    from src.services.filters import folder_prefix_clause
-
-    parts = [not_(folder_prefix_clause(f)) for f in settings.excluded_folders]
-    ex_tags = [tl_mod.normalise_tag(t) for t in settings.excluded_note_tags if tl_mod.normalise_tag(t)]
-    if ex_tags:
-        tag = func.unnest(NoteMetadata.tags).column_valued("note_tag")
-        norm = _norm_tag_sql(tag)
-        cond = or_(*(
-            or_(norm == literal(t), func.left(norm, len(t) + 1) == literal(t + "/"))
-            for t in ex_tags
-        ))
-        parts.append(not_(exists(select(literal(1)).where(cond))))
-    return and_(true(), *parts)
-
-
 async def duplicate_scan(session, uid, settings, norm: str, terms: Sequence[str], *, exclude_path: str | None = None):
     """D9: ``(exact, similar, stopped)`` among the caller's OPEN tasks in the
     default scope, owner-scoped (the total `NoteMetadata` owner mapping).
@@ -1483,21 +1457,29 @@ async def duplicate_scan(session, uid, settings, norm: str, terms: Sequence[str]
       ``description_key(norm)``, ordered by ``(file_path, line)``. Rows of
       ``exclude_path`` (the target note, whose current bytes `plan_add`
       already checked) are left out.
-    * ``similar`` — up to 5 non-exact candidates whose term-set Jaccard
-      score against ``norm`` is at least 0.5, best first; candidates are the
+    * ``similar`` — up to 5 non-exact candidates whose term set contains
+      or is contained in ``norm``'s (the smaller set holding at least 2
+      terms), or whose Jaccard score is at least 0.5; containment matches
+      first, then score, then ``(file_path, line)``. Candidates are the
       rows whose ``text_fold`` contains any of ``terms``, ordered by
       ``(file_path, line)``, at most ``TASK_SIMILAR_SCAN_MAX``.
     * ``stopped`` — True when the candidate scan hit that bound.
 
     Never refuses; the caller decides (``duplicate_task`` unless
     ``allow_duplicate``)."""
-    from sqlalchemy import and_, func, or_, select
+    from sqlalchemy import and_, func, or_, select, true
 
     from src.models.db import NoteMetadata, NoteTask
 
     key = tl_mod.description_key(norm)
     owner = NoteMetadata.user_id.is_(None) if uid is None else NoteMetadata.user_id == uid
-    scope = scope_exclusion_clause(settings)
+    from src.services.task_query import scope_clause
+
+    # The listing's own default-scope predicate (D12/D14): a note `list_tasks`
+    # excludes under the caller's settings is excluded here by construction.
+    scope = scope_clause(settings)
+    if scope is None:
+        scope = true()
     join_on = and_(NoteMetadata.id == NoteTask.note_id, owner)
     cols = (NoteMetadata.file_path, NoteTask.line, NoteTask.task_key, NoteTask.key_ordinal,
             NoteTask.key_count, NoteTask.text, NoteTask.description_key)
@@ -1531,10 +1513,12 @@ async def duplicate_scan(session, uid, settings, norm: str, terms: Sequence[str]
         for r in rows:
             if r.description_key == key:
                 continue
-            score = jaccard(mine, term_set(tl_mod.normalise_description(r.text)))
-            if score >= SIMILAR_MIN_SCORE:
-                scored.append((-score, r.file_path, r.line, r, score))
-        scored.sort(key=lambda x: x[:3])
+            theirs = term_set(tl_mod.normalise_description(r.text))
+            contained = contains(mine, theirs)
+            score = jaccard(mine, theirs)
+            if contained or score >= SIMILAR_MIN_SCORE:
+                scored.append((0 if contained else 1, -score, r.file_path, r.line, r, score))
+        scored.sort(key=lambda x: x[:4])
         similar = [_ref(r, score=s) for *_k, r, s in scored[:SIMILAR_LIST_MAX]]
     return exact, similar, stopped
 
@@ -1549,6 +1533,6 @@ def _ref(row, score: float | None = None) -> TaskRef:
 __all__ = [
     "AddArgs", "CompleteArgs", "Expect", "Inserted", "Intent", "NewLine", "Plan",
     "Span", "TaskRef", "TaskWriteRefusal", "UpdateArgs", "continuation_block",
-    "duplicate_scan", "jaccard", "plan_add", "plan_complete", "plan_update",
-    "resolve", "scope_exclusion_clause", "similarity_terms", "term_set", "verify",
+    "contains", "duplicate_scan", "jaccard", "plan_add", "plan_complete", "plan_update",
+    "resolve", "similarity_terms", "term_set", "verify",
 ]
