@@ -2173,14 +2173,33 @@ the line is serialised again: the plugin's own `GlobalFilter.prependTo`.
 Prepending, not appending before the field run, because it is what the plugin
 does, it cannot touch the trailing field run (a non-tag filter such as
 `TODO` or `[task]` needs no special case), and it keeps F inside the first
-1,000 characters, so a server-added line can never be an unsure row. A
+1,000 characters of a line the server prepended it to. (One server-written
+line can still be an unsure row: a description near 1,000 characters whose
+caller supplied F as one of the call's tags — nothing is prepended, the tag
+sits past the stored cut, and the row is kept and counted as unsure.) A
 combination over 1,000 characters is refused `invalid_argument` naming the
 global filter. **The structure check runs again on the combined
 description** before any dry-run answer and before publication, so a filter
 text that reached the row some other way (a manual edit, a future writer)
-still cannot open a comment or a fence that hides the rest of the note. The
-duplicate key, similar terms and verification use the final line; the
-response and dry run say `global filter added: <json F>`.
+still cannot open a comment or a fence that hides the rest of the note.
+Before prepending, the planner also runs the settings' own filter validator
+on F — every rule, not only the structure rules — and refuses with nothing
+written if it fails, so the guarantee does not rest on the settings layer.
+Verification uses the final line; the response and dry run say
+`global filter added: <json F>`.
+
+**Under `filter`, a duplicate is matched in either placement of F** (found
+by the independent verification of #434). Tags usually sit at the END of a
+line, while the server prepends F, so comparing only the final line's
+description key would let `add_task(text="Renew passport")` add a second
+copy next to an existing `Renew passport #task`. The exact-duplicate check
+therefore compares a small set of candidate keys, each built with the same
+`normalise_description` / `description_key` the extractor uses: the final
+description (F in front), the caller's description with F as a trailing
+token, and — for the check against the target note's own bytes only, which
+is rule-independent — the caller's bare description. F is not a similar-task
+term on either side. A filter in the middle of an existing description is
+not matched (accepted limitation).
 
 **The rule never blocks a write, and every write states a non-task.**
 Resolution reads the note's bytes and never consults `note_tasks` scope, so

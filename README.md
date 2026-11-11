@@ -529,6 +529,10 @@ that only `scope="all"` lists.
   every open checkbox in that note: the same words in the same note are
   most likely the same thing (`update_task` can give that line a date;
   `allow_duplicate=true` adds anyway).
+- Under `filter`, the duplicate check recognises an existing task whether
+  its filter text sits in front (where the server puts it) or as a
+  trailing tag (where people usually put one): `add_task(text="Renew
+  passport")` is refused as a duplicate of `Renew passport #task`.
 
 A `list_tasks` cursor is refused (`invalid_argument`) once the rule
 changes in a way that changes the rows (another rule, other task tags
