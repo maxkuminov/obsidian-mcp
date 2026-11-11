@@ -1416,7 +1416,7 @@ def test_duplicate_candidates_per_rule():
     assert plan.dup_norms == ("#task renew passport", "renew passport #task")
     for s in ({"task_rule": "all", "global_filter": "#task"}, {"task_rule": "fields"}):
         plan = ok(add(INBOX, "Renew passport", s=s))
-        assert plan.norm == "renew passport" and plan.dup_norms == ("renew passport",)
+        assert plan.norm == "renew passport" and plan.dup_norms == ()
         # all / fields: a filter-tagged line is not the same description.
         assert _added(add("- [ ] Renew passport #task\n", "Renew passport", s=s)) == \
             "- [ ] Renew passport"

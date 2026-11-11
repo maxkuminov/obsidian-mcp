@@ -1097,7 +1097,7 @@ def plan_add(note_text: str, args: AddArgs, settings, today: datetime.date) -> P
         note_text, [span],
         target_line=None, intent=None, inserted=tuple(inserted),
         norm=norm, terms=_similarity_terms_for(norm, settings), filter_added=filter_added,
-        dup_norms=index_norms,
+        dup_norms=index_norms if _filter_text(settings) else (),
     )
 
 
