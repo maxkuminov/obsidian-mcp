@@ -525,3 +525,5 @@ The change is small enough for two agents, in sequence or in parallel. The docs 
 
   It confirmed against `origin/main` that the default-scope SQL and the filters digest are byte-identical under the rule `all`, and that no pre-existing test was weakened.
 - **Adversarial Codex**, one focused pass with a per-scenario trace: **PASS**, 12 of 12 scenarios SAFE. Its one MINOR (the README still said the global filter was not modelled) was fixed in the docs slice.
+
+**Gates on the tree this change is archived from (2026-11-10).** The full offline suite passed (10,310 tests); `make audit` is clean; the schema gate passed on the implementation branch (431 tests, with the 040 cases); the task, settings, panel and migration integration modules passed on throwaway databases (the implementation's, and the verifier's own run of the rule and migration modules). The complete integration suite and the schema gate run in CI on the pull request, which is the authoritative gate. The live exercise (4.5) and the owner's panel pass (4.6) follow the deploy.

@@ -69,32 +69,32 @@ There are two slices (design §"Slice plan"): **I** (groups 1–2) and **D** (gr
 
 ## 3. D: documentation (from this change's text; no code)
 
-- [ ] 3.1 `README.md`, the task section:
+- [x] 3.1 `README.md`, the task section:
   - a short "Which checkboxes are tasks" paragraph for readers without the plugin (the three rules, the default, `scope="all"`, writes never blocked, `add_task` adding the filter);
   - the settings table gains `TASKS_RULE`, `TASKS_RULE_TAGS` and `TASKS_GLOBAL_FILTER`;
   - the Tasks card paragraph names the new block.
-- [ ] 3.2 `.env.example`: the three variables, commented, with defaults and one line each.
-- [ ] 3.3 `DEPLOYMENT.md`: "Upgrading across migration 040 (task rule, #434)" in the 039 section's style: what 040 adds, that nothing changes until a rule is chosen, the new boot refusals (and that the init container is refused too), backups unchanged, and rollback stated precisely:
+- [x] 3.2 `.env.example`: the three variables, commented, with defaults and one line each.
+- [x] 3.3 `DEPLOYMENT.md`: "Upgrading across migration 040 (task rule, #434)" in the 039 section's style: what 040 adds, that nothing changes until a rule is chosen, the new boot refusals (and that the init container is refused too), backups unchanged, and rollback stated precisely:
   - an already-running previous-image process keeps working during the rolling deploy;
   - a restarted previous image cannot start at revision 040;
   - rollback is roll-forward, or `alembic downgrade 039` run with the 040-aware image **before** starting the previous image, which discards every saved task rule, task tag and filter text (the previous image then lists every checkbox).
-- [ ] 3.4 `docs/architecture/vault-tools.md` ("Task tools (#428)"):
+- [x] 3.4 `docs/architecture/vault-tools.md` ("Task tools (#428)"):
   - the rule, its predicates and the one-place composition into `scope_clause`;
   - the counts, the rule line and its bounds;
   - the filter prepend and the note line;
   - the duplicate-check split;
   - the accepted limitations;
   - #428 L12 reversed for the global filter.
-- [ ] 3.5 `docs/architecture/control-panel.md`: the card's rule block and the absent-key rule. `docs/architecture/schema-and-migrations.md`: 040 and 039's new allow-list (the second allow-list after 032's).
-- [ ] 3.6 `CLAUDE.md`, a short Key-decisions bullet: the rule and its default `all`; byte-identical under `all`; one place (`task_rule` composed into `scope_clause`); the rule line; writes never blocked; the filter prepended; 040 and 039's allow-list.
-- [ ] 3.7 Public-repo check: no personal names, private paths, real tags or task text. Grep every new setting name across README, `.env.example` and DEPLOYMENT.
+- [x] 3.5 `docs/architecture/control-panel.md`: the card's rule block and the absent-key rule. `docs/architecture/schema-and-migrations.md`: 040 and 039's new allow-list (the second allow-list after 032's).
+- [x] 3.6 `CLAUDE.md`, a short Key-decisions bullet: the rule and its default `all`; byte-identical under `all`; one place (`task_rule` composed into `scope_clause`); the rule line; writes never blocked; the filter prepended; 040 and 039's allow-list.
+- [x] 3.7 Public-repo check: no personal names, private paths, real tags or task text. Grep every new setting name across README, `.env.example` and DEPLOYMENT.
 
 ## 4. Gates (merged result)
 
-- [ ] 4.1 `openspec validate task-rule --strict`.
-- [ ] 4.2 `make test-schema`, `make test-integration` (sequentially), `make audit` and the offline suite on the merged tree. Then grep the seams (design §"Slice plan").
-- [ ] 4.3 `openspec-verifier` subagent: iterate to zero blocking gaps.
-- [ ] 4.4 Adversarial Codex (mandatory: listing correctness and `add_task` change). Frame "wrong" as a default listing that silently omits a real task, a count that does not add up, a cursor that crosses rules, a write the rule blocks or reshapes, or a byte changed under `all`. Two rounds by default; triage per the workflow, and record declined findings as accepted limitations.
+- [x] 4.1 `openspec validate task-rule --strict`.
+- [x] 4.2 `make test-schema`, `make test-integration` (sequentially), `make audit` and the offline suite on the merged tree. Then grep the seams (design §"Slice plan").
+- [x] 4.3 `openspec-verifier` subagent: iterate to zero blocking gaps.
+- [x] 4.4 Adversarial Codex (mandatory: listing correctness and `add_task` change). Frame "wrong" as a default listing that silently omits a real task, a count that does not add up, a cursor that crosses rules, a write the rule blocks or reshapes, or a byte changed under `all`. Two rounds by default; triage per the workflow, and record declined findings as accepted limitations.
 - [ ] 4.5 Live exercise after deploy, saying which tools were called:
   - `list_tasks()` and `list_tasks(scope="all")` under `all` (byte-identical to before);
   - set `fields` with workflow tags on the owner's own account in the panel;
@@ -108,4 +108,4 @@ There are two slices (design §"Slice plan"): **I** (groups 1–2) and **D** (gr
 
 ## 5. Archive
 
-- [ ] 5.1 `/openspec-archive-change task-rule -y` as the last commits of the feature PR, with group 3's docs. One PR, `Closes #434`, and a release tag at its merge commit.
+- [x] 5.1 `/openspec-archive-change task-rule -y` as the last commits of the feature PR, with group 3's docs. One PR, `Closes #434`, and a release tag at its merge commit.
