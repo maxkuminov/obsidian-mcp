@@ -1318,3 +1318,97 @@ def test_context_indentation_adapts(note, task, want):
 def test_add_task_context_uses_tabs_in_a_tab_nested_note():
     p = ok(add("- [ ] a\n\t- c\n", "b", context="why"))
     assert p.new_text == "- [ ] a\n\t- c\n- [ ] b\n\t- why\n"
+
+
+# ── the task rule (#434, D7) ─────────────────────────────────────────────────
+
+INBOX = "# Inbox\n\n- [ ] existing\n"
+
+
+def _added(plan) -> str:
+    ok(plan)
+    (nl,) = [n for n in plan.new_lines if n.kind == "task"]
+    return nl.text
+
+
+def filter_rule(text):
+    return {"task_rule": "filter", "global_filter": text}
+
+
+def test_add_prepends_the_global_filter_text():
+    plan = add(INBOX, "Book flights", s=filter_rule("#task"), due=D(2026, 12, 1))
+    assert _added(plan) == "- [ ] #task Book flights 📅 2026-12-01"
+    assert plan.filter_added == "#task"
+
+
+@pytest.mark.parametrize("text,tags", [("Book flights", ("task",)), ("#task Book flights", ())])
+def test_a_filter_already_present_is_not_added_again(text, tags):
+    plan = add(INBOX, text, s=filter_rule("#task"), tags=tags)
+    line = _added(plan)
+    assert line.count("#task") == 1 and plan.filter_added is None
+
+
+def test_the_filter_match_is_case_sensitive():
+    plan = add(INBOX, "Book flights #Task", s=filter_rule("#task"))
+    assert _added(plan) == "- [ ] #task Book flights #Task"
+
+
+def test_a_non_tag_filter_is_added_the_same_way():
+    assert _added(add(INBOX, "Call the bank", s=filter_rule("TODO"))) == "- [ ] TODO Call the bank"
+    assert _added(add(INBOX, "Call the bank", s=filter_rule("[task]"))) == \
+        "- [ ] [task] Call the bank"
+
+
+def test_the_combined_description_bound_names_the_global_filter():
+    r = refused(add(INBOX, "x" * 1000, s=filter_rule("#task")), "invalid_argument")
+    assert "global filter text (1006 characters) exceeds 1,000 characters" in r.reason
+    # Exactly at the bound is accepted.
+    assert _added(add(INBOX, "x" * 994, s=filter_rule("#task"))).startswith("- [ ] #task x")
+
+
+@pytest.mark.parametrize("bad,marker", [("%%", "%%"), ("<!--", "HTML comment opener"),
+                                        ("-->", "HTML comment closer"), ("~~~", "tildes")])
+def test_a_filter_that_would_open_a_comment_cannot_reach_the_note(bad, marker):
+    """Layer (b): the planner handed the rule directly, bypassing the save
+    validation and the settings fallback, refuses on the FINAL combined
+    description — for a dry run and a write alike (one planner), so nothing
+    is planned and nothing can be published."""
+    r = refused(add(INBOX, "Call bank", s=filter_rule(bad)), "invalid_argument")
+    assert marker in r.reason and "nothing was written" in r.reason
+
+
+def test_a_balanced_filter_handed_in_directly_is_judged_on_the_combined_text():
+    # Balanced markers keep the combined description balanced: allowed by
+    # the structure check (the save validator refuses them, layer (a)).
+    line = _added(add(INBOX, "Call bank", s=filter_rule("%%x%%")))
+    assert line == "- [ ] %%x%% Call bank"
+
+
+def test_under_fields_and_all_nothing_is_prepended():
+    for s in ({"task_rule": "fields"}, {"task_rule": "all", "global_filter": "#task"}):
+        plan = add(INBOX, "Read the report", s=s)
+        assert _added(plan) == "- [ ] Read the report" and plan.filter_added is None
+
+
+def test_the_duplicate_key_uses_the_final_line():
+    note = "- [ ] #task Book flights\n"
+    refused(add(note, "Book flights", s=filter_rule("#task")), "duplicate_task")
+    # A plain same-text checkbox without the filter is a different key.
+    plain = "- [ ] Book flights\n"
+    assert _added(add(plain, "Book flights", s=filter_rule("#task"))) == \
+        "- [ ] #task Book flights"
+
+
+def test_update_never_re_adds_the_filter():
+    note = "- [ ] TODO Call the bank\n"
+    plan = ok(update(note, "- [ ] TODO Call the bank", s=filter_rule("TODO"),
+                     text="Call the bank today"))
+    assert plan.new_text == "- [ ] Call the bank today\n"
+
+
+def test_extracted_task_at_reads_the_planned_bytes():
+    plan = ok(add(INBOX, "Read the report", due=D(2026, 12, 1)))
+    (nl,) = [n for n in plan.new_lines if n.kind == "task"]
+    task = tw.extracted_task_at(plan.new_text, nl.line)
+    assert task is not None and task.due == D(2026, 12, 1)
+    assert tw.extracted_task_at(plan.new_text, 1) is None  # the heading

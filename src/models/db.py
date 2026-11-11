@@ -473,6 +473,21 @@ _TASK_SETTINGS_TABLE_MARKER = "task settings per owner scope (039_task_tools)"
 _TASK_KEY_SHAPE_CHECK_MARKER = "task id key shape (039_task_tools)"
 _TASK_TAG_PREFIXES_INDEX_MARKER = "task tag-prefix filter index (039_task_tools)"
 _TASK_OPEN_DESC_INDEX_MARKER = "open-task duplicate lookup index (039_task_tools)"
+# Migration 040 (#434, the task rule). The column markers are the comments
+# `alembic check` compares; the CHECK markers and predicates are byte identical
+# to the migration's literals (alembic compares neither; the schema gate does).
+_TASK_RULE_COLUMN_MARKER = "task rule kind (040_task_rule)"
+_TASK_RULE_TAGS_COLUMN_MARKER = "task rule task tags (040_task_rule)"
+_TASK_RULE_FILTER_COLUMN_MARKER = "task rule global filter text (040_task_rule)"
+_TASK_RULE_CHECK_NAME = "ck_task_settings_task_rule"
+_TASK_RULE_CHECK_PREDICATE = "task_rule IN ('all', 'fields', 'filter')"
+_TASK_RULE_CHECK_MARKER = "task rule kinds (040_task_rule)"
+_TASK_GLOBAL_FILTER_CHECK_NAME = "ck_task_settings_global_filter"
+_TASK_GLOBAL_FILTER_CHECK_PREDICATE = (
+    "(global_filter IS NULL OR btrim(global_filter) <> '') AND "
+    "(task_rule IS DISTINCT FROM 'filter' OR global_filter IS NOT NULL)"
+)
+_TASK_GLOBAL_FILTER_CHECK_MARKER = "a filter rule has its filter text (040_task_rule)"
 # 039's CHECK over the task-id triple. Byte identical to the migration's
 # `KEY_SHAPE_PREDICATE`; alembic does not compare it, the schema gate does.
 _NOTE_TASK_KEY_SHAPE_CHECK_NAME = "ck_note_tasks_key_shape"
@@ -1093,12 +1108,33 @@ class TaskSettings(Base):
     updated_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    # Migration 040 (#434): the task rule, inherited as one unit. A NULL rule
+    # means the server's whole rule (`TASKS_RULE`, `TASKS_RULE_TAGS`,
+    # `TASKS_GLOBAL_FILTER`); a set rule uses this row's tags and filter.
+    task_rule: Mapped[str | None] = mapped_column(
+        String(8), nullable=True, comment=_TASK_RULE_COLUMN_MARKER
+    )
+    # Task tags for `fields`, lower-case without `#` (≤ 32).
+    task_tags: Mapped[list[str]] = mapped_column(
+        ARRAY(String(128)), nullable=False, server_default=text("'{}'"),
+        comment=_TASK_RULE_TAGS_COLUMN_MARKER,
+    )
+    # The global filter text for `filter` (1–64 characters), NULL for none.
+    global_filter: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, comment=_TASK_RULE_FILTER_COLUMN_MARKER
+    )
 
     __table_args__ = (
         UniqueConstraint(
             "user_id",
             name="uq_task_settings_user_id",
             postgresql_nulls_not_distinct=True,
+        ),
+        # Migration 040. Alembic does not compare CHECK predicates; the schema
+        # gate asserts both through `pg_constraint`.
+        CheckConstraint(_TASK_RULE_CHECK_PREDICATE, name=_TASK_RULE_CHECK_NAME),
+        CheckConstraint(
+            _TASK_GLOBAL_FILTER_CHECK_PREDICATE, name=_TASK_GLOBAL_FILTER_CHECK_NAME
         ),
         {"comment": _TASK_SETTINGS_TABLE_MARKER},
     )

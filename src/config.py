@@ -877,6 +877,79 @@ class Settings(BaseSettings):
     def _validate_tasks_default_timezone(cls, v):
         return _validate_timezone_name(v, variable="TASKS_DEFAULT_TIMEZONE")
 
+    # ── The task rule's server default (#434, design D8, D9) ───────────────
+    #
+    # Which checkboxes count as tasks for a scope whose `task_settings` row
+    # has no rule of its own (`task_rule` NULL, or no row). Inherited as ONE
+    # unit — kind, task tags and filter text together — never field by field:
+    # a row that sets its own rule ignores all three.
+    #
+    # - `TASKS_RULE`: `all` (default; every checkbox, exactly as before),
+    #   `fields` (a task field or a task tag) or `filter` (contains
+    #   `TASKS_GLOBAL_FILTER`, case-sensitively, like the Tasks plugin's
+    #   "Global task filter").
+    # - `TASKS_RULE_TAGS`: comma-separated task tags for `fields` (≤ 32, each
+    #   `#` optional, lower-cased, the tag grammar, no trailing `/`).
+    # - `TASKS_GLOBAL_FILTER`: the filter text for `filter` (1–64 characters,
+    #   one line, no backtick, no field emoji, no `%%`, `<!--` or `-->`, no
+    #   leading list marker / checkbox / heading marker / `>`).
+    #
+    # Validated here by the same functions the panel's save uses
+    # (`task_rule.normalise_*`, imported inside each validator so loading this
+    # module imports nothing that imports it back): an invalid value refuses
+    # startup naming the variable — and refuses the migration init container
+    # too, which imports these settings. That is deliberate: the values are
+    # image-independent text, so a value the init container refuses the app
+    # would refuse as well, and failing before the migration is the earlier,
+    # clearer failure. `TASKS_RULE=filter` with an empty filter text is
+    # refused naming both variables.
+    tasks_rule: str = "all"
+    tasks_rule_tags: Annotated[list[str], NoDecode] = []
+    tasks_global_filter: str = ""
+
+    @field_validator("tasks_rule", mode="before")
+    @classmethod
+    def _validate_tasks_rule(cls, v):
+        from src.services import task_rule
+
+        value, error = task_rule.normalise_rule(v)
+        if error:
+            raise ValueError(f"TASKS_RULE {error}")
+        return value
+
+    @field_validator("tasks_rule_tags", mode="before")
+    @classmethod
+    def _validate_tasks_rule_tags(cls, v):
+        from src.services import task_rule
+
+        if v is None:
+            return []
+        items = v.split(",") if isinstance(v, str) else list(v)
+        items = [str(i).strip() for i in items]
+        tags, errors = task_rule.normalise_task_tags([i for i in items if i])
+        if errors:
+            raise ValueError("TASKS_RULE_TAGS: " + " ".join(errors))
+        return tags
+
+    @field_validator("tasks_global_filter", mode="before")
+    @classmethod
+    def _validate_tasks_global_filter(cls, v):
+        from src.services import task_rule
+
+        value, error = task_rule.normalise_filter("" if v is None else v)
+        if error:
+            raise ValueError(f"TASKS_GLOBAL_FILTER: {error}")
+        return value or ""
+
+    @model_validator(mode="after")
+    def _validate_tasks_rule_combination(self):
+        if self.tasks_rule == "filter" and not self.tasks_global_filter:
+            raise ValueError(
+                "TASKS_RULE=filter needs TASKS_GLOBAL_FILTER: set the text every "
+                "task line contains (for example #task), or choose another TASKS_RULE."
+            )
+        return self
+
     # Cap on how much note/file text a single read_note / read_file call may
     # return to the model. The byte caps above stop the server from reading a
     # huge file into memory; this one stops a legitimately-read file from

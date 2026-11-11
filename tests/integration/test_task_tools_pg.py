@@ -695,3 +695,141 @@ async def test_a_backtick_path_cannot_forge_a_row_and_round_trips(sessionmaker, 
     # The escaped form names no note.
     out = await call("complete_task", path=shown, id=tid)
     assert code(out) in {"not_found", "validation_failed"}, out
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# The task rule (#434, D7): writes follow the rule, never blocked by it
+# ══════════════════════════════════════════════════════════════════════════
+
+FIELDS_NOTE = ('note: not a task under your task rule "fields" (no task field and no task '
+               'tag), so default listings will not show it; list_tasks(scope="all") will.')
+
+
+async def set_rule(sessionmaker, rule, *, tags=(), filt=None, created=None):
+    async with sessionmaker() as session:
+        await session.execute(text("DELETE FROM task_settings"))
+        await session.execute(text(
+            "INSERT INTO task_settings (user_id, task_rule, task_tags, global_filter, "
+            " set_created_date) VALUES (NULL, :r, :t, :f, :c)"),
+            {"r": rule, "t": list(tags), "f": filt, "c": created})
+        await session.commit()
+
+
+async def test_add_task_under_filter_prepends_and_lists(sessionmaker, vault):
+    put(vault, "Inbox.md", "# Inbox\n")
+    await index()
+    await set_rule(sessionmaker, "filter", filt="#task")
+    dry = await call("add_task", path="Inbox.md", text="Book flights", due="2026-12-01",
+                     dry_run=True)
+    assert code(dry) is None, dry
+    assert '\nglobal filter added: "#task"\n' in dry
+    assert "line 2: - [ ] #task Book flights 📅 2026-12-01" in dry
+    assert disk(vault, "Inbox.md") == b"# Inbox\n"
+    out = await call("add_task", path="Inbox.md", text="Book flights", due="2026-12-01")
+    assert code(out) is None, out
+    lines = out.splitlines()
+    i = lines.index("line 2: - [ ] #task Book flights 📅 2026-12-01")
+    assert lines[i + 1] == 'global filter added: "#task"'
+    assert disk(vault, "Inbox.md") == "# Inbox\n- [ ] #task Book flights 📅 2026-12-01\n".encode()
+    listing = await call("list_tasks")
+    assert "#task Book flights 📅 2026-12-01" in ids_by_text(listing)
+    assert listing.splitlines()[2].startswith('Rule — task rule: filter "#task"')
+
+    for args in ({"text": "Hotel", "tags": ["task"]}, {"text": "#task Hotel two"}):
+        out = await call("add_task", path="Inbox.md", **args)
+        assert code(out) is None and "global filter added" not in out, out
+    body = disk(vault, "Inbox.md").decode()
+    assert "- [ ] Hotel #task\n" in body and "- [ ] #task Hotel two\n" in body
+
+    out = await call("add_task", path="Inbox.md", text="Car #Task")
+    assert "line 5: - [ ] #task Car #Task" in out and 'global filter added: "#task"' in out
+
+    before = disk(vault, "Inbox.md")
+    out = await call("add_task", path="Inbox.md", text="x" * 1000)
+    assert code(out) == "invalid_argument" and "global filter text" in out, out
+    assert disk(vault, "Inbox.md") == before
+
+
+async def test_a_stored_unsafe_filter_text_is_treated_as_all(sessionmaker, vault):
+    put(vault, "Inbox.md", "# Inbox\n")
+    await index()
+    for bad in ("%%", "<!--"):
+        await set_rule(sessionmaker, "filter", filt=bad)
+        out = await call("add_task", path="Inbox.md", text=f"Call bank {len(bad)}")
+        assert code(out) is None, out
+        assert "global filter added" not in out and "note:" not in out
+    body = disk(vault, "Inbox.md").decode()
+    assert "%%" not in body and "<!--" not in body
+    listing = await call("list_tasks")
+    assert "the configured rule cannot be applied: filter text not allowed" in listing
+
+
+async def test_add_task_under_fields_states_a_non_task(sessionmaker, vault):
+    put(vault, "Inbox.md", "# Inbox\n")
+    await index()
+    await set_rule(sessionmaker, "fields")
+    for dry_run in (True, False):
+        out = await call("add_task", path="Inbox.md", text="Read the report", dry_run=dry_run)
+        assert code(out) is None, out
+        lines = out.splitlines()
+        i = next(k for k, ln in enumerate(lines) if ln.startswith("line 2: - [ ] Read the report"))
+        assert lines[i + 1] == FIELDS_NOTE
+    assert disk(vault, "Inbox.md") == b"# Inbox\n- [ ] Read the report\n"
+    out = await call("add_task", path="Inbox.md", text="Dated", due="2026-12-01")
+    assert code(out) is None and "note:" not in out, out
+    await set_rule(sessionmaker, "fields", created=True)
+    out = await call("add_task", path="Inbox.md", text="Created")
+    assert code(out) is None and "note:" not in out and "➕ 2026-11-10" in out, out
+    # The non-task is not listed by default, is listed by scope="all", and
+    # an id from that listing completes it: the rule never blocks a write.
+    assert "Read the report" not in ids_by_text(await call("list_tasks"))
+    ids = ids_by_text(await call("list_tasks", scope="all"))
+    out = await call("complete_task", path="Inbox.md", id=ids["Read the report"])
+    assert code(out) is None and "note:" not in out, out
+    assert "- [x] Read the report ✅ 2026-11-10\n" in disk(vault, "Inbox.md").decode()
+
+
+async def test_update_task_states_a_non_task_and_never_re_adds_the_filter(sessionmaker, vault):
+    put(vault, "Inbox.md", "- [ ] Renew passport 📅 2026-12-01\n- [ ] TODO Call the bank\n")
+    await index()
+    await set_rule(sessionmaker, "fields")
+    ids = ids_by_text(await call("list_tasks", scope="all"))
+    out = await call("update_task", path="Inbox.md", id=ids["Renew passport 📅 2026-12-01"],
+                     clear=["due"])
+    assert code(out) is None, out
+    lines = out.splitlines()
+    assert lines[lines.index("line 1: - [ ] Renew passport") + 1] == FIELDS_NOTE
+
+    await set_rule(sessionmaker, "filter", filt="TODO")
+    ids = ids_by_text(await call("list_tasks"))
+    for dry_run in (True, False):
+        out = await call("update_task", path="Inbox.md", id=ids["TODO Call the bank"],
+                         text="Call the bank today", dry_run=dry_run)
+        assert code(out) is None, out
+        assert ('note: not a task under your task rule "filter" (the line does not contain '
+                '"TODO"), so default listings will not show it; list_tasks(scope="all") will.'
+                ) in out
+    assert disk(vault, "Inbox.md").decode().endswith("- [ ] Call the bank today\n")
+
+
+async def test_a_checklist_elsewhere_no_longer_blocks_but_the_target_note_still_does(
+        sessionmaker, vault):
+    put(vault, "Projects/Alpha.md", "- [ ] Renew passport\n")
+    put(vault, "Inbox.md", "# Inbox\n")
+    await index()
+    await set_rule(sessionmaker, "all")
+    out = await call("add_task", path="Inbox.md", text="Renew passport", due="2026-12-01",
+                     dry_run=True)
+    assert code(out) == "duplicate_task", out
+    await set_rule(sessionmaker, "fields")
+    out = await call("add_task", path="Inbox.md", text="Renew passport", due="2026-12-01")
+    assert code(out) is None, out
+    assert "Projects/Alpha.md" not in out and "similar open tasks: none" in out
+
+    put(vault, "Inbox2.md", "- [ ] Renew passport\n")
+    await index()
+    out = await call("add_task", path="Inbox2.md", text="Renew passport", due="2026-12-01")
+    assert code(out) == "duplicate_task", out
+    out = await call("add_task", path="Inbox2.md", text="Renew passport", due="2026-12-01",
+                     allow_duplicate=True)
+    assert code(out) is None, out

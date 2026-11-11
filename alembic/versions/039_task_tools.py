@@ -280,16 +280,44 @@ def _table_comment(bind, qualified: str):
     ).scalar()
 
 
+# Units a later revision adds to `task_settings`, by kind and exact name, each
+# with the exact marker comment that revision writes. The complete comparison
+# below leaves out exactly these — a unit of one of these names *and* this
+# comment — because that revision verifies them; otherwise a stamp-back that
+# re-runs 039 over a head database would refuse them as foreign (032's device
+# for 039's `note_tasks` units). Anything else (another name, the right name
+# with another comment) is compared and refused as before.
+#
+# **A future revision that adds a unit to `task_settings` must extend these
+# lists on purpose**, with its literal names and markers; nothing is inferred
+# from a comment's shape. Byte identical to 040's literals (#434).
+LATER_SETTINGS_COLUMNS = {
+    "task_rule": "task rule kind (040_task_rule)",
+    "task_tags": "task rule task tags (040_task_rule)",
+    "global_filter": "task rule global filter text (040_task_rule)",
+}
+LATER_SETTINGS_CONSTRAINTS = {
+    "ck_task_settings_task_rule": "task rule kinds (040_task_rule)",
+    "ck_task_settings_global_filter": "a filter rule has its filter text (040_task_rule)",
+}
+
+
+def _later_revision_unit(allow_list: dict, name, comment) -> bool:
+    return comment is not None and allow_list.get(name) == comment
+
+
 def _shape(bind, qualified: str) -> dict:
     """Everything 039 compares about `task_settings`, from the catalogue (033's
-    reader). Foreign keys are excluded here and compared on their own."""
+    reader), less a later revision's marked units (`LATER_SETTINGS_*`).
+    Foreign keys are excluded here and compared on their own."""
     columns = [
-        tuple(r)
+        tuple(r[:4])
         for r in bind.execute(
             sa.text(
                 "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, "
                 "       CASE WHEN pg_get_expr(d.adbin, d.adrelid) LIKE 'nextval(%%' "
-                "            THEN 'nextval' ELSE pg_get_expr(d.adbin, d.adrelid) END "
+                "            THEN 'nextval' ELSE pg_get_expr(d.adbin, d.adrelid) END, "
+                "       col_description(a.attrelid, a.attnum) "
                 "FROM pg_attribute a "
                 "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
                 "WHERE a.attrelid = CAST(:q AS regclass) AND a.attnum > 0 "
@@ -297,18 +325,22 @@ def _shape(bind, qualified: str) -> dict:
             ),
             {"q": qualified},
         ).fetchall()
+        if not _later_revision_unit(LATER_SETTINGS_COLUMNS, r[0], r[4])
     ]
     constraints = sorted(
         (r[0], r[1], r[2], r[3])
         for r in bind.execute(
             sa.text(
                 "SELECT c.conname, CAST(c.contype AS text), "
-                "       pg_get_constraintdef(c.oid), c.convalidated "
+                "       pg_get_constraintdef(c.oid), c.convalidated, "
+                "       obj_description(c.oid, 'pg_constraint') "
                 "FROM pg_constraint c WHERE c.conrelid = CAST(:q AS regclass) "
                 "  AND c.contype <> 'f'"
             ),
             {"q": qualified},
         ).fetchall()
+        if not (r[1] == "c"
+                and _later_revision_unit(LATER_SETTINGS_CONSTRAINTS, r[0], r[4]))
     )
     indexes = sorted(
         (r[0], _normalise_indexdef(r[1]), r[2])

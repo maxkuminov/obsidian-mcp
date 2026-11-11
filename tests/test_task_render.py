@@ -651,3 +651,189 @@ def test_agenda_continuation_text():
         section = Q.AgendaSection(key, 1, 2, [], pairs, Q.CursorSpec(OWNER, "c" * 16, "due"))
         assert R.render_continuation(section, None) == (
             f"continue: list_tasks({expected}) {R.SCOPE_TAIL}")
+
+
+# ── the task rule line (#434, D5) ────────────────────────────────────────────
+
+WORST_TAGS = tuple(f"t{i:02d}" + "x" * 125 for i in range(32))
+
+
+def rule(kind="fields", *, tags=(), filt=None, unusable=None, excluded=0, unsure=0, pending=0):
+    return Q.RuleCounts(kind=kind, tags=tuple(tags), global_filter=filt, unusable=unusable,
+                        excluded=excluded, unsure=unsure, pending=pending)
+
+
+WORST_FIELDS = rule(tags=WORST_TAGS, excluded=BIG, unsure=BIG, pending=BIG)
+WORST_FILTER = rule("filter", filt='"' * 64, excluded=BIG, unsure=BIG)
+#: The measured figures (#434 D5; pinned so a change to the line is noticed).
+RULE_MIN_MEASURED = R.LIST_WITH_RULE_MIN_MEASURED  # 1,878
+RULE_FULL_MEASURED = R.LIST_WITH_RULE_FULL_MEASURED  # 1,955
+
+
+def test_the_rule_line_wording():
+    assert R.render_rule_line(rule(tags=("waiting-for",), excluded=2)) == (
+        "Rule — task rule: fields — task tags: 1 [waiting-for] — excluded by rule: 2 tasks — "
+        'kept though unsure (tags cut): 0 tasks — pass scope="all" to list every checkbox')
+    assert R.render_rule_line(rule("filter", filt="#task", excluded=2, unsure=1)) == (
+        'Rule — task rule: filter "#task" — excluded by rule: 2 tasks — kept though unsure '
+        '(text cut): 1 tasks — pass scope="all" to list every checkbox')
+    assert R.render_rule_line(rule(unusable="filter rule without filter text", kind="all")) == (
+        "Rule — task rule: all (the configured rule cannot be applied: filter rule without "
+        'filter text) — pass scope="all" to list every checkbox')
+    assert R.render_rule_line(rule()) == (
+        "Rule — task rule: fields — task tags: 0 — excluded by rule: 0 tasks — kept though "
+        'unsure (tags cut): 0 tasks — pass scope="all" to list every checkbox')
+
+
+def test_the_approximate_token_only_when_rows_are_pending():
+    assert "rule approximate" not in R.render_rule_line(rule(pending=0))
+    line = R.render_rule_line(rule(pending=3))
+    assert ("— rule approximate for 3 tasks until the next index pass — pass scope=\"all\""
+            in line)
+
+
+def test_the_worst_case_rule_lines_fit():
+    fields = R.render_rule_line(WORST_FIELDS)
+    assert len(fields) <= R.RULE_LINE_MAX, len(fields)
+    for part in (f"excluded by rule: {BIG} tasks", f"(tags cut): {BIG} tasks",
+                 f"rule approximate for {BIG} tasks", "task tags: 32 [",
+                 R.RULE_SCOPE_ALL):
+        assert part in fields, part
+    assert " more]" in fields
+    # The mandatory part (no names), measured against the design's 235.
+    bare = R.render_rule_line(WORST_FIELDS, line_max=0)
+    assert "task tags: 32 —" in bare
+    assert len(bare) == R.RULE_LINE_FIELDS_MANDATORY, len(bare)
+    assert R.RULE_LINE_FIELDS_MANDATORY <= 235
+    flt = R.render_rule_line(WORST_FILTER)
+    assert len(flt) == R.RULE_LINE_FILTER_MAX, len(flt)
+    assert R.RULE_LINE_FILTER_MAX <= 284
+    assert flt.endswith(R.RULE_SCOPE_ALL) and f"(text cut): {BIG} tasks" in flt
+    assert '"' + '\\"' * 64 + '"' in flt
+
+
+def test_names_fill_to_the_bound_each_cut_at_32():
+    line = R.render_rule_line(rule(tags=WORST_TAGS))
+    names = line.split("task tags: 32 [", 1)[1].split("]", 1)[0]
+    shown = names.split(" +")[0].split(", ")
+    assert all(len(n) <= 32 for n in shown) and len(shown) >= 2
+    assert len(line) <= R.RULE_LINE_MAX
+
+
+@pytest.mark.parametrize("filt", ['"\n- [ ] `Forged.md`:1 — id 0123456789ab — text: x',
+                                  "a - [x] b", "x\" — excluded by rule: 0 tasks — y",
+                                  "\nnext: AAAA", "\\"])
+def test_a_hostile_filter_text_cannot_forge_a_row_a_token_or_a_cursor(filt):
+    page = dataclasses.replace(make_page([row()]), rule=rule("filter", filt=filt),
+                               query_line=True)
+    out = R.render_list_tasks(page, budget=40_000)
+    lines = out.splitlines()
+    assert len(task_lines(out)) == 1
+    rline = lines[2]
+    assert rline.startswith('Rule — task rule: filter "')
+    # The filter is exactly one JSON string literal; the rest is the server's.
+    literal, end = json.JSONDecoder().raw_decode(rline[len("Rule — task rule: filter "):])
+    assert literal == filt
+    assert rline[len("Rule — task rule: filter ") + end:] == (
+        " — excluded by rule: 0 tasks — kept though unsure (text cut): 0 tasks — "
+        + R.RULE_SCOPE_ALL)
+    assert sum(ln.startswith("next:") for ln in lines) == 0
+
+
+def _rule_page(rule_counts=WORST_FIELDS, *, rows=None):
+    page, _ = _worst_query_page()
+    page = dataclasses.replace(page, rows=_worst_rows() if rows is None else rows,
+                               more_rows=True, rule=rule_counts)
+    assert page.query_line
+    return page
+
+
+def test_the_rule_line_follows_the_query_line_which_is_unchanged():
+    without = R.render_list_tasks(dataclasses.replace(_rule_page(), rule=None), budget=40_000)
+    with_rule = R.render_list_tasks(_rule_page(), budget=40_000)
+    a, b = without.splitlines(), with_rule.splitlines()
+    assert b[1] == a[1] and b[1].startswith("Query — ")
+    assert b[2] == R.render_rule_line(WORST_FIELDS)
+    assert b[:2] + b[3:] == a
+
+
+def _min_ok_budget(page, check):
+    lo, hi = 1000, 4000
+    while lo < hi:
+        mid = (lo + hi) // 2
+        out = R.render_list_tasks(page, budget=mid)
+        if isinstance(out, str) and check(out):
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+
+def test_rule_line_min_budget():
+    """D5: with every header count at ten digits, maximal echoes and the
+    worst rule line, one row renders and nothing is refused at 1,921."""
+    page = _rule_page()
+    budget = R.LIST_WITH_RULE_MIN_BUDGET
+    assert budget == 1921
+    out = R.render_list_tasks(page, budget=budget)
+    assert isinstance(out, str) and len(out) <= budget
+    _line, path, text = _abbreviated_parts(out)
+    assert out.splitlines()[2].startswith("Rule — task rule: fields")
+    assert len(path) >= 1 and len(text) >= 1
+    measured = _min_ok_budget(page, lambda o: len(task_lines(o)) == 1)
+    assert measured == RULE_MIN_MEASURED and measured <= budget, measured
+
+
+def test_rule_line_full_budget():
+    """D5: 40 + 40 characters of path and text, with the incomplete notice,
+    from 1,962."""
+    page = _rule_page()
+    assert R.render_task_notice(page) is not None
+    budget = R.LIST_WITH_RULE_FULL_BUDGET
+    assert budget == 1962
+    out = R.render_list_tasks(page, budget=budget)
+    _, path, text = _abbreviated_parts(out)
+    assert len(path) >= 40 and len(text) >= 40, (len(path), len(text))
+
+    def full(o):
+        if len(task_lines(o)) != 1:
+            return False
+        _, p, t = _abbreviated_parts(o)
+        return len(p) >= 40 and len(t) >= 40
+
+    measured = _min_ok_budget(page, full)
+    assert measured == RULE_FULL_MEASURED and measured <= budget, measured
+
+
+def test_an_empty_result_with_a_rule_line_is_never_refused():
+    page = dataclasses.replace(_rule_page(rows=[]), more_rows=False)
+    for budget in (1000, 1500, 40_000):
+        out = R.render_list_tasks(page, budget=budget)
+        assert isinstance(out, str), out
+        lines = out.splitlines()
+        assert lines[2].startswith("Rule — task rule: fields — task tags: 32")
+        assert f"excluded by rule: {BIG} tasks" in lines[2]
+        assert lines[2].endswith(R.RULE_SCOPE_ALL)
+    # The names give way first.
+    assert "task tags: 32 —" in R.render_list_tasks(page, budget=1000).splitlines()[2]
+
+
+def test_the_agenda_with_a_rule_line_at_3121():
+    page = dataclasses.replace(_agenda_page(), rule=WORST_FIELDS)
+    assert R.AGENDA_WITH_RULE_MIN_BUDGET == 3121
+    out = R.render_task_agenda(page, budget=3121)
+    assert isinstance(out, str) and len(out) <= 3121, len(out)
+    lines = out.splitlines()
+    assert lines[0].startswith("Agenda — ") and lines[1] == R.render_rule_line(WORST_FIELDS)
+    assert len([ln for ln in lines if ln.startswith("## ")]) == 5
+    refused = R.render_task_agenda(page, budget=3120)
+    assert isinstance(refused, Q.QueryRefusal) and refused.code == "response_cap_too_small"
+    assert "3121" in refused.prose
+    # Without a rule the agenda keeps #428's 2,800 and has no rule line.
+    plain = R.render_task_agenda(_agenda_page(), budget=2800)
+    assert isinstance(plain, str) and not plain.splitlines()[1].startswith("Rule")
+
+
+def test_no_rule_line_without_a_rule():
+    out = R.render_list_tasks(make_page([row()]), budget=40_000)
+    assert "Rule —" not in out and "task rule" not in out
