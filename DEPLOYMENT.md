@@ -758,6 +758,12 @@ deployment; on a compose-file deployment the equivalents are plain
   `docker compose -f docker-compose.simple.yml exec obsidian-mcp alembic check`
   should print "No new upgrade operations detected."
 
+  **Upgrading across migration 040 (task rule, #434)** has its own
+  section, [below](#upgrading-across-migration-040-task-rule-434): new
+  boot refusals for the three task-rule settings (they stop the migration
+  step too), nothing changed until a rule is chosen, and a rollback that
+  needs `alembic downgrade 039` first.
+
   **Upgrading across migration 039 (task tools, #428)** has its own
   section, [below](#upgrading-across-migration-039-task-tools-428): a new
   boot refusal for an invalid `TASKS_DEFAULT_TIMEZONE` (it stops the
@@ -1300,6 +1306,81 @@ authentication header.
 argument is new and optional. Rolling back is a redeploy of the previous
 image; a client still sending `rerank` is then refused by the
 unknown-argument rule.
+
+## Upgrading across migration 040 (task rule, #434)
+
+This release adds a per-user **task rule**: which markdown checkboxes count
+as tasks in default `list_tasks` and `task_agenda` listings and in
+`add_task`'s duplicate check across the index. `all` (every checkbox, the
+behaviour before this release) is the default; `fields` and `filter`
+narrow it. Why, and how to choose, is in the README's
+[Which checkboxes are tasks](README.md#which-checkboxes-are-tasks). What an
+operator has to know:
+
+- **Nothing changes until a rule is chosen.** With the settings unset and
+  no rule saved on any Tasks card, every response, every write and every
+  outstanding `list_tasks` cursor is byte-identical to the previous
+  release. No tool, argument or schema is added; the descriptions of
+  `list_tasks`, `task_agenda` and `add_task` gain a sentence about the
+  rule.
+- **Migration 040.** It adds to `task_settings` the columns `task_rule
+  varchar(8)` (nullable; NULL means "use the server's rule"), `task_tags
+  varchar(128)[] NOT NULL DEFAULT '{}'` and `global_filter varchar(64)`
+  (nullable), and the CHECKs `ck_task_settings_task_rule` (one of `all`,
+  `fields`, `filter`) and `ck_task_settings_global_filter` (a filter text
+  is never blank, and a `filter` rule always has one). It writes no row:
+  the default is metadata-only on PostgreSQL 16 and both CHECKs admit
+  every existing row. Nothing is re-derived or re-embedded. It runs as
+  the database's owning role, needs no superuser, creates no extension,
+  and sets and resets its own `lock_timeout` and `statement_timeout`.
+  Run `make test-schema` before merging; afterwards `alembic check` must
+  print "No new upgrade operations detected."
+- **Three new settings, and new boot refusals for each.** `TASKS_RULE`
+  (`all`; or `fields`, `filter`), `TASKS_RULE_TAGS` (empty;
+  comma-separated task tags for `fields`, at most 32) and
+  `TASKS_GLOBAL_FILTER` (empty; the filter text for `filter`, 1–64
+  characters on one line, with no backtick, Tasks field emoji, `%%`,
+  `<!--` or `-->`, and not beginning like a list item, checkbox, heading
+  or quote). They are the server's rule for every user who has not chosen
+  one on the panel's Tasks card, and are inherited as one unit. An
+  invalid value stops the app with a message naming the variable, and
+  `TASKS_RULE=filter` with an empty `TASKS_GLOBAL_FILTER` stops it naming
+  both. The validation runs wherever the settings are loaded, so it also
+  stops `alembic upgrade head` (the compose `run --rm … alembic` step,
+  `make deploy`'s migrate step, the Kubernetes `migrate` initContainer).
+  Set the values in the `.env` (or ConfigMap) that every one of those
+  reads, or leave them unset.
+- **Quote the filter text.** In `.env`, write
+  `TASKS_GLOBAL_FILTER="#task"`. Unquoted, a hash sign after a space
+  starts a comment, so `TASKS_GLOBAL_FILTER= #task` reads as empty (and,
+  with `TASKS_RULE=filter`, refuses startup) and `TODO #task` reads as
+  `TODO`. In YAML (a ConfigMap) the value must be quoted too, or `#task`
+  is read as a comment.
+- **`task_agenda`'s minimum response cap** is 3,121 characters while a
+  rule other than `all` is in force for the caller (2,800 otherwise),
+  because the response carries one more header line of at most 320
+  characters. It binds only if `MAX_READ_RESPONSE_CHARS` (default 40,000)
+  was lowered below that; such a call is refused `response_cap_too_small`.
+- **Backups.** The new columns belong to `task_settings`, which is
+  already durable and dumped with its rows; nothing changes in
+  `make db-backup` or the Kubernetes backup Job.
+- **Rollback is roll-forward.** Two cases differ:
+  - a server process of the previous image that is **already running**
+    during a rolling deploy keeps working against 040: it never reads the
+    new columns, and its inserts leave them NULL, `'{}'` and NULL, which
+    both CHECKs admit;
+  - a previous image that is **restarted or newly scheduled cannot
+    start**: its migration step runs `alembic upgrade head`, its scripts
+    end at 039, and a database at 040 is an unknown revision to it.
+
+  To run the previous image, first run `alembic downgrade 039` **with the
+  new image** (for example
+  `docker compose run --rm obsidian-mcp alembic downgrade 039` before
+  switching the image), then start the previous image. The downgrade
+  drops only the five marked units, the CHECKs first, and with them
+  **every saved task rule, task tag and filter text**; the rest of
+  `task_settings` is untouched. The previous image then lists every
+  checkbox, without any statement, because it knows no rule.
 
 ## Upgrading across migration 039 (task tools, #428)
 

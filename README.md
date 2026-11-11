@@ -407,10 +407,12 @@ and find, add and close them without reading files. Nobody has to use
 them. A vault without checkboxes behaves exactly as before, and no other
 tool depends on them.
 
-**What counts as a task.** Any markdown checkbox list item: `- [ ] Renew
-the certificate`, `* [x] …`, `1. [/] …`, including one inside a blockquote
-or callout, or indented under another item. A plain checkbox is a
-complete task, and Obsidian does not have to be installed. The optional
+**What counts as a task.** By default, any markdown checkbox list item:
+`- [ ] Renew the certificate`, `* [x] …`, `1. [/] …`, including one inside
+a blockquote or callout, or indented under another item. A plain checkbox
+is a complete task, and Obsidian does not have to be installed. A vault
+whose checkboxes are not all tasks can narrow this with a task rule; see
+[Which checkboxes are tasks](#which-checkboxes-are-tasks). The optional
 fields use the [Obsidian Tasks plugin](https://publish.obsidian.md/tasks/)'s
 emoji format, so the same notes also work in Obsidian, with or without
 that plugin:
@@ -433,6 +435,104 @@ not evaluate. The server supplies the mechanics (listing, one-line
 edits, and recurrence for the rules listed below) and no policy: where
 tasks live, what a tag means and what is due when are up to you, your
 agents and your vault guide.
+
+<a id="which-checkboxes-are-tasks"></a>
+
+**Which checkboxes are tasks.** A checkbox is not always a task. People
+use checkboxes for checklists, runbooks, verification steps, acceptance
+criteria, packing lists, meeting agendas and the step lists inside work
+tickets. None of those is a commitment someone has to act on, but a tool
+that treats every unchecked box as an open task reports them all.
+
+This matters more in a vault that AI agents write into. Agents produce
+checkbox lists freely: a plan, a step-by-step procedure, the "done when"
+criteria of a ticket, a status note. Each list adds open "tasks". An
+agent that asks "what is on my plate" then gets an answer made mostly of
+procedure steps; a `text` search for a task also matches the same words
+in a runbook; and `add_task`'s duplicate check refuses a new task, or
+lists "similar tasks", because of a checklist line that was never a task.
+In one real vault, 1,868 checkboxes were open: 314 were tasks and 1,554
+(83%) were not. In that vault's dedicated task lists, every open checkbox
+carried a date, a priority, a recurrence rule or a workflow tag. The
+plain checkboxes sat in the same folders and often the same notes as the
+tasks, so excluding folders or note tags could not separate them.
+
+So each user (in single-user mode, the server) has a **task rule** that
+says which checkboxes count as tasks:
+
+| Rule | A checkbox is a task when | Choose it when |
+| --- | --- | --- |
+| `all` (default) | always | Your checkboxes are your tasks, for example a small agent-memory vault. |
+| `fields` | it carries a task field (a due, scheduled, start, created, done or cancelled date, a priority or a recurrence rule) or one of your *task tags* | Your real tasks carry a date, a priority or a tag such as `#waiting`, and your checklists do not. |
+| `filter` | its text contains your *global filter* text, such as `#task` | You mark every task with one marker, or you already use the Tasks plugin's "Global task filter". |
+
+Task tags match the way `list_tasks(tags=…)` does: ignoring case and by
+`/` segment, so the task tag `waiting` matches `#Waiting/bob` but not
+`#waitingroom`. The global filter is the Tasks plugin's own mechanism: a
+plain text match that respects case, anywhere on the line. `#Task` does
+not satisfy `#task`, while `#tasks` and a `#task` inside inline code do;
+the filter does not have to be a tag (`TODO` works).
+
+The default stays `all` for three reasons: plain checkboxes keep working
+for a vault whose checkboxes are its tasks; it is what the Tasks plugin
+does when no global filter is set; and an existing deployment sees no
+change until someone picks another rule (under `all` every response is
+byte for byte what it was before). **A vault that agents write into
+should choose `fields` or `filter`, and say in its vault guide (the
+vault's `CLAUDE.md`, served by `get_vault_guide`) how a task is
+written**, for example "every task has a 📅 due date or the `#waiting`
+tag" or "every task line contains `#task`". Agents then create tasks the
+rule recognises. `add_task` helps: under `filter` it adds the filter text
+itself, and under `fields` it says when the line it wrote is not a task.
+
+The rule is chosen on the panel's [Tasks card](#tasks-settings), or for
+everyone without a choice of their own by `TASKS_RULE`,
+`TASKS_RULE_TAGS` and `TASKS_GLOBAL_FILTER` (see
+[Configuration](#configuration)). It applies to the default scope only:
+default listings from `list_tasks` and `task_agenda`, and `add_task`'s
+duplicate check across the index. **Nothing is hidden silently.** While
+`fields` or `filter` is in force, a default-scope response carries one
+more header line, for example:
+
+```
+Rule — task rule: filter "#task" — excluded by rule: 2 tasks — kept though unsure (text cut): 1 tasks — pass scope="all" to list every checkbox
+```
+
+It names the rule, counts the checkboxes the rule left out (`excluded by
+rule`, apart from `excluded by scope`, which counts the folder and
+note-tag exclusions), and counts the ones kept only because the server
+could not judge them: a line whose stored text was cut at 1,000
+characters before the filter text appeared, or whose tags were cut past
+64. Those are listed rather than hidden. **`scope="all"` lists every
+checkbox**, whatever the rule. Under `fields`, while rows still await
+the first index pass after an upgrade, the line also says the rule is
+approximate for them. A stored rule the server cannot apply (only a
+manual database edit can produce one) is treated as `all`, and the line
+says so.
+
+**Writes under a rule.** The rule never blocks a write: `complete_task`
+and `update_task` address any checkbox by `path` and id, including one
+that only `scope="all"` lists.
+
+- Under `filter`, `add_task` puts the filter text at the start of the new
+  task's text when the line does not already contain it, as the Tasks
+  plugin's own task dialog does, and the response adds
+  `global filter added: "#task"`. A text that would pass 1,000 characters
+  with the filter added is refused, with nothing written.
+- Under `fields`, `add_task` writes a line with no field and no task tag
+  as asked, and the response adds `note: not a task under your task rule
+  "fields" …`: default listings will not show it. `update_task` adds the
+  same note, under `fields` or `filter`, when its edit leaves a line that
+  is not a task by the rule, for example after removing the last date or the filter text.
+  `update_task` never adds the filter text back.
+- `add_task`'s check against the note it writes into still compares
+  every open checkbox in that note: the same words in the same note are
+  most likely the same thing (`update_task` can give that line a date;
+  `allow_duplicate=true` adds anyway).
+
+A `list_tasks` cursor is refused (`invalid_argument`) once the rule
+changes in a way that changes the rows (another rule, other task tags
+under `fields`, another filter text under `filter`); list again.
 
 | Tool | What it does |
 | --- | --- |
@@ -535,14 +635,18 @@ timezone, because the dates moved; list again.
 **The default scope.** `list_tasks`, `task_agenda` and `add_task`'s
 duplicate check across other notes work in the caller's *default scope*: the whole vault
 minus the excluded folders and excluded note tags saved on the panel's
-Tasks card. With nothing saved, which is the default, nothing is
-excluded. `scope="all"` ignores the exclusions, and every listing states
-its scope and how many tasks the scope left out, so an exclusion is
-never silent.
+Tasks card, and only the checkboxes that are tasks under the caller's
+[task rule](#which-checkboxes-are-tasks). With nothing saved, which is
+the default, nothing is excluded. `scope="all"` ignores the exclusions
+and the rule, and every listing states its scope and how many tasks the
+scope and the rule left out, so an exclusion is never silent.
 
 Not modelled: custom status cycles (completing a task with any open
-marker writes `[x]`), the plugin's global filter, task dependencies, and
-its "remove scheduled date on recurrence" setting. A task with
+marker writes `[x]`), task dependencies, the plugin's "remove scheduled
+date on recurrence" setting, and its "remove global filter from
+description" display option (the filter text stays part of the task's
+text and, when it is a tag, of its tags, so with `#task` as the filter
+`list_tasks(tags=["task"])` matches every task). A task with
 `🏁 delete` is refused on completion (`on_completion_unsupported`)
 rather than deleted. The settings are under
 [Configuration](#configuration) and the panel card under
@@ -994,6 +1098,20 @@ caller of the server. Nothing is stored until the card is saved, and an
 unsaved card means the server defaults from
 [Configuration](#configuration).
 
+- **Which checkboxes are tasks** (first on the card; see
+  [Which checkboxes are tasks](#which-checkboxes-are-tasks)). A choice of
+  *Server default* (which shows the server's rule in words), *Every
+  checkbox is a task* (`all`), *Only checkboxes with task details or a
+  task tag* (`fields`) or *Only checkboxes that contain the global filter
+  text* (`filter`); a **Task tags** list, one per line, at most 32; and a
+  **Global filter text** field, at most 64 characters on one line. An
+  "In use now" line shows the rule in effect and whether it is the server
+  default or set here. *Server default* takes the server's whole rule as
+  one unit (rule, task tags and filter text together) and ignores the
+  card's two fields, so what the card says is in use is exactly what is
+  used. Tags or a filter text the chosen rule does not use are kept, so
+  switching rules to compare loses nothing. The `filter` rule without a
+  filter text is refused, with nothing saved.
 - **Timezone.** What "today" means for task dates: relative dates such
   as `today` or `+3d`, and the date written when a task is completed,
   cancelled or added. Any IANA timezone name (the field suggests common
@@ -1277,6 +1395,40 @@ too.
 
 Pull, then `make deploy` (or rebuild your compose stack); migrations
 run on start.
+
+Across the task-rule release (migration 040, #434):
+
+- **Nothing changes until a rule is chosen.** The default rule, `all`,
+  keeps every checkbox a task: every response, write and outstanding
+  `list_tasks` cursor stays exactly as it was. See
+  [Which checkboxes are tasks](#which-checkboxes-are-tasks).
+- **Migration 040** adds three columns (`task_rule`, `task_tags`,
+  `global_filter`) and two CHECKs to `task_settings`. It writes no row,
+  rewrites no table, re-derives and re-embeds nothing, and runs as the
+  database's non-superuser owner.
+- **New boot refusals, only for a value you set:** an invalid
+  `TASKS_RULE`, `TASKS_RULE_TAGS` or `TASKS_GLOBAL_FILTER`, or
+  `TASKS_RULE=filter` without a filter text, stops the app **and the
+  migration step**, since both load the same settings. Set them wherever
+  the settings are loaded (on Kubernetes, the ConfigMap the `migrate`
+  initContainer also reads), and quote a filter text that starts with a
+  hash sign (see [Configuration](#configuration)).
+- **No tool or argument is added.** The descriptions of `list_tasks`,
+  `task_agenda` and `add_task` now mention the rule; the tool count and
+  every schema are unchanged.
+- **`task_agenda` needs a slightly larger response cap while a rule is in
+  force:** 3,121 characters instead of 2,800 (`MAX_READ_RESPONSE_CHARS`,
+  default 40,000, so this binds only on a deployment that lowered it).
+- **Backups.** The new columns are part of `task_settings`, which is
+  already dumped with its rows.
+- **Rollback is roll-forward.** A server process of the previous image
+  that is already running keeps working against 040, but a previous image
+  that starts anew cannot: its migration step does not know revision 040.
+  To run the previous image, first run `alembic downgrade 039` **with the
+  new image**. That drops the three columns and both CHECKs, and with
+  them **every saved task rule, task tag and filter text**; the previous
+  image then lists every checkbox again. Details in
+  [`DEPLOYMENT.md`](./DEPLOYMENT.md#upgrading-across-migration-040-task-rule-434).
 
 Across the task-tools release (migration 039, #428):
 
@@ -1912,6 +2064,9 @@ reason.
 | `TASKS_SET_CANCELLED_DATE` | `true` | `update_task(status="cancelled")` adds `❌ <date>`. The plugin's "Set cancelled date on every cancelled task". |
 | `TASKS_SET_CREATED_DATE` | `false` | `add_task` and a recurring task's next occurrence get `➕ <date>`. The plugin's "Set created date on every added task". |
 | `TASKS_NEXT_RECURRENCE_BELOW` | `false` | Where a recurring task's next occurrence goes: `false` above the completed line, `true` below it, after any lines indented under the completed task. The plugin's "Next recurrence appears on the line below". |
+| `TASKS_RULE` | `all` | Which checkboxes count as tasks for every caller who has not chosen a rule on the panel's Tasks card: `all` (every checkbox, as before this setting existed), `fields` (a task field, or one of `TASKS_RULE_TAGS`) or `filter` (the text contains `TASKS_GLOBAL_FILTER`). Case-insensitive. See [Which checkboxes are tasks](#which-checkboxes-are-tasks). Any other value **refuses startup**, and so does `filter` with an empty `TASKS_GLOBAL_FILTER` (the message names both); both also refuse the migration step, which loads the same settings. The three `TASKS_RULE*` / `TASKS_GLOBAL_FILTER` values are inherited together: a user who chooses a rule on the card uses none of them. |
+| `TASKS_RULE_TAGS` | empty | Comma-separated task tags for `fields`, such as `waiting,someday`: a checkbox carrying one of them, or a tag nested under it (`waiting/bob`), is a task even without a field. A leading `#` is optional and tags are lower-cased. At most 32, each a tag: an ASCII letter first, then letters, digits, `_`, `-` or `/`, no trailing `/`, at most 128 characters. Anything else **refuses startup**, naming the variable. Unused by the other rules. |
+| `TASKS_GLOBAL_FILTER` | empty | The filter text for `filter`, such as `#task` (if you use the Tasks plugin's "Global task filter", the same text). Spaces at either end are stripped; then 1–64 characters on one line. Because `add_task` puts this text at the start of new task lines, it **refuses startup** when it contains a backtick, a Tasks field emoji, `%%`, `<!--` or `-->`, begins like a list item, checkbox, heading or quote (`- `, `1. `, `[x]`, `# `, `>`), or is only whitespace. Allowed: `#task`, `TODO`, `[task]`. **Quote it in `.env`**: `TASKS_GLOBAL_FILTER="#task"`. Unquoted, a hash sign after a space starts a comment, so `TASKS_GLOBAL_FILTER= #task` reads as empty and `TASKS_GLOBAL_FILTER=TODO #task` as `TODO`. In a Kubernetes ConfigMap, quote it too (`"#task"`): unquoted YAML reads it as a comment. |
 | `EMBEDDING_PROVIDER` | `ollama` | `ollama`, `openai`, or `tei` (TEI native `/embed`) |
 | `EMBEDDING_DIMENSIONS` | `1024` | pgvector column width |
 | `OLLAMA_URL` | `http://ollama:11434` | Used when provider is Ollama. Must be `https`, loopback `http`, or covered by `EMBEDDING_ALLOW_PLAINTEXT`. |
