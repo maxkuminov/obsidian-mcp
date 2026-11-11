@@ -9,8 +9,14 @@
 claude.ai, ChatGPT, Claude Code and your phone.**
 
 A self-hosted [Model Context Protocol](https://modelcontextprotocol.io)
-server over an Obsidian vault. Three things it does that the
-alternatives mostly don't:
+server that turns an Obsidian vault into long-term memory for every
+agent you use. Agents search it by meaning or by exact words, follow
+its wikilinks, see what changed since their last session and who
+changed it, keep their to-dos in it, and write back through guarded,
+atomic edits. 32 tools over plain markdown files that you can open,
+edit and grep.
+
+What sets it apart:
 
 - **Your existing vault, served in place.** No imposed note format, no
   sidecar syntax, no "memory" folder you have to adopt. Agents read what
@@ -19,10 +25,13 @@ alternatives mostly don't:
 - **Remote and multi-user.** OAuth 2.0 PKCE and API keys, so claude.ai,
   Claude Desktop, Claude mobile, ChatGPT, Claude Code and n8n all read
   and write the same files, each user confined to their own vault root.
-- **Writes cannot clobber.** `expected_hash` preconditions refuse an
-  edit made from a stale read, every publish is atomic and
-  no-clobber by default, deletes go to `.trash/`, and `dry_run` returns
-  the diff before anything lands.
+- **Writes are guarded.** An edit that carries `expected_hash` is
+  refused when the note changed since it was read, and a deployment
+  can require the hash on every edit
+  ([Guarding edits against stale reads](#guarding-edits-against-stale-reads)).
+  Every publish is atomic, a create refuses a path that is already taken,
+  deletes go to `.trash/`, and `dry_run` returns the diff before
+  anything lands.
 
 Connect from Claude Code:
 
@@ -36,11 +45,9 @@ In claude.ai, Claude Desktop or ChatGPT, add a custom connector at
 `https://obsidian-mcp.<your-domain>/mcp` and sign in through the OAuth
 consent page. [Connect a client](#4-connect-a-client) has the rest.
 
-Stack: Python 3.12, FastAPI, PostgreSQL with pgvector. Pluggable
-embeddings (Ollama — `bge-m3` by default, `qwen3-embedding:0.6b` in the
-reference deployment — OpenAI `text-embedding-3-{small,large}`, or
-Hugging Face TEI through its native `/embed` API or OpenAI-compatible
-`/v1/embeddings` route).
+Stack: Python 3.12, FastAPI, PostgreSQL with pgvector, and an embedding
+backend of your choice (Ollama, OpenAI or Hugging Face TEI; see
+[Pick an embedding backend](#2-pick-an-embedding-backend)).
 
 ![Dashboard](https://raw.githubusercontent.com/maxkuminov/obsidian-mcp/main/screenshots/dashboard.png)
 
@@ -148,6 +155,14 @@ notes live in my structure, picks the right format and frontmatter,
 and leaves a session log I can later roll into a status report. No
 path-passing, no telling it what to write — the conventions are
 already in the vault, and it follows them.
+
+The same goes for commitments. My to-dos are checkbox lines in those
+notes, and the [task tools](#tasks-optional) let an agent read the same
+list I do: what is overdue, what is due this week, what I am waiting on
+from someone else. It can add a follow-up from a conversation or tick
+one off when the work is done, and the change is one line in a file I
+can see. That part is optional. Plenty of vaults hold no tasks at all,
+and nothing else depends on it.
 
 That's the exocortex idea made concrete: one place that holds
 context, and both the human and the agents reading and writing into it
@@ -998,6 +1013,10 @@ vault was in git at all.
 - Folks who want agent memory to live as plain markdown files they
   can read, edit, grep, and version-control, not in an opaque
   vector store or a managed memory service.
+- People who keep their to-dos as checkboxes in their notes and want
+  agents to work from that one list (see what is due, add a
+  follow-up, close what is done) instead of keeping a second one
+  somewhere else.
 
 ### Who this isn't for
 
