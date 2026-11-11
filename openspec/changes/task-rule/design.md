@@ -82,7 +82,7 @@ Two rows cannot be judged from what is stored:
 Both are **kept** (listed) and counted as `kept though unsure (text cut)` or `kept though unsure (tags cut)` on the rule line.
 
 - Rejected: excluding them and counting them. A real task would then be hidden behind a count, while keeping a rare non-task is visible and harmless. Fail-visible bias.
-- `add_task`'s filter prepending (D7) puts the filter at the start of the line, so a line the server adds can never be in this case.
+- `add_task`'s filter prepending (D7) puts the filter at the start of the line, so a line the server adds is almost never in this case. The one exception (L12): a filter that is already present as one of the call's tags is not prepended, and with a long `text` the tag can fall after the 1,000-character cut. That row is then listed and counted as `kept though unsure (text cut)`, and nothing is lost.
 
 The `unsure` predicate is `text_cut AND strpos(text, F) = 0` under `filter`, and `T ≠ ∅ AND tags_cut AND NOT has_field AND NOT has_tag` under `fields`.
 
@@ -186,11 +186,12 @@ Consequences:
 - **Prepend, not append before the field run** (the brief suggested appending, "like a tag"). Prepending:
   - is what the plugin does;
   - cannot touch the trailing field run, so the line parses the same whether or not F is a tag;
-  - keeps F inside the first 1,000 characters, so the stored `text` always contains it and D3's unsure case cannot arise for a server-added line;
+  - keeps F inside the first 1,000 characters when it is prepended, so the stored `text` then contains it (when F is already present as a tag and not prepended, see L12);
   - needs no special case for a non-tag filter such as `TODO` or `[task]`.
 - **Already contains F** (in the text, in a tag the caller passed, `tags=["task"]` with F = `#task`, or anywhere in the serialised body): nothing is added.
 - **Case differs** (`#Task` in the text, F = `#task`): the substring test is case-sensitive, as the plugin's is, so F is prepended. The response says so, and the agent sees both.
 - **Length.** The D4 description bound (1,000 characters) applies to the combined description. A `text` whose combination would exceed it is refused `invalid_argument` with "text plus the global filter text (N characters) exceeds 1,000 characters", writing nothing.
+- **The filter validator, in the planner (implementation review).** Before prepending, `plan_add` applies to F the **same** validator the settings use (every D9 filter rule). A filter that fails is refused `invalid_argument`, with nothing written.
 - **Structure, on the final description (Codex spec r1 #1).** `plan_add` runs `task_write._structure_refusal(…, context=False, what="text")`, the one check every entry point uses, a second time, on the **combined** description (F, a space, the caller's text) **before the dry run is answered and before anything is published**. That is: an even number of `%%`, every `<!--` closed by `-->` and no closer without an opener, no run of three or more backticks or tildes. A failure gives that check's own refusal, writing nothing. This guarantee does not depend on D9's validation of F: a filter text that reached the database some other way (a manual edit, a future writer) still cannot open a comment or a fence that hides the rest of the note. D5's verification is unchanged.
 - The duplicate key, the similar terms and the D5 verification all use the final line.
 - The response, and the dry run, carry `global filter added: <json F>` on its own line after the `line N:` line.
@@ -217,6 +218,13 @@ note: not a task under your task rule "filter" (the line does not contain <json 
 **Duplicate detection.**
 
 - **Index side (#428 D9 (b)) and the similar-task list:** both go through `scope_clause`, so they consider only tasks by the rule (D4). A plain checklist line elsewhere no longer refuses or crowds a new task.
+- **Two keys under `filter` (implementation review).** An existing open line is an exact duplicate when its description key equals **either** of:
+  - the key of the final line's description (F prepended);
+  - the key of the caller's description without F in front, with F as its trailing token instead (`text + " " + F`, normalised as D9 does).
+  
+  The D9 key keeps trailing tags in order, so a bare "without F" key would not equal the key of `Renew passport #task`; the trailing-token form does.
+
+  So an existing task carrying F as a trailing tag is caught, and so is one the server added earlier with F in front. F is not a similar-task term on either side. A filter sitting in the middle of an existing description is not matched (L13).
 - **Target-note side (#428 D9 (a)) stays rule-independent**, as it is scope-independent today. It is a byte check of the note being written. A same-description checkbox in the same note is most likely the thing the agent means: `update_task` can give that line a date instead of adding a second one. `allow_duplicate=true` remains the escape. Under `filter` the new line carries F, so a plain checkbox without F has a different description key and cannot collide. Owner decision Q1 (2026-11-10).
 
 **The rule never blocks a write.** Write resolution reads the note's bytes (#428 D2) and never consults `note_tasks` scope, so an id from a `scope="all"` listing works under any rule.
@@ -399,6 +407,8 @@ Once a user picks `fields` or `filter`:
 - **L9**: The duplicate check against the target note's own bytes ignores the rule (D7, owner decision Q1).
 - **L10**: The plugin removes a global-filter tag from a task's tags when it reads the line. This server keeps it in `tags` and `tag_prefixes`, so `list_tasks(tags=["task"])` matches every filter-rule task when F is `#task`.
 - **L11**: A `scope="all"` response does not mention the caller's rule. Its query line says `scope: all`.
+- **L12**: `add_task` with the filter supplied as one of the call's tags and a text near 1,000 characters is not prepended. Its stored text may be cut before the tag, so the row is listed as `kept though unsure (text cut)` (D3). Nothing is lost.
+- **L13**: Under `filter`, a duplicate whose existing line holds F in the middle of its description, rather than in front or as a trailing tag, is not matched as exact (D7).
 
 ## Test plan
 
@@ -505,3 +515,13 @@ The change is small enough for two agents, in sequence or in parallel. The docs 
 3. **MAJOR, accepted.** "The previous image keeps working" held only for a running process. D11, the schema-integrity delta and tasks §3.3 now distinguish a running old process (compatible) from a restarted one (cannot start at 040), state that rollback is roll-forward or `alembic downgrade 039` with the 040-aware image first (dropping every saved rule), and state exactly what the schema gate tests (the upgrade → downgrade 039 → upgrade round trip).
 
 **Codex spec review, round 2 (2026-11-10), verification only:** findings 2 and 3 were VERIFIED. Finding 1 was VERIFIED for its original input, and one MINOR gap was tightened: the filter-text validator had forbidden only *unbalanced* comment delimiters, so `%%x%%` or a whole HTML comment was accepted. The filter text now may not contain `%%`, `<!--` or `-->` at all. `add_task`'s check on the final combined description is unchanged. There is no round 3.
+
+**Implementation review (2026-11-10).**
+
+- **`openspec-verifier`:** no BLOCKER or MAJOR. It raised three non-blocking items:
+  - the duplicate keys under `filter`, fixed (D7, two keys);
+  - the planner's filter validator, fixed (D7);
+  - the D3 claim that a server-added line is never unsure, corrected (L12).
+
+  It confirmed against `origin/main` that the default-scope SQL and the filters digest are byte-identical under the rule `all`, and that no pre-existing test was weakened.
+- **Adversarial Codex**, one focused pass with a per-scenario trace: **PASS**, 12 of 12 scenarios SAFE. Its one MINOR (the README still said the global filter was not modelled) was fixed in the docs slice.

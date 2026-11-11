@@ -81,6 +81,11 @@ A file without a final terminator SHALL keep none.
 
 **Duplicate checks.** `add_task`'s index-side exact-duplicate refusal and its similar-task list SHALL consider only rows that are tasks under the caller's rule, through the default scope they already use. The exact-duplicate check against the target note's own current bytes SHALL remain independent of scope and rule.
 
+**Under the rule `filter`.**
+- An existing open line SHALL be an exact duplicate when its description key equals either the key of the final line's description (filter text prepended) or the key of the caller's description with the filter text as its trailing token instead of in front.
+- The filter text SHALL NOT be a similar-task term on either side.
+- Before prepending, the planner SHALL validate the filter text with the same validator the settings use. A filter text that fails SHALL be refused with `invalid_argument`, writing nothing.
+
 #### Scenario: A line without fields is written and explained
 - **WHEN** the caller's rule is `fields` with no task tags, `set_created_date` is false, and `add_task(path="Inbox.md", text="Read the report")` runs
 - **THEN** the line SHALL be written, and the response SHALL carry the `fields` note line
@@ -101,6 +106,10 @@ A file without a final terminator SHALL keep none.
 #### Scenario: A checklist elsewhere no longer blocks a new task
 - **WHEN** the caller's rule is `fields`, `Projects/Alpha.md` holds a plain `- [ ] Renew passport`, and `add_task(path="Inbox.md", text="Renew passport", due="2026-12-01")` runs
 - **THEN** the line SHALL be inserted, and the plain checkbox SHALL appear in neither a refusal nor the similar list
+
+#### Scenario: Under filter, a duplicate is caught with the filter in front or as a trailing tag
+- **WHEN** the caller's rule is `filter` with `#task`, `Projects/Alpha.md` holds `- [ ] Renew passport #task` and `Projects/Beta.md` holds `- [ ] #task Book flights`, and `add_task(path="Inbox.md", text="Renew passport")` and `add_task(path="Inbox.md", text="Book flights")` run
+- **THEN** each SHALL be refused with `duplicate_task` naming the existing line, and `Inbox.md` SHALL be unchanged
 
 #### Scenario: The target note's own bytes are still checked
 - **WHEN** the caller's rule is `fields`, `Inbox.md` holds a plain `- [ ] Renew passport`, and `add_task(path="Inbox.md", text="Renew passport", due="2026-12-01")` runs
