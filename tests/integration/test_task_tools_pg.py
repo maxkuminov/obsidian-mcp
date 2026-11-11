@@ -833,3 +833,37 @@ async def test_a_checklist_elsewhere_no_longer_blocks_but_the_target_note_still_
     out = await call("add_task", path="Inbox2.md", text="Renew passport", due="2026-12-01",
                      allow_duplicate=True)
     assert code(out) is None, out
+
+
+async def test_under_filter_a_duplicate_in_front_or_as_a_trailing_tag_is_refused(
+        sessionmaker, vault):
+    """#434 D7: the existing task carries the filter as a trailing tag (in
+    another note: the index-side scan) or in front (added by the server
+    earlier); both refuse `duplicate_task`, and Inbox.md is unchanged."""
+    put(vault, "Projects/Alpha.md", "- [ ] Renew passport #task\n")
+    put(vault, "Projects/Beta.md", "- [ ] #task Book flights\n")
+    put(vault, "Inbox.md", "# Inbox\n")
+    await index()
+    await set_rule(sessionmaker, "filter", filt="#task")
+    for text_, where in (("Renew passport", "Projects/Alpha.md"),
+                         ("Book flights", "Projects/Beta.md")):
+        out = await call("add_task", path="Inbox.md", text=text_)
+        assert code(out) == "duplicate_task", out
+        assert f"`{where}`:1" in out
+    assert disk(vault, "Inbox.md") == b"# Inbox\n"
+    # In the target note itself: trailing tag, and the bare description.
+    put(vault, "Inbox.md", "# Inbox\n- [ ] Call bank #task\n- [ ] Water plants\n")
+    await index()
+    for text_ in ("Call bank", "Water plants"):
+        out = await call("add_task", path="Inbox.md", text=text_, dry_run=True)
+        assert code(out) == "duplicate_task", out
+    out = await call("add_task", path="Inbox.md", text="Renew passport", allow_duplicate=True)
+    assert code(out) is None and "line 4: - [ ] #task Renew passport" in out, out
+    # The filter text is not a similar-task term: "#task Book hotel" would be
+    # similar to "#task Book flights" (Jaccard 2/4) only through `task`.
+    out = await call("add_task", path="Inbox.md", text="Book hotel", dry_run=True)
+    assert "similar open tasks: none" in out, out
+    # Rule `all`: a filter-tagged line elsewhere is a different description.
+    await set_rule(sessionmaker, "all")
+    out = await call("add_task", path="Inbox.md", text="Book flights", dry_run=True)
+    assert code(out) is None, out

@@ -9518,8 +9518,12 @@ async def add_task_impl(
         """D9 (b): the index side, owner- and default-scope-scoped; the target
         note itself was checked against its current bytes by the planner."""
         async with async_session() as session:
+            # `extra_norms` (#434 D7) only under a `filter` rule, so every other
+            # call is the #428 call exactly.
+            extra = {"extra_norms": plan.dup_norms} if plan.dup_norms else {}
             exact, similar, stopped = await task_write.duplicate_scan(
-                session, uid, effective, plan.norm or "", plan.terms, exclude_path=rel)
+                session, uid, effective, plan.norm or "", plan.terms, exclude_path=rel,
+                **extra)
         if exact and not allow_duplicate:
             return _task_refusal(
                 f"{tool}: `{_escape_task_path(rel)}`: an open task with the same description already "

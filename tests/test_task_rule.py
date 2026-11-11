@@ -351,3 +351,86 @@ def test_the_filter_digest_is_unchanged_under_all_and_scope_all():
     # The defensive fallback digests as `all`.
     bad = task_settings._merge(TaskSettings(task_rule="filter", global_filter=None))
     assert Q.filters_digest(n, bad) == plain
+
+
+# ── byte identity under `all`, pinned against the previous release ──────────
+#
+# These literals were produced by the `origin/main` code (58564cd, v1.3.0):
+# `git show origin/main:src/services/task_query.py` was loaded into a
+# temporary module (registered in `sys.modules` so its dataclasses build) and
+# its `filters_digest`, `scope_clause` (compiled for the postgresql dialect
+# with `literal_binds`) and `encode_cursor` were called with the inputs below
+# (NOW, `ListTasksArgs()` / `ListTasksArgs(scope="all")`, owner None, the row
+# `Projects/Alpha.md:3` due 2026-11-30). They are pasted here, never recomputed.
+
+V130_DIGEST = {
+    ("none", "default"): "562eb91873ee9f43", ("none", "all"): "c3f2515bfea4c4cf",
+    ("exclusions", "default"): "9e8db59d9358f4ae", ("exclusions", "all"): "e833abac771dfb61",
+}
+V130_EXCLUSIONS_SQL = (
+    "notes_metadata.file_path NOT LIKE 'Archive/%%' ESCAPE '\\\\' AND notes_metadata.file_path "
+    "NOT LIKE 'Work/Tickets/%%' ESCAPE '\\\\' AND NOT (EXISTS (SELECT 1 AS anon_1 \n"
+    "FROM unnest(notes_metadata.tags) AS t(v) \n"
+    "WHERE rtrim(regexp_replace(lower(regexp_replace(t.v, '^#', '')), '/{2,}', '/', 'g'), '/') "
+    "= 'private' OR left(rtrim(regexp_replace(lower(regexp_replace(t.v, '^#', '')), '/{2,}', "
+    "'/', 'g'), '/'), 8) = 'private/' OR rtrim(regexp_replace(lower(regexp_replace(t.v, '^#', "
+    "'')), '/{2,}', '/', 'g'), '/') = 'ticket/ops' OR left(rtrim(regexp_replace(lower("
+    "regexp_replace(t.v, '^#', '')), '/{2,}', '/', 'g'), '/'), 11) = 'ticket/ops/'))"
+)
+V130_CURSOR = (
+    "eyJ2IjoyLCJvIjoiYzU3MTc4Nzg4ZmEwMTE0MCIsImYiOiI1NjJlYjkxODczZWU5ZjQzIiwib2IiOiJkdWUiLCJr"
+    "IjpbIjIwMjYtMTEtMzAiXSwicCI6IlByb2plY3RzL0FscGhhLm1kIiwibCI6M30"
+)
+
+
+def _v130_settings():
+    base = task_settings.defaults()
+    leftover = task_settings._merge(TaskSettings(task_rule="all", task_tags=["waiting-for"],
+                                                 global_filter="#task"))
+    excl = dataclasses.replace(base, excluded_folders=("Archive/", "Work/Tickets/"),
+                               excluded_note_tags=("private", "ticket/ops"))
+    excl_leftover = dataclasses.replace(leftover, excluded_folders=excl.excluded_folders,
+                                        excluded_note_tags=excl.excluded_note_tags)
+    return {"none": base, "leftover": leftover, "exclusions": excl,
+            "exclusions+leftover": excl_leftover}
+
+
+def test_scope_sql_and_digest_under_all_equal_v130():
+    from sqlalchemy.dialects import postgresql
+
+    from src.services import task_query as Q
+
+    now = dt.datetime(2026, 11, 10, 12, tzinfo=dt.timezone.utc)
+    for name, ts in _v130_settings().items():
+        assert ts.task_rule == "all" and ts.task_rule_unusable is None
+        group = "exclusions" if name.startswith("exclusions") else "none"
+        for scope in ("default", "all"):
+            n = Q.normalise_list_args(Q.ListTasksArgs(scope=scope), ts, now=now)
+            assert Q.filters_digest(n, ts) == V130_DIGEST[(group, scope)], (name, scope)
+        clause = Q.scope_clause(ts)
+        if group == "none":
+            assert clause is None, name
+        else:
+            sql = str(clause.compile(dialect=postgresql.dialect(),
+                                     compile_kwargs={"literal_binds": True}))
+            assert sql == V130_EXCLUSIONS_SQL, name
+
+
+def test_a_v130_cursor_is_accepted_under_all():
+    from src.services import task_query as Q
+
+    now = dt.datetime(2026, 11, 10, 12, tzinfo=dt.timezone.utc)
+    for ts in _v130_settings().values():
+        if ts.excluded_folders:
+            continue
+        n = Q.normalise_list_args(Q.ListTasksArgs(), ts, now=now)
+        got = Q.decode_cursor(V130_CURSOR, owner=Q.owner_discriminator(None),
+                              filters=Q.filters_digest(n, ts), order_by="due")
+        assert not isinstance(got, Q.QueryRefusal), got
+        assert got == {"k": ["2026-11-30"], "l": 3, "p": "Projects/Alpha.md"}
+    # The same cursor is refused once a rule is in force (D6).
+    fields = eff("fields")
+    n = Q.normalise_list_args(Q.ListTasksArgs(), fields, now=now)
+    assert isinstance(Q.decode_cursor(V130_CURSOR, owner=Q.owner_discriminator(None),
+                                      filters=Q.filters_digest(n, fields), order_by="due"),
+                      Q.QueryRefusal)
