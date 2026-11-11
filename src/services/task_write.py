@@ -1057,13 +1057,17 @@ def plan_add(note_text: str, args: AddArgs, settings, today: datetime.date) -> P
             filter_added = f_text
     norm = tl_mod.normalise_description(new_tl.full_text)
 
+    # #434: under a `filter` rule the same task may be written with the
+    # filter text at the front or as a trailing tag; every such form is one
+    # description (`duplicate_norms`). Under any other rule: `norm` alone.
+    dup_norms = duplicate_norms(norm, settings)
     if not args.allow_duplicate:
         dups = []
         for t in tasks:
             if t.state != STATE_OPEN:
                 continue
             p = view.parse(t.line - 1)
-            if p is not None and tl_mod.normalise_description(p.full_text) == norm:
+            if p is not None and tl_mod.normalise_description(p.full_text) in dup_norms:
                 dups.append(TaskRef(line=t.line, id=_render(t), text=t.text))
         if dups:
             return _refuse(
@@ -1084,7 +1088,7 @@ def plan_add(note_text: str, args: AddArgs, settings, today: datetime.date) -> P
     return _finish(
         note_text, [span],
         target_line=None, intent=None, inserted=tuple(inserted),
-        norm=norm, terms=similarity_terms(norm), filter_added=filter_added,
+        norm=norm, terms=_similarity_terms_for(norm, settings), filter_added=filter_added,
     )
 
 
@@ -1095,6 +1099,14 @@ def _prepend_filter(filter_text: str, desc: str) -> str | TaskWriteRefusal:
     so a filter text that reached the settings row some other way still
     cannot open a comment or a fence in the note — then the description
     rules. Before any dry-run answer and before anything is published."""
+    # Layer (b) does not trust the settings: the filter text it is about to
+    # prepend must pass the one validator the settings use (every rule), or
+    # nothing is planned.
+    checked, error = task_rule.normalise_filter(filter_text)
+    if error is not None or checked != filter_text:
+        why = error.rstrip(".") if error else "it has surrounding whitespace"
+        return _refuse("invalid_argument",
+                       f"the global filter text cannot be added ({why}); nothing was written")
     combined = f"{filter_text} {desc}"
     if len(combined) > tl_mod.DESCRIPTION_MAX_CHARS:
         return _refuse(
@@ -1109,6 +1121,66 @@ def _prepend_filter(filter_text: str, desc: str) -> str | TaskWriteRefusal:
     if isinstance(got, TaskLineRefusal):
         return _refuse("invalid_argument", "text plus the global filter text: " + got.reason)
     return got
+
+
+def _filter_norm(settings) -> str | None:
+    """The global filter text normalised like a description (NFC, casefold,
+    whitespace collapsed) under a `filter` rule, else None."""
+    if getattr(settings, "task_rule", "all") != task_rule.RULE_FILTER:
+        return None
+    text = getattr(settings, "global_filter", None)
+    if not text:
+        return None
+    return " ".join(unicodedata.normalize("NFC", text).casefold().split()) or None
+
+
+def _strip_filter(norm: str, fn: str) -> str:
+    """`norm` without the filter at its front or as its last word (a filter
+    in the middle of a description stays: #434 accepted limitation)."""
+    if norm.startswith(fn + " "):
+        return norm[len(fn) + 1:]
+    if norm.endswith(" " + fn):
+        return norm[: -len(fn) - 1]
+    return norm
+
+
+def duplicate_norms(norm: str, settings) -> tuple[str, ...]:
+    """#434: the normalised descriptions an exact duplicate of `norm` may
+    have. Under a `filter` rule: the description without the filter, with
+    it prepended (as `add_task` writes it) and with it as a trailing tag
+    (where people put a tag); otherwise `(norm,)`. `plan_add`'s target-note
+    check and `duplicate_scan`'s index-side check both use it."""
+    fn = _filter_norm(settings)
+    if fn is None:
+        return (norm,)
+    plain = _strip_filter(norm, fn)
+    out: list[str] = []
+    for n in (norm, plain, f"{fn} {plain}", f"{plain} {fn}"):
+        if n and n not in out:
+            out.append(n)
+    return tuple(out)
+
+
+def _filter_terms(settings) -> frozenset[str]:
+    fn = _filter_norm(settings)
+    return term_set(fn) if fn else frozenset()
+
+
+def _similar_term_set(norm: str, settings) -> frozenset[str]:
+    """The similarity terms of `norm`; under a `filter` rule the filter text
+    is not a term (on either side of the comparison)."""
+    fn = _filter_norm(settings)
+    if fn is None:
+        return term_set(norm)
+    return term_set(_strip_filter(norm, fn)) - _filter_terms(settings)
+
+
+def _similarity_terms_for(norm: str, settings) -> tuple[str, ...]:
+    fn = _filter_norm(settings)
+    if fn is None:
+        return similarity_terms(norm)
+    drop = _filter_terms(settings)
+    return tuple(t for t in similarity_terms(_strip_filter(norm, fn)) if t not in drop)
 
 
 def extracted_task_at(text: str, line: int):
@@ -1695,6 +1767,8 @@ async def duplicate_scan(session, uid, settings, norm: str, terms: Sequence[str]
     from src.models.db import NoteMetadata, NoteTask
 
     key = tl_mod.description_key(norm)
+    # #434: every form an exact duplicate may take under a `filter` rule.
+    keys = [tl_mod.description_key(n) for n in duplicate_norms(norm, settings)]
     # The one owner mapping (`tools._note_owner_predicate`, the predicate
     # `list_tasks` joins under), imported at call time like `task_query` does.
     from src.mcp_server import tools as _tools
@@ -1713,7 +1787,9 @@ async def duplicate_scan(session, uid, settings, norm: str, terms: Sequence[str]
 
     exact_stmt = (
         select(*cols).select_from(NoteTask).join(NoteMetadata, join_on)
-        .where(NoteTask.state == STATE_OPEN, NoteTask.description_key == key, scope)
+        .where(NoteTask.state == STATE_OPEN,
+               NoteTask.description_key == key if len(keys) == 1
+               else NoteTask.description_key.in_(keys), scope)
     )
     if exclude_path is not None:
         exact_stmt = exact_stmt.where(NoteMetadata.file_path != exclude_path)
@@ -1724,7 +1800,7 @@ async def duplicate_scan(session, uid, settings, norm: str, terms: Sequence[str]
     stopped = False
     terms = [t for t in terms if t]
     if terms:
-        mine = term_set(norm)
+        mine = _similar_term_set(norm, settings)
         cand_stmt = (
             select(*cols).select_from(NoteTask).join(NoteMetadata, join_on)
             .where(NoteTask.state == STATE_OPEN, scope,
@@ -1738,9 +1814,9 @@ async def duplicate_scan(session, uid, settings, norm: str, terms: Sequence[str]
             rows = rows[:TASK_SIMILAR_SCAN_MAX]
         scored = []
         for r in rows:
-            if r.description_key == key:
+            if r.description_key in keys:
                 continue
-            theirs = term_set(tl_mod.normalise_description(r.text))
+            theirs = _similar_term_set(tl_mod.normalise_description(r.text), settings)
             contained = contains(mine, theirs)
             score = jaccard(mine, theirs)
             if contained or score >= SIMILAR_MIN_SCORE:
