@@ -1307,6 +1307,44 @@ shows the values still stored. Both routes take the router-wide CSRF check.
 
 **The controls.**
 
+- **"Which checkboxes are tasks"** (#434), the first block on the card. Why
+  the rule exists and what it does are in [vault tools](vault-tools.md),
+  "The task rule (#434)". Three controls, every one always visible (no
+  show/hide logic, so `panel.js` is untouched), each input labelled with the
+  rule that uses it:
+  - a `task_rule` select, consistent with the card's other three-way
+    selects: *Server default (<the server's rule in words>)* (stored NULL),
+    *Every checkbox is a task* (`all`), *Only checkboxes with task details or
+    a task tag* (`fields`), *Only checkboxes that contain the global filter
+    text* (`filter`);
+  - a `task_tags` textarea, one per line, at most 32, normalised like the
+    excluded note tags (a leading `#` stripped, lower-cased, the tag
+    grammar, no trailing `/`);
+  - a `global_filter` text input, `maxlength="64"`, placeholder `#task`,
+    validated by `task_rule.normalise_filter`, the same function that
+    validates `TASKS_GLOBAL_FILTER` at startup.
+
+  The help text is written for someone who has never installed the Tasks
+  plugin (it lists the emoji fields and names the plugin's "Global task
+  filter"). Under the select, "In use now: <rule in words>[, task tags: …]
+  [, filter: …] (server default | set here)" shows the *effective* rule;
+  with the server default selected, the server's tags or filter appear
+  read-only there. **"Server default" inherits the server's whole rule as
+  one unit** (kind, tags and filter text), never field by field, so what the
+  card says is in use is exactly what the tools use, and a user who picks
+  `filter` can never silently inherit a filter text the card does not show.
+  A stored rule the server cannot apply (only a manual database edit can
+  make one) is shown with a warning, and the tools treat it as "every
+  checkbox". Save rules: an absent `task_rule`, `task_tags` or
+  `global_filter` key leaves the stored value unchanged (a client posting
+  part of the card must not erase a rule); tags or a filter text the chosen
+  rule does not use are stored and kept, so switching rules to compare
+  loses nothing; a merged `filter` rule without a filter text is refused
+  ("The “filter” rule needs a global filter text…"), nothing written. The
+  scope's saves are serialised by `pg_advisory_xact_lock` taken before the
+  row is read (two first saves for a scope with no row cannot interleave),
+  and a `ck_task_settings_global_filter` violation at flush is the same
+  refusal.
 - A timezone `<input list>` with a `<datalist>` of a **fixed** list of 76
   common IANA names (`TASK_TIMEZONE_SUGGESTIONS` in `routes.py`). The list is
   fixed rather than `zoneinfo.available_timezones()` because that set is the
@@ -1330,8 +1368,10 @@ shows the values still stored. Both routes take the router-wide CSRF check.
 **CSP posture** (#195, #289): the card has no script, no inline handler, no
 `style=` and no `javascript:` URL; every control is a plain form field, so
 `panel.js` gains nothing. Classes are existing components and generated
-utilities. The `page_account_*` goldens were regenerated deliberately; the
-settings page has no golden. The owner walks the card by hand in both modes
+utilities. The #434 rule block keeps that posture unchanged: no script,
+handler or `style=`, only existing classes. The `page_account_*` goldens
+were regenerated deliberately (again for #434); the settings page has no
+golden. The owner walks the card by hand in both modes
 with devtools open, and zero CSP violations is part of the bar.
 
 ## Optional native OIDC (#414, #416)
