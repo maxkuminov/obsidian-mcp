@@ -1499,7 +1499,11 @@ grammar, L1); signifiers count anywhere on the line, not only trailing (L2);
 custom statuses and dependencies are not modelled (L6); nesting is visible
 only through line order (L7). Version 5 (#428, below) adds the task id, the
 recurrence rule text, the created and cancelled dates and a capped context
-run to each row; the grammar above is unchanged.
+run to each row; the grammar above is unchanged. Every checkbox is still a
+row: which rows count as tasks is the caller's task rule (#434), decided at
+query time and never stored here (see "The task rule (#434)" in
+[vault tools](vault-tools.md)), which is why the `text_cut` and `tags_cut`
+flags above matter to it.
 
 ### The seam: a second per-note derivation beside the link rebuild (D4)
 

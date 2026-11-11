@@ -53,7 +53,7 @@ import json
 import re
 from typing import Any
 
-from src.services import task_dates, task_line
+from src.services import task_dates, task_line, task_rule
 
 # ── constants ────────────────────────────────────────────────────────────────
 
@@ -205,6 +205,26 @@ class Exclusions:
     excluded: int
 
 
+@dataclasses.dataclass(frozen=True)
+class RuleCounts:
+    """The task rule as one default-scope call applied it (#434, D4, D5).
+
+    Present on a page only while the rule line is: under `scope="default"`
+    with a rule in force (`fields` / `filter`) or a configured rule that
+    could not be applied (`unusable` set, `kind` then `all`). `excluded`
+    counts *other* ∧ L ∧ ¬R, `unsure` the kept rows whose verdict depended on
+    cut data, `pending` (under `fields`) the matching rows awaiting the
+    version-5 backfill, which the rule judges approximately."""
+
+    kind: str
+    tags: tuple[str, ...]
+    global_filter: str | None
+    unusable: str | None
+    excluded: int = 0
+    unsure: int = 0
+    pending: int = 0
+
+
 @dataclasses.dataclass
 class Normalised:
     """Validated, normalised arguments (internal; also carried to the
@@ -256,6 +276,8 @@ class TaskPage:
     exclusions: Exclusions
     query_line: bool
     cursor: CursorSpec
+    #: #434: the rule line's facts, or None when no rule line is shown.
+    rule: RuleCounts | None = None
 
 
 @dataclasses.dataclass
@@ -291,6 +313,8 @@ class AgendaPage:
     ids_pending: int
     cut_tags: int | None
     sections: list[AgendaSection]
+    #: #434: the rule line's facts, or None when no rule line is shown.
+    rule: RuleCounts | None = None
 
 
 # ── helpers shared with tools.py (imported lazily: tools imports us) ─────────
@@ -556,6 +580,12 @@ def filters_digest(n: Normalised, task_settings) -> str:
         "excluded_note_tags": sorted(task_settings.excluded_note_tags),
         "today": n.today.isoformat() if n.any_relative else None,
     }
+    # #434 D6: the rule only when it applies, so every payload under `all` (and
+    # under `scope="all"`) is byte-identical to v1.3.0's and old cursors live.
+    if n.scope == "default":
+        part = task_rule.digest_part(task_settings)
+        if part is not None:
+            payload["rule"] = part
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
@@ -724,10 +754,33 @@ def tags_none_clause(values: list[str]):
 
 
 def scope_clause(task_settings):
-    """The default scope's *keep* predicate (never NULL): the note is under
-    no excluded folder (the `folder_prefix_clause` semantics) and none of
-    its note tags hierarchically matches an excluded note tag. None when
-    nothing is excluded."""
+    """The default scope's *keep* predicate (never NULL), or None when it
+    keeps everything: the location part (`location_clause`: no excluded
+    folder, no excluded note tag) AND the caller's task rule
+    (`task_rule.rule_clause`, #434 D4). The one place that decides what is
+    in the default scope: the `list_tasks` page and counts, the `task_agenda`
+    totals and rows, and `add_task`'s duplicate scan all call it."""
+    from sqlalchemy import and_
+
+    parts = [p for p in (location_clause(task_settings), rule_clause(task_settings))
+             if p is not None]
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return parts[0]
+    return and_(*parts)
+
+
+def rule_clause(task_settings):
+    """The task rule's keep predicate (`task_rule.rule_clause`), or None."""
+    return task_rule.rule_clause(task_settings)
+
+
+def location_clause(task_settings):
+    """The default scope's location *keep* predicate (never NULL): the note
+    is under no excluded folder (the `folder_prefix_clause` semantics) and
+    none of its note tags hierarchically matches an excluded note tag. None
+    when nothing is excluded. (#428's `scope_clause` body, moved verbatim.)"""
     from sqlalchemy import and_, not_
     from src.services.filters import folder_prefix_clause
 
@@ -903,6 +956,13 @@ class _Filters:
             tag.append(tags_none_clause(n.exclude_tags))
         self.tag = tag
         self.scope = scope_clause(task_settings) if n.scope == "default" else None
+        # #434 D4: the scope's two parts, so each exclusion is counted once.
+        default = n.scope == "default"
+        self.location = location_clause(task_settings) if default else None
+        self.rule = rule_clause(task_settings) if default else None
+        self.unsure = task_rule.unsure_clause(task_settings) if default else None
+        self.rule_line = default and task_rule.line_present(task_settings)
+        self.pending_ignores_rule = default and task_rule.pending_approximate(task_settings)
 
     def all(self, *, tag: bool = True, text: bool = True, recurring: bool = True,
             scope: bool = True) -> list:
@@ -917,6 +977,23 @@ class _Filters:
         if scope and self.scope is not None:
             out.append(self.scope)
         return out
+
+    def other_and_location(self, **kw) -> list:
+        """Every predicate except the default scope's rule part."""
+        out = self.all(scope=False, **kw)
+        if self.location is not None:
+            out.append(self.location)
+        return out
+
+
+def rule_counts(task_settings, *, excluded: int = 0, unsure: int = 0,
+                pending: int = 0) -> RuleCounts:
+    return RuleCounts(
+        kind=task_settings.task_rule, tags=tuple(task_settings.task_tags),
+        global_filter=task_settings.global_filter,
+        unusable=task_settings.task_rule_unusable,
+        excluded=excluded, unsure=unsure, pending=pending,
+    )
 
 
 def _session_factory(session_factory):
@@ -1028,16 +1105,38 @@ async def list_tasks_query(
                 return _refuse(CURSOR_GONE)
         not_scanned, failed, capped = await _note_counts(
             session, uid, folder=n.folder, path=n.path)
-        excluded = 0
-        if f.scope is not None:
-            from sqlalchemy import not_
+        from sqlalchemy import not_
 
+        excluded = 0
+        if f.location is not None:
+            # `excluded by scope` (#434 D4): *other* ∧ ¬L, the rule not
+            # consulted — under `all` this is #428's statement exactly.
             excluded = (await session.execute(
-                count_stmt(f.all(scope=False) + [not_(f.scope)])
+                count_stmt(f.all(scope=False) + [not_(f.location)])
             )).scalar_one()
+        rule = None
+        if f.rule_line:
+            by_rule = unsure = 0
+            if f.rule is not None:
+                by_rule = (await session.execute(
+                    count_stmt(f.other_and_location() + [not_(f.rule)])
+                )).scalar_one()
+            if f.unsure is not None:
+                unsure = (await session.execute(
+                    count_stmt(f.all() + [f.unsure])
+                )).scalar_one()
+            rule = rule_counts(settings, excluded=by_rule, unsure=unsure)
+        if f.pending_ignores_rule:
+            # Under `fields` the pending count ignores the rule (D2): it reads
+            # columns a pending row does not have yet.
+            pending_conds = f.other_and_location(text=False, recurring=False)
+        else:
+            pending_conds = f.all(text=False, recurring=False)
         ids_pending = (await session.execute(
-            count_stmt(f.all(text=False, recurring=False) + [NoteTask.task_key.is_(None)])
+            count_stmt(pending_conds + [NoteTask.task_key.is_(None)])
         )).scalar_one()
+        if rule is not None and f.pending_ignores_rule:
+            rule = dataclasses.replace(rule, pending=ids_pending)
         cut_tags = None
         if n.tags or n.exclude_tags:
             cut_tags = (await session.execute(
@@ -1064,6 +1163,8 @@ async def list_tasks_query(
         uses_new_arguments(args)
         or n.any_relative
         or (n.scope == "default" and bool(settings.excluded_folders or settings.excluded_note_tags))
+        # #434 D5: the rule line follows the query line, so it is shown too.
+        or rule is not None
     )
     return TaskPage(
         args=n, rows=fetched[: n.limit], more_rows=len(fetched) > n.limit,
@@ -1071,6 +1172,7 @@ async def list_tasks_query(
         cut_tags=cut_tags, cut_text=cut_text, exclusions=exclusions,
         query_line=query_line,
         cursor=CursorSpec(owner=owner, filters=filters, order_by=n.order_by),
+        rule=rule,
     )
 
 
@@ -1191,8 +1293,14 @@ async def task_agenda_query(
     if exclude:
         tag_conds.append(tags_none_clause(exclude))
     keep = scope_clause(settings) if scope == "default" else None
+    location = location_clause(settings) if scope == "default" else None
+    rule_keep = rule_clause(settings) if scope == "default" else None
+    unsure_cond = task_rule.unsure_clause(settings) if scope == "default" else None
+    show_rule = scope == "default" and task_rule.line_present(settings)
+    pending_ignores_rule = scope == "default" and task_rule.pending_approximate(settings)
     union = or_(*[_agenda_predicate(key, d, days) for key, *_ in AGENDA_SECTIONS])
     scoped = common + tag_conds + ([keep] if keep is not None else [])
+    located = common + tag_conds + ([location] if location is not None else [])
 
     def count_stmt(conds):
         return select(func.count()).select_from(NoteTask).join(NoteMetadata, join_on).where(*conds)
@@ -1202,13 +1310,28 @@ async def task_agenda_query(
         await _begin_snapshot(session)
         not_scanned, failed, capped = await _note_counts(session, uid, folder=folder, path=None)
         excluded = 0
-        if keep is not None:
+        if location is not None:
             excluded = (await session.execute(
-                count_stmt(common + tag_conds + [union, not_(keep)])
+                count_stmt(common + tag_conds + [union, not_(location)])
             )).scalar_one()
+        rule = None
+        if show_rule:
+            by_rule = unsure = 0
+            if rule_keep is not None:
+                by_rule = (await session.execute(
+                    count_stmt(located + [union, not_(rule_keep)])
+                )).scalar_one()
+            if unsure_cond is not None:
+                unsure = (await session.execute(
+                    count_stmt(scoped + [union, unsure_cond])
+                )).scalar_one()
+            rule = rule_counts(settings, excluded=by_rule, unsure=unsure)
         ids_pending = (await session.execute(
-            count_stmt(scoped + [union, NoteTask.task_key.is_(None)])
+            count_stmt((located if pending_ignores_rule else scoped)
+                       + [union, NoteTask.task_key.is_(None)])
         )).scalar_one()
+        if rule is not None and pending_ignores_rule:
+            rule = dataclasses.replace(rule, pending=ids_pending)
         cut_tags = None
         if tags or exclude:
             cut_tags = (await session.execute(
@@ -1238,5 +1361,5 @@ async def task_agenda_query(
         exclusions=Exclusions(scope=scope, folders=tuple(settings.excluded_folders),
                               note_tags=tuple(settings.excluded_note_tags), excluded=excluded),
         not_scanned=not_scanned, failed=failed, capped=capped, ids_pending=ids_pending,
-        cut_tags=cut_tags, sections=sections,
+        cut_tags=cut_tags, sections=sections, rule=rule,
     )

@@ -14,9 +14,12 @@ import _harness
 pytestmark = _harness.requires_pgvector
 
 DIM = 64
-# The current head (039 since #428). A downgrade 038 refuses rolls back the
-# whole run, 039's step included, so the version stays at head.
-HEAD_REVISION = "039"
+# The current head (040 since #434; 039 since #428). A downgrade 038 refuses
+# rolls back the whole run, the later steps included, so the version stays at
+# head. Bump this with every new migration: it is a literal on purpose (the
+# test must notice a head it was not written for), and the full integration
+# suite is what catches a stale value.
+HEAD_REVISION = "040"
 URL = "https://chatgpt.com/oauth/client.json"
 JWKS_URI = "https://chatgpt.com/oauth/jwks.json"
 SNAPSHOT = '{"keys": [{"kty": "RSA", "kid": "k1", "n": "AQAB", "e": "AQAB"}]}'

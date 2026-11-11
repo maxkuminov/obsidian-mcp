@@ -1739,6 +1739,59 @@ content-security-policy: default-src 'self'; script-src 'nonce-<NONCE>'; style-s
         <form method="POST" action="/admin/account/tasks">
             <input type="hidden" name="csrf_token" value="<CSRF>">
 
+            
+            <div class="field">
+                <label class="field-label" for="task-rule">Which checkboxes are tasks</label>
+                <div class="u-font-size-11px u-color-text-3 u-margin-bottom-14px">
+                    Agents list, check off and add tasks in your notes. A task is a
+                    Markdown checkbox (<code>- [ ] …</code>). If you also use checkboxes
+                    for checklists, steps or reference cards, choose which ones count as
+                    tasks. “Task details” are the optional emoji fields of the Obsidian
+                    Tasks plugin, which you can type without it: 📅 due, ⏳ scheduled,
+                    🛫 start, ➕ created, ✅ done, ❌ cancelled, 🔺⏫🔼🔽⏬ priority,
+                    🔁 repeat. The global filter is the Tasks plugin’s “Global task
+                    filter”: if you set one there, set the same text here. Agents can
+                    always ask for every checkbox.
+                </div>
+                <select name="task_rule" id="task-rule" class="field-select">
+                    <option value="default" selected>Server default (every checkbox is a task)</option>
+                    <option value="all">Every checkbox is a task</option>
+                    <option value="fields">Only checkboxes with task details or a task tag</option>
+                    <option value="filter">Only checkboxes that contain the global filter text</option>
+                </select>
+                <div class="u-font-size-11px u-color-text-3 u-margin-top-6px">
+                    In use now: every checkbox is a task
+                    (server default).
+                </div>
+                
+            </div>
+
+            <div class="field">
+                <label class="field-label" for="task-rule-tags">Task tags (used by “task details or a task tag”)</label>
+                <textarea name="task_tags" id="task-rule-tags" rows="3"
+                          class="field-input mono" spellcheck="false"
+                          placeholder="waiting-for"></textarea>
+                <div class="u-font-size-11px u-color-text-3 u-margin-top-6px">
+                    One tag per line, with or without <code>#</code>. A checkbox carrying one
+                    of these tags, or a nested tag below it (<code>waiting-for/bob</code> under
+                    <code>waiting-for</code>), counts as a task even without task details.
+                    Leave empty to count task details only. At most 32.
+                </div>
+            </div>
+
+            <div class="field">
+                <label class="field-label" for="task-global-filter">Global filter text (used by “global filter”)</label>
+                <input type="text" name="global_filter" id="task-global-filter" class="field-input mono"
+                       maxlength="64" autocomplete="off" spellcheck="false"
+                       value="" placeholder="#task">
+                <div class="u-font-size-11px u-color-text-3 u-margin-top-6px">
+                    A checkbox counts as a task when its text contains this exactly
+                    (capital letters matter). Tasks that agents add get it at the start.
+                    For example <code>#task</code> or <code>TODO</code>; at most
+                    64 characters on one line.
+                </div>
+            </div>
+
             <div class="field">
                 <label class="field-label" for="task-timezone">Timezone</label>
                 <input type="text" name="timezone" id="task-timezone" class="field-input mono"

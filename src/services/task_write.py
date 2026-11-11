@@ -52,6 +52,7 @@ from dataclasses import dataclass, field
 from src.config import TASK_SIMILAR_SCAN_MAX
 from src.services import refusals
 from src.services import task_line as tl_mod
+from src.services import task_rule
 from src.services.links import BODY, mask_code, unmatched_indented_openers
 from src.services.task_line import (
     CANCELLED,
@@ -206,6 +207,12 @@ class Plan:
     fields_changed: tuple[str, ...] = ()
     norm: str | None = None
     terms: tuple[str, ...] = ()
+    #: #434 D7: the global filter text `plan_add` prepended, or None.
+    filter_added: str | None = None
+    #: #434 D7: under a `filter` rule, every normalised description an
+    #: index-side exact duplicate may have (`duplicate_scan(extra_norms=…)`);
+    #: empty under any other rule.
+    dup_norms: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -636,10 +643,6 @@ def _context_line(view: _NoteView, i: int | None, task_line: str, text: str) -> 
     return task_line[:lead_end] + ("\t" if tabbed else "    ") + "- " + text
 
 
-_CONTEXT_STRUCTURE_RE = re.compile(r"[ \t]*(?:[-*+](?:[ \t]|$)|[0-9]{1,9}[.)](?:[ \t]|$)|\[.\]|#{1,6}(?:[ \t]|$)|>)")
-_FENCE_RUN_RE = re.compile(r"`{3,}|~{3,}")
-
-
 def _structure_refusal(text: str, *, context: bool, what: str) -> TaskWriteRefusal | None:
     """Caller text that would smuggle structure into the note (S5 audit
     item 4), for a description (`add_task` / `update_task` ``text``) and a
@@ -648,33 +651,10 @@ def _structure_refusal(text: str, *, context: bool, what: str) -> TaskWriteRefus
     its closer on the same text (or a closer without an opener), a run of
     three or more backticks or tildes (a fence); and, for a context line,
     text that begins with a list marker, a checkbox, a heading marker or
-    ``>``. The one check every entry point uses."""
-    problem = None
-    if text.count("%%") % 2:
-        problem = "an unbalanced %% comment marker"
-    elif _FENCE_RUN_RE.search(text):
-        problem = "a run of three or more backticks or tildes"
-    else:
-        depth = 0
-        pos = 0
-        while True:
-            o, c = text.find("<!--", pos), text.find("-->", pos)
-            if o < 0 and c < 0:
-                break
-            if o >= 0 and (c < 0 or o < c):
-                if depth:
-                    problem = "a nested HTML comment opener"
-                    break
-                depth, pos = 1, o + 4
-            else:
-                if not depth:
-                    problem = "an HTML comment closer without its opener"
-                    break
-                depth, pos = 0, c + 3
-        if problem is None and depth:
-            problem = "an HTML comment opener without its closer"
-    if problem is None and context and _CONTEXT_STRUCTURE_RE.match(text):
-        problem = "text that begins with a list marker, checkbox, heading marker or '>'"
+    ``>``. The one check every entry point uses; its rules live in
+    `task_rule.structure_problem`, which the global filter validator (#434
+    D9) shares."""
+    problem = task_rule.structure_problem(text, context=context)
     if problem is None:
         return None
     return _refuse("invalid_argument", f"{what} contains {problem}; nothing was written")
@@ -1060,15 +1040,42 @@ def plan_add(note_text: str, args: AddArgs, settings, today: datetime.date) -> P
     if isinstance(line, TaskLineRefusal):
         return _from_line_refusal(line)
     new_tl = tl_mod.parse(line)
+    plain_tl = new_tl  # the caller's line, before any global filter is added
+    filter_added = None
+    if getattr(settings, "task_rule", "all") == task_rule.RULE_FILTER and settings.global_filter:
+        # #434 D7: under a `filter` rule a line whose body lacks the filter
+        # text gets it prepended, as the plugin's task modal does
+        # (`GlobalFilter.prependTo`), and the line is serialised again.
+        f_text = settings.global_filter
+        if f_text not in new_tl.full_text:
+            got = _prepend_filter(f_text, desc if isinstance(desc, str) else args.text)
+            if isinstance(got, TaskWriteRefusal):
+                return got
+            line = tl_mod.serialize_new_task(
+                got, marker=marker, tags=tuple(args.tags), priority=args.priority,
+                recurrence=args.recurrence, created=created, start=args.start,
+                scheduled=args.scheduled, due=args.due,
+            )
+            if isinstance(line, TaskLineRefusal):
+                return _from_line_refusal(line)
+            new_tl = tl_mod.parse(line)
+            filter_added = f_text
     norm = tl_mod.normalise_description(new_tl.full_text)
 
+    # #434 D7: under a `filter` rule the same task may already be written with
+    # the filter text in front or as its trailing token; both are candidate
+    # keys everywhere (`index_norms`, also handed to `duplicate_scan`), and the
+    # target note's own bytes (rule-independent) also match the caller's bare
+    # description. Under any other rule: `norm` alone.
+    index_norms, note_norms = _duplicate_candidates(norm, plain_tl, settings)
+    dup_norms = note_norms
     if not args.allow_duplicate:
         dups = []
         for t in tasks:
             if t.state != STATE_OPEN:
                 continue
             p = view.parse(t.line - 1)
-            if p is not None and tl_mod.normalise_description(p.full_text) == norm:
+            if p is not None and tl_mod.normalise_description(p.full_text) in dup_norms:
                 dups.append(TaskRef(line=t.line, id=_render(t), text=t.text))
         if dups:
             return _refuse(
@@ -1089,8 +1096,102 @@ def plan_add(note_text: str, args: AddArgs, settings, today: datetime.date) -> P
     return _finish(
         note_text, [span],
         target_line=None, intent=None, inserted=tuple(inserted),
-        norm=norm, terms=similarity_terms(norm),
+        norm=norm, terms=_similarity_terms_for(norm, settings), filter_added=filter_added,
+        dup_norms=index_norms if _filter_text(settings) else (),
     )
+
+
+def _prepend_filter(filter_text: str, desc: str) -> str | TaskWriteRefusal:
+    """#434 D7: `filter_text + " " + desc`, checked as the final description
+    is: the 1,000-character bound (naming the global filter), then the one
+    structure check every entry point uses, run again on the combined text —
+    so a filter text that reached the settings row some other way still
+    cannot open a comment or a fence in the note — then the description
+    rules. Before any dry-run answer and before anything is published."""
+    # Layer (b) does not trust the settings: the filter text it is about to
+    # prepend must pass the one validator the settings use (every rule), or
+    # nothing is planned.
+    checked, error = task_rule.normalise_filter(filter_text)
+    if error is not None or checked != filter_text:
+        why = error.rstrip(".") if error else "it has surrounding whitespace"
+        return _refuse("invalid_argument",
+                       f"the global filter text cannot be added ({why}); nothing was written")
+    combined = f"{filter_text} {desc}"
+    if len(combined) > tl_mod.DESCRIPTION_MAX_CHARS:
+        return _refuse(
+            "invalid_argument",
+            f"text plus the global filter text ({len(combined)} characters) exceeds "
+            f"{tl_mod.DESCRIPTION_MAX_CHARS:,} characters",
+        )
+    bad = _structure_refusal(combined, context=False, what="text plus the global filter text")
+    if bad is not None:
+        return bad
+    got = tl_mod.validate_description(combined)
+    if isinstance(got, TaskLineRefusal):
+        return _refuse("invalid_argument", "text plus the global filter text: " + got.reason)
+    return got
+
+
+def _filter_text(settings) -> str | None:
+    if getattr(settings, "task_rule", "all") != task_rule.RULE_FILTER:
+        return None
+    return getattr(settings, "global_filter", None) or None
+
+
+def _duplicate_candidates(norm: str, plain_tl, settings) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """#434 D7: `(index candidates, target-note candidates)`.
+
+    Under a `filter` rule an existing open line is an exact duplicate when its
+    normalised description equals (1) the final line's (`norm`, the filter
+    prepended) or (2) the caller's description with the filter as its
+    trailing token instead of in front. Each is computed with
+    `normalise_description` over a constructed text, as the extractor
+    computes a stored line's — never by editing a key. The target note's own
+    bytes (a rule-independent check) also match (3) the caller's bare
+    description. Under any other rule both are `(norm,)`. A filter in the
+    middle of an existing description is not matched (L13)."""
+    f_text = _filter_text(settings)
+    if f_text is None:
+        return (norm,), (norm,)
+    desc = tl_mod.plugin_description(plain_tl.full_text)
+    if desc.startswith(f_text + " "):
+        desc = desc[len(f_text) + 1:]
+    trailing = tl_mod.normalise_description(f"{desc} {f_text}")
+    bare = tl_mod.normalise_description(desc)
+    index = tuple(dict.fromkeys((norm, trailing)))
+    return index, tuple(dict.fromkeys((norm, trailing, bare)))
+
+
+def _filter_terms(settings) -> frozenset[str]:
+    f_text = _filter_text(settings)
+    if f_text is None:
+        return frozenset()
+    return term_set(" ".join(unicodedata.normalize("NFC", f_text).casefold().split()))
+
+
+def _similar_term_set(norm: str, settings) -> frozenset[str]:
+    """The similarity terms of `norm`; under a `filter` rule the filter text
+    is not a term (on either side of the comparison, #434 D7)."""
+    return term_set(norm) - _filter_terms(settings)
+
+
+def _similarity_terms_for(norm: str, settings) -> tuple[str, ...]:
+    drop = _filter_terms(settings)
+    return tuple(t for t in similarity_terms(norm) if t not in drop)
+
+
+def extracted_task_at(text: str, line: int):
+    """The `ExtractedTask` at 1-based `line` of `text` (a planned new text),
+    or None — from the same memoised extraction the planner and `verify`
+    used, so the write tools' rule statement (#434 D7) judges exactly the
+    bytes the plan writes."""
+    got = _extract(text)
+    if isinstance(got, TaskWriteRefusal):
+        return None
+    for t in got[0]:
+        if t.line == line:
+            return t
+    return None
 
 
 def _expect_new(args: AddArgs, created, line: str) -> dict[str, str | None]:
@@ -1640,7 +1741,8 @@ def _heading_lines(v: _NoteView) -> list[tuple[int, int, str]]:
 # ── duplicate scan (D9) ──────────────────────────────────────────────────────
 
 
-async def duplicate_scan(session, uid, settings, norm: str, terms: Sequence[str], *, exclude_path: str | None = None):
+async def duplicate_scan(session, uid, settings, norm: str, terms: Sequence[str], *,
+                         exclude_path: str | None = None, extra_norms: Sequence[str] = ()):
     """D9: ``(exact, similar, stopped)`` among the caller's OPEN tasks in the
     default scope, owner-scoped (the total `NoteMetadata` owner mapping).
 
@@ -1663,6 +1765,10 @@ async def duplicate_scan(session, uid, settings, norm: str, terms: Sequence[str]
     from src.models.db import NoteMetadata, NoteTask
 
     key = tl_mod.description_key(norm)
+    # #434 D7: under a `filter` rule `plan_add` hands every candidate form an
+    # exact duplicate may take (`Plan.dup_norms`); otherwise `norm` alone.
+    keys = list(dict.fromkeys(
+        [key] + [tl_mod.description_key(n) for n in extra_norms]))
     # The one owner mapping (`tools._note_owner_predicate`, the predicate
     # `list_tasks` joins under), imported at call time like `task_query` does.
     from src.mcp_server import tools as _tools
@@ -1681,7 +1787,9 @@ async def duplicate_scan(session, uid, settings, norm: str, terms: Sequence[str]
 
     exact_stmt = (
         select(*cols).select_from(NoteTask).join(NoteMetadata, join_on)
-        .where(NoteTask.state == STATE_OPEN, NoteTask.description_key == key, scope)
+        .where(NoteTask.state == STATE_OPEN,
+               NoteTask.description_key == key if len(keys) == 1
+               else NoteTask.description_key.in_(keys), scope)
     )
     if exclude_path is not None:
         exact_stmt = exact_stmt.where(NoteMetadata.file_path != exclude_path)
@@ -1692,7 +1800,7 @@ async def duplicate_scan(session, uid, settings, norm: str, terms: Sequence[str]
     stopped = False
     terms = [t for t in terms if t]
     if terms:
-        mine = term_set(norm)
+        mine = _similar_term_set(norm, settings)
         cand_stmt = (
             select(*cols).select_from(NoteTask).join(NoteMetadata, join_on)
             .where(NoteTask.state == STATE_OPEN, scope,
@@ -1706,9 +1814,9 @@ async def duplicate_scan(session, uid, settings, norm: str, terms: Sequence[str]
             rows = rows[:TASK_SIMILAR_SCAN_MAX]
         scored = []
         for r in rows:
-            if r.description_key == key:
+            if r.description_key in keys:
                 continue
-            theirs = term_set(tl_mod.normalise_description(r.text))
+            theirs = _similar_term_set(tl_mod.normalise_description(r.text), settings)
             contained = contains(mine, theirs)
             score = jaccard(mine, theirs)
             if contained or score >= SIMILAR_MIN_SCORE:
@@ -1728,6 +1836,6 @@ def _ref(row, score: float | None = None) -> TaskRef:
 __all__ = [
     "AddArgs", "CompleteArgs", "Expect", "Inserted", "Intent", "NewLine", "Plan",
     "Span", "TaskRef", "TaskWriteRefusal", "UpdateArgs", "continuation_block",
-    "contains", "duplicate_scan", "jaccard", "plan_add", "plan_complete", "plan_update",
+    "contains", "duplicate_scan", "extracted_task_at", "jaccard", "plan_add", "plan_complete", "plan_update",
     "resolve", "similarity_terms", "term_set", "verify",
 ]

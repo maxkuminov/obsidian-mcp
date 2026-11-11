@@ -1568,7 +1568,8 @@ plugin's format. The modules: `src/services/task_line.py` (the line anatomy
 and the minimal editor, pure), `task_recurrence.py` (the closed grammar,
 pure), `task_dates.py` (relative dates, pure), `task_write.py` (planning,
 verification, the duplicate scan), `task_query.py` (listing and agenda SQL),
-`task_settings.py`, and `task_index.py` (the write-time refresh, described in
+`task_settings.py`, `task_rule.py` (which checkboxes are tasks, #434; see
+"The task rule (#434)" below), and `task_index.py` (the write-time refresh, described in
 [indexing and embeddings](indexing-and-embeddings.md#the-write-time-task-refresh-428));
 `src/mcp_server/task_render.py` renders. The full record is the `task-tools`
 change under `openspec/`. What follows must not be silently reversed.
@@ -1839,7 +1840,9 @@ whatever the scope) or **in the index under the caller's default scope** is
 `duplicate_task`, naming up to 5 matches, unless `allow_duplicate=true`. The
 index side reflects the caller's own earlier task writes through the refresh;
 a duplicate written by a generic tool since the last pass can be missed
-(L14).
+(L14). Since #434 the index side and the similar-task scan see only tasks by
+the caller's task rule (they go through `scope_clause`); the target-note side
+does not (see "The task rule (#434)").
 
 Similar tasks never block. The up to 8 longest terms of 2 or more code points
 (not all digits) select candidates by `strpos` on `text_fold` in the default
@@ -1934,7 +1937,9 @@ optional: `due_from`, `scheduled_from`, `done_from`, `done_by`, `undated`,
   same segment rule; `all` drops nothing. It applies to `path` and `folder`
   too. The query line always states the scope and `excluded by scope: N
   tasks`, so exclusion is never silent; with no settings saved, nothing
-  changes.
+  changes. Since #434 `default` also applies the caller's task rule, and
+  `all` lifts it too; `excluded by scope` still counts only the folder and
+  note-tag exclusions (see "The task rule (#434)").
 - **Rows.** `full` inserts ` — id <id>` after `path:line` (` — id pending` for
   a row whose `task_key` is still NULL). `brief` is one row of at most 260
   characters plus the escaped path, which is never cut because the write tools
@@ -1999,7 +2004,251 @@ capped section ends with the exact `list_tasks` arguments that continue it
 and a cursor minted **only from a row actually shown**; a section that showed
 no row gives the arguments without a cursor, which continue from its first row
 (Codex spec review r1 #5). Below a 2,800-character response cap it refuses
-`response_cap_too_small`. Class `scan`, annotations `_READ_ONLY`.
+`response_cap_too_small` (3,121 while it carries the #434 rule line).
+Class `scan`, annotations `_READ_ONLY`.
+
+### The task rule (#434)
+
+**A checkbox is not a task, and the server must not pretend it is.** #428
+treated every markdown checkbox as a task. Checkboxes are also checklists,
+runbooks, verification steps, acceptance criteria, packing lists, meeting
+agendas and the step lists inside work tickets, and a vault that AI agents
+write into collects them fast: agents produce checkbox lists freely (plans,
+procedures, "done when" criteria, status notes), and none of those is a
+commitment anyone must act on. Listing every unchecked box as an open task
+breaks the three things an agent uses the task tools for: "what is on my
+plate" answers are dominated by non-tasks, a `text` search matches procedure
+steps, and `add_task`'s duplicate refusal and similar-task list fire on
+checklist lines. The evidence that drove the change, from one real vault:
+1,868 open checkboxes, 314 tasks, 1,554 (83%) not tasks; in that vault's
+dedicated task lists every open checkbox carried a date, a priority, a
+recurrence rule or a workflow tag. The two populations shared folders and
+notes, so #428's default scope (excluded folders and note tags) could not
+separate them. The Tasks plugin's answer is its global filter, which #428
+deliberately left unmodelled (#428 L12). **#434 reverses L12 for the global
+filter**: it is rule `filter`. "Remove scheduled date on recurrence" stays
+unmodelled.
+
+**Three rules, per owner scope.** The effective rule is one of:
+
+- **`all`** — every checkbox is a task. **The default, and it must stay the
+  default**: plain checkboxes keep working for a vault whose checkboxes are
+  its tasks, it is what the plugin does with no global filter, and an
+  existing deployment sees no change until someone opts in (owner decision
+  Q5).
+- **`fields`** — the row has a non-NULL `due`, `scheduled`, `start`,
+  `done_on`, `priority`, `recurrence`, `created` or `cancelled`, or matches
+  one of the scope's task tags. Task tags match exactly as
+  `list_tasks(tags=…)` does: by `/` segment and case-insensitively, through
+  `tag_prefixes` (`tags_any` is `NOT tags_none_clause`, the existing NULL-safe
+  clause), so `waiting-for` matches `#Waiting-For/bob` and never
+  `#waiting-forever`. Zero task tags is valid and means "fields only".
+- **`filter`** — `strpos(text, F) > 0`: a case-sensitive substring of the
+  stored `text` (the line after the checkbox, right-stripped, cut at 1,000
+  characters), the plugin's own `description.includes(globalFilter)`. No
+  folding: `#Task` does not satisfy `#task`; `#tasks` does, and so does a
+  filter inside inline code or inside a field value, because the plugin
+  tests the whole body too.
+
+**Query time, one place, never stored in the index.** The rule is a
+predicate over indexed columns evaluated per call, so changing it needs no
+re-index. `task_rule.rule_clause(eff)` is the rule as SQL (`None` under
+`all`); `task_query.scope_clause` keeps its name and meaning ("the default
+scope's keep predicate") and is now `location_clause ∧ rule_clause`. Its
+callers — the `list_tasks` page and counts, the `task_agenda` totals and
+rows, and `task_write.duplicate_scan` (exact and similar) — get the rule
+with no code of their own. A test pins that `duplicate_scan` and
+`_Filters.scope` call `scope_clause` and that nothing else imports
+`rule_clause`. Do not add a second evaluation of the rule anywhere: the
+listing, its counts, the agenda and the duplicate scan must never disagree
+about what is a task. `scope="all"` lifts the rule together with the
+location exclusions. The rule is a further `AND` inside the same statements,
+so the owner predicate and tenancy are untouched. `task_rule.extracted_is_task`
+is the Python twin over an `ExtractedTask`, used only for the write tools'
+statement; an integration test asserts the two agree on every version-5 row.
+
+**Uncertain rows are kept and counted, not excluded** (D3, owner decision
+Q2). Under `filter`, a row with `text_cut` whose stored 1,000 characters lack
+F may carry F after the cut. Under `fields` with task tags, a row with
+`tags_cut` (a 65th tag, or one over 128 characters, was dropped) and no field
+and no task-tag match may carry a task tag that was dropped. Both are listed
+and counted as `kept though unsure`. Excluding them would hide a real task
+behind a count; keeping a rare non-task is visible and harmless. Fail
+visible.
+
+**Rows awaiting the version-5 backfill** (NULL `task_key`). `filter` reads
+only version-4 columns and is exact. `fields` is exact for the dates,
+priority and tags, and judges the NULL `recurrence` / `created` /
+`cancelled` by the presence of `🔁`, `➕` or `❌` in the stored text,
+which is approximate; under `fields` the `task ids pending` count ignores the
+rule (it stays the conservative "might match" count), and while it is
+non-zero the rule line says `rule approximate for <P> tasks until the next
+index pass`.
+
+**Counts and the rule line.** With *other* = every filter of the call except
+the default scope, L the location predicate and R the rule: `excluded by
+scope` = other ∧ ¬L (the rule is not consulted, so this count is unchanged
+from #428); `excluded by rule` = other ∧ L ∧ ¬R; `kept though unsure` = other
+∧ L ∧ R ∧ unsure. The rows of `scope="all"` are exactly the default rows plus
+the two excluded sets, all disjoint; an integration test pins the identity
+for each rule with folder and note-tag exclusions configured. A default-scope
+response carries the rule line (after the query line in `list_tasks`, which
+is then always present; after the header in `task_agenda`) **iff** the rule
+is `fields` or `filter`, or a configured rule could not be applied:
+
+```
+Rule — task rule: fields — task tags: <n>[ [<name>, … +K more]] — excluded by rule: <N> tasks — kept though unsure (tags cut): <U> tasks[ — rule approximate for <P> tasks until the next index pass] — pass scope="all" to list every checkbox
+Rule — task rule: filter <json F> — excluded by rule: <N> tasks — kept though unsure (text cut): <U> tasks — pass scope="all" to list every checkbox
+Rule — task rule: all (the configured rule cannot be applied: <reason>) — pass scope="all" to list every checkbox
+```
+
+Every count is stated even at 0. F is one JSON string literal
+(`task_rule.quote`, which also escapes U+0085, U+2028 and U+2029), so it
+cannot forge a token or a row. `RULE_LINE_MAX` is 320; every part except the
+task-tag names is mandatory and never cut (measured worst cases 235 for
+`fields`, names filling the rest, and 284 for `filter`). The response-cap
+guarantees rise by at most 321: a `list_tasks` row always renders and nothing
+is refused from 1,921 characters (`LIST_WITH_RULE_MIN_BUDGET`; measured
+1,878), 40 + 40 characters of path and text with the incomplete notice from
+1,962 (`LIST_WITH_RULE_FULL_BUDGET`; measured 1,955), and `task_agenda` is
+refused below 3,121 (`AGENDA_WITH_RULE_MIN_BUDGET`). Pinned by
+`test_rule_line_min_budget` / `test_rule_line_full_budget`. Rule tokens on
+the query line were rejected: it was measured at 591 of 600 characters, and
+raising its bound would change every query-line response, ruled or not.
+
+**Byte-identical under `all`.** Under a chosen or inherited `all`, and under
+`scope="all"` with any rule, no predicate is built, no line is added, and the
+cursor digest (`filters_digest`) carries no `"rule"` key, so every response
+and every outstanding cursor is byte-identical to v1.3.0. This is the 1.0
+tool-contract promise (only response text and descriptions are added to; no
+argument, schema, annotation or refusal code changed), pinned by the existing
+golden and render tests, an integration test running a fixed call set under
+an absent row and under `task_rule='all'` with tags and filter filled in, and
+a pre-change cursor accepted after it. Under `fields` the digest carries
+`{"kind":"fields","tags":[…]}`, under `filter` `{"kind":"filter","filter":F}`,
+so a cursor is refused after a change of kind, of task tags under `fields` or
+of the filter text under `filter`, and survives a change of the unused value.
+
+**A rule the server cannot apply is `all`, and says so** (D8). The CHECKs and
+the validators make it unreachable through this server, but if
+`task_settings._merge` meets an unknown kind, `filter` with NULL or blank
+text, or a stored filter text the validator refuses, it does not build a
+predicate from it: the effective rule becomes `all` with a reason (`unknown
+rule`, `filter rule without filter text`, `filter text not allowed`), one
+WARNING per call names the owner id (never the text), and the rule line
+reads as above. A NULL in a substring predicate would otherwise drop rows
+uncounted. The write tools and the cursor digest treat it as `all`.
+
+**Storage and inheritance.** `task_settings.task_rule` (NULL: the server's
+rule), `task_tags` (`NOT NULL DEFAULT '{}'`, ≤ 32, lower-case, no `#`) and
+`global_filter` (NULL: none); migration 040 (see
+[schema and migrations](schema-and-migrations.md)). **The rule is inherited
+as one unit**: a NULL `task_rule` takes `TASKS_RULE`, `TASKS_RULE_TAGS` and
+`TASKS_GLOBAL_FILTER` together, a set one takes the row's kind, tags and
+filter (owner decision Q4). Per-field inheritance was rejected: a list column
+would need a fourth state, and a user choosing `filter` could silently
+inherit a filter text the card never shows. `effective()` is one indexed
+read per call with no cache, so a saved change applies on the next call.
+
+**The filter text is validated because `add_task` writes it into notes.**
+One function, `task_rule.normalise_filter`, checks `TASKS_GLOBAL_FILTER` at
+startup and the card at save: spaces and tabs stripped at both ends; 1–64
+characters; not whitespace only; one line (no control character, line break,
+U+0085, U+2028 or U+2029); no backtick (it would open inline code and change
+how the added line is masked); no Tasks field signifier and no U+FE0F (it
+would add a field to every line it is prepended to); no `%%`, `<!--` or
+`-->` at all, balanced or not (a filter is a marker, never a comment); and
+the caller-text structure rules of `task_rule.structure_problem` with
+`context=True`, which `task_write._structure_refusal` shares, so F may not
+begin with a list marker, a checkbox (`[` + one character + `]`), a heading
+marker or `>`, nor hold a run of three backticks or tildes. `#task`, `TODO`
+and `[task]` pass. Allowing any string, as the plugin does, was rejected:
+the plugin never prepends to a line that its own reader re-reads with
+masking. Task tags pass the card's tag grammar.
+
+**`add_task` prepends the filter, and checks the result again** (D7, owner
+decision Q3). Under `filter`, when the serialised line's body does not
+contain F (case-sensitively), the description becomes `F + " " + text` and
+the line is serialised again: the plugin's own `GlobalFilter.prependTo`.
+Prepending, not appending before the field run, because it is what the plugin
+does, it cannot touch the trailing field run (a non-tag filter such as
+`TODO` or `[task]` needs no special case), and it keeps F inside the first
+1,000 characters of a line the server prepended it to. (One server-written
+line can still be an unsure row: a description near 1,000 characters whose
+caller supplied F as one of the call's tags — nothing is prepended, the tag
+sits past the stored cut, and the row is kept and counted as unsure.) A
+combination over 1,000 characters is refused `invalid_argument` naming the
+global filter. **The structure check runs again on the combined
+description** before any dry-run answer and before publication, so a filter
+text that reached the row some other way (a manual edit, a future writer)
+still cannot open a comment or a fence that hides the rest of the note.
+Before prepending, the planner also runs the settings' own filter validator
+on F — every rule, not only the structure rules — and refuses with nothing
+written if it fails, so the guarantee does not rest on the settings layer.
+Verification uses the final line; the response and dry run say
+`global filter added: <json F>`.
+
+**Under `filter`, a duplicate is matched in either placement of F** (found
+by the independent verification of #434). Tags usually sit at the END of a
+line, while the server prepends F, so comparing only the final line's
+description key would let `add_task(text="Renew passport")` add a second
+copy next to an existing `Renew passport #task`. The exact-duplicate check
+therefore compares a small set of candidate keys, each built with the same
+`normalise_description` / `description_key` the extractor uses: the final
+description (F in front), the caller's description with F as a trailing
+token, and — for the check against the target note's own bytes only, which
+is rule-independent — the caller's bare description. F is not a similar-task
+term on either side. A filter in the middle of an existing description is
+not matched (accepted limitation).
+
+**The rule never blocks a write, and every write states a non-task.**
+Resolution reads the note's bytes and never consults `note_tasks` scope, so
+an id from a `scope="all"` listing works under any rule. `add_task` under
+`fields` writes a line with no field or task tag as asked; when
+`extracted_is_task` over the written line's own extraction says it is not a
+task, `add_task` and `update_task` (result and dry run) carry
+`note: not a task under your task rule "<kind>" (…), so default listings
+will not show it; list_tasks(scope="all") will.` `update_task` never re-adds
+F (L8). `complete_task` is unchanged. The statement never changes the
+outcome classification or the usage row.
+
+**The duplicate check is split on purpose** (owner decision Q1). The index
+side and the similar list follow the rule, so a checklist line elsewhere no
+longer refuses or crowds a new task. The target note's own byte check stays
+rule-independent, as it is scope-independent: the same words in the same note
+are almost always the same intent (`update_task` can date that line;
+`allow_duplicate=true` overrides).
+
+**Accepted limitations** (the `task-rule` change's L1–L11):
+
+- **L1** The rule reads indexed columns only: an invalid date (stored NULL)
+  and the unindexed `🆔`, `⛔` and `🏁` do not make a line a task under
+  `fields`.
+- **L2** Dates and priority are read anywhere on the line (#428 L2), so a
+  checklist line quoting `📅 2026-01-01` counts under `fields`.
+- **L3** `filter` is a case-sensitive substring test of the whole body, as
+  the plugin's is; it also counts text inside a field value or inline code,
+  and `#task` matches `#tasks`.
+- **L4** Rows whose verdict depended on cut text or cut tags are listed and
+  counted; they may be non-tasks.
+- **L5** During a version-5 backfill, `fields` approximates recurrence,
+  created and cancelled by signifier presence; the rule line says so.
+- **L6** Rolling back to v1.3.0 needs `alembic downgrade 039` first, which
+  drops every saved rule; the old image then lists every checkbox without a
+  statement.
+- **L7** The note line is decided from the written bytes; the listing
+  reflects them after the write-time refresh, or the next pass if it lagged.
+- **L8** `update_task` never re-adds the global filter; a description
+  replacement that drops a non-tag filter makes the line a non-task, and the
+  response says so.
+- **L9** The duplicate check against the target note's own bytes ignores the
+  rule.
+- **L10** The plugin removes a global-filter tag from a task's tags when it
+  reads the line ("remove global filter from description" is not applied
+  either); this server keeps it in `tags` and `tag_prefixes`, so with F =
+  `#task` `list_tasks(tags=["task"])` matches every filter-rule task.
+- **L11** A `scope="all"` response does not mention the caller's rule; its
+  query line says `scope: all`.
 
 ### Metadata and visibility
 

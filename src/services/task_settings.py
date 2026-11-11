@@ -22,16 +22,31 @@ scope's row.
 from __future__ import annotations
 
 import dataclasses
+import logging
 import re
 import zoneinfo
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 
 from src.config import is_portable_zone_name, settings
 from src.models.db import TaskSettings
+from src.services import task_rule
+
+logger = logging.getLogger(__name__)
+
+#: #434 D9: `save` serialises one owner scope's saves with the two-key
+#: `pg_advisory_xact_lock(TASK_SETTINGS_LOCK_NS, <user id, or 0>)`, taken
+#: before the row is read, so two concurrent first saves (no row yet, nothing
+#: for `FOR UPDATE` to lock) still see each other's result. A wire constant:
+#: an old and a new process must take the same lock.
+TASK_SETTINGS_LOCK_NS = 4_340_434
+#: The CHECK that makes a `filter` rule without its text unrepresentable
+#: (migration 040); a violation at flush is the same readable refusal.
+GLOBAL_FILTER_CHECK = "ck_task_settings_global_filter"
 
 #: Entries each exclusion list may hold (D14).
 TASK_SETTINGS_MAX_ENTRIES = 32
@@ -45,7 +60,7 @@ FOLDER_MAX_CHARS = 1024
 TAG_MAX_CHARS = 128
 #: The tag grammar after one leading `#` is stripped and the tag lower-cased:
 #: the inline-tag rule (`vault.INLINE_TAG_RE`), with no trailing `/` (D12).
-_TAG_RE = re.compile(r"[a-z][a-z0-9_/-]*")
+_TAG_RE = task_rule.TAG_RE
 #: Every C0/C1 control and the line/paragraph separators: never part of a
 #: folder name an operator meant to type.
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f  ]")
@@ -53,6 +68,9 @@ _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f  ]")
 _TRUE = frozenset({"on", "true", "1", "yes"})
 _FALSE = frozenset({"off", "false", "0", "no"})
 _DEFAULT = "default"
+
+#: #434: the three task-rule fields; each absent key leaves its stored value.
+RULE_FIELDS = ("task_rule", "task_tags", "global_filter")
 
 #: The four nullable write-behaviour fields, in the order the card shows them.
 BOOLEAN_FIELDS = (
@@ -82,6 +100,15 @@ class EffectiveTaskSettings:
     set_cancelled_date: bool
     set_created_date: bool
     next_recurrence_below: bool
+    # ── The task rule (#434, D8): one unit — the row's kind, task tags and
+    # filter text, or (row NULL / absent) the server's whole rule. An
+    # unevaluable configured rule is `all` here with the reason in
+    # `task_rule_unusable`, so no predicate is built from it. ──────────────
+    task_rule: str = "all"
+    task_tags: tuple[str, ...] = ()
+    global_filter: str | None = None
+    task_rule_inherited: bool = True
+    task_rule_unusable: str | None = None
 
     @property
     def tzinfo(self) -> zoneinfo.ZoneInfo:
@@ -116,6 +143,16 @@ def _merge(row: TaskSettings | None) -> EffectiveTaskSettings:
         value = getattr(row, field) if row is not None else None
         return bool(getattr(settings, f"tasks_{field}")) if value is None else bool(value)
 
+    stored_rule = getattr(row, "task_rule", None) if row is not None else None
+    if stored_rule is None:
+        inherited = True
+        kind, tags, filter_text = (
+            settings.tasks_rule, settings.tasks_rule_tags, settings.tasks_global_filter or None)
+    else:
+        inherited = False
+        kind, tags, filter_text = stored_rule, row.task_tags, row.global_filter
+    kind, tags, filter_text, unusable = task_rule.resolve(kind, tags, filter_text)
+
     return EffectiveTaskSettings(
         timezone=timezone,
         timezone_fallback=fallback,
@@ -126,6 +163,11 @@ def _merge(row: TaskSettings | None) -> EffectiveTaskSettings:
         set_cancelled_date=pick("set_cancelled_date"),
         set_created_date=pick("set_created_date"),
         next_recurrence_below=pick("next_recurrence_below"),
+        task_rule=kind,
+        task_tags=tags,
+        global_filter=filter_text,
+        task_rule_inherited=inherited,
+        task_rule_unusable=unusable,
     )
 
 
@@ -139,9 +181,17 @@ async def stored(session, uid: int | None) -> TaskSettings | None:
 async def effective(session, uid: int | None) -> EffectiveTaskSettings:
     """The caller's effective settings: its row merged over the defaults.
 
-    One indexed read (the unique key on `user_id`). Never refuses.
+    One indexed read (the unique key on `user_id`). Never refuses. A
+    configured task rule that cannot be evaluated is `all` with a reason
+    (#434 D8), logged once per call by owner id — never the text.
     """
-    return _merge(await stored(session, uid))
+    merged = _merge(await stored(session, uid))
+    if merged.task_rule_unusable:
+        logger.warning(
+            "task rule for owner scope %s cannot be applied (%s); treated as 'all'",
+            "single-user" if uid is None else uid, merged.task_rule_unusable,
+        )
+    return merged
 
 
 # --------------------------------------------------------------------------
@@ -284,9 +334,16 @@ class ValidatedForm:
     set_cancelled_date: bool | None
     set_created_date: bool | None
     next_recurrence_below: bool | None
+    #: #434: the task rule (`None` = server default), task tags and filter
+    #: text (`None` = none). Absent keys are in `rule_unchanged`.
+    task_rule: str | None = None
+    task_tags: list[str] = dataclasses.field(default_factory=list)
+    global_filter: str | None = None
     #: The boolean fields absent from the form: left as stored by `save`
     #: (their value above is None and is not written).
     unchanged: frozenset = frozenset()
+    #: #434: the rule fields absent from the form, likewise left as stored.
+    rule_unchanged: frozenset = frozenset()
 
 
 def validate(form: Mapping[str, Any]) -> tuple[ValidatedForm | None, list[str]]:
@@ -302,8 +359,29 @@ def validate(form: Mapping[str, Any]) -> tuple[ValidatedForm | None, list[str]]:
         form.get("excluded_note_tags"), normalise_tag, "excluded note tags"
     )
     errors += folder_errors + tag_errors
+    rule_values: dict[str, Any] = {}
+    if "task_rule" in form:
+        raw = form["task_rule"]
+        choice = ("" if raw is None else str(raw)).strip().lower()
+        if choice == _DEFAULT:
+            rule_values["task_rule"] = None
+        elif choice in task_rule.RULES:
+            rule_values["task_rule"] = choice
+        else:
+            errors.append("Unrecognised value for the task rule.")
+    if "task_tags" in form:
+        task_tags, tag_errors = task_rule.normalise_task_tags(_lines(form["task_tags"]))
+        errors += tag_errors
+        rule_values["task_tags"] = task_tags
+    if "global_filter" in form:
+        raw = form["global_filter"]
+        filter_text, error = task_rule.normalise_filter("" if raw is None else raw)
+        if error:
+            errors.append(error)
+        rule_values["global_filter"] = filter_text
     flags: dict[str, bool | None] = {}
     unchanged = frozenset(f for f in BOOLEAN_FIELDS if f not in form)
+    rule_unchanged = frozenset(f for f in RULE_FIELDS if f not in form)
     for field in BOOLEAN_FIELDS:
         if field in unchanged:
             flags[field] = None
@@ -319,7 +397,9 @@ def validate(form: Mapping[str, Any]) -> tuple[ValidatedForm | None, list[str]]:
         excluded_folders=folders,
         excluded_note_tags=tags,
         unchanged=unchanged,
+        rule_unchanged=rule_unchanged,
         **flags,
+        **rule_values,
     ), []
 
 
@@ -327,13 +407,22 @@ async def save(session, uid: int | None, form: Mapping[str, Any]) -> list[str]:
     """Validate `form` and upsert the scope's row; return the errors.
 
     `form` keys: `timezone` (blank = server default), `excluded_folders` and
-    `excluded_note_tags` (one per line, or a list), and the four checkbox
-    fields in `BOOLEAN_FIELDS` (`"on"` / `"off"` / `"default"` = NULL, the
-    environment default; an absent key leaves the stored value, or NULL for
-    a scope with no row). Any error refuses the whole save with
-    nothing written. Otherwise the scope's row is locked (`FOR UPDATE`) and
-    updated, or inserted (`ON CONFLICT` on the scope's unique key, so two
-    first saves cannot both insert). Does not commit.
+    `excluded_note_tags` (one per line, or a list), the four checkbox fields
+    in `BOOLEAN_FIELDS` (`"on"` / `"off"` / `"default"` = NULL, the
+    environment default), and the task rule (#434): `task_rule`
+    (`default` = NULL, `all`, `fields`, `filter`), `task_tags` (one per
+    line) and `global_filter` (blank = NULL). An absent boolean or rule key
+    leaves the stored value (NULL / empty for a scope with no row). Any error
+    refuses the whole save with nothing written.
+
+    Otherwise the scope's saves are serialised by a transaction advisory
+    lock taken **before** the row is read (#434 D9), the merged state
+    (submitted values over stored ones) is checked — a `filter` rule needs a
+    filter text — and the row is updated under `FOR UPDATE`, or inserted
+    (`ON CONFLICT` on the scope's unique key). The write runs in a savepoint:
+    a violation of `ck_task_settings_global_filter` at flush, the last line
+    of defence, is rolled back to it and returned as the same refusal.
+    Does not commit.
     """
     values, errors = validate(form)
     if errors:
@@ -347,25 +436,48 @@ async def save(session, uid: int | None, form: Mapping[str, Any]) -> list[str]:
         "set_cancelled_date": values.set_cancelled_date,
         "set_created_date": values.set_created_date,
         "next_recurrence_below": values.next_recurrence_below,
+        "task_rule": values.task_rule,
+        "task_tags": values.task_tags,
+        "global_filter": values.global_filter,
     }
-    for name in values.unchanged:
+    for name in values.unchanged | values.rule_unchanged:
         del fields[name]
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(:ns, :key)"),
+        {"ns": TASK_SETTINGS_LOCK_NS, "key": 0 if uid is None else uid},
+    )
     existing = (
         await session.execute(
             select(TaskSettings.id).where(_owner_predicate(uid)).with_for_update()
         )
     ).scalar_one_or_none()
+    row = None
     if existing is not None:
         row = await session.get(TaskSettings, existing, populate_existing=True)
-        for name, value in fields.items():
-            setattr(row, name, value)
-        row.updated_at = func.now()
-    else:
-        statement = pg_insert(TaskSettings).values(user_id=uid, **fields)
-        statement = statement.on_conflict_do_update(
-            constraint="uq_task_settings_user_id",
-            set_={**fields, "updated_at": func.now()},
-        )
-        await session.execute(statement)
-    await session.flush()
+    merged_rule = fields["task_rule"] if "task_rule" in fields else (
+        row.task_rule if row is not None else None)
+    merged_filter = fields["global_filter"] if "global_filter" in fields else (
+        row.global_filter if row is not None else None)
+    if merged_rule == task_rule.RULE_FILTER and not merged_filter:
+        return [task_rule.FILTER_NEEDS_TEXT]
+    try:
+        async with session.begin_nested():
+            if row is not None:
+                for name, value in fields.items():
+                    setattr(row, name, value)
+                row.updated_at = func.now()
+            else:
+                statement = pg_insert(TaskSettings).values(user_id=uid, **fields)
+                statement = statement.on_conflict_do_update(
+                    constraint="uq_task_settings_user_id",
+                    set_={**fields, "updated_at": func.now()},
+                )
+                await session.execute(statement)
+            await session.flush()
+    except IntegrityError as e:
+        if GLOBAL_FILTER_CHECK not in str(getattr(e, "orig", e)):
+            raise
+        if row is not None:
+            await session.refresh(row)
+        return [task_rule.FILTER_NEEDS_TEXT]
     return []

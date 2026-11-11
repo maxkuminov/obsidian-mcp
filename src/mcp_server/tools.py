@@ -90,6 +90,7 @@ from src.services import (
     task_line,
     task_query,
     task_recurrence,
+    task_rule,
     task_write,
 )
 from src.services import task_settings as task_settings_service
@@ -9269,6 +9270,21 @@ def _target_lines(plan) -> list[str]:
     return out
 
 
+def _task_rule_note(plan, line: int, effective) -> str | None:
+    """#434 D7: the statement that the line a task write wrote (or would
+    write, in a dry run) is not a task under the caller's effective rule, so
+    default listings will not show it. Decided by `task_rule.extracted_is_task`
+    over the written bytes' own extraction (`tasks.tasks_from_note_text`,
+    via the planner's memo). None under `all`, for a task, or when the line
+    no longer parses as a task. Never changes the write or its outcome."""
+    if not task_rule.in_force(effective):
+        return None
+    task = task_write.extracted_task_at(plan.new_text, line)
+    if task is None or task_rule.extracted_is_task(task, effective):
+        return None
+    return task_rule.not_task_note(effective)
+
+
 def _context_lines(plan) -> list[str]:
     return [f"context line {nl.line}: {_one_line(nl.text)}"
             for nl in plan.new_lines if nl.kind == "context"]
@@ -9427,8 +9443,12 @@ async def update_task_impl(
 
     def describe(plan, rel, _extra):
         changed = ", ".join(plan.fields_changed) or "none"
+        target = _target_lines(plan)
+        nl = _plan_line(plan, "target")
+        if nl is not None and (note := _task_rule_note(plan, nl.line, effective)):
+            target.insert(1, note)
         lines = [f"Updated task in `{_escape_task_path(rel)}` — fields changed: {changed}",
-                 *_target_lines(plan), *_context_lines(plan)]
+                 *target, *_context_lines(plan)]
         if (dl := dates.line()) is not None:
             lines.append(dl)
         return lines
@@ -9498,8 +9518,12 @@ async def add_task_impl(
         """D9 (b): the index side, owner- and default-scope-scoped; the target
         note itself was checked against its current bytes by the planner."""
         async with async_session() as session:
+            # `extra_norms` (#434 D7) only under a `filter` rule, so every other
+            # call is the #428 call exactly.
+            extra = {"extra_norms": plan.dup_norms} if plan.dup_norms else {}
             exact, similar, stopped = await task_write.duplicate_scan(
-                session, uid, effective, plan.norm or "", plan.terms, exclude_path=rel)
+                session, uid, effective, plan.norm or "", plan.terms, exclude_path=rel,
+                **extra)
         if exact and not allow_duplicate:
             return _task_refusal(
                 f"{tool}: `{_escape_task_path(rel)}`: an open task with the same description already "
@@ -9515,6 +9539,10 @@ async def add_task_impl(
         nl = _plan_line(plan, "task")
         if nl is not None:
             lines.append(f"line {nl.line}: {_one_line(nl.text)}")
+            if plan.filter_added:
+                lines.append(f"global filter added: {task_rule.quote(plan.filter_added)}")
+            if note := _task_rule_note(plan, nl.line, effective):
+                lines.append(note)
         lines.append(f"id: {plan.new_ids.get('task') or 'none'}")
         lines.extend(_context_lines(plan))
         if similar:

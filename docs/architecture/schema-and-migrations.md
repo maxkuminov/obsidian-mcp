@@ -1350,6 +1350,70 @@ Every existing `none` / `client_secret_post` enforcement case is kept.
   build does not read them. A column read by a surviving unmarked CHECK or
   index is kept; but PostgreSQL drops a foreign, unmarked index on a dropped
   039 column along with it (L20).
-- **The gate.** `HEAD_REVISION` in `tests/integration/test_schema_check.py` is
-  `"039"`; its 039 cases cover a fresh upgrade, the stamp-back to 038 and
-  re-upgrade, and an impostor of each unit.
+- **The gate.** `tests/integration/test_schema_check.py`'s 039 cases cover a
+  fresh upgrade, the stamp-back to 038 and re-upgrade, and an impostor of
+  each unit. (`HEAD_REVISION` is `"040"` since #434.)
+- **Since 040, 039 carries an allow-list too** (see "040" below), for
+  `task_settings`.
+
+## 040: the task rule on `task_settings` (#434)
+
+040 adds exactly three columns and two CHECKs to `task_settings` and writes
+no row. Why the rule exists is in [vault tools](vault-tools.md), "The task
+rule (#434)".
+
+- **Columns**: `task_rule varchar(8)` (nullable; NULL means "the server's
+  rule", `TASKS_RULE` / `TASKS_RULE_TAGS` / `TASKS_GLOBAL_FILTER` as one
+  unit), `task_tags varchar(128)[] NOT NULL DEFAULT '{}'` (≤ 32, enforced by
+  the service, mirroring `excluded_note_tags`) and `global_filter
+  varchar(64)` (nullable; NULL rather than empty means none).
+- **CHECKs**, which make an unevaluable stored rule unrepresentable:
+  `ck_task_settings_task_rule` (`task_rule IN ('all','fields','filter')`,
+  NULL passes) and `ck_task_settings_global_filter` (`(global_filter IS NULL
+  OR btrim(global_filter) <> '') AND (task_rule IS DISTINCT FROM 'filter' OR
+  global_filter IS NOT NULL)`). The service also takes a per-scope advisory
+  lock before reading the row and treats a violation of the second at flush
+  as its readable refusal; the query side still treats any rule it cannot
+  evaluate as `all` and says so, so a manual edit cannot drop rows uncounted.
+- **No data written.** No row is updated; `ADD COLUMN … DEFAULT '{}'` is
+  metadata-only on PostgreSQL 16, and both CHECKs admit every existing row
+  (NULL, `'{}'`, NULL). `search_path` pinned, `lock_timeout` /
+  `statement_timeout` set and `RESET`, no superuser, no extension
+  (`test_nonsuperuser_migrations_pg.py` covers 040).
+- **Reconcile or refuse**, 039's shape. Every unit carries an exact
+  `… (040_task_rule)` comment marker (`task rule kind`, `task rule task
+  tags`, `task rule global filter text`, `task rule kinds`, `a filter rule
+  has its filter text`), mirrored byte-identically in `src/models/db.py`
+  (both CHECKs in `TaskSettings.__table_args__`) so `alembic check` stays
+  clean. A column is verified by type, nullability, default and marker; a
+  CHECK by its validated definition against a TEMP-table probe and its
+  marker; a same-named object of another shape, or without the marker, is
+  refused by name before anything is created. `downgrade()` drops only
+  marked units, the CHECKs first.
+- **039's allow-list, the second after 032's.** 039 compares `task_settings`
+  completely against a TEMP twin of its own DDL, so a stamp-back to 038 that
+  re-runs 039 over a 040 database would refuse the table as foreign. 039
+  therefore leaves out **exactly** 040's three columns and two CHECKs, each
+  only with its exact 040 marker (`LATER_SETTINGS_COLUMNS`,
+  `LATER_SETTINGS_CONSTRAINTS` in `039_task_tools.py`, byte-identical to
+  040's literals), exactly as 032 does for 039's `note_tasks` units. Any
+  other extra column or constraint, or one of these names with another
+  comment, is still compared and refused. 032's list is untouched (040 adds
+  nothing to `note_tasks`). **A future revision that adds a unit to
+  `task_settings` must extend 039's lists on purpose.**
+- **The previous image.** An already-running v1.3.0 process keeps working
+  against 040 (it never reads the new columns; its inserts leave them NULL,
+  `'{}'`, NULL, which the CHECKs admit). A restarted v1.3.0 image cannot
+  start: its migration step ends at 039 and 040 is an unknown revision.
+  Rollback is roll-forward, or `alembic downgrade 039` **with the 040-aware
+  image** first, which drops the columns and with them every saved task
+  rule, task tag and filter text (L6).
+- **The gate.** `HEAD_REVISION` is `"040"`. The 040 cases cover a fresh
+  upgrade, stamp-backs to 039 and to 038 over head (both reconcile, 039's
+  allow-list exercised), impostors (an unmarked `task_rule`, a
+  `task_tags varchar(64)[]`, an unmarked CHECK), both CHECKs refusing their
+  bad rows, and the upgrade → `downgrade 039` → upgrade round trip, which
+  asserts 039's exact `task_settings` shape after the downgrade and
+  `alembic check` clean at the end. Running `alembic check` under the
+  039-era models after the downgrade is not available in this tree and is
+  not claimed.

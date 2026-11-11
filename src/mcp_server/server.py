@@ -1375,7 +1375,8 @@ async def list_tasks(
     The header always states what the index could not show — notes not yet
     scanned, tasks that could not be indexed, notes over the 5,000-task cap,
     ids pending — and, under `scope="default"`, how many tasks your excluded
-    folders and note tags removed, so "no tasks" does not mean none exist.
+    folders, note tags and task rule removed, so "no tasks" does not mean
+    none exist.
     When more rows match, the header says `more: yes` and the response ends
     `next: <cursor>`: pass it back with the same arguments. A cursor from other
     arguments, an older server version, or a relative-date query continued
@@ -1408,8 +1409,9 @@ async def list_tasks(
             `done` (newest first) or `path`.
         detail: `full` (default) or `brief`.
         context: true to include each task's indented context lines.
-        scope: `default` applies your task settings' excluded folders and note
-            tags; `all` ignores them.
+        scope: `default` applies your task settings: excluded folders,
+            excluded note tags and the task rule (which checkboxes count as
+            tasks); `all` ignores them.
     """
     return await list_tasks_impl(
         folder=folder, status=status, due_by=due_by, scheduled_by=scheduled_by,
@@ -1592,7 +1594,8 @@ async def task_agenda(
     scanned, tasks that could not be indexed, notes over the task cap, ids
     pending), so an empty section does not mean no tasks exist. Invalid
     arguments are refused `invalid_argument`; `response_cap_too_small` means
-    the deployment's response cap is under 2,800 characters.
+    the deployment's response cap is under 2,800 characters (3,121 while a
+    task rule is in force).
 
     Args:
         date: The day to report on: `YYYY-MM-DD`, `today` (default),
@@ -1602,8 +1605,9 @@ async def task_agenda(
         tags: Only tasks carrying every one of these tags, matched by `/`
             segment and case-insensitively. At most 32.
         exclude_tags: Drop tasks carrying any of these tags.
-        scope: `default` applies your task settings' excluded folders and note
-            tags; `all` ignores them.
+        scope: `default` applies your task settings: excluded folders,
+            excluded note tags and the task rule (which checkboxes count as
+            tasks); `all` ignores them.
     """
     return await task_agenda_impl(
         date=date, days=days, folder=folder, tags=tags,
@@ -1815,6 +1819,10 @@ async def add_task(
     arguments you give, in the plugin's order: `#tags`, priority, 🔁 rule,
     ➕ created (per your task settings), 🛫 start, ⏳ scheduled, 📅 due.
     `context` adds one indented `- <text>` line under the new task.
+    Under a `filter` task rule your global filter text is put at the start of
+    `text` when the line lacks it; under `fields`, a line with no task field
+    or task tag is still written and the response says default listings will
+    not show it.
 
     An open task with the same description (case, spacing and Unicode form
     ignored; tags count) in this note, or elsewhere in your default scope, is

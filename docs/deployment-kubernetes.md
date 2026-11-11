@@ -704,6 +704,28 @@ The procedure:
    `kubectl -n obsidian-mcp exec deploy/obsidian-mcp -- alembic check` should print
    "No new upgrade operations detected."
 
+**Across migration 040 (task rule, #434)** nothing changes until a task
+rule is chosen: the default, `all`, keeps every checkbox a task, and every
+response and outstanding cursor stays as it was. 040 adds three columns and
+two CHECKs to `task_settings` and writes no row, as the non-superuser owner;
+nothing is re-derived or re-embedded. The one check: if the ConfigMap sets
+`TASKS_RULE`, `TASKS_RULE_TAGS` or `TASKS_GLOBAL_FILTER`, the values must
+be valid, and `TASKS_RULE: filter` needs a `TASKS_GLOBAL_FILTER`. A bad
+value fails the `migrate` initContainer as well as the server, and under
+`Recreate` that is downtime until you fix the ConfigMap. Quote a filter text
+that starts with a hash sign (`TASKS_GLOBAL_FILTER: "#task"`): unquoted,
+YAML reads it as a comment. While a rule is in force, `task_agenda` needs a
+response cap of 3,121 characters instead of 2,800. **Rollback:** after 040
+has run, the previous image's `migrate` initContainer cannot start (it does
+not know revision 040), and under `Recreate` no previous-image pod is left
+running. Roll forward, or first run `alembic downgrade 039` with the new
+image (for example
+`kubectl -n obsidian-mcp exec deploy/obsidian-mcp -- alembic downgrade 039`),
+then revert the image at once (the running new-image server's task tools
+fail against the downgraded table until it is replaced); the downgrade drops every saved task rule, task tag
+and filter text, and the previous image lists every checkbox again. The
+details are in [`DEPLOYMENT.md`](../DEPLOYMENT.md#upgrading-across-migration-040-task-rule-434).
+
 **Across migration 039 (task tools, #428)** there is no operator step
 beyond one check: if the ConfigMap sets `TASKS_DEFAULT_TIMEZONE`, it must
 be an IANA timezone the image knows (`Europe/Berlin`), not a misspelling or

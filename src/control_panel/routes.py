@@ -59,7 +59,7 @@ from src.oauth.scope import (
     has_vault_scope,
     token_has_write,
 )
-from src.services import panel_csp, security_events, task_settings, vault_overlap
+from src.services import panel_csp, security_events, task_rule, task_settings, vault_overlap
 from src.services.index_state import (
     KEY_EMBEDDING_FINGERPRINT,
     acquire_generation_lock_unbounded,
@@ -899,6 +899,21 @@ async def _task_settings_context(session: AsyncSession, uid: int | None, action:
             "excluded_note_tags": "\n".join(effective.excluded_note_tags),
             "max_entries": task_settings.TASK_SETTINGS_MAX_ENTRIES,
             "flags": flags,
+            # #434: the task rule. `rule_choice` is the select's option
+            # (stored NULL is "default"); the tags and filter inputs show what
+            # is stored on this card (kept even while another rule is chosen);
+            # "in use now" is the effective rule and where it comes from.
+            "rule_choice": getattr(row, "task_rule", None) or "default",
+            "default_rule_words": task_rule.describe(
+                defaults.task_rule, defaults.task_tags, defaults.global_filter),
+            "task_tags": "\n".join(getattr(row, "task_tags", None) or ()),
+            "global_filter": getattr(row, "global_filter", None) or "",
+            "effective_rule_words": task_rule.describe(
+                effective.task_rule, effective.task_tags, effective.global_filter),
+            "rule_inherited": effective.task_rule_inherited,
+            "rule_unusable": effective.task_rule_unusable,
+            "filter_max": task_rule.FILTER_MAX_CHARS,
+            "task_tags_max": task_rule.TASK_TAGS_MAX,
         },
     }
 
@@ -919,7 +934,7 @@ async def _save_task_settings(
     form = await request.form()
     payload: dict[str, Any] = {}
     for name in ("timezone", "excluded_folders", "excluded_note_tags",
-                 *task_settings.BOOLEAN_FIELDS):
+                 *task_settings.BOOLEAN_FIELDS, *task_settings.RULE_FIELDS):
         if name in form:
             value = form.get(name)
             payload[name] = value if isinstance(value, str) else ""

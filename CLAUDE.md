@@ -644,10 +644,34 @@ update it in the same change.** What stays here is the short list:
   `index: may lag (<code>)`. Generic writers do not refresh (L5). Settings
   are per owner scope in `task_settings` (durable, `UNIQUE NULLS NOT
   DISTINCT`, NULL fields → `TASKS_*` env defaults); an invalid
-  `TASKS_DEFAULT_TIMEZONE` refuses boot, init container included. 032 skips
+  `TASKS_DEFAULT_TIMEZONE` (or, since #434, `TASKS_RULE`,
+  `TASKS_RULE_TAGS`, `TASKS_GLOBAL_FILTER`) refuses boot, init container
+  included. 032 skips
   exactly 039's marked units by an allow-list a future `note_tasks` revision
   must extend on purpose. See [vault tools](docs/architecture/vault-tools.md),
   "Task tools (#428)", and [indexing and embeddings](docs/architecture/indexing-and-embeddings.md).
+- **A checkbox is not a task; the task rule says which are** (#434,
+  migration 040). Per owner scope: `all` (every checkbox — **the default,
+  byte-identical to v1.3.0**, cursors included), `fields` (a date,
+  priority or recurrence field, or a task tag matched like `tags=`) or
+  `filter` (case-sensitive `strpos` of the stored text, the plugin's
+  global filter; reverses #428 L12). Evaluated at query time from indexed
+  columns in **one place**, `task_rule.rule_clause` composed into
+  `task_query.scope_clause` (listing, counts, agenda, `duplicate_scan`);
+  `scope="all"` lifts it. Rows cut at 1,000 text characters or 64 tags
+  are **kept and counted** (`kept though unsure`), never hidden; an
+  unevaluable stored rule is `all`, stated on the rule line (≤ 320) with
+  `excluded by rule` and `pass scope="all"…`. Inherited from
+  `TASKS_RULE` / `TASKS_RULE_TAGS` / `TASKS_GLOBAL_FILTER` as one unit;
+  invalid values (or `filter` without text) refuse boot, init container
+  included. The filter text is validated (no backtick, field emoji,
+  comment marker, leading structure) because `add_task` **prepends** it,
+  and the combined description is structure-checked again before any
+  dry run or publish. The rule never blocks a write; `add_task` /
+  `update_task` state a non-task. The cursor digest carries the rule only
+  when one applies. 039 skips exactly 040's marked units (its own
+  allow-list). See [vault tools](docs/architecture/vault-tools.md),
+  "The task rule (#434)".
 - **The change feed is `note_events`, written at the moment the server
   knows** (#351, migration 033). Tools write attributed events (actor label,
   exact principal, tool) after their confirmed publication; the index pass
@@ -753,6 +777,9 @@ indexing.
 fields optional) — `list_tasks` and `task_agenda` read `note_tasks`, never a
 file; `complete_task`, `update_task` (both `path` + task id) and `add_task`
 write one line (write bucket, `write` class, `WRITE_REQUIRED_TOOLS`).
+Default listings and `add_task`'s index-side duplicate check apply the
+caller's task rule (#434: `all` | `fields` | `filter`, panel Tasks card or
+`TASKS_RULE*` / `TASKS_GLOBAL_FILTER`); `scope="all"` lists every checkbox.
 `list_tasks` is registered after the first 25 (then `get_changes`, then
 `hybrid_search`), so those keep the 5a391ca fixture's order; the four #428
 tools follow `hybrid_search` in the order `task_agenda`, `complete_task`,
