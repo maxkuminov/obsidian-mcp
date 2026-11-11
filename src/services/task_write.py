@@ -209,6 +209,10 @@ class Plan:
     terms: tuple[str, ...] = ()
     #: #434 D7: the global filter text `plan_add` prepended, or None.
     filter_added: str | None = None
+    #: #434 D7: under a `filter` rule, every normalised description an
+    #: index-side exact duplicate may have (`duplicate_scan(extra_norms=…)`);
+    #: empty under any other rule.
+    dup_norms: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1036,6 +1040,7 @@ def plan_add(note_text: str, args: AddArgs, settings, today: datetime.date) -> P
     if isinstance(line, TaskLineRefusal):
         return _from_line_refusal(line)
     new_tl = tl_mod.parse(line)
+    plain_tl = new_tl  # the caller's line, before any global filter is added
     filter_added = None
     if getattr(settings, "task_rule", "all") == task_rule.RULE_FILTER and settings.global_filter:
         # #434 D7: under a `filter` rule a line whose body lacks the filter
@@ -1057,10 +1062,13 @@ def plan_add(note_text: str, args: AddArgs, settings, today: datetime.date) -> P
             filter_added = f_text
     norm = tl_mod.normalise_description(new_tl.full_text)
 
-    # #434: under a `filter` rule the same task may be written with the
-    # filter text at the front or as a trailing tag; every such form is one
-    # description (`duplicate_norms`). Under any other rule: `norm` alone.
-    dup_norms = duplicate_norms(norm, settings)
+    # #434 D7: under a `filter` rule the same task may already be written with
+    # the filter text in front or as its trailing token; both are candidate
+    # keys everywhere (`index_norms`, also handed to `duplicate_scan`), and the
+    # target note's own bytes (rule-independent) also match the caller's bare
+    # description. Under any other rule: `norm` alone.
+    index_norms, note_norms = _duplicate_candidates(norm, plain_tl, settings)
+    dup_norms = note_norms
     if not args.allow_duplicate:
         dups = []
         for t in tasks:
@@ -1089,6 +1097,7 @@ def plan_add(note_text: str, args: AddArgs, settings, today: datetime.date) -> P
         note_text, [span],
         target_line=None, intent=None, inserted=tuple(inserted),
         norm=norm, terms=_similarity_terms_for(norm, settings), filter_added=filter_added,
+        dup_norms=index_norms,
     )
 
 
@@ -1123,64 +1132,52 @@ def _prepend_filter(filter_text: str, desc: str) -> str | TaskWriteRefusal:
     return got
 
 
-def _filter_norm(settings) -> str | None:
-    """The global filter text normalised like a description (NFC, casefold,
-    whitespace collapsed) under a `filter` rule, else None."""
+def _filter_text(settings) -> str | None:
     if getattr(settings, "task_rule", "all") != task_rule.RULE_FILTER:
         return None
-    text = getattr(settings, "global_filter", None)
-    if not text:
-        return None
-    return " ".join(unicodedata.normalize("NFC", text).casefold().split()) or None
+    return getattr(settings, "global_filter", None) or None
 
 
-def _strip_filter(norm: str, fn: str) -> str:
-    """`norm` without the filter at its front or as its last word (a filter
-    in the middle of a description stays: #434 accepted limitation)."""
-    if norm.startswith(fn + " "):
-        return norm[len(fn) + 1:]
-    if norm.endswith(" " + fn):
-        return norm[: -len(fn) - 1]
-    return norm
+def _duplicate_candidates(norm: str, plain_tl, settings) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """#434 D7: `(index candidates, target-note candidates)`.
 
-
-def duplicate_norms(norm: str, settings) -> tuple[str, ...]:
-    """#434: the normalised descriptions an exact duplicate of `norm` may
-    have. Under a `filter` rule: the description without the filter, with
-    it prepended (as `add_task` writes it) and with it as a trailing tag
-    (where people put a tag); otherwise `(norm,)`. `plan_add`'s target-note
-    check and `duplicate_scan`'s index-side check both use it."""
-    fn = _filter_norm(settings)
-    if fn is None:
-        return (norm,)
-    plain = _strip_filter(norm, fn)
-    out: list[str] = []
-    for n in (norm, plain, f"{fn} {plain}", f"{plain} {fn}"):
-        if n and n not in out:
-            out.append(n)
-    return tuple(out)
+    Under a `filter` rule an existing open line is an exact duplicate when its
+    normalised description equals (1) the final line's (`norm`, the filter
+    prepended) or (2) the caller's description with the filter as its
+    trailing token instead of in front. Each is computed with
+    `normalise_description` over a constructed text, as the extractor
+    computes a stored line's — never by editing a key. The target note's own
+    bytes (a rule-independent check) also match (3) the caller's bare
+    description. Under any other rule both are `(norm,)`. A filter in the
+    middle of an existing description is not matched (L13)."""
+    f_text = _filter_text(settings)
+    if f_text is None:
+        return (norm,), (norm,)
+    desc = tl_mod.plugin_description(plain_tl.full_text)
+    if desc.startswith(f_text + " "):
+        desc = desc[len(f_text) + 1:]
+    trailing = tl_mod.normalise_description(f"{desc} {f_text}")
+    bare = tl_mod.normalise_description(desc)
+    index = tuple(dict.fromkeys((norm, trailing)))
+    return index, tuple(dict.fromkeys((norm, trailing, bare)))
 
 
 def _filter_terms(settings) -> frozenset[str]:
-    fn = _filter_norm(settings)
-    return term_set(fn) if fn else frozenset()
+    f_text = _filter_text(settings)
+    if f_text is None:
+        return frozenset()
+    return term_set(" ".join(unicodedata.normalize("NFC", f_text).casefold().split()))
 
 
 def _similar_term_set(norm: str, settings) -> frozenset[str]:
     """The similarity terms of `norm`; under a `filter` rule the filter text
-    is not a term (on either side of the comparison)."""
-    fn = _filter_norm(settings)
-    if fn is None:
-        return term_set(norm)
-    return term_set(_strip_filter(norm, fn)) - _filter_terms(settings)
+    is not a term (on either side of the comparison, #434 D7)."""
+    return term_set(norm) - _filter_terms(settings)
 
 
 def _similarity_terms_for(norm: str, settings) -> tuple[str, ...]:
-    fn = _filter_norm(settings)
-    if fn is None:
-        return similarity_terms(norm)
     drop = _filter_terms(settings)
-    return tuple(t for t in similarity_terms(_strip_filter(norm, fn)) if t not in drop)
+    return tuple(t for t in similarity_terms(norm) if t not in drop)
 
 
 def extracted_task_at(text: str, line: int):
@@ -1744,7 +1741,8 @@ def _heading_lines(v: _NoteView) -> list[tuple[int, int, str]]:
 # ── duplicate scan (D9) ──────────────────────────────────────────────────────
 
 
-async def duplicate_scan(session, uid, settings, norm: str, terms: Sequence[str], *, exclude_path: str | None = None):
+async def duplicate_scan(session, uid, settings, norm: str, terms: Sequence[str], *,
+                         exclude_path: str | None = None, extra_norms: Sequence[str] = ()):
     """D9: ``(exact, similar, stopped)`` among the caller's OPEN tasks in the
     default scope, owner-scoped (the total `NoteMetadata` owner mapping).
 
@@ -1767,8 +1765,10 @@ async def duplicate_scan(session, uid, settings, norm: str, terms: Sequence[str]
     from src.models.db import NoteMetadata, NoteTask
 
     key = tl_mod.description_key(norm)
-    # #434: every form an exact duplicate may take under a `filter` rule.
-    keys = [tl_mod.description_key(n) for n in duplicate_norms(norm, settings)]
+    # #434 D7: under a `filter` rule `plan_add` hands every candidate form an
+    # exact duplicate may take (`Plan.dup_norms`); otherwise `norm` alone.
+    keys = list(dict.fromkeys(
+        [key] + [tl_mod.description_key(n) for n in extra_norms]))
     # The one owner mapping (`tools._note_owner_predicate`, the predicate
     # `list_tasks` joins under), imported at call time like `task_query` does.
     from src.mcp_server import tools as _tools

@@ -9519,7 +9519,8 @@ async def add_task_impl(
         note itself was checked against its current bytes by the planner."""
         async with async_session() as session:
             exact, similar, stopped = await task_write.duplicate_scan(
-                session, uid, effective, plan.norm or "", plan.terms, exclude_path=rel)
+                session, uid, effective, plan.norm or "", plan.terms, exclude_path=rel,
+                extra_norms=plan.dup_norms)
         if exact and not allow_duplicate:
             return _task_refusal(
                 f"{tool}: `{_escape_task_path(rel)}`: an open task with the same description already "

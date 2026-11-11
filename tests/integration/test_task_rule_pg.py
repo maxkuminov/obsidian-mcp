@@ -451,13 +451,25 @@ async def test_a_rule_change_refuses_an_old_cursor_and_all_keeps_old_cursors(db)
         assert refused.prose == task_query.CURSOR_FOREIGN
     # An unused filter text under `fields` does not change the rows: accepted.
     assert not isinstance(await with_cursor(eff("fields", ["waiting-for"], "#x")), QueryRefusal)
-    # A cursor minted under v1.3.0 (no rule) stays valid under a stored `all`.
-    old = await page(db, ts=task_settings.defaults(), limit=1)
-    old_token = task_query.encode_cursor(old.cursor, old.rows[-1], compact=False)
-    got = await task_query.list_tasks_query(
-        None, ListTasksArgs(limit=1, cursor=old_token), eff("all", ["x"], "#task"), now=NOW,
-        session_factory=db)
-    assert not isinstance(got, QueryRefusal)
+    # A cursor minted by v1.3.0 itself stays valid, and continues after its
+    # row, under no rule and under a stored `all`. The literal was produced by
+    # loading `git show origin/main:src/services/task_query.py` (58564cd) into
+    # a temporary module and calling its `encode_cursor` for owner None,
+    # `ListTasksArgs()`, NOW and the row `Projects/Alpha.md:3` due 2026-11-30
+    # (the same literal is `V130_CURSOR` in `tests/test_task_rule.py`).
+    v130_cursor = (
+        "eyJ2IjoyLCJvIjoiYzU3MTc4Nzg4ZmEwMTE0MCIsImYiOiI1NjJlYjkxODczZWU5ZjQzIiwib2IiOiJkdWUi"
+        "LCJrIjpbIjIwMjYtMTEtMzAiXSwicCI6IlByb2plY3RzL0FscGhhLm1kIiwibCI6M30")
+    V130_CURSOR = v130_cursor
+    for ts in (task_settings.defaults(), eff("all", ["x"], "#task")):
+        got = await task_query.list_tasks_query(
+            None, ListTasksArgs(limit=500, cursor=V130_CURSOR), ts, now=NOW,
+            session_factory=db)
+        assert not isinstance(got, QueryRefusal), got
+        # Strictly after (2026-11-30, Projects/Alpha.md, line 3) in `due` order.
+        assert all(r["due"] is None or (r["due"], r["file_path"], r["line"])
+                   > (datetime.date(2026, 11, 30), "Projects/Alpha.md", 3) for r in got.rows)
+        assert got.rows
 
 
 # ── byte identity under `all` ────────────────────────────────────────────────
@@ -470,6 +482,12 @@ CALLS = [dict(), dict(status="all"), dict(order_by="priority"), dict(detail="bri
 
 @pytest.mark.parametrize("kw", CALLS)
 async def test_the_default_rule_changes_nothing(db, kw):
+    """Under no row and a stored `all` the rendered output is identical. The
+    previous release itself is pinned by literals captured from `origin/main`
+    (the default-scope SQL, the filters digest and a cursor:
+    `tests/test_task_rule.py::test_scope_sql_and_digest_under_all_equal_v130`);
+    the rendering is pinned by the pre-existing render and integration tests,
+    which pass unmodified."""
     await seed(db, "Projects/Alpha.md")
     await seed(db, "Pending/Backfill.md", pending=True)
     base = task_settings.defaults()

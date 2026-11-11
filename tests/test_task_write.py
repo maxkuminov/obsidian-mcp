@@ -1366,22 +1366,23 @@ def test_the_combined_description_bound_names_the_global_filter():
     assert _added(add(INBOX, "x" * 994, s=filter_rule("#task"))).startswith("- [ ] #task x")
 
 
-@pytest.mark.parametrize("bad,marker", [("%%", "%%"), ("<!--", "HTML comment opener"),
-                                        ("-->", "HTML comment closer"), ("~~~", "tildes")])
-def test_a_filter_that_would_open_a_comment_cannot_reach_the_note(bad, marker):
+@pytest.mark.parametrize("bad,fragment", [
+    ("%%", "comment marker"), ("%%x%%", "comment marker"), ("<!--", "HTML comment marker"),
+    ("-->", "HTML comment marker"), ("<!-- x -->", "HTML comment marker"),
+    ("~~~", "tildes"), ("[ ]", "checkbox"), ("[x]", "checkbox"), ("- todo", "list marker"),
+    ("1. todo", "list marker"), ("# task", "heading marker"), ("> task", "'>'"),
+    ("a`b", "backtick"), ("#task 📅", "field emoji"), ("a\ufe0fb", "field emoji"),
+    ("a\u2028b", "single line"), ("a\x07b", "single line"), ("x" * 65, "longer than 64"),
+    ("\u3000", "whitespace"), (" #task", "surrounding whitespace"),
+])
+def test_the_planner_validates_a_filter_handed_in_directly(bad, fragment):
     """Layer (b): the planner handed the rule directly, bypassing the save
-    validation and the settings fallback, refuses on the FINAL combined
-    description — for a dry run and a write alike (one planner), so nothing
-    is planned and nothing can be published."""
+    validation and the settings fallback, applies the settings' own filter
+    validator before prepending — for a dry run and a write alike (one
+    planner), so nothing is planned and nothing can be published."""
     r = refused(add(INBOX, "Call bank", s=filter_rule(bad)), "invalid_argument")
-    assert marker in r.reason and "nothing was written" in r.reason
-
-
-def test_a_balanced_filter_handed_in_directly_is_judged_on_the_combined_text():
-    # Balanced markers keep the combined description balanced: allowed by
-    # the structure check (the save validator refuses them, layer (a)).
-    line = _added(add(INBOX, "Call bank", s=filter_rule("%%x%%")))
-    assert line == "- [ ] %%x%% Call bank"
+    assert "global filter text cannot be added" in r.reason, r.reason
+    assert fragment in r.reason and "nothing was written" in r.reason, r.reason
 
 
 def test_under_fields_and_all_nothing_is_prepended():
@@ -1390,13 +1391,44 @@ def test_under_fields_and_all_nothing_is_prepended():
         assert _added(plan) == "- [ ] Read the report" and plan.filter_added is None
 
 
-def test_the_duplicate_key_uses_the_final_line():
-    note = "- [ ] #task Book flights\n"
-    refused(add(note, "Book flights", s=filter_rule("#task")), "duplicate_task")
-    # A plain same-text checkbox without the filter is a different key.
-    plain = "- [ ] Book flights\n"
-    assert _added(add(plain, "Book flights", s=filter_rule("#task"))) == \
-        "- [ ] #task Book flights"
+@pytest.mark.parametrize("existing", [
+    "- [ ] Renew passport #task\n",           # the filter as a trailing tag
+    "- [ ] #task Renew passport\n",           # added by the server earlier
+    "- [ ] Renew passport #task 📅 2026-12-01\n",
+    "- [ ] Renew passport\n",                 # the bare description, same note
+])
+def test_under_filter_a_duplicate_is_caught_in_front_trailing_or_bare(existing):
+    refused(add(existing, "Renew passport", s=filter_rule("#task")), "duplicate_task")
+    refused(add(existing, "#task Renew passport", s=filter_rule("#task")), "duplicate_task")
+    plan = add(existing, "Renew passport", s=filter_rule("#task"), allow_duplicate=True)
+    assert _added(plan) == "- [ ] #task Renew passport"
+
+
+def test_under_filter_a_filter_in_the_middle_is_not_matched():  # L13
+    note = "- [ ] Renew #task passport\n"
+    assert _added(add(note, "Renew passport", s=filter_rule("#task"))) == \
+        "- [ ] #task Renew passport"
+
+
+def test_duplicate_candidates_per_rule():
+    plan = ok(add(INBOX, "Renew passport", s=filter_rule("#task"), due=D(2026, 12, 1)))
+    assert plan.norm == "#task renew passport"
+    assert plan.dup_norms == ("#task renew passport", "renew passport #task")
+    for s in ({"task_rule": "all", "global_filter": "#task"}, {"task_rule": "fields"}):
+        plan = ok(add(INBOX, "Renew passport", s=s))
+        assert plan.norm == "renew passport" and plan.dup_norms == ("renew passport",)
+        # all / fields: a filter-tagged line is not the same description.
+        assert _added(add("- [ ] Renew passport #task\n", "Renew passport", s=s)) == \
+            "- [ ] Renew passport"
+
+
+def test_the_filter_text_is_not_a_similarity_term():
+    plan = ok(add(INBOX, "Renew the passport", s=filter_rule("#task")))
+    assert "task" not in plan.terms and set(plan.terms) == {"renew", "the", "passport"}
+    assert "task" in ok(add(INBOX, "Renew the passport #task")).terms
+    s = settings(task_rule="filter", global_filter="#task")
+    assert tw._similar_term_set("#task book flights", s) == {"book", "flights"}
+    assert tw._similar_term_set("#task book flights", settings()) == {"task", "book", "flights"}
 
 
 def test_update_never_re_adds_the_filter():
