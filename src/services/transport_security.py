@@ -731,3 +731,11 @@ def log_embedding_transport() -> None:
         security_events.emit(
             "internal_transport_plaintext", reason="embedding", outcome="override"
         )
+    if provider == "tei" and plaintext_remote and settings.tei_api_key is not None:
+        # #426 D4: admitted, because EMBEDDING_ALLOW_PLAINTEXT already sends
+        # every note in clear over this hop. Said once, never the value.
+        logger.warning(
+            "TEI_API_KEY is sent in clear over http to a non-loopback host "
+            "(admitted by EMBEDDING_ALLOW_PLAINTEXT); use an https TEI_URL to "
+            "protect it"
+        )

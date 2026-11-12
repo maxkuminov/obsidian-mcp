@@ -2975,7 +2975,14 @@ async def settings_page(
                 provider_ok = r.status_code == 200
         elif provider == "tei":
             async with embedding_http_client(5.0) as client:
-                r = await client.get(f"{settings.tei_url.rstrip('/')}/health")
+                # The same bearer token as `/embed` and `/info` (#426): a
+                # gateway may protect every path. `None` when unset.
+                from src.services.embeddings import _tei_auth_headers
+
+                r = await client.get(
+                    f"{settings.tei_url.rstrip('/')}/health",
+                    headers=_tei_auth_headers(),
+                )
                 provider_ok = r.status_code == 200
         else:
             provider_ok = bool((settings.openai_api_key or "").strip())
