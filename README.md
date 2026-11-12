@@ -605,9 +605,13 @@ the note's `content_hash` from `read_note` as `expected_hash`.
 - **Listings see the write at once.** A successful write refreshes that
   note's task rows in the index (`index: refreshed`). If the refresh
   cannot run, the write still stands and the response says
-  `index: may lag (<reason>)` until the next index pass. `edit_note` and
-  the other generic write tools do not refresh task rows, so their
-  changes show up after the next pass (every 300 s by default).
+  `index: may lag (<reason>)` until the next index pass. `edit_note`,
+  `set_frontmatter` and `write_file` also try to refresh the task rows
+  of a note they change, and `delete_note` removes a deleted note's
+  tasks; their output does not say whether that worked. A new note
+  created by `create_note`, `write_file`, an import or an upload, links
+  rewritten by `move_note`, and any refresh that could not run show up
+  after the next pass (every 300 s by default).
 
 <a id="supported-recurrence-rules"></a>
 

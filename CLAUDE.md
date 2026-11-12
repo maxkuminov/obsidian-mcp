@@ -641,7 +641,15 @@ update it in the same change.** What stays here is the short list:
   which the pass never stat-shortcuts (R3) and keeps only when refreshed at
   or after its `scan_started_at` (R4), so every row converges and none is
   stuck. A refresh that cannot run leaves the write standing:
-  `index: may lag (<code>)`. Generic writers do not refresh (L5). Settings
+  `index: may lag (<code>)`. Since #432 `edit_note`, `set_frontmatter`
+  and a `write_file` that replaces a note also attempt the refresh, after
+  their change-feed event, only when the replaced or published bytes may
+  hold a checkbox (`tasks.may_hold_tasks`, a superset of the extractor),
+  and silently: their output is unchanged, and a refresh that cannot run
+  leaves the rows to the next pass. `delete_note` always clears the deleted
+  note's task rows (absence form, never over a recreated file).
+  `create_note`, imports, uploads and `move_note`'s link rewrites wait for
+  the pass (task-refresh-on-write L1/L4). Settings
   are per owner scope in `task_settings` (durable, `UNIQUE NULLS NOT
   DISTINCT`, NULL fields → `TASKS_*` env defaults); an invalid
   `TASKS_DEFAULT_TIMEZONE` (or, since #434, `TASKS_RULE`,

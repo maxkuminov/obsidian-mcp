@@ -1839,8 +1839,9 @@ open task with the same key **in the target note's current bytes** (always,
 whatever the scope) or **in the index under the caller's default scope** is
 `duplicate_task`, naming up to 5 matches, unless `allow_duplicate=true`. The
 index side reflects the caller's own earlier task writes through the refresh;
-a duplicate written by a generic tool since the last pass can be missed
-(L14). Since #434 the index side and the similar-task scan see only tasks by
+a duplicate written since the last pass by `create_note`, an import, an
+upload, a `move_note` link rewrite, or a generic write whose refresh did not
+run can be missed (L14, narrowed by #432). Since #434 the index side and the similar-task scan see only tasks by
 the caller's task rule (they go through `scope_clause`); the target-note side
 does not (see "The task rule (#434)").
 

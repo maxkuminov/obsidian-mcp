@@ -828,6 +828,12 @@ The task tools log through the same `_tracked` named-parameter list and the
   `derivation_failed`, `error`) or `skipped` (a dry run or a no-change call:
   nothing was published). A lag is **not an error marker**: the write
   stands, and the response said `index: may lag (<code>)`.
+- **Since #432 `edit_note`, `set_frontmatter`, `write_file` and
+  `delete_note` carry `task_refresh` too**, as `refreshed` or
+  `lagged:<code>`, and **only when a refresh (or `delete_note`'s clear)
+  was attempted**: a write to a note with no checkbox on either side logs
+  exactly the params it logged before. Their responses never mention it,
+  so the usage row is the only record of a lag.
 - `task_write_attempts` appears only when the in-call conflict retry ran (2
   or 3); `similar_count` is the number of similar open tasks `add_task`
   listed.
