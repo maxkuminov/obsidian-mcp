@@ -196,8 +196,12 @@ def test_the_startup_line_is_logged_only_when_on(monkeypatch, caplog):
     # Importing `src.main` reconfigures logging (the root handlers are
     # replaced), so attach the capture handler to its logger directly.
     log = logging.getLogger("src.main")
+    # Not propagated meanwhile: when the root still holds the capture handler
+    # (src.main was imported earlier in the session) a record would be
+    # captured twice.
     log.addHandler(caplog.handler)
     monkeypatch.setattr(log, "level", logging.INFO)
+    monkeypatch.setattr(log, "propagate", False)
     try:
         _startup_line_cases(main, monkeypatch, caplog)
     finally:
