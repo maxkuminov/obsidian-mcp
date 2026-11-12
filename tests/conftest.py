@@ -45,6 +45,8 @@ SETTINGS_ENV_KEYS = (
     # The scan's stat shortcut and its backstop (#282).
     "INDEX_STAT_SHORTCUT",
     "INDEX_FULL_HASH_INTERVAL_HOURS",
+    # The opt-in sync-conflict exclusion (#392).
+    "INDEX_EXCLUDE_CONFLICT_FILES",
     # The change feed (#351).
     "CHANGE_FEED_RETENTION_DAYS",
     "CHANGE_FEED_MAX_EVENTS_PER_SCOPE",
