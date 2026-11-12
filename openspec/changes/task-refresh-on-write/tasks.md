@@ -55,6 +55,15 @@ This is one slice: the files overlap in `tools.py`, so there is no fan-out.
   - out-of-order refreshes across writer kinds;
   - multi-user;
   - `lock_timeout`.
+- [x] 3.5 Implementation review r1 follow-ups:
+  - `write_file` refreshes after every note-path publication, with the move-between-sample-and-publish interleaving pinned offline;
+  - a `write_file` creation is a `not_indexed` no-op (integration);
+  - a call cancelled while its refresh waits on a held row lock (integration), and its lease released in `queue` mode (offline);
+  - a worker-thread test for the gate and the derivation, replacing the 100 ms bound;
+  - literal pre-change response strings;
+  - an AST check that only the four writers call `_refresh_after_write`;
+  - more no-refresh paths;
+  - nesting and multi-line callouts in the gate generator.
 - [x] 3.4 Run the offline suite once, and the integration modules covering the task index, the refresh, the pass's task derivation and the change feed. `tools_list_full_v2.json` must pass untouched.
 
 ## 4. Docs (same PR)

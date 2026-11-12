@@ -1,22 +1,22 @@
 ## ADDED Requirements
 
-### Requirement: `edit_note`, `set_frontmatter` and a `write_file` that replaces a note SHALL attempt a task refresh after publication and event when either side may hold a task
+### Requirement: `edit_note`, `set_frontmatter` and `write_file` to a note path SHALL attempt a task refresh after publication and event when either side may hold a task
 
 After a confirmed publication and after its change-feed event, each of these writers SHALL call the write-time task refresh. The call SHALL pass the bytes the writer published and SHALL be made while the path's anchored target is still open:
 
 - `edit_note`, in every mode;
 - `set_frontmatter`;
-- `write_file`, when the path is a note path (`change_feed.is_note_path`) and an incumbent stood at it.
+- `write_file`, after every publication to a note path (`change_feed.is_note_path`). The decision SHALL NOT depend on any existence check made before the publication. A creation finds no index row, and the refresh then writes nothing (`not_indexed`).
 
-These SHALL NOT call the refresh: `create_note`, `write_file` creating a note or writing a non-note path, `move_note` (with or without link rewrites), `import_from_url`, `PUT /transfer/upload` and `delete_file`. No writer SHALL call it after a refusal, a dry run, a "No changes" answer, a publication that raised (including an in-call conflict), or an uncertain publication.
+These SHALL NOT call the refresh: `create_note`, `write_file` writing a non-note path, `move_note` (with or without link rewrites), `import_from_url`, `PUT /transfer/upload` and `delete_file`. No writer SHALL call it after a refusal, a dry run, a "No changes" answer, a publication that raised (including an in-call conflict), or an uncertain publication.
 
 **The gate.** The call SHALL be made only when at least one of these holds:
 
 - `tasks.may_hold_tasks(published)` is true;
 - the call read the bytes it replaced, and `tasks.may_hold_tasks(replaced)` is true;
-- the call replaced an incumbent whose bytes it did not read.
+- the call does not hold the bytes it replaced: every `write_file` except a guarded overwrite, whose publication is bound to the incumbent it read.
 
-A call that read the bytes it replaced and published exactly those bytes SHALL NOT call the refresh.
+A call that holds the bytes it replaced and published exactly those bytes SHALL NOT call the refresh.
 
 `tasks.may_hold_tasks(data)` SHALL be true when `data` is not UTF-8. Otherwise it SHALL be whether the extractor's checkbox prefix matches anywhere in `note_hash.canonical_note_text(data)`. The prefix is `_CHECKBOX_RE`'s pattern through the closing `]`, without its trailing lookahead, anchored with `^` and compiled with `re.MULTILINE`.
 
@@ -24,7 +24,7 @@ A call that read the bytes it replaced and published exactly those bytes SHALL N
 
 - return true for every input on which `tasks.tasks_from_note_text` returns at least one task;
 - take time linear in the input;
-- run off the event loop;
+- run in a worker thread, never on the event loop's thread;
 - read no file and no database row.
 
 An exception from the gate SHALL count as true.
@@ -56,6 +56,14 @@ When the refresh runs, a following `list_tasks` SHALL reflect the write. When it
 #### Scenario: A dry run never refreshes
 - **WHEN** `edit_note(dry_run=true)` runs on a note with tasks
 - **THEN** no refresh SHALL be attempted
+
+#### Scenario: A note moved onto the path between `write_file`'s existence check and its publication is refreshed
+- **WHEN** `write_file(path="A.md", overwrite=True)` samples the path while it is absent, a move then lands an indexed note with tasks at `A.md`, and `write_file` then overwrites it with different task lines
+- **THEN** the refresh SHALL be attempted for `A.md`
+
+#### Scenario: A `write_file` creation attempts a refresh that does nothing
+- **WHEN** `write_file` creates `fresh.md`, which has no index row
+- **THEN** the refresh SHALL be attempted, the usage row SHALL record `task_refresh = lagged:not_indexed`, and no `notes_metadata` or `note_tasks` row SHALL be written
 
 #### Scenario: A created note and a link rewrite wait for the pass
 - **WHEN** `create_note` creates a note with tasks, or `move_note(rewrite_links=True)` rewrites a link inside another note's task line
@@ -132,12 +140,12 @@ The three task write tools SHALL keep their order: publication, refresh, event.
 
 ### Requirement: A generic writer SHALL attempt at most one bounded task refresh per call
 
-`edit_note`, `set_frontmatter`, `write_file` and `delete_note` SHALL each attempt at most one refresh or clear per call. The gate and the derivation SHALL run off the event loop. The row-lock wait SHALL be the existing 2-second bound. A note with more than `MAX_TASKS_PER_NOTE` tasks SHALL be stored truncated with `tasks_truncated` set, as the pass stores it.
+`edit_note`, `set_frontmatter`, `write_file` and `delete_note` SHALL each attempt at most one refresh or clear per call. The gate and the derivation SHALL run in a worker thread (`asyncio.to_thread`), never on the event loop's thread. The row-lock wait SHALL be the existing 2-second bound. A note with more than `MAX_TASKS_PER_NOTE` tasks SHALL be stored truncated with `tasks_truncated` set, as the pass stores it.
 
 #### Scenario: A maximal note
 - **WHEN** `edit_note` publishes exactly `MAX_NOTE_BYTES` holding 5,001 checkboxes
 - **THEN** the refresh SHALL store 5,000 task rows with `tasks_truncated = true`
-- **AND** no single event-loop step SHALL exceed 100 ms on account of the gate or the derivation
+- **AND** the gate and the task derivation SHALL each run in a worker thread, not on the event loop's thread
 
 ### Requirement: Task rows written by a generic writer's refresh SHALL converge with the index pass under the existing rules
 

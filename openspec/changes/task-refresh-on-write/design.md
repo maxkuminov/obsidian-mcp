@@ -66,7 +66,7 @@ The pass composes with it through three rules:
    - task text, ids, tags, dates, context and heading path come from the body and do not change.
 
    The task rule (#434) reads only `note_tasks` columns, so its verdict does not change either. `excluded_note_tags` reads `notes_metadata.tags`, which the refresh does not write (L2). `set_frontmatter` refreshes so that line numbers stay true, and the gate keeps the cost off notes without tasks.
-3. **`write_file` on a `.md` path that had an incumbent** (`had_incumbent`, which the tool already computes for its event kind). The path predicate is `change_feed.is_note_path(target.rel)`, the one the event uses, so a path that may refresh is exactly a path that gets an event.
+3. **`write_file`, after every publication to a note path.** The path predicate is `change_feed.is_note_path(target.rel)`, the one the event uses. The decision does **not** depend on `had_incumbent`: that is an `lstat` sampled before the publication, for the event's kind only, and a note moved onto the path between the sample and the publication would be overwritten with no refresh (implementation review r1, MAJOR). The replaced bytes are known only for a guarded overwrite, whose publication is bound to them (`expected=incumbent`); otherwise they are unknown (D2). A genuine creation finds no index row, so the refresh is the existing `not_indexed` no-op: one query, nothing written.
 
 **Clear** (D3):
 
@@ -76,7 +76,7 @@ The pass composes with it through three rules:
 
 **Excluded:**
 
-- **`create_note`, and `write_file` creating a note.** There is no index row for a path this call just created. The one exception is a stale row the pass has not pruned yet: the file was deleted outside the server, or deleted by `delete_note` and already cleared. Writing a new note's tasks under a row whose other columns describe a different note would anticipate a decision that belongs to the pass: upsert, or move pairing by hash. Such a refresh would almost always report `not_indexed` anyway. The new note's tasks appear after the next pass (L1).
+- **`create_note`.** There is no index row for a path this call just created. The one exception is a stale row the pass has not pruned yet: the file was deleted outside the server, or deleted by `delete_note` and already cleared. Writing a new note's tasks under a row whose other columns describe a different note would anticipate a decision that belongs to the pass: upsert, or move pairing by hash. Such a refresh would almost always report `not_indexed` anyway. The new note's tasks appear after the next pass (L1). (`write_file` is not excluded the same way: it may land on a path a move filled after its existence sample, D1.3.)
 - **Plain `move_note`.** The bytes do not change, and the task rows are keyed by `note_id`. The metadata transaction re-keys `file_path` on that row, so the listing shows the tasks under the new path at once (the `note-tasks` rule "an id-preserving move SHALL leave the rows attached"). There is nothing to refresh. When that transaction fails (`DB update failed; reindex will reconcile`), the rows stay under the old path until the pass (L6).
 - **`move_note`'s link rewrites**, of the moved note and of each backlink source. A rewritten link inside a task line changes that task's text and id. Until the pass, a task write that uses the listed old id refuses with `task_not_found` and writes nothing. That is a refusal, not a wrong write. Refreshing every rewritten note would add a per-call budget, stop rules and time under the process-wide `_MOVE_REWRITE_LOCK` that serialises every rewrite move. Cut by review (finding 6), as L4.
 - **`import_from_url` and `PUT /transfer/upload`.** They stream to a staged file and publish without ever holding the whole content, through `transfer`'s own path rather than a `MutableTarget`. R1 derives only from the bytes the call published and never from a re-read, so that a refresh cannot "launder" a concurrent writer's bytes into refreshed state. A refresh here would need exactly such a re-read, or a buffered copy of up to `MAX_NOTE_BYTES` per upload. The upload route is also not an MCP tool call (L1).
@@ -89,7 +89,7 @@ A refresh by `edit_note`, `set_frontmatter` or `write_file` is attempted only wh
 
 - `may_hold_tasks(published)` is true; **or**
 - the replaced bytes are known and `may_hold_tasks(replaced)` is true; **or**
-- the call replaced an incumbent whose bytes it did not read: an unguarded `write_file(overwrite=True)`, or an over-cap incumbent. Such an incumbent is assumed to have held a task.
+- the call does not hold the bytes it replaced: every `write_file` except a guarded overwrite (including a creation, and an unguarded or over-cap overwrite). Such bytes are assumed to have held a task.
 
 **Equal bytes.** A call that **knows** the bytes it replaced and published exactly those bytes attempts nothing. `edit_note` and `set_frontmatter` know them. So does `write_file` when it read the incumbent. `edit_note` already skips its event in that case. An unguarded `write_file` overwrite does not know them, so the third gate rule applies to it even when the bytes happen to be equal. The refresh then rewrites the same rows (review finding 3).
 
@@ -115,6 +115,8 @@ The lookahead is deliberately left out of the gate. The extractor evaluates it o
 With `re.MULTILINE`, `^` matches at every line start of the canonical text. The body is a suffix of that text and starts at a line start. The gate runs over the whole text, frontmatter included, so it can only match more.
 
 It over-matches checkboxes in code fences, in frontmatter values and in non-task contexts. Each over-match costs one refresh, never a wrong answer. A property test pins the superset, with deterministic generated notes built from task-shaped fragments so that thousands of them hold tasks.
+
+**The same pre-publication question for `edit_note` and `set_frontmatter`** (checked for review r1). Both read the incumbent through the anchored target and publish with `expected=` those bytes, so the bytes the gate examines as "replaced" are exactly the bytes the publication replaced; a different file at the leaf refuses the publication (`concurrent_write`) and no refresh runs. The only residual is #428 L26's declared window between `expected=`'s comparison and the rename: a non-cooperating writer landing inside it is overwritten, and if its bytes alone held a task (neither the read nor the published bytes did), no refresh runs; its own refresh, if any, left the row task-dirty, so the next pass converges (L10).
 
 **Failure.** The caller wraps the gate: any exception from it counts as "may hold". A gate fault can only cost a refresh. It can never skip one, and it can never fail the write.
 
@@ -165,7 +167,7 @@ No code forces the other order. The feed append and the refresh each run in thei
 - **Task rows:** the refresh's transaction rolls back, so the rows are unchanged and converge at the next pass (the publication changed the stat; for a delete, the walk no longer finds the file).
 - **Response:** none. The call is cancelled.
 - **Usage row:** none. `_tracked` deliberately does not catch `BaseException`, and a cancelled call writes no row, exactly as a call cancelled anywhere else in its body today.
-- **Lease:** released by `_tracked`'s `finally`.
+- **Lease:** released by `_tracked`'s `finally` (pinned by an offline test in `queue` mode: a lease is held during the refresh, and every controller counter is back to zero after the cancellation).
 
 **Locks are R1's, unchanged.**
 
@@ -180,7 +182,7 @@ No code forces the other order. The feed append and the refresh each run in thei
 
 The generic writers' responses stay **byte-identical**, whatever the refresh did. Their texts are pinned by the existing response tests and by the 1.0 tool-contract promise. An agent parsing `Created note:`, `Replaced …`, `Updated frontmatter in …`, `Wrote N bytes …` or `Soft-deleted: …` must see no new line.
 
-**A lag is therefore silent to the agent (L3).** If the row lock is held for more than 2 s, or the file was superseded, or the refresh errors, the agent gets its usual success text, and a `list_tasks` right after it shows the old rows until the next pass. This is the behaviour of every generic write before this change, now in a minority of cases rather than all of them. It is accepted for the owner as a choice (review finding 2): best-effort freshness, no new response text.
+**A lag is therefore silent to the agent (L3).** If the row lock is held for more than 2 s, or the file was superseded, or the refresh errors, the agent gets its usual success text, and a `list_tasks` right after it shows the old rows until the next pass. This is the behaviour of every generic write before this change, now in a minority of cases rather than all of them. Best-effort freshness with no new response text was decided by the implementing session on 2026-11-12 (review finding 2), pending the owner's confirmation.
 
 **Rejected:** printing `index: may lag (<code>)` on a lagged generic refresh. It would change the success text of four tools and every test pinning it, and it would put index state into tools whose callers mostly never list tasks.
 
@@ -221,6 +223,7 @@ The interleavings and their outcomes:
 11. **`delete_note`, then a recreation at the path before the clear takes the lock.** `target.lstat()` finds a file, so the clear is `superseded` and nothing is cleared. The recreating writer's own refresh, or the pass, covers the new file.
 12. **`delete_note`, the clear, then a recreation before the pass.** The row is task-dirty, so R3 reads the new file and the pass derives it.
 13. **A root reassignment between the publication and the refresh.** The outcome is `root_changed` and nothing is written. #428 L21 (an unlocked re-check) applies unchanged.
+14. **A note moved onto `write_file`'s path between its existence sample and its publication** (implementation review r1). `write_file(overwrite=True)` replaces it; the refresh runs regardless of the sample (D1.3), with the replaced bytes unknown, so the rows describe the published bytes. Pinned by an offline test that lands the move inside the publication step.
 
 **No row is ever stuck.** Every refreshing write leaves the row in one of two states:
 
@@ -232,10 +235,10 @@ The interleavings and their outcomes:
 | Where | Current | Replacement |
 |---|---|---|
 | Archived `2026-11-10-task-tools` L5 | "`edit_note`, `set_frontmatter`, `move_note`, `write_file` and transfer uploads do not refresh task rows. Their changes appear after the next pass." | Not edited: archives are history. Narrowed by this change's D1, L1 and L4. |
-| Archived L14 (the duplicate scan misses generic writes) | as written | Narrowed, not edited: the index side now reflects `edit_note`, `set_frontmatter` and `write_file` overwrites whose refresh ran. |
-| `CLAUDE.md`, "Task writes address a line…" | "Generic writers do not refresh (L5)." | "Since #432 `edit_note`, `set_frontmatter` and a `write_file` that replaces a note also attempt the refresh, after their change-feed event, only when the replaced or published bytes may hold a checkbox (`tasks.may_hold_tasks`), and silently: their output is unchanged, and a lag converges at the next pass. `delete_note` always clears the deleted note's task rows (absence form, never over a recreated file). `create_note`, imports, uploads and `move_note`'s link rewrites wait for the pass." |
+| Archived L14 (the duplicate scan misses generic writes) | as written | Narrowed, not edited: the index side now reflects `edit_note`, `set_frontmatter` and `write_file` writes whose refresh ran. |
+| `CLAUDE.md`, "Task writes address a line…" | "Generic writers do not refresh (L5)." | "Since #432 `edit_note`, `set_frontmatter` and every `write_file` to a note path also attempt the refresh, after their change-feed event, only when the replaced or published bytes may hold a checkbox (`tasks.may_hold_tasks`), and silently: their output is unchanged, and a lag converges at the next pass. `delete_note` always clears the deleted note's task rows (absence form, never over a recreated file). `create_note`, imports, uploads and `move_note`'s link rewrites wait for the pass." |
 | `docs/architecture/indexing-and-embeddings.md`, the "What generic writers do not do (L5)." paragraph | the whole paragraph | Retitled "**Generic writers (#432).**" The new text gives D1's writer list, the D2 gate and its superset argument, the D3 clear, the D4 order with its cancellation outcome, and "the pass is unchanged; R3/R4 cover every refreshing writer; a refresh that cannot run leaves the rows to the next pass, as before". The L21 and L23 residuals are kept verbatim. |
-| Same file, "What `list_tasks` can and cannot see" | "except an edit made by a task tool, which refreshes that note's task rows at once (#428, the next section). `edit_note` and the other generic writers do not." | "except a write whose refresh ran: the task tools (#428), and since #432 `edit_note`, `set_frontmatter`, a `write_file` replacing a note, and `delete_note` (a clear). A refresh that cannot run, a new note (`create_note`, `write_file` creating, import, upload) and `move_note`'s link rewrites wait for the next pass." |
+| Same file, "What `list_tasks` can and cannot see" | "except an edit made by a task tool, which refreshes that note's task rows at once (#428, the next section). `edit_note` and the other generic writers do not." | "except a write whose refresh ran: the task tools (#428), and since #432 `edit_note`, `set_frontmatter`, a `write_file` to a note path, and `delete_note` (a clear). A refresh that cannot run, a new note (`create_note`, a `write_file` creation whose refresh finds no row, an import or an upload) and `move_note`'s link rewrites wait for the next pass." |
 | `docs/architecture/vault-tools.md`, duplicate-scan paragraph | "a duplicate written by a generic tool since the last pass can be missed (L14)" | "a duplicate written since the last pass by `create_note`, an import, an upload, a `move_note` link rewrite, or a generic write whose refresh did not run can be missed (L14, narrowed by #432)" |
 | `README.md`, task section | "`edit_note` and the other generic write tools do not refresh task rows, so their changes show up after the next pass (every 300 s by default)." | "`edit_note`, `set_frontmatter` and `write_file` also try to refresh the task rows of a note they change, and `delete_note` removes a deleted note's tasks; their output does not say whether that worked. A new note created by `create_note`, `write_file`, an import or an upload, links rewritten by `move_note`, and any refresh that could not run show up after the next pass (every 300 s by default)." |
 | `docs/architecture/usage-attribution.md`, task section | no generic writers listed | One added paragraph: `edit_note`, `set_frontmatter`, `write_file` and `delete_note` gain the result-side key `task_refresh`, present only when a refresh or clear was attempted. |
@@ -264,7 +267,7 @@ No tool name, argument, schema, title, annotation or description changes. `tests
 
 ## What existing behaviour changes
 
-- After `edit_note`, `set_frontmatter` or `write_file` (replacing a note) on a note whose old or new bytes may hold a checkbox, the server refreshes that note's task rows in the same call when it can. When the refresh runs, `list_tasks`, `task_agenda` and `add_task`'s index-side duplicate scan reflect the write in the next call. When it cannot run, they reflect it after the next pass, as before.
+- After `edit_note`, `set_frontmatter` or `write_file` (to a note path) on a note whose old or new bytes may hold a checkbox, the server refreshes that note's task rows in the same call when it can. When the refresh runs, `list_tasks`, `task_agenda` and `add_task`'s index-side duplicate scan reflect the write in the next call. When it cannot run, they reflect it after the next pass, as before.
 - After every `delete_note`, its tasks leave listings when the clear runs.
 - Writes to such notes take longer by one derivation plus one short transaction, and by at most a 2 s lock wait when a pass holds the row. Every delete takes one short transaction longer.
 - Usage rows of those writes gain `task_refresh` (D5).
@@ -272,21 +275,23 @@ No tool name, argument, schema, title, annotation or description changes. `tests
 
 ## Accepted limitations
 
-- **L1**: A new note's tasks appear only after the next pass. This covers `create_note`, `write_file` creating a note, `import_from_url`, and an upload (creating or overwriting). An import or upload that overwrites a note with tasks also leaves its old rows until the pass.
+- **L1**: A new note's tasks appear only after the next pass. This covers `create_note`, `write_file` creating a note (its refresh finds no row), `import_from_url`, and an upload (creating or overwriting). An import or upload that overwrites a note with tasks also leaves its old rows until the pass.
 - **L2**: `excluded_note_tags` reads `notes_metadata.tags`, which only the pass writes, so a tag change by `set_frontmatter` or `edit_note` changes that note's exclusion only after the next pass.
-- **L3**: The refresh is best effort and its lag is silent. When it cannot run (`lock_timeout`, `superseded`, `error`, `root_changed`, `not_indexed`), the generic writer returns its usual success text, the next listing may still show the old rows, and they converge at the next pass. The usage row records the lag. The task tools still say `index: may lag`. Owner choice.
+- **L3**: The refresh is best effort and its lag is silent. When it cannot run (`lock_timeout`, `superseded`, `error`, `root_changed`, `not_indexed`), the generic writer returns its usual success text, the next listing may still show the old rows, and they converge at the next pass. The usage row records the lag. The task tools still say `index: may lag`. Decided by the implementing session on 2026-11-12, pending the owner's confirmation.
 - **L4**: `move_note`'s link rewrites (the moved note's own and every backlink source's) do not refresh. Until the next pass, a task whose text contained a rewritten link is listed with its old text and id, and a task write that uses that id refuses with `task_not_found` and writes nothing.
 - **L5**: The gate considers only the bytes this call replaced and published. Rows left stale by an earlier outside edit are not corrected by a later gated-out write. That is the pre-existing pass lag, unchanged.
 - **L6**: When `move_note`'s metadata transaction fails, the tasks stay listed under the old path until the pass, like every other row of that note.
 - **L7**: A feed consumer that reacts to a generic writer's event may list tasks before that call's refresh commits (D4), for at most the refresh's duration.
 - **L8**: The gate over-matches: a checkbox in a code fence or a frontmatter value triggers a refresh that writes the same rows. It costs time, never correctness.
 - **L9**: #428 L21 (the unlocked root re-check) and L23 (a clean row keeping a non-NULL `tasks_refreshed_at`) apply to the new call sites unchanged.
+- **L10**: Inside #428 L26's declared window (between `expected=`'s comparison and the rename), a non-cooperating writer's bytes that `edit_note` or `set_frontmatter` overwrite are not seen by the gate; when only those bytes held a task, no refresh runs and the next pass converges.
+- **L11**: The clear's absence check and its `DELETE` are separate steps under the row lock, which does not serialise publication at the path. A note recreated between them is present when the clear commits: the rows cleared were the deleted note's, and the new note's rows wait for the pass, as any created note's do (L1). Implementation review r1, NOTE, accepted.
 
 ## Adversarial scenarios a reviewer should trace
 
 Trace each through the code as implemented, against the expected outcome given.
 
-1. **Every interleaving in D7 (1–13)**, with `edit_note`, `set_frontmatter`, a `write_file` overwrite and the `delete_note` clear in the writer role. After at most two passes, `tasks_source_hash = content_hash` and the rows equal `tasks_from_note_text(disk)`. No pass writes rows older than a refresh that began after its scan.
+1. **Every interleaving in D7 (1–14)**, with `edit_note`, `set_frontmatter`, a `write_file` overwrite and the `delete_note` clear in the writer role. After at most two passes, `tasks_source_hash = content_hash` and the rows equal `tasks_from_note_text(disk)`. No pass writes rows older than a refresh that began after its scan.
 2. **Failure injection after a confirmed publication.** In each case the response text and outcome classification are byte-identical to the no-refresh run, and the change-feed event is recorded, because it precedes the refresh:
    - the gate raises: counted as "may hold", the refresh runs, nothing propagates;
    - the derivation raises: `derivation_failed`, rows removed, `tasks_failed` set;
@@ -298,8 +303,8 @@ Trace each through the code as implemented, against the expected outcome given.
    - the commit fails: `error`.
 
    **If the publication itself raises**, the refusal is unchanged and there is no event and no refresh.
-3. **Cancellation during the refresh** (D4): the file stands, the event is recorded, the task rows are unchanged, there is no response and no usage row, and the lease is released.
-4. **A note at the size caps.** `edit_note` publishes exactly `MAX_NOTE_BYTES` with 5,001 checkboxes: 5,000 rows, `tasks_truncated = true`, and no event-loop step over 100 ms caused by the gate or the derivation. The same for `write_file` at its `.md` cap. A file grown past the cap by an outside writer before the re-check: the re-read fails and the outcome is `superseded`.
+3. **Cancellation during the refresh** (D4): the file stands, the event is recorded, the task rows are unchanged, there is no response and no usage row, and the lease is released (integration test with a real held row lock; offline test of the lease in `queue` mode).
+4. **A note at the size caps.** `edit_note` publishes exactly `MAX_NOTE_BYTES` with 5,001 checkboxes: 5,000 rows, `tasks_truncated = true`; the gate and the derivation run in a worker thread, never on the event loop's thread (a structural test records the thread each runs on; no wall-clock bound, issue #401). The same for `write_file` at its `.md` cap. A file grown past the cap by an outside writer before the re-check: the re-read fails and the outcome is `superseded`.
 5. **A 10 MiB adversarial gate input** (`- - - …`, `> > > …`, digits with no delimiter): `may_hold_tasks` returns within 2 s.
 6. **The gate's superset property.** No input on which the extractor finds a task and the gate says no. Inputs to cover: CRLF and lone CR, U+0000 inside the brackets, a BOM, blockquote and callout prefixes, ordered markers, a code span directly after `]`, and a last line without a terminator.
 7. **Multi-user ownership.** Users 7 and 8 each have `Notes/a.md` with tasks. User 7 edits, then deletes. User 8's task rows and `tasks_*` columns stay byte-identical. Single-user (NULL owner) also works, and a user-7 call never touches a NULL-owned row.
@@ -331,6 +336,8 @@ Trace each through the code as implemented, against the expected outcome given.
   - the cancellation outcome.
 - **Integration, `tests/integration/test_task_refresh_generic_pg.py` (new, through the registered tools; `test_task_refresh_pg.py` keeps the R1 cases):**
   - list → write → list with no pass between, for `edit_note`, `set_frontmatter` and `write_file`;
+  - a `write_file` creation (`not_indexed`, no row written);
+  - a call cancelled while its refresh waits for a held row lock;
   - an edit that removes the last checkbox removes the rows;
   - `delete_note` → list, soft and permanent;
   - the finding-1 interleaving;
@@ -343,11 +350,28 @@ Trace each through the code as implemented, against the expected outcome given.
 
 ## Review record
 
-Codex spec review, round 1 (verdict `FAIL`: 2 MAJOR, 3 MINOR, 1 NOTE), and the supervisor's dispositions:
+**Who decided.** Every product decision in this change was decided by the implementing session on 2026-11-12, pending the owner's confirmation; none is owner-accepted. The pull request lists them for the owner to confirm or overrule:
+
+- the refresh is best effort and its lag is silent to the agent (L3, D5);
+- `delete_note` clears the deleted note's task rows after every confirmed delete (D1.4, D3);
+- `set_frontmatter` refreshes, for line numbers (D1.2);
+- `create_note` is excluded (D1, L1);
+- `move_note` link-rewrite refreshes are cut (D1, L4);
+- the generic writers run publish → event → refresh, while the task tools keep publish → refresh → event (D4).
+
+Codex spec review, round 1 (verdict `FAIL`: 2 MAJOR, 3 MINOR, 1 NOTE), and the dispositions the implementing session took:
 
 1. **The delete gate could skip the clear** (MAJOR). Fixed: the clear now runs after every confirmed delete, with the under-lock absence check kept (D1.4, D3, D7.10).
-2. **The unconditional "next listing reflects the write" claim** (MAJOR). Resolved as best-effort freshness with a silent lag, accepted as L3 (owner choice). The claim is removed throughout.
+2. **The unconditional "next listing reflects the write" claim** (MAJOR). Resolved as best-effort freshness with a silent lag, recorded as L3, decided by the implementing session on 2026-11-12, pending the owner's confirmation. The claim is removed throughout.
 3. **The equal-bytes skip for an unguarded `write_file`** (MINOR). Fixed: the skip applies only when the replaced bytes are known (D2).
 4. **The failure matrix and cancellation** (MINOR). Fixed, and the order changed to publish → event → refresh for the generic writers (D4).
 5. **The 40-source scenario** (MINOR). Moot after 6.
 6. **Link-rewrite refreshes in `move_note`** (NOTE). Cut (D1, L4), with the 32-note constant.
+
+Implementation review, round 1, at `1c53083` (Codex `FAIL`, 1 MAJOR, 1 NOTE; the independent verifier: 2 blocking gaps), and the dispositions the implementing session took:
+
+1. **`write_file` keyed the refresh on a pre-publication existence sample** (MAJOR, found by both). Fixed: the refresh is attempted after every publication to a note path (D1.3, D7.14); `edit_note` and `set_frontmatter` were checked for the same shape and are bound to the bytes they read (D2, L10).
+2. **The clear's absence check is not atomic with its `DELETE`** (NOTE). Accepted as L11.
+3. **The cancellation clauses (lease, unchanged rows) were untested** (verifier). Integration test with a real held row lock, and an offline lease test in `queue` mode.
+4. **The 100 ms event-loop bound was unmeasurable** (verifier). Replaced by the structural requirement that the gate and the derivation run in a worker thread, tested by recording their threads.
+
