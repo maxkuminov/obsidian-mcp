@@ -190,6 +190,43 @@ def test_an_excluded_copy_is_never_statted_or_read(conflict_vault, monkeypatch):
     assert result.read_failures == [] and result.unverified == []
 
 
+def test_the_startup_line_is_logged_only_when_on(monkeypatch, caplog):
+    import src.main as main
+
+    # Importing `src.main` reconfigures logging (the root handlers are
+    # replaced), so attach the capture handler to its logger directly.
+    log = logging.getLogger("src.main")
+    log.addHandler(caplog.handler)
+    monkeypatch.setattr(log, "level", logging.INFO)
+    try:
+        _startup_line_cases(main, monkeypatch, caplog)
+    finally:
+        log.removeHandler(caplog.handler)
+
+
+def _startup_line_cases(main, monkeypatch, caplog):
+    monkeypatch.setattr(main.settings, "index_exclude_conflict_files", False)
+    main._log_index_exclusion()
+    assert not [r for r in caplog.records if "sync-conflict" in r.getMessage()]
+
+    monkeypatch.setattr(main.settings, "index_exclude_conflict_files", True)
+    main._log_index_exclusion()
+    lines = [r for r in caplog.records if "sync-conflict" in r.getMessage()]
+    assert [(r.levelno, r.getMessage()) for r in lines] == [(
+        logging.INFO,
+        "Index exclusion: sync-conflict copies are not indexed "
+        "(INDEX_EXCLUDE_CONFLICT_FILES=true)",
+    )]
+
+
+def test_the_lifespan_calls_the_startup_line():
+    import inspect
+
+    import src.main as main
+
+    assert "_log_index_exclusion()" in inspect.getsource(main.lifespan)
+
+
 def test_the_pass_result_counts_excluded_apart_from_not_indexable():
     r = indexer.IndexPassResult(5, 1, not_indexable=1, excluded=2)
     assert tuple(r) == (5, 1)

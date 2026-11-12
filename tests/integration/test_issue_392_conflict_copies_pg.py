@@ -13,7 +13,7 @@ exact path.
 
 Skipped unless `PGVECTOR_TEST_ADMIN_URL` is set (see `_harness`).
 """
-import contextlib
+import logging
 import os
 
 import pytest
@@ -26,12 +26,16 @@ import src.mcp_server.tools as tools
 from src.auth.session import current_actor, current_principal
 from src.config import settings
 from src.mcp_server.auth import current_permission
-from src.models.db import IndexerRun, NoteEmbedding, NoteLink, NoteMetadata, NoteTask
+from src.models.db import (
+    IndexerRun, NoteEmbedding, NoteLink, NoteMetadata, NoteTask, User,
+)
 from src.services import change_feed, indexer, indexer_health
 from src.services import embeddings as embeddings_service
 from src.services import vault as vault_service
 from src.services.note_hash import canonical_note_hash
+from src.services.transfer import canonical_vault_root
 import _harness
+import _poison
 
 pytestmark = [
     _harness.requires_pgvector,
@@ -54,7 +58,9 @@ def migrated_url():
 async def sessionmaker(migrated_url):
     engine = create_async_engine(migrated_url, poolclass=None)
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    await _poison.install(maker)
     yield maker
+    await _poison.uninstall(maker)
     await engine.dispose()
 
 
@@ -95,6 +101,7 @@ async def vault(sessionmaker, monkeypatch, tmp_path):
     indexer.excluded_conflict_copies.clear()
     vault_service.clear_user_vault_cache()
     async with sessionmaker() as session:
+        await session.execute(text("DELETE FROM poison_rules"))
         for table in FEED_TABLES + ("note_tasks", "note_links", "note_embeddings",
                                     "notes_metadata", "indexer_runs", "users"):
             await session.execute(text(f"DELETE FROM {table}"))
@@ -187,6 +194,9 @@ async def test_toggle_on_removes_the_copy_and_nothing_else_then_off_restores(
     n_events = len(await events(sessionmaker))
 
     exclude(monkeypatch, True)
+    # Forget the seeding pass's backstop record, so the assertion below can
+    # only pass if THIS (full-hash) pass advanced the clock.
+    indexer._last_full_hash.clear()
     assert await indexer._index_pass_once(None) is True
     after = await rows(sessionmaker)
     assert set(after) == {"A.md", "B.md"}
@@ -407,3 +417,214 @@ async def test_move_onto_an_excluded_name_notices_and_the_next_pass_removes(
     assert await count(sessionmaker, NoteTask, NoteTask.note_id, e_id) == 0
     assert await count(sessionmaker, NoteLink, NoteLink.source_note_id, e_id) == 0
     assert (vault / target).exists()
+
+
+# ── Review r1 additions ───────────────────────────────────────────────────
+
+
+async def test_a_quarantine_restart_never_pairs_a_conflict_copy_as_destination(
+    vault, sessionmaker, monkeypatch
+):
+    """C: the attempt restarts on a PoisonNote with copies of the scan's
+    verdicts; the copy stays not-indexable across the restart."""
+    write(vault, "B.md", "bravo body\n")
+    await indexer.index_vault()
+    b_id = (await rows(sessionmaker))["B.md"].id
+    exclude(monkeypatch, True)
+    mark = len(await events(sessionmaker))
+    target = "B.sync-conflict-20260529-194539-ABC2DEF.md"
+    (vault / "B.md").rename(vault / target)
+    write(vault, "P.md", "a new note the database refuses\n")
+    await _poison.poison(sessionmaker, "upsert", "P.md", "22001")
+
+    result = await indexer.index_vault()
+    assert result.quarantined == ("P.md",), "a PoisonNote restart happened"
+    assert result.excluded == 1
+    after = await rows(sessionmaker)
+    assert after == {}, after
+    assert b_id not in {r.id for r in after.values()}
+    new = [(e.kind, e.path, e.from_path, e.reason)
+           for e in (await events(sessionmaker))[mark:]]
+    assert ("deleted", "B.md", None, "removed") in new
+    assert not [e for e in new if e[0] == "moved"]
+    assert not [e for e in new if e[1] == target]
+
+
+async def tenant(sessionmaker, root, name: str) -> int:
+    root.mkdir(exist_ok=True)
+    async with sessionmaker() as session:
+        user = User(username=name, password_hash="x", vault_path=str(root))
+        session.add(user)
+        await session.commit()
+        await vault_service.warm_user_vault_cache(session, user_id=user.id)
+        return user.id
+
+
+async def test_a_re_derive_over_conflict_copy_rows_records(
+    vault, sessionmaker, monkeypatch
+):
+    """D: rows with no recorded provenance force a re-derive; the
+    conflict-copy row is deleted (no withholding) and the stamp is written."""
+    root = vault / "tenant"
+    uid = await tenant(sessionmaker, root, "rederive392")
+    try:
+        write(root, "a.md", "a\n")
+        write(root, COPY, "a copy\n")
+        async with sessionmaker() as session:
+            for path in ("a.md", COPY):
+                session.add(NoteMetadata(
+                    user_id=uid, file_path=path, title="foreign", tags=[],
+                    frontmatter={}, content_hash="0" * 64,
+                ))
+            await session.commit()
+        exclude(monkeypatch, True)
+        result = await indexer.index_vault(user_id=uid)
+        assert result.rederive == indexer.REDERIVE_RECORDED
+        assert result.excluded == 1
+        async with sessionmaker() as session:
+            paths = (await session.execute(
+                select(NoteMetadata.file_path).where(NoteMetadata.user_id == uid)
+            )).scalars().all()
+            recorded = (await session.execute(
+                select(User.indexed_vault_assignment).where(User.id == uid)
+            )).scalar_one()
+        assert sorted(paths) == ["a.md"]
+        assert recorded == canonical_vault_root(root)
+        assert indexer.excluded_conflict_copies[uid] == 1
+    finally:
+        vault_service.clear_user_vault_cache(user_id=uid)
+
+
+async def test_a_quarantined_note_that_becomes_excluded_is_cleared(
+    vault, sessionmaker, monkeypatch
+):
+    """E: a quarantined note renamed onto a conflict name, and a quarantine
+    entry already at a conflict path when the setting turns on."""
+    write(vault, "keep.md", "keep\n")
+    write(vault, "Bad.md", "refused\n")
+    await _poison.poison(sessionmaker, "upsert", "Bad.md", "22001")
+    await indexer.index_vault()
+    assert indexer.quarantined_paths(None) == ["Bad.md"]
+    await _poison.cure(sessionmaker)
+
+    exclude(monkeypatch, True)
+    renamed = "Bad (conflict 2026-05-29-19-45-39).md"
+    (vault / "Bad.md").rename(vault / renamed)
+    await indexer.index_vault()
+    assert indexer.quarantined_paths(None) == []
+    assert set(await rows(sessionmaker)) == {"keep.md"}
+
+    # An entry at an excluded path itself (quarantined before the toggle).
+    exclude(monkeypatch, False)
+    await _poison.poison(sessionmaker, "upsert", renamed, "22001")
+    await indexer.index_vault()
+    assert indexer.quarantined_paths(None) == [renamed]
+    await _poison.cure(sessionmaker)
+    exclude(monkeypatch, True)
+    result = await indexer.index_vault()
+    assert indexer.quarantined_paths(None) == []
+    assert result.excluded == 1 and result.quarantined == ()
+    assert set(await rows(sessionmaker)) == {"keep.md"}
+
+
+async def test_the_removal_and_count_lines(vault, sessionmaker, monkeypatch, caplog):
+    """B: one INFO removal line through `_format_skips` (20 paths, then
+    `, and N more`), one INFO count line, no WARNING naming a copy."""
+    write(vault, "keep.md", "k\n")
+    names = [f"N{i:02d} (conflict 2026-05-29-19-45-39).md" for i in range(23)]
+    for n in names:
+        write(vault, n, f"body {n}\n")
+    await indexer.index_vault()
+    exclude(monkeypatch, True)
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="src.services.indexer"):
+        await indexer.index_vault()
+    messages = [(r.levelno, r.getMessage()) for r in caplog.records]
+    removal = [m for lvl, m in messages if m.startswith("Removed the index row(s)")]
+    assert len(removal) == 1, removal
+    assert removal[0].startswith(
+        "Removed the index row(s) of 23 excluded sync-conflict copies: "
+    )
+    assert removal[0].endswith(", and 3 more")
+    assert sum(n in removal[0] for n in names) == 20
+    counts = [m for lvl, m in messages if m.startswith("Excluded ")]
+    assert counts == [
+        "Excluded 23 sync-conflict copies from the index (INDEX_EXCLUDE_CONFLICT_FILES)"
+    ]
+    assert all(lvl == logging.INFO for lvl, m in messages if m in removal + counts)
+    assert not [m for lvl, m in messages
+                if lvl >= logging.WARNING and "conflict 2026" in m]
+
+    # The next pass: the count line again, no removal line.
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="src.services.indexer"):
+        await indexer.index_vault()
+    msgs = [r.getMessage() for r in caplog.records]
+    assert not [m for m in msgs if m.startswith("Removed the index row(s)")]
+    assert [m for m in msgs if m.startswith("Excluded ")] == counts
+
+    # Singular, and nothing at all with zero.
+    for n in names[1:]:
+        (vault / n).unlink()
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="src.services.indexer"):
+        await indexer.index_vault()
+    assert [r.getMessage() for r in caplog.records
+            if r.getMessage().startswith("Excluded ")] == [
+        "Excluded 1 sync-conflict copy from the index (INDEX_EXCLUDE_CONFLICT_FILES)"
+    ]
+    (vault / names[0]).unlink()
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="src.services.indexer"):
+        await indexer.index_vault()
+    assert not [r for r in caplog.records if "sync-conflict" in r.getMessage()]
+
+
+async def test_a_link_rewriting_move_out_of_an_excluded_name_notices(
+    vault, sessionmaker, monkeypatch
+):
+    """A: backlinks to an excluded copy cannot be discovered; the move
+    succeeds and says so. Both notices, each once, when the destination is
+    excluded too. Byte-identical output otherwise."""
+    write(vault, "B.md", "see [[A (conflict 2026-05-29-19-45-39)]]\n")
+    write(vault, COPY, "the copy\n")
+    write(vault, "C (conflict 2026-05-29-19-45-39).md", "another copy\n")
+    write(vault, "D.md", "plain\n")
+    exclude(monkeypatch, True)
+    monkeypatch.setattr(tools.settings, "index_exclude_conflict_files", True)
+    await indexer.index_vault()
+    assert set(await rows(sessionmaker)) == {"B.md", "D.md"}
+    b_before = (vault / "B.md").read_text()
+
+    out = await tools.move_note_impl(COPY, "A.md", rewrite_links=True)
+    assert out.endswith("\n" + tools.CONFLICT_REWRITE_NOTICE), out
+    assert out.count("\n") == 1 and tools.CONFLICT_EXCLUSION_NOTICE not in out
+    assert (vault / "B.md").read_text() == b_before, "the link was not rewritten"
+    assert (vault / "A.md").exists()
+
+    both = await tools.move_note_impl(
+        "C (conflict 2026-05-29-19-45-39).md",
+        "C.sync-conflict-20260529-194539-ABC2DEF.md",
+        rewrite_links=True,
+    )
+    assert both.endswith(
+        "\n" + tools.CONFLICT_REWRITE_NOTICE + "\n" + tools.CONFLICT_EXCLUSION_NOTICE
+    ), both
+    assert both.count(tools.CONFLICT_REWRITE_NOTICE) == 1
+    assert both.count(tools.CONFLICT_EXCLUSION_NOTICE) == 1
+
+    # No rewrite notice: rewrite_links=False, or a non-matching source.
+    plain = await tools.move_note_impl(
+        "C.sync-conflict-20260529-194539-ABC2DEF.md", "C.md"
+    )
+    assert "\n" not in plain, plain
+    moved = await tools.move_note_impl("D.md", "D2.md", rewrite_links=True)
+    assert "\n" not in moved, moved
+
+    # Setting off: the same shape of call carries no notice at all.
+    monkeypatch.setattr(tools.settings, "index_exclude_conflict_files", False)
+    write(vault, "E (conflict 2026-05-29-19-45-39).md", "e\n")
+    off = await tools.move_note_impl(
+        "E (conflict 2026-05-29-19-45-39).md", "E.md", rewrite_links=True
+    )
+    assert "\n" not in off, off

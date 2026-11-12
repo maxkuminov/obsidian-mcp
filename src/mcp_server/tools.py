@@ -4483,6 +4483,16 @@ CONFLICT_EXCLUSION_NOTICE = (
     "run. Read it by exact path."
 )
 
+#: #392 r1: the line a fully successful `move_note(rewrite_links=True)`
+#: appends when its SOURCE has an excluded sync-conflict name. Exact text
+#: pinned by the index-integrity spec delta.
+CONFLICT_REWRITE_NOTICE = (
+    "note: the source name matches the sync-conflict exclusion "
+    "(INDEX_EXCLUDE_CONFLICT_FILES), so it is not in the index and links to "
+    "its old name may not have been found or rewritten; search for the old "
+    "name and fix any by hand."
+)
+
 
 def _with_conflict_notice(message: str, rel: str) -> str:
     """`message`, plus the exclusion notice line when it applies (#392).
@@ -7091,6 +7101,16 @@ async def _move_note_locked(
             )
         # #392: a fully successful move onto an excluded sync-conflict name
         # says so; partial and refused outcomes are unchanged.
+        # #392 r1: backlink discovery is keyed on the source's index row,
+        # which the exclusion removed, so a link rewrite out of an excluded
+        # name cannot find the links to it. Say so rather than refuse the
+        # recovery move. Then the destination notice, if that name matches.
+        if (
+            rewrite_links
+            and settings.index_exclude_conflict_files
+            and is_conflict_copy(from_rel.rsplit("/", 1)[-1])
+        ):
+            message = f"{message}\n{CONFLICT_REWRITE_NOTICE}"
         return _with_conflict_notice(message, to_rel)
     finally:
         for opened in targets:
