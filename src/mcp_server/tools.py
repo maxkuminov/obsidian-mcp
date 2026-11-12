@@ -7833,16 +7833,19 @@ async def write_file_impl(
             await _record_note_events(uid, [_content_event(
                 "modified" if had_incumbent else "created", target.rel, data
             )])
-            if had_incumbent:
-                # #432: replacing a note, after the event, best effort and
-                # silent. An incumbent read for the precondition is known;
-                # otherwise (unguarded, or over the read cap) it is unknown
-                # and assumed to have held a task. Creation never refreshes.
-                await _refresh_after_write(
-                    uid, target,
-                    replaced=incumbent if incumbent is not None else _UNKNOWN_BYTES,
-                    published=data,
-                )
+            # #432: after the event, best effort and silent, after EVERY
+            # publication to a note path. Never keyed on `had_incumbent`:
+            # that is sampled before the publication, and a note moved onto
+            # the path in between would be overwritten without a refresh
+            # (impl review r1). The replaced bytes are known only when the
+            # publication was bound to them (`expected=incumbent`); otherwise
+            # they are unknown and assumed to have held a task. A genuine
+            # creation finds no index row: `not_indexed`, nothing written.
+            await _refresh_after_write(
+                uid, target,
+                replaced=incumbent if incumbent is not None else _UNKNOWN_BYTES,
+                published=data,
+            )
         result = f"Wrote {len(data):,} bytes to {path}"
         if over_cap or len(data) > read_cap:
             return result + (

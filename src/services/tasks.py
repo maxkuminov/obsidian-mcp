@@ -58,7 +58,7 @@ A third derivation is one more call after `_update_tasks_for_changed`.
 
 **The write-time refresh exception (#428, design D10; #432).** Rule 3 has
 exactly one exception: a write-time refresh, by a task tool or by a generic
-note writer (`edit_note`, `set_frontmatter`, a `write_file` replacing a note,
+note writer (`edit_note`, `set_frontmatter`, a `write_file` to a note path,
 `delete_note`; #432), through `src.services.task_index.refresh_note_tasks`,
 may rewrite one note's task rows outside the pass, under that note's
 `notes_metadata` row lock, from the bytes its own call published, or, after

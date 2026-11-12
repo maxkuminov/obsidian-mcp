@@ -3,7 +3,7 @@
 A task tool (`complete_task`, `update_task`, `add_task`) publishes a note and
 then calls `refresh_note_tasks`, so that a `list_tasks` right after the write
 sees it (read-your-writes). Since #432 the generic note writers call it too:
-`edit_note`, `set_frontmatter` and a `write_file` that replaces a note, after
+`edit_note`, `set_frontmatter` and every `write_file` to a note path, after
 their change-feed event and only when the replaced or published bytes may
 hold a task (`tasks.may_hold_tasks`), silently (their responses are
 unchanged); and `delete_note`, after every confirmed delete, through the

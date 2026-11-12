@@ -365,6 +365,57 @@ async def test_a_held_row_lock_leaves_response_and_event_unchanged(sessionmaker,
     assert await converged(sessionmaker, vault, "l.md")
 
 
+async def test_a_call_cancelled_while_its_refresh_waits_for_the_row_lock(sessionmaker, vault):
+    """The cancellation scenario against real locks: the file stands, the
+    attributed event exists, the task rows (and the row's task columns) are
+    unchanged, and nothing partial was written."""
+    put(vault, "k.md", TASKS)
+    await index()
+    row_sql = ("SELECT id, tasks_source_hash, tasks_refreshed_at, tasks_failed, tasks_truncated "
+               "FROM notes_metadata WHERE file_path = 'k.md'")
+    tasks_sql = ("SELECT t.id, t.line, t.text, t.state, t.task_key FROM note_tasks t JOIN notes_metadata m "
+                 "ON m.id = t.note_id WHERE m.file_path = 'k.md' ORDER BY t.line")
+    async with sessionmaker() as s:
+        row_before = (await s.execute(text(row_sql))).one()
+        tasks_before = (await s.execute(text(tasks_sql))).all()
+    async with sessionmaker() as holder:
+        await holder.execute(
+            text("SELECT id FROM notes_metadata WHERE id = :i FOR UPDATE"), {"i": row_before.id})
+        edit = asyncio.ensure_future(
+            call("edit_note", path="k.md", find="- [ ] Buy milk", content="- [x] Buy milk"))
+        # Wait (bounded) until the refresh's statement is blocked on the lock.
+        for _ in range(400):
+            waiting = await scalar(
+                sessionmaker,
+                "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
+                "AND query ILIKE '%notes_metadata%FOR UPDATE%'")
+            if waiting:
+                break
+            await asyncio.sleep(0.01)
+        assert waiting, "the refresh never reached the row lock"
+        edit.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await edit
+        await holder.rollback()
+    assert b"- [x] Buy milk" in (vault / "k.md").read_bytes()
+    assert await events(sessionmaker, "edit_note") == 1
+    async with sessionmaker() as s:
+        assert (await s.execute(text(row_sql))).one() == row_before
+        assert (await s.execute(text(tasks_sql))).all() == tasks_before
+    assert await scalar(sessionmaker, "SELECT count(*) FROM usage_logs WHERE tool = 'edit_note'") == 0
+    await index()
+    assert await converged(sessionmaker, vault, "k.md")
+
+
+async def test_write_file_creating_a_note_is_a_no_op_refresh(sessionmaker, vault):
+    out = await call("write_file", path="fresh.md", content="- [ ] new\n", encoding="text")
+    assert code(out) is None, out
+    assert (await usage(sessionmaker, "write_file"))["task_refresh"] == "lagged:not_indexed"
+    assert await scalar(sessionmaker, "SELECT count(*) FROM notes_metadata") == 0
+    await index()
+    assert texts(await call("list_tasks")) == ["new"]
+
+
 async def test_an_edit_refresh_finishing_after_a_task_write_is_superseded(
     sessionmaker, vault, monkeypatch,
 ):

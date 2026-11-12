@@ -599,7 +599,26 @@ def _generated_notes(count: int, seed: int = 432):
         if rng.random() < 0.2:
             parts.append("---\n" + rng.choice(["a: 1\n", "tags: [x]\n", "- [ ] y\n"]) + "---\n")
         for _ in range(rng.randint(1, 12)):
-            if rng.random() < 0.25:
+            roll = rng.random()
+            if roll < 0.1:
+                # Real nesting: a parent item, then indented child tasks.
+                parent = rng.choice(["- ", "* ", "1. ", "- [ ] "]) + "parent\n"
+                kids = "".join(
+                    rng.choice(["  ", "    ", "\t", "      "]) + rng.choice(_GEN_MARKER)
+                    + " " + rng.choice(_GEN_STATUS) + rng.choice(_GEN_TAIL) + "\n"
+                    for _ in range(rng.randint(1, 4))
+                )
+                parts.append(parent + kids)
+            elif roll < 0.2:
+                # A multi-line callout: header, then quoted task lines.
+                head = rng.choice(["> [!note]", "> [!todo]- Folded", ">[!tip] Title"]) + "\n"
+                body = "".join(
+                    rng.choice(["> ", ">", "> > ", ">  "]) + rng.choice(_GEN_MARKER) + " "
+                    + rng.choice(_GEN_STATUS) + rng.choice(_GEN_TAIL) + "\n"
+                    for _ in range(rng.randint(1, 4))
+                )
+                parts.append(head + body)
+            elif roll < 0.4:
                 parts.append(rng.choice(_GEN_BLOCK))
             else:
                 parts.append(
