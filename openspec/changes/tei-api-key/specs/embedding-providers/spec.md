@@ -64,12 +64,17 @@ With `EMBEDDING_PROVIDER=tei` and `TEI_API_KEY` set, every request the server ma
 - **THEN** the embedding fingerprint and the retrieval fingerprint SHALL be unchanged and startup SHALL proceed
 
 ### Requirement: `TEI_API_KEY` SHALL never be disclosed by the server
-The value of `TEI_API_KEY` SHALL NOT appear in any log record (message, arguments or formatted exception), in the `/health` response, in any control-panel page, in any exception message or stored embed-failure message, in any security event, in `repr` or `str` of the settings object, in a settings `ValidationError`, or in either embedding fingerprint. The setting SHALL be held as a `SecretStr`, and `Settings` SHALL keep `hide_input_in_errors` enabled.
+The value of `TEI_API_KEY` SHALL NOT appear in any log record (message, arguments or formatted exception), in the `/health` response, in any control-panel page (the `/admin/health` run history and error ring included), in the persisted `indexer_runs.error` column, in any exception message or stored embed-failure message, in any security event, in `repr` or `str` of the settings object, in a settings `ValidationError`, or in either embedding fingerprint. The setting SHALL be held as a `SecretStr`, and `Settings` SHALL keep `hide_input_in_errors` enabled.
 
 #### Scenario: A sentinel value never surfaces
 - **WHEN** `TEI_API_KEY` is a sentinel and the test runs startup (transport line, plaintext warning, identity check answering 200 match, 200 mismatch, 401 and 403), `embed_note` with `/embed` answering 200, 401, 403 and three 503s, the panel settings page, the app's `/health`, both fingerprints, and every security event emitted along the way, with logs captured at DEBUG
 - **THEN** the sentinel SHALL NOT occur in any captured log record, response body, exception string, stored failure message, event or fingerprint
 - **AND** the mock TEI SHALL have received the sentinel in the `Authorization` header, as the positive control
+
+#### Scenario: The persisted pass record and the health page do not carry it
+- **WHEN** `TEI_API_KEY` is a sentinel and an index pass runs against a verified TEI whose `/embed` answers 401
+- **THEN** the persisted `indexer_runs.error` value of that pass SHALL NOT contain the sentinel, and SHALL name `TEI_API_KEY`
+- **AND** the rendered `/admin/health` page (run history and the error ring) SHALL NOT contain the sentinel
 
 #### Scenario: The settings representation masks it
 - **WHEN** `repr(settings)` and `str(settings.tei_api_key)` are taken with the sentinel set
@@ -119,11 +124,12 @@ A `GET /info` answered 401 or 403 SHALL be an inconclusive identity check, never
 
 #### Scenario: /embed 401 mid-run
 - **WHEN** the server is verified and `/embed` answers 401 for every note of a 50-note pass
-- **THEN** each note SHALL record `PROVIDER_FAILED` with the message `TEI /embed answered HTTP 401; the server rejected TEI_API_KEY`, exactly one request SHALL be made per slice, exactly one ERROR line SHALL be logged for the pass, and no `/info` request SHALL be made
+- **THEN** each note SHALL record `PROVIDER_FAILED` with the message `TEI /embed answered HTTP 401; the server rejected TEI_API_KEY`, exactly one request SHALL be made per slice, and no `/info` request SHALL be made
+- **AND** exactly one provider ERROR line naming `TEI_API_KEY` SHALL be logged for the pass, beside the indexer's existing pass-summary ERROR line and its existing per-note WARNING lines (`Failed to embed <path>: …`), which this change SHALL NOT alter
 
 #### Scenario: The ERROR line re-arms after success
 - **WHEN** `/embed` answers 401, then 200, then 401
-- **THEN** two ERROR lines SHALL have been logged
+- **THEN** two provider ERROR lines naming `TEI_API_KEY` SHALL have been logged
 
 ### Requirement: A key on a plaintext non-loopback TEI hop SHALL be admitted with one startup warning
 When `EMBEDDING_PROVIDER=tei`, `TEI_API_KEY` is set, and `TEI_URL` is `http` to a non-loopback host (admitted by `EMBEDDING_ALLOW_PLAINTEXT=true`), the server SHALL start and SHALL log, once at startup after the embedding transport line, one WARNING: `TEI_API_KEY is sent in clear over http to a non-loopback host (admitted by EMBEDDING_ALLOW_PLAINTEXT); use an https TEI_URL to protect it`. With an `https` URL, a loopback `http` URL, or the key unset, no such line SHALL be logged. The embedding transport line and the `internal_transport_plaintext` event SHALL be unchanged.

@@ -29,6 +29,7 @@ Refs #426. Read `proposal.md`, `design.md` (D1–D6, the accepted limitations, T
 - [ ] 3.6 401/403 classification: `/info` reasons (both wordings), never `mismatch`, no exit from the lifespan path; the connection-error-then-401 CRITICAL sequence; `/embed` 401 under `embed_note` gives `PROVIDER_FAILED`, one request per slice, one ERROR line per run, and re-arming after a 200.
 - [ ] 3.7 Plaintext-key WARNING: present once for `http://tei:80` with the override and a key, absent for loopback, `https` and an unset key.
 - [ ] 3.8 The sentinel secrecy test of design §"Secrecy test", including the positive control.
+- [ ] 3.8a An index pass against a verified TEI answering 401 with the sentinel key: read the persisted `indexer_runs.error` row and render `/admin/health`; the sentinel is absent from both and the row names `TEI_API_KEY` (a database-backed integration test).
 - [ ] 3.9 Fingerprints: both are unchanged by setting the key.
 - [ ] 3.10 Run the TEI, transport and config modules (`tests/test_tei_provider.py`, `tests/test_tei_identity.py`, `tests/test_internal_transport_*.py`, `tests/test_config_validation.py`, `tests/test_perf_provider_batching.py`, `tests/test_issue_309_panel_confirm_empty.py`), then the whole offline suite once.
 

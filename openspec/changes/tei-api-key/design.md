@@ -51,7 +51,7 @@ Other statuses keep today's reason.
 
 **The CRITICAL line must show the auth reason.** Today an inconclusive verdict is deduplicated on the status alone, so a TEI that was first unreachable while starting and then answered 401 would never log the 401 line. An auth refusal therefore counts as its own verdict, `("inconclusive-auth", reason)`. It logs one CRITICAL when it first appears or its reason changes, and nothing more while it repeats. Every other inconclusive reason keeps today's single verdict.
 
-**`POST /embed`.** A 401 or 403 raises `RuntimeError` with `TEI /embed answered HTTP 401; TEI_API_KEY is not set`, or `…; the server rejected TEI_API_KEY`. It is raised after one request and never retried, because neither status is retryable today and a wrong key does not heal in 3 s. The message carries no URL, header or body. `EmbedNoteFailure.capture` records it, so the pass outcome is `PROVIDER_FAILED`, previous vectors stay intact and the note stays uncertified. One ERROR line with the same text is logged on the first such failure. The line is suppressed while the failures repeat and re-armed by the next 200 from `/embed`, so 2,000 notes do not log 2,000 lines. The process is not un-verified: an auth failure says nothing about model identity.
+**`POST /embed`.** A 401 or 403 raises `RuntimeError` with `TEI /embed answered HTTP 401; TEI_API_KEY is not set`, or `…; the server rejected TEI_API_KEY`. It is raised after one request and never retried, because neither status is retryable today and a wrong key does not heal in 3 s. The message carries no URL, header or body. `EmbedNoteFailure.capture` records it, so the pass outcome is `PROVIDER_FAILED`, previous vectors stay intact and the note stays uncertified. One provider ERROR line with the same text is logged on the first such failure. The line is suppressed while the failures repeat and re-armed by the next 200 from `/embed`, so the provider adds one line per run of failures, not one per note. The existing loggers stay as they are: `embed_note`'s per-note WARNING (`Failed to embed <path>: …`, which now carries the auth wording) and the indexer's pass-summary ERROR line. A failed 50-note pass therefore logs one provider ERROR line, one pass-summary ERROR line and 50 WARNING lines. The process is not un-verified: an auth failure says nothing about model identity.
 
 The statuses are handled through a TEI-only hook in `_post_with_retries`, evaluated where `input_limit` is today (before the retry decision). OpenAI passes no hook. Its behaviour stays pinned by #425's characterization tests.
 
@@ -79,6 +79,7 @@ The key is not a property of the vectors, so it is in neither the stored embeddi
 - `verify_tei_server` against 200 match, 200 mismatch, 401 and 403;
 - `/embed` answering 200, 401, 403 and 503 three times, through `embed_note`, with the stored `EmbedNoteFailure` message;
 - the panel settings page HTML;
+- an index pass whose `/embed` answers 401, then the persisted `indexer_runs.error` row and the rendered `/admin/health` page (run history and error ring);
 - the app's `/health` body;
 - `embedding_fingerprint()` and `retrieval_fingerprint()`;
 - every emitted security event;
