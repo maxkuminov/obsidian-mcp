@@ -942,39 +942,84 @@ returned, by the same API key or OAuth grant. The design and every rule are
 in [search](docs/architecture/search.md#search-evaluation-harness-356).
 `make search-eval` with no arguments runs on a committed synthetic fixture
 and needs nothing; the real run is this path, from a checkout with
-`requirements-dev.txt` installed:
+`requirements-dev.txt` installed. Only step 1 touches production, and only
+to read it: the dump is taken without a `backups_log` row, and the export,
+the snapshot and the replay all run against the restored copy, so the usage
+rows and the indexed notes come from the same moment (#408).
 
-1. **Export.** `make search-eval-export [DAYS=90] USER_ID=<your user id>`.
-   It runs one read-only transaction holding one `SELECT` through the same
-   channel as `make db-backup` (`DB_BACKEND=docker` or `cnpg`, set in
-   `Makefile.local`), and writes the `keyword_search`, `semantic_search`,
-   `hybrid_search` and `read_note` rows of the last `DAYS` days (1 to 365) to
-   `.search-eval/usage-export.jsonl` (`SEARCH_EVAL_DIR` to move it): a `0700`
-   directory, a `0600` file, git-ignored. **It is tenant data**: query text,
-   the paths agents read, owner ids. Never commit it, upload it or paste it
-   into an issue. On a multi-user deployment `USER_ID=` is required for a
-   report you will attach to a PR; an unfiltered export covers every user
-   and is for your private use only. `SEARCH_EVAL_DB_NAME` (default
-   `obsidian_mcp`, the name `make db-backup` dumps) names the database to
-   export from.
-2. **Back up with the derived tables.** `BACKUP_FULL=1 make db-backup`. The
-   default dump stores `notes_metadata` and `note_embeddings` as schema
-   only, and replay needs their rows.
-3. **Restore it into a scratch database**, never over the live one. For
-   example, on a throwaway pgvector container bound to loopback:
+1. **Dump production, full and unrecorded.** Not `make db-backup`: it
+   records the dump in `backups_log` (a write to production, and a row the
+   Health page then reports as your newest backup), puts the file among the
+   production backups, where retention counts it, and by default stores
+   `notes_metadata` and `note_embeddings` as schema only, while replay needs
+   their rows. Call `pg_dump` through the same channel instead, into the
+   git-ignored, owner-only `.search-eval/` directory, using the
+   `DB_BACKEND` / `DB_CONTAINER` (docker) or `CNPG_NAMESPACE` /
+   `CNPG_CLUSTER` (cnpg) values your `Makefile.local` sets:
+
+   ```sh
+   umask 077; mkdir -p .search-eval && chmod 700 .search-eval
+   ( set -o pipefail
+     DB_BACKEND=<docker|cnpg> DB_CONTAINER=<postgres container> \
+     CNPG_NAMESPACE=<namespace> CNPG_CLUSTER=<cluster> \
+       bash docker/db-exec.sh pg_dump -U postgres --no-owner --no-privileges obsidian_mcp \
+       | gzip > .search-eval/eval-dump.sql.gz ) || echo "DUMP FAILED"
+   gzip -t .search-eval/eval-dump.sql.gz
+   gunzip -c .search-eval/eval-dump.sql.gz | tail -n 5 | grep -q 'PostgreSQL database dump complete' \
+       || echo "DUMP INCOMPLETE"
+   ```
+
+   Then, at once, record the source's row counts for step 2's check:
+
+   ```sh
+   DB_BACKEND=<docker|cnpg> DB_CONTAINER=<postgres container> \
+   CNPG_NAMESPACE=<namespace> CNPG_CLUSTER=<cluster> \
+     bash docker/db-exec.sh psql -U postgres -d obsidian_mcp -X -A -t -c \
+     "SELECT (SELECT count(*) FROM notes_metadata), (SELECT count(*) FROM note_embeddings), (SELECT count(*) FROM usage_logs)"
+   ```
+
+   The dump holds every tenant's note text and every credential hash:
+   delete it with the scratch container when you are done.
+2. **Restore it into a scratch database**, never over the live one, and
+   verify it. For example, on a throwaway pgvector container bound to
+   loopback (its PostgreSQL major version at least the source's, or the
+   dump's `SET` lines can fail):
 
    ```sh
    docker run --rm -d --name omcp-eval -e POSTGRES_PASSWORD=<scratch password> \
-       -p 127.0.0.1:55499:5432 pgvector/pgvector:pg16
-   docker exec omcp-eval createuser -U postgres obsidian_mcp
+       -p 127.0.0.1:<scratch port>:5432 pgvector/pgvector:pg16
    docker exec omcp-eval createdb -U postgres eval_copy
-   gunzip -c <the backup>.sql.gz | docker exec -i omcp-eval psql -q -U postgres -d eval_copy
+   gunzip -c .search-eval/eval-dump.sql.gz \
+       | docker exec -i omcp-eval psql -q -X -U postgres -d eval_copy -v ON_ERROR_STOP=1 --single-transaction
+   docker exec omcp-eval psql -U postgres -d eval_copy -X -A -t -c \
+       "SELECT (SELECT count(*) FROM notes_metadata), (SELECT count(*) FROM note_embeddings), (SELECT count(*) FROM usage_logs)"
    ```
 
-   `SEARCH_EVAL_DATABASE_URL` is then
-   `postgresql+asyncpg://postgres:<scratch password>@127.0.0.1:55499/eval_copy`.
+   `ON_ERROR_STOP` with `--single-transaction` makes the first error abort
+   the restore with nothing committed, instead of scrolling past. The copy's
+   `notes_metadata` and `note_embeddings` counts must equal the source's
+   from step 1 (a difference means the indexer wrote between the dump and
+   the count: count again; a zero means the dump carried no rows for that
+   table), and its `usage_logs` count may be lower only by the rows logged
+   after the dump. `SEARCH_EVAL_DATABASE_URL` is then
+   `postgresql+asyncpg://postgres:<scratch password>@127.0.0.1:<scratch port>/eval_copy`.
    It is the only replay target the harness documents; it never reads
    `DATABASE_URL`.
+3. **Export the usage rows from the copy.**
+   `make search-eval-export DB_BACKEND=docker DB_CONTAINER=omcp-eval SEARCH_EVAL_DB_NAME=eval_copy [DAYS=90] USER_ID=<your user id>`.
+   The three variables point the export at the scratch container instead of
+   production (command-line values override `Makefile.local`); without them
+   it reads production, whose usage rows are newer than the dump. It runs
+   one read-only transaction holding one `SELECT` through
+   `docker/db-exec.sh`, and writes the `keyword_search`, `semantic_search`,
+   `hybrid_search` and `read_note` rows of the last `DAYS` days (1 to 365)
+   to `.search-eval/usage-export.jsonl` (`SEARCH_EVAL_DIR` to move it): a
+   `0700` directory, a `0600` file, git-ignored. **It is tenant data**:
+   query text, the paths agents read, owner ids. Never commit it, upload it
+   or paste it into an issue. On a multi-user deployment `USER_ID=` is
+   required for a report you will attach to a PR; an unfiltered export
+   covers every user and is for your private use only. `SEARCH_EVAL_DB_NAME`
+   (default `obsidian_mcp`) names the database to export from.
 4. **Snapshot, before any candidate.**
    `make search-eval-snapshot SEARCH_EVAL_DATA=.search-eval SEARCH_EVAL_DATABASE_URL=<scratch copy>`
    records which indexed notes each arm can reach. Taken after a candidate
@@ -984,14 +1029,68 @@ and needs nothing; the real run is this path, from a checkout with
 5. **Apply the candidate to the copy**, if it changes indexed data (a
    migration, a re-chunk, a re-embed).
 6. **Score.**
-   `make search-eval SEARCH_EVAL_DATA=.search-eval SEARCH_EVAL_DATABASE_URL=<scratch copy> ARMS="keyword semantic <candidate>" BASELINE=keyword`.
+   `make search-eval SEARCH_EVAL_DATA=.search-eval SEARCH_EVAL_DATABASE_URL=<scratch copy> USER_ID=<your user id> ARMS="keyword semantic <candidate>" BASELINE=keyword`.
    It mines the export (plus `.search-eval/manual.jsonl`, operator-written
    judgments, when present), replays every arm against the copy and prints
-   a table; `report.json` lands next to the export. The built-in arms call
-   the server's own search services, so run it in an environment that
-   carries the server's search settings (`FTS_CONFIGS`, the embedding
-   provider settings, and a `SECRET_KEY`, which the settings module needs
-   to import). `MIN_QUERIES` (50) and `SEED` (0) are overridable.
+   a table; `report.json` lands next to the export. Pass the same
+   `USER_ID=` as the export: `mine` then re-applies the filter
+   (`--user-id`), so rows of another owner left in the data directory can
+   never enter the report. `MIN_QUERIES` (50) and `SEED` (0) are
+   overridable.
+
+   **The environment.** The built-in arms call the server's own search
+   services, which import the server's settings module, and that module
+   validates on import and also reads a `.env` in the checkout. Set, in the
+   shell that runs steps 4 and 6 (placeholders only; take each
+   "production's value" from the deployment's configuration):
+
+   ```sh
+   # The only database the harness connects to: the restored copy.
+   export SEARCH_EVAL_DATABASE_URL='postgresql+asyncpg://postgres:<scratch password>@127.0.0.1:<scratch port>/eval_copy'
+   # The settings module refuses a placeholder SECRET_KEY. Any fresh value;
+   # never production's.
+   export SECRET_KEY='<random hex>'
+   # Never read by the harness; set to the copy so nothing in the process
+   # names production.
+   export DATABASE_URL="$SEARCH_EVAL_DATABASE_URL"
+   # The scratch container speaks no TLS; a strict production mode would
+   # refuse the URL above at import.
+   export DATABASE_SSL_MODE=disable
+   # Production's value: the settings module validates the login and OIDC
+   # settings against it.
+   export MULTI_USER_MODE=<production's value>
+   # Production's search settings, or the arms measure another configuration:
+   # FTS_CONFIGS, CHUNK_SIZE, HYBRID_RRF_K, EMBEDDING_PROVIDER, EMBEDDING_MODEL,
+   # EMBEDDING_DIMENSIONS and the provider's own settings.
+   export FTS_CONFIGS='<production value>' EMBEDDING_MODEL='<production value>'
+   # The embedding provider, reached from this host, for example over a
+   # port-forward to loopback (a loopback URL needs no EMBEDDING_ALLOW_PLAINTEXT).
+   export OLLAMA_URL='http://127.0.0.1:<forwarded port>'
+   # Production's instruction, byte for byte: it enters the query embedding
+   # and the arm's retrieval fingerprint. A newline in it must be a real line
+   # feed, not the two characters backslash and n, so use $'...' quoting.
+   export EMBEDDING_QUERY_INSTRUCTION=$'<first line>\n<second line>'
+   # Unset, even when production sets it, unless you are scoring the rerank
+   # arms: production's value names a reranker this host normally cannot
+   # reach, and the rerank arms are the only ones that use it.
+   unset RERANK_URL
+   ```
+
+   **Evidence that is not scored.** The table's second and third lines
+   count what the run could not use; both are expected to be non-zero on
+   real data, and together they say how much of the log the report stands
+   on. `drift: <P> judged path(s) and <Q> query(ies) absent from the
+   snapshot` counts judgments whose note is not in the copy's index
+   (renamed, deleted or never indexed since the read) and the queries left
+   with no judged path; those queries are dropped, not scored as misses.
+   `not scored: <U> usage row(s) unresolved_principal` counts rows whose
+   API key or OAuth grant no longer resolves (a deleted key, a token row
+   already cleaned up): they are never paired with anything, because
+   pairing by a weaker identity could credit one agent's read to another
+   agent's search. The same line counts reads no search explains
+   (`unattributed`) and searches no read followed. All of them are in
+   `report.json` (`counts` and `mine`). A large share of either means the
+   report rests on a small part of the log: say so next to it.
    `ARM_OPTS="key=value …"` passes one `--arm-opt` per pair to the replay;
    every arm of the run sees the same options. The fusion arms of
    `hybrid_search` (#354) use it: `ARMS="keyword semantic
@@ -999,7 +1098,9 @@ and needs nothing; the real run is this path, from a checkout with
    scripts.search_eval_arms.hybrid:make_arm_alt" ARM_OPTS="hybrid_k=60
    hybrid_alt_k=20"` scores two values of `HYBRID_RRF_K` in one report
    (`make_arm` defaults `hybrid_k` to the setting; `make_arm_alt` refuses to
-   run without `hybrid_alt_k`). A hybrid arm fails the run if the embedding
+   run without `hybrid_alt_k`). Each arm is labelled by its full spec, in
+   `report.json` and in the table, whose arm column widens to the longest
+   label, so the two are told apart by their factory name. A hybrid arm fails the run if the embedding
    provider is down during replay, because a keyword-only answer is not
    evidence for the fusion.
    The rerank arms (#367) are separate factories, so the incumbent
@@ -1047,8 +1148,8 @@ prefix, the embedding model) needs the incumbent code on the pre-change copy
 for the baseline and the new code on the *same* copy after a re-embed. The
 harness's `runfile:` arms carry the baseline across:
 
-1. Steps 1–4 above: export, `BACKUP_FULL=1` backup, restore into a scratch
-   copy, snapshot.
+1. Steps 1–4 above: full unrecorded dump, restore into a scratch copy and
+   verify it, export from the copy, snapshot.
 2. **Baseline generation**, from a checkout of the incumbent release:
    `make search-eval … ARMS="keyword semantic"`. Keep that generation's
    staged `semantic` arm file (`.search-eval/runs/<generation>/semantic.json`).
@@ -1118,8 +1219,9 @@ included) needs its own number.
    Every page's usage row records `confidence`, `top_similarity` and, on
    `hybrid_search`, `keyword_all`, whatever the threshold.
 2. **Tabulate a single-user export.**
-   `make search-eval-export USER_ID=<your user id>` (step 1 of "Measuring
-   search quality" above), then
+   `make search-eval-export USER_ID=<your user id>` (the export of
+   "Measuring search quality" above; this tabulation replays nothing, so it
+   may read production directly), then
    `python -m scripts.search_eval mine --export .search-eval/usage-export.jsonl --out .search-eval`
    (it writes `confidence-rows.jsonl` beside the judgments) and
    `python -m scripts.search_eval confidence --data .search-eval --threshold 0.50`.
