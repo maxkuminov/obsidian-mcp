@@ -326,6 +326,12 @@ def _fmt(v: float | None) -> str:
     return "   -  " if v is None else f"{v:6.3f}"
 
 
+#: The arm column is at least this wide, and widens to the longest label in
+#: the report (#408): two `module:factory` arms from one module share a long
+#: prefix, and a fixed-width cut made them indistinguishable in the table.
+ARM_COLUMN_MIN = 28
+
+
 def render_table(report: dict) -> str:
     lines: list[str] = []
     if not report["attachable"]:
@@ -341,20 +347,31 @@ def render_table(report: dict) -> str:
         f"drift: {c['dropped_paths']} judged path(s) and {c['dropped_queries']} query(ies) "
         f"absent from the snapshot; {c['ownerless_queries']} ownerless"
     )
-    header = (f"{'arm':<28} {'slice':<16} {'n':>4} {'R@5':>6} {'R@10':>6} {'R@20':>6} "
+    # #408: evidence the miner set aside never reaches the scored queries, so
+    # it is stated here rather than left in mine-report.json alone.
+    mine_counts = report.get("mine") or {}
+    excluded = mine_counts.get("excluded") or {}
+    lines.append(
+        f"not scored: {excluded.get('unresolved_principal') or 0} usage row(s) unresolved_principal, "
+        f"{mine_counts.get('unattributed_reads') or 0} read(s) unattributed, "
+        f"{mine_counts.get('queries_without_judgment') or 0} search query(ies) without a judgment"
+    )
+    labels = [arm["arm"] for arm in report["arms"]] + list(report["deltas"])
+    w = max([ARM_COLUMN_MIN, *(len(label) for label in labels)])
+    header = (f"{'arm':<{w}} {'slice':<16} {'n':>4} {'R@5':>6} {'R@10':>6} {'R@20':>6} "
               f"{'R@50':>6} {'MRR':>6} {'nDCG@10':>7} {'novel@10':>8}")
     lines.append(header)
     for arm in report["arms"]:
         for sl in SLICES:
             m = arm["metrics"][sl]
             lines.append(
-                f"{arm['arm'][:28]:<28} {sl:<16} {m['n_queries']:>4} {_fmt(m['recall@5'])} "
+                f"{arm['arm']:<{w}} {sl:<16} {m['n_queries']:>4} {_fmt(m['recall@5'])} "
                 f"{_fmt(m['recall@10'])} {_fmt(m['recall@20'])} {_fmt(m['recall@50'])} "
                 f"{_fmt(m['mrr'])} {_fmt(m['ndcg@10']):>7} "
                 f"{_fmt(m['novel@10']):>8}"
             )
         lines.append(
-            f"{'':<28} membership {arm['membership']}, staged_depth {arm['staged_depth']}, "
+            f"{'':<{w}} membership {arm['membership']}, staged_depth {arm['staged_depth']}, "
             f"corpus_loss {arm['corpus_loss']}, "
             f"unsearchable_before {arm['unsearchable_before']}, missing {arm['missing_queries']}"
         )
@@ -367,7 +384,7 @@ def render_table(report: dict) -> str:
                 ci = d["ci95"]
                 ci_s = "-" if ci is None else f"[{ci[0]:+.3f}, {ci[1]:+.3f}]"
                 mean_s = "-" if d["mean"] is None else f"{d['mean']:+.3f}"
-                lines.append(f"  {label[:28]:<28} {metric:<10} {mean_s:>7} {ci_s}")
+                lines.append(f"  {label:<{w}} {metric:<10} {mean_s:>7} {ci_s}")
     return "\n".join(lines) + "\n"
 
 
