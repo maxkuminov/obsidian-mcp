@@ -1,8 +1,14 @@
-"""The write-time task refresh (#428, design D10 R1).
+"""The write-time task refresh (#428, design D10 R1; #432).
 
 A task tool (`complete_task`, `update_task`, `add_task`) publishes a note and
 then calls `refresh_note_tasks`, so that a `list_tasks` right after the write
-sees it (read-your-writes). It refreshes **only that note's `note_tasks`
+sees it (read-your-writes). Since #432 the generic note writers call it too:
+`edit_note`, `set_frontmatter` and a `write_file` that replaces a note, after
+their change-feed event and only when the replaced or published bytes may
+hold a task (`tasks.may_hold_tasks`), silently (their responses are
+unchanged); and `delete_note`, after every confirmed delete, through the
+**absence form** (`published=ABSENT`, below). Every caller makes at most one
+call. It refreshes **only that note's `note_tasks`
 rows** and records which bytes they describe. It does not index the note: the
 row's content hash, stat, keyword vector, links, embeddings, `derived_under`
 and `extraction_version` stay the pass's alone (the full single-note index was
@@ -35,6 +41,19 @@ rejected in D10 as a second writer of the hottest code in the server).
 6. `tasks_source_hash = canonical_note_hash(published)`,
    `tasks_refreshed_at = clock_timestamp()`, and `tasks_truncated` /
    `tasks_failed` per the result. **No other column is written.**
+
+## The absence form (#432, design D3)
+
+`published=ABSENT`, for `delete_note`: steps 1–3 as above; 3a confirms that
+**nothing** is at the leaf (`target.lstat() is None` through the anchored
+parent descriptor), else `superseded`, so a note recreated at the path is
+never cleared; the note's task rows are deleted; and the stamp is the empty
+note's: `tasks_source_hash = canonical_note_hash(b"")` (the tasks of the
+empty note are none), `tasks_refreshed_at = clock_timestamp()`,
+`tasks_failed = tasks_truncated = false`. The `notes_metadata` row is the
+pass's to prune. The row is task-dirty (R3) unless the deleted note was
+itself empty, and R4 keeps the cleared set against a pass that read the
+note before the delete.
 
 ## Locks
 
@@ -78,6 +97,21 @@ from src.services.tasks import note_task_row, tasks_from_note_text
 logger = logging.getLogger(__name__)
 
 REFRESHED = "refreshed"
+
+
+class _Absent:
+    """The absence form's sentinel type (a distinct object, never `None`)."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "ABSENT"
+
+
+#: `published=ABSENT`: the call removed the note (`delete_note`, #432 D3).
+ABSENT = _Absent()
+#: The canonical hash of the empty note: what a cleared row's tasks describe.
+EMPTY_NOTE_HASH = canonical_note_hash(b"")
 LAGGED = "lagged"
 
 LAG_LOCK_TIMEOUT = "lock_timeout"
@@ -171,7 +205,7 @@ async def refresh_note_tasks(
     root,
     target,
     rel: str,
-    published: bytes,
+    published: "bytes | _Absent",
 ) -> RefreshResult:
     """Refresh one note's task rows from the bytes this call published (R1).
 
@@ -179,10 +213,16 @@ async def refresh_note_tasks(
     vault root the tool ran under (what `change_feed.root_binding` digests),
     `target` the call's anchored `MutableTarget` (still open), `rel` the
     note's vault-relative path as the index stores it, and `published` the
-    exact bytes `write_file_at` published. Call it only after a confirmed
-    publication. Never raises.
+    exact bytes `write_file_at` published, or `ABSENT` after a confirmed
+    delete (the absence form). Call it only after a confirmed publication.
+    Never raises.
     """
     try:
+        if published is ABSENT:
+            return await _run_locked(
+                uid=uid, root=root, target=target, rel=rel, published=ABSENT,
+                source_hash=EMPTY_NOTE_HASH, derived=([], False),
+            )
         source_hash = canonical_note_hash(published)
         if source_hash is None:
             return _lagged(LAG_NOT_UTF8)
@@ -196,6 +236,28 @@ async def refresh_note_tasks(
             derived = await asyncio.to_thread(tasks_from_note_text, published)
         except Exception as exc:  # noqa: BLE001 - recorded as the pass records it
             derived = exc
+        return await _run_locked(
+            uid=uid, root=root, target=target, rel=rel, published=published,
+            source_hash=source_hash, derived=derived,
+        )
+    except Exception as exc:  # noqa: BLE001 - the write stands either way
+        return _lag_from(exc)
+
+
+def _lag_from(exc: BaseException) -> RefreshResult:
+    code = LAG_LOCK_TIMEOUT if _is_lock_not_available(exc) else LAG_ERROR
+    logger.warning(
+        "Task refresh after a write did not run (%s, %s); the write stands "
+        "and the next index pass converges the task rows.",
+        code,
+        type(exc).__name__,
+    )
+    return _lagged(code)
+
+
+async def _run_locked(*, uid, root, target, rel, published, source_hash, derived):
+    """Steps 1–6 in one session. Never raises an `Exception`."""
+    try:
         from src import database
 
         async with database.async_session() as session:
@@ -219,14 +281,7 @@ async def refresh_note_tasks(
             await session.commit()
             return result
     except Exception as exc:  # noqa: BLE001 - the write stands either way
-        code = LAG_LOCK_TIMEOUT if _is_lock_not_available(exc) else LAG_ERROR
-        logger.warning(
-            "Task refresh after a task write did not run (%s, %s); the write "
-            "stands and the next index pass converges the task rows.",
-            code,
-            type(exc).__name__,
-        )
-        return _lagged(code)
+        return _lag_from(exc)
 
 
 async def _refresh_locked(
@@ -265,6 +320,19 @@ async def _refresh_locked(
         raise _Outcome(_lagged(LAG_NOT_INDEXED))
 
     # 3a. Still the bytes this call published?
+    if published is ABSENT:
+        # The absence form: still nothing at the leaf? Anything there was
+        # published at the path after the delete, and is never cleared.
+        try:
+            present = await asyncio.to_thread(target.lstat)
+        except Exception:  # noqa: BLE001 - cannot tell: write nothing
+            raise _Outcome(_lagged(LAG_SUPERSEDED)) from None
+        if present is not None:
+            raise _Outcome(_lagged(LAG_SUPERSEDED))
+        await session.execute(delete(NoteTask).where(NoteTask.note_id == note_id))
+        await _stamp(session, note_id, uid, source_hash, failed=False, truncated=False)
+        return _REFRESHED
+
     from src.services.vault import read_bytes_at
 
     try:
@@ -325,6 +393,8 @@ async def _stamp(
 
 
 __all__ = [
+    "ABSENT",
+    "EMPTY_NOTE_HASH",
     "LAGGED",
     "LAG_CODES",
     "LAG_DERIVATION_FAILED",
