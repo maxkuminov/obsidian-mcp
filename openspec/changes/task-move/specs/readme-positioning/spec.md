@@ -7,7 +7,7 @@ The README SHALL describe task support as an optional capability of the agent-me
 - plain `- [ ]` checkboxes work without the Obsidian Tasks plugin, whose emoji fields are optional;
 - the server owns task mechanics (query, one-line edits, moving a task between notes, recurrence for a stated closed set of rules) and no task policy.
 
-It SHALL list `list_tasks`, `task_agenda`, `complete_task`, `update_task`, `add_task` and `move_task` with one line each. The `move_task` line SHALL say that the destination is written before the source, so an interrupted move leaves the task in both notes and never in neither. It SHALL document every `TASKS_*` environment default and the panel's Tasks card. It SHALL NOT claim that every Tasks-plugin feature or recurrence rule is supported.
+It SHALL list `list_tasks`, `task_agenda`, `complete_task`, `update_task`, `add_task` and `move_task` with one line each. The `move_task` line SHALL say that the destination is written before the source, so an interrupted move leaves the task in both notes, that `resume=true` completes it, and that an outside save of an older destination during the move can still lose the task. It SHALL document every `TASKS_*` environment default and the panel's Tasks card. It SHALL NOT claim that every Tasks-plugin feature or recurrence rule is supported.
 
 It SHALL explain, in a few sentences for a reader without the plugin, which checkboxes count as tasks:
 
@@ -31,4 +31,4 @@ It SHALL explain, in a few sentences for a reader without the plugin, which chec
 
 #### Scenario: The move order is stated
 - **WHEN** the README's `move_task` line is read
-- **THEN** it SHALL say that the destination is written first and that a retry of an interrupted move removes the source copy
+- **THEN** it SHALL say that the destination is written first and that `resume=true` completes an interrupted move
