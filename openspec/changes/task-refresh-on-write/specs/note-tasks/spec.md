@@ -20,7 +20,7 @@ The exception is a row whose `tasks_refreshed_at` is at or after the attempt's s
 **Lifecycle.**
 
 - Deleting a note's row by any route (prune, quarantine removal, provenance discard, user deletion) SHALL remove its task rows.
-- `delete_note` SHALL remove the deleted note's task rows at once through the delete clear of the `task-write` capability, and the pass SHALL later prune the row itself.
+- `delete_note` SHALL attempt to remove the deleted note's task rows in the same call through the delete clear of the `task-write` capability; the pass SHALL later prune the row itself, and SHALL remove the task rows if the clear could not run.
 - A row protected from the prune by an unlistable directory SHALL keep its task rows.
 - An id-preserving move SHALL leave the rows attached to the moved note.
 - `CURRENT_EXTRACTION_VERSION` SHALL be 5, with versions 4 and 5 sharing version 3's embedding cleaner, so that neither bump re-embeds anything.
