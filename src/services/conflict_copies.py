@@ -17,7 +17,7 @@ digits. Matching is case-sensitive, including the `.md` suffix the walk
 requires.
 
 Pure: no settings, no I/O. See
-`openspec/changes/index-exclude-conflict-files/design.md` (D2).
+`openspec/changes/archive/2026-11-12-index-exclude-conflict-files/design.md` (D2).
 """
 
 from __future__ import annotations

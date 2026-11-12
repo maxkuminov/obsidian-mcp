@@ -1264,7 +1264,7 @@ next unforeseen value costs one note rather than its owner's whole index.
 `INDEX_EXCLUDE_CONFLICT_FILES` (default `false`, deployment-wide) adds a
 **third not-indexable reason**, `EXCLUDED_CONFLICT_COPY`, beside D7's and the
 quarantine's. The full contract is in
-`openspec/changes/index-exclude-conflict-files/design.md` (D1–D10, L1–L13).
+`openspec/changes/archive/2026-11-12-index-exclude-conflict-files/design.md` (D1–D10, L1–L15).
 
 - **One matcher, by basename.** `src/services/conflict_copies.py` holds six
   source-cited patterns (Syncthing, Nextcloud current and legacy, Dropbox,
