@@ -258,13 +258,33 @@ async def test_an_unparseable_content_length_is_malformed(monkeypatch):
 
 async def test_no_rerank_ms_when_the_pool_wait_runs_out_before_sending(fake, monkeypatch):
     """Codex round 1 (C3): two calls hold both pooled connections past the
-    deadline; the third never transmits, so it carries no exchange time."""
-    monkeypatch.setattr(settings, "rerank_timeout_ms", 400, raising=False)
-    fake.mode = "sleep:3000"
-    outs = await asyncio.gather(*(rerank.rerank_candidates("q", CANDS) for _ in range(3)))
-    assert [o.reason for o in outs] == [rerank.TIMEOUT] * 3
-    assert sorted(o.ms is None for o in outs) == [False, False, True]
-    assert len(fake.requests) == 2
+    deadline; the third never transmits, so it carries no exchange time.
+
+    Deterministic (#401): the holders run under a generous deadline against a
+    server that holds each request until an explicit release, and the third
+    call starts only once the server has received both. It can therefore only
+    be waiting for the pool when its own short deadline runs out — no
+    wall-clock race between the pool wait and the holders' deadlines."""
+    fake.mode = "hold"
+    monkeypatch.setattr(settings, "rerank_timeout_ms", 120_000, raising=False)
+    holders = [asyncio.create_task(rerank.rerank_candidates("q", CANDS)) for _ in range(2)]
+    try:
+        async with asyncio.timeout(60):
+            while len(fake.requests) < 2:
+                await asyncio.sleep(0.01)
+        # Both pooled connections are now on the wire and held open.
+        monkeypatch.setattr(settings, "rerank_timeout_ms", 300, raising=False)
+        out = await rerank.rerank_candidates("q", CANDS)
+        assert out.reason == rerank.TIMEOUT
+        assert out.ms is None, "a request that never reached the wire has no rerank_ms"
+        assert len(fake.requests) == 2
+        assert not any(h.done() for h in holders), "the pool was not exhausted"
+    finally:
+        fake.release.set()
+        outs = await asyncio.gather(*holders, return_exceptions=True)
+    # The two that were sent carry their exchange time.
+    assert all(o.reranked and o.ms is not None for o in outs), outs
+    assert fake.max_in_flight == 2
 
 
 async def test_no_rerank_ms_when_nothing_listens(fake, monkeypatch):
