@@ -1299,6 +1299,16 @@ semantic search and indexing fail per call during that window while keyword
 search, reads and writes keep working. The check compares the name only;
 replaced weights behind one name are not detected.
 
+If your TEI server was started with `--api-key` (or sits behind a gateway
+that wants a bearer token), set `TEI_API_KEY`. The server sends it as
+`Authorization: Bearer <key>` on `/embed`, the `/info` check and the panel's
+`/health` probe, and to no other host. Without it such a server answers 401:
+the startup check logs `GET /info answered HTTP 401; TEI_API_KEY is not set`
+(or `the server rejected TEI_API_KEY` when the key is wrong), the process
+keeps serving with embedding withheld, and it never exits over it. The key
+is never logged or shown. The `openai` provider against TEI's `/v1` route
+already sends `OPENAI_API_KEY` as its bearer token.
+
 The provider sends `truncate: true`, so a chunk or query longer than the
 model's limit is embedded from its leading tokens, the rest is not
 represented in the vector, and the note is still marked as embedded. Ollama
@@ -2100,6 +2110,7 @@ reason.
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Override for Azure, proxies, or any OpenAI-compatible embeddings server (including TEI's `/v1`). Same transport rule as `OLLAMA_URL` when this provider is active. |
 | `TEI_URL` | `http://tei:80` | TEI endpoint, used when the provider is `tei`. Same transport rule as `OLLAMA_URL`. |
 | `TEI_EMBEDDING_MODEL` | `BAAI/bge-m3` | Must equal the `model_id` the TEI server reports at `GET /info`, exactly (a different value refuses startup). Recorded in the fingerprint; a change needs `make reset-embeddings`. No startup check detects replaced weights behind the same name. |
+| `TEI_API_KEY` | — | **Secret.** Bearer token for a TEI started with `--api-key`; sent only to `TEI_URL` (`/embed`, `/info`, the panel's `/health`). Empty means no header. Never logged or shown; a 401/403 logs a line naming the setting. Not in the fingerprint (no reset). |
 | `TEI_EMBED_BATCH_SIZE` | `16` | Inputs per native `/embed` request (1–256). A value above the server's `--max-client-batch-size` (32 on TEI 1.8.3 unless set) refuses startup; large full-size batches can exceed the 60 s timeout on a shared GPU. |
 | `EMBEDDING_ALLOW_PLAINTEXT` | `false` | Permit `http` to a non-loopback embedding host. Without it such a URL refuses to start. `.env.example` sets it `true` to match its `http://ollama:11434` default. |
 | `EMBEDDING_CA_FILE` | — | Trust anchor (PEM) for an `https` embedding endpoint behind an internal CA; replaces the default certifi bundle. Refused with an `http` URL. Embedding clients ignore `HTTP(S)_PROXY`, `SSL_CERT_*` and `.netrc`. |

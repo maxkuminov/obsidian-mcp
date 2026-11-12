@@ -426,6 +426,33 @@ read-only). They apply to the strict modes only (`require`, `verify-ca`,
 `verify-full`), and must be set together or not at all; either one
 alone, or both with `disable`/`prefer`, refuses to start.
 
+**A TEI server with `--api-key`.** Set `TEI_API_KEY` in the secret part of
+your configuration (the deploy directory's `.env`, or the Kubernetes
+Secret, never a ConfigMap). It is sent as `Authorization: Bearer <key>` on
+`POST /embed`, `GET /info` and the panel's `GET /health` to `TEI_URL`, and
+nowhere else: not to the reranker, not to Ollama or OpenAI, and never to a
+redirect target (embedding clients do not follow redirects). Leave it empty
+for a TEI without authentication; no header is sent then. What to expect:
+
+- A missing or wrong key does not stop the server. The startup check logs
+  one CRITICAL line, `GET /info answered HTTP 401; TEI_API_KEY is not set`
+  or `…; the server rejected TEI_API_KEY`, and embedding stays withheld
+  (re-checked every 30 s) while keyword search, reads and writes work.
+- A key rejected later (rotated on the TEI side) fails each note with
+  `TEI /embed answered HTTP 401; the server rejected TEI_API_KEY`. The
+  provider logs one ERROR line per run of such failures, beside the
+  indexer's per-note warnings and pass summary.
+- Rotating the key needs an app restart. It is in no fingerprint, so no
+  reset is needed.
+- With `EMBEDDING_ALLOW_PLAINTEXT` and an `http://` TEI on another host,
+  the key crosses that hop in clear. The server starts and logs one WARNING:
+  `TEI_API_KEY is sent in clear over http to a non-loopback host …`. Use an
+  `https` `TEI_URL` to protect it.
+- The value is never logged, shown on the panel or in `/health`, or written
+  to a pass record. Surrounding whitespace is stripped (a Secret file's
+  trailing newline is fine). Anything but visible ASCII refuses startup with
+  a message naming the setting.
+
 ### Panel Content-Security-Policy
 
 The admin panel, the login/register pages and the OAuth consent page

@@ -294,6 +294,47 @@ the problem. Observed on TEI 1.8.3: `truncate: true` answers 200 past both the
 the 2 MB body limit (`--payload-limit`), a separate `413 Failed to buffer the
 request body`, out of reach at any default chunk size.
 
+### `TEI_API_KEY` (#426)
+
+An optional secret for a TEI started with `--api-key` or behind a
+bearer-protected gateway. These are the decisions not to undo:
+
+- **Three requests carry it, passed per request.** `POST /embed`, the
+  identity check's `GET /info` and the panel's `GET /health` each pass
+  `headers=embeddings._tei_auth_headers()`, the only reader of
+  `get_secret_value()`. It is never a client default and never in
+  `embedding_http_client`, because that factory also builds the Ollama and
+  OpenAI clients. A test pins the setting to `config.py`, `embeddings.py` and
+  `transport_security.py`, and pins the reranker against the helper. Unset
+  passes `headers=None`, so the requests are exactly the pre-#426 ones (the
+  test holds the header lists captured on `aafb9f0`).
+- **Never shown.** `SecretStr` (masked `repr`), `hide_input_in_errors` (or
+  pydantic prints the raw env dict in every validation error), fixed-text
+  messages, and no response body, URL or header in any failure text. A
+  sentinel test sweeps logs, pages, exceptions, stored failures and
+  fingerprints. An integration test does the same for `indexer_runs.error`
+  and `/admin/health`.
+- **Format check in `Settings`, under `tei` only, no I/O.** Blank means unset.
+  Surrounding whitespace is stripped (a Secret file's newline), and anything
+  outside U+0021 to U+007E refuses boot. An absent key always passes, so the
+  alembic init container starts without the Secret.
+- **401/403 are never a mismatch.** At `/info` they are `inconclusive`, with
+  `TEI_API_KEY is not set` or `the server rejected TEI_API_KEY`, and the
+  auth reason is its own CRITICAL verdict. Otherwise "unreachable, then 401"
+  would log only the first line. At `/embed` they are a non-retried
+  `RuntimeError` through `_post_with_retries`' `refuse` hook (OpenAI passes
+  none), with one ERROR line per run of failures, re-armed by a 200. They
+  leave the verified state alone: a key says nothing about the model.
+- **A plaintext remote hop is admitted with one WARNING.**
+  `EMBEDDING_ALLOW_PLAINTEXT` already sends every note in clear, and refusing
+  would push operators to turn TEI authentication off.
+- **Not in either fingerprint.** Changing the key needs a restart, not a reset.
+
+Accepted (change design L1–L6): restart to rotate; the key crosses an
+admitted plaintext hop in clear; no reranker key; no panel indicator; the key
+lives in process memory and in the container environment; a key with
+deliberate surrounding whitespace cannot be matched.
+
 ### Chunk-vector reuse (#281, D16)
 
 A stored vector is reused for a chunk whose **provider input** is

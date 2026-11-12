@@ -290,7 +290,11 @@ update it in the same change.** What stays here is the short list:
   5 s `wait_for` (a phase timeout cannot bound a trickling body). The process
   exits only on a proven mismatch; a vector is requested only after a match.
   Unreachable or unusable answers serve with embedding withheld, re-checked at
-  most every 30 s (a late mismatch never exits). See
+  most every 30 s (a late mismatch never exits). The optional secret
+  `TEI_API_KEY` (#426) goes as a per-request bearer on `/embed`, `/info` and
+  the panel `/health` only (`_tei_auth_headers`, never a client default; unset
+  sends the pre-#426 requests), is never shown, and a 401/403 is inconclusive,
+  never a mismatch, with a reason naming the setting. See
   [indexing and embeddings](docs/architecture/indexing-and-embeddings.md).
 - **Unused dynamically registered OAuth clients expire** (#194).
   `oauth_clients.last_used_at` is stamped by consent approval, code exchange
