@@ -1369,8 +1369,12 @@ through `docker/db-exec.sh`, the channel `make db-backup` uses; a test parses
 the file and fails on any added statement, and the integration gate runs the
 real Make target through a `DB_EXEC` shim. Replay connects only to
 `SEARCH_EVAL_DATABASE_URL` (or `--database-url`), never `DATABASE_URL`, and
-the documented target is a disposable copy restored from a `BACKUP_FULL=1`
-dump. **The built-in `keyword` and `semantic` arms write nothing** (they call
+the documented target is a disposable copy restored from a full dump.
+Since #408 that dump is a direct `pg_dump` through the same channel, not
+`make db-backup`: the target records every dump in `backups_log`, which is a
+write to production and a false "newest backup" on the Health page. The
+export then runs against the restored copy, not production, so the usage
+rows and the snapshot describe one moment. **The built-in `keyword` and `semantic` arms write nothing** (they call
 the services directly, never through `_tracked`, and an integration test
 reads `pg_stat_user_tables` before and after). **An imported arm runs with
 whatever the replay URL permits**: it can open its own engine or `SET
@@ -1484,6 +1488,11 @@ both before writing it. `stable_projection` drops `UNSTABLE_KEYS`
 (`commit_sha`, `generated_at`, `generation`), which is what the committed
 golden file `tests/fixtures/search_eval/expected-report.json` is compared
 with; `commit_sha` is asserted separately against `git rev-parse HEAD`.
+The printed table (#408) never cuts an arm label (the column widens to the
+longest, so two factories of one module stay distinct) and states the
+evidence that was set aside: the drift line, and a `not scored:` line with
+the miner's `unresolved_principal` rows, unattributed reads and searches
+without a judgment, all read from fields `report.json` already carries.
 Exit codes: 0 `OK`, 2 `INSUFFICIENT_DATA` (fewer than `--min-queries`,
 default 50) or `CORPUS_LOSS`, 64 usage error or an incomplete or mismatched
 run, 1 anything else. **`score` has no metric threshold** (E2): the report

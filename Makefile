@@ -87,7 +87,7 @@ help:
 	@echo "  make reset-embeddings - Drop & recreate embedding column at configured dim"
 	@echo "  make rebuild-tsvectors - Recompute keyword index for FTS_CONFIGS and store snippet excerpts (no embeddings, no API calls)"
 	@echo "  make concurrency-report TARGET=queue|enforce [DAYS=n] [END=iso] - Concurrency readiness verdict (#188; exit 0 only on PASS)"
-	@echo "  make search-eval  - Score retrieval on the synthetic fixture (no DB); with SEARCH_EVAL_DATA=dir SEARCH_EVAL_DATABASE_URL=<restored BACKUP_FULL=1 copy> [ARMS=...] [ARM_OPTS=\"k=v ...\"] [BASELINE=arm], on real judgments (#356); rerank arms: scripts.search_eval_arms.rerank:make_semantic_arm / make_hybrid_arm with RERANK_URL set (#367)"
+	@echo "  make search-eval  - Score retrieval on the synthetic fixture (no DB); with SEARCH_EVAL_DATA=dir SEARCH_EVAL_DATABASE_URL=<restored BACKUP_FULL=1 copy> [ARMS=...] [ARM_OPTS=\"k=v ...\"] [BASELINE=arm] [USER_ID=id], on real judgments (#356); rerank arms: scripts.search_eval_arms.rerank:make_semantic_arm / make_hybrid_arm with RERANK_URL set (#367)"
 	@echo "  make search-eval-export [DAYS=90] [USER_ID=id] - Read-only export of search/read_note usage rows into SEARCH_EVAL_DIR (#356; tenant data, 0700)"
 	@echo "  make search-eval-snapshot SEARCH_EVAL_DATA=dir SEARCH_EVAL_DATABASE_URL=url - Record the restored copy's searchable notes; run it BEFORE applying any candidate"
 	@echo "  make status       - Show container and health status"
@@ -518,6 +518,10 @@ concurrency-report:
 # arms (#367) are factories, not options, so ARMS="semantic
 # scripts.search_eval_arms.rerank:make_semantic_arm" BASELINE=semantic keeps
 # the incumbent unreranked; they need RERANK_URL in the environment.
+# USER_ID (the same variable search-eval-export takes) is passed to the
+# real-data `mine` as --user-id (#408): the export's own filter already scopes
+# the rows, and the miner re-applies it so a wider export left in the data
+# directory cannot carry another owner's rows into the report.
 SEARCH_EVAL_DATA ?=
 SEARCH_EVAL_FIXTURE := tests/fixtures/search_eval
 ARMS ?=
@@ -546,10 +550,11 @@ search-eval:
 		echo "$(RED)$(SEARCH_EVAL_DATA)/corpus-snapshot.json is missing: run make search-eval-snapshot on the restored copy BEFORE applying any candidate$(NC)"; \
 		exit 64; \
 	fi; \
+	case "$(USER_ID)" in '') ;; *[!0-9]*) echo "$(RED)Usage: USER_ID must be empty or an integer (got '$(USER_ID)')$(NC)"; exit 64;; esac; \
 	MANUAL=""; \
 	if [ -f "$(SEARCH_EVAL_DATA)/manual.jsonl" ]; then MANUAL="--manual $(SEARCH_EVAL_DATA)/manual.jsonl"; fi; \
 	$(PYTHON) -m scripts.search_eval mine --export "$(SEARCH_EVAL_DATA)/usage-export.jsonl" \
-		$$MANUAL --out "$(SEARCH_EVAL_DATA)" || exit $$?; \
+		$$MANUAL $(if $(USER_ID),--user-id $(USER_ID)) --out "$(SEARCH_EVAL_DATA)" || exit $$?; \
 	$(PYTHON) -m scripts.search_eval run --data "$(SEARCH_EVAL_DATA)" --arm $(SEARCH_EVAL_ARMS) \
 		$(foreach o,$(ARM_OPTS),--arm-opt $(o)) || exit $$?; \
 	$(PYTHON) -m scripts.search_eval score --data "$(SEARCH_EVAL_DATA)" --arm $(SEARCH_EVAL_ARMS) \
