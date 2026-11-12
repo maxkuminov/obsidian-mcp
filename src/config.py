@@ -518,6 +518,13 @@ class Settings(BaseSettings):
     # the panel's Reindex, and once this many hours have elapsed since that
     # scope's last *successful* one (one that committed with nothing skipped).
     index_full_hash_interval_hours: int = Field(24, ge=1)
+    # Opt-in (#392): leave sync-conflict copies (`Note.sync-conflict-…`,
+    # `Note (conflicted copy …)`, `Note (conflict 2026-05-29-19-45-39)` and the
+    # rest of the fixed set in `src/services/conflict_copies.py`) out of the
+    # index. The files are never touched and stay readable and writable by
+    # exact path; their rows are removed by the next pass. Deployment-wide.
+    # See openspec/changes/index-exclude-conflict-files/design.md.
+    index_exclude_conflict_files: bool = False
     # The change feed (#351, `note_events`, design D9/D10). Retention runs in
     # the periodic tick's `finally`, never inside a pass. The age limit is a
     # `NullableLimit`-style "null disables" setting (`OAUTH_CLIENT_UNUSED_

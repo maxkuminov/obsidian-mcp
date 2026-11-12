@@ -661,6 +661,13 @@ async def lifespan(app: FastAPI):
         await check_database_role()
         log_embedding_transport()
         _log_retrieval_fingerprint()
+        if settings.index_exclude_conflict_files:
+            # #392: say once, where the operator looks, that the index leaves
+            # sync-conflict copies out (the files themselves are untouched).
+            logging.getLogger(__name__).info(
+                "Index exclusion: sync-conflict copies are not indexed "
+                "(INDEX_EXCLUDE_CONFLICT_FILES=true)"
+            )
         await _check_embedding_dim()
         await _check_pgvector_version()
         await _validate_fts_configs()
