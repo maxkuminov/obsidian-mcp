@@ -9137,9 +9137,11 @@ async def _run_task_write(
     after_plan=None,
 ):
     """D2 steps 3–16 for one task write. `plan_fn(text)` is a pure planner
-    (run off the event loop); `describe(plan, rel, extra)` renders the D16
-    lines; `after_plan(plan, rel)` (add_task's index-side duplicate scan) may
-    return a refusal, else its result is passed to `describe` as `extra`.
+    (run off the event loop); `describe(plan, rel, extra, dry_run)` renders
+    the D16 lines — in a dry run its heading says what *would* happen, so no
+    line of a dry run asserts a write; `after_plan(plan, rel)` (add_task's
+    index-side duplicate scan) may return a refusal, else its result is passed
+    to `describe` as `extra`.
 
     **The bounded retry (D2).** When publication reports an in-call conflict
     and the caller supplied no `expected_hash`, the whole sequence repeats from
@@ -9212,7 +9214,8 @@ async def _run_task_write(
             new_bytes = new_text.encode("utf-8")
             if dry_run:
                 timing.record("task_refresh", "skipped")
-                lines = ["Dry run — nothing was written.", *describe(plan, rel, extra)]
+                lines = ["Dry run — nothing was written.",
+                         *describe(plan, rel, extra, True)]
                 lines.append("diff:")
                 # The diff BODY is note content (prefixed `+`/`-`/` `, so no
                 # line of it can start a row); only its header names the path.
@@ -9247,7 +9250,7 @@ async def _run_task_write(
             refresh = await _refresh_task_rows(uid, target, new_bytes)
             timing.record("task_refresh", refresh.usage)
             await _record_note_events(uid, [_content_event("modified", rel, new_bytes)])
-            lines = describe(plan, rel, extra)
+            lines = describe(plan, rel, extra, False)
             lines.append(f"content_hash: {content_hash_for_bytes(new_bytes)}")
             lines.append(refresh.line)
             return "\n".join(lines)
@@ -9323,8 +9326,9 @@ async def complete_task_impl(
     args = task_write.CompleteArgs(id=id, done_on=done, hash_supplied=expected_hash is not None)
     today = dates.today
 
-    def describe(plan, rel, _extra):
-        lines = [f"Completed task in `{_escape_task_path(rel)}`", *_target_lines(plan)]
+    def describe(plan, rel, _extra, dry_run):
+        verb = "Would complete" if dry_run else "Completed"
+        lines = [f"{verb} task in `{_escape_task_path(rel)}`", *_target_lines(plan)]
         if plan.replaced_status not in (None, " "):
             lines.append(f"replaced marker: `{_one_line(plan.replaced_status)}`")
         nxt = _plan_line(plan, "next")
@@ -9441,13 +9445,14 @@ async def update_task_impl(
     )
     today = dates.today
 
-    def describe(plan, rel, _extra):
+    def describe(plan, rel, _extra, dry_run):
         changed = ", ".join(plan.fields_changed) or "none"
         target = _target_lines(plan)
         nl = _plan_line(plan, "target")
         if nl is not None and (note := _task_rule_note(plan, nl.line, effective)):
             target.insert(1, note)
-        lines = [f"Updated task in `{_escape_task_path(rel)}` — fields changed: {changed}",
+        verb = "Would update" if dry_run else "Updated"
+        lines = [f"{verb} task in `{_escape_task_path(rel)}` — fields changed: {changed}",
                  *target, *_context_lines(plan)]
         if (dl := dates.line()) is not None:
             lines.append(dl)
@@ -9533,9 +9538,10 @@ async def add_task_impl(
         timing.record("similar_count", len(similar))
         return similar, stopped
 
-    def describe(plan, rel, extra):
+    def describe(plan, rel, extra, dry_run):
         similar, stopped = extra if extra is not None else ((), False)
-        lines = [f"Added task to `{_escape_task_path(rel)}`"]
+        verb = "Would add" if dry_run else "Added"
+        lines = [f"{verb} task to `{_escape_task_path(rel)}`"]
         nl = _plan_line(plan, "task")
         if nl is not None:
             lines.append(f"line {nl.line}: {_one_line(nl.text)}")
