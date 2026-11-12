@@ -164,7 +164,7 @@ No code forces the other order. The feed append and the refresh each run in thei
 
 - **File:** the published bytes stand. For a delete, the leaf stays deleted.
 - **Event:** the attributed event is already recorded.
-- **Task rows:** the refresh's transaction rolls back, so the rows are unchanged and converge at the next pass (the publication changed the stat; for a delete, the walk no longer finds the file).
+- **Task rows:** either unchanged, or fully replaced, never a partial set. If the cancellation arrives before the refresh's `COMMIT` is sent, its transaction rolls back, the rows are unchanged, and they converge at the next pass (the publication changed the stat; for a delete, the walk no longer finds the file). If it arrives during or after the `COMMIT`, PostgreSQL may already have committed, and the rows are then exactly those derived from the published bytes (or, for a delete, cleared). That is harmless, because they describe what is on disk. Every task-row write of a refresh happens in one transaction with one commit (`src/services/task_index.py`, `_run_locked`, the single `session.commit()`), so there is no partial state; a structural test pins the single commit. (Implementation review r2, MINOR.)
 - **Response:** none. The call is cancelled.
 - **Usage row:** none. `_tracked` deliberately does not catch `BaseException`, and a cancelled call writes no row, exactly as a call cancelled anywhere else in its body today.
 - **Lease:** released by `_tracked`'s `finally` (pinned by an offline test in `queue` mode: a lease is held during the refresh, and every controller counter is back to zero after the cancellation).
@@ -303,7 +303,7 @@ Trace each through the code as implemented, against the expected outcome given.
    - the commit fails: `error`.
 
    **If the publication itself raises**, the refusal is unchanged and there is no event and no refresh.
-3. **Cancellation during the refresh** (D4): the file stands, the event is recorded, the task rows are unchanged, there is no response and no usage row, and the lease is released (integration test with a real held row lock; offline test of the lease in `queue` mode).
+3. **Cancellation during the refresh** (D4): the file stands, the event is recorded, the task rows are either unchanged (cancelled before the refresh's commit began) or fully replaced by the rows derived from the published bytes (cancelled during or after the commit), never partial, there is no response and no usage row, and the lease is released (integration test with a real held row lock; offline test of the lease in `queue` mode).
 4. **A note at the size caps.** `edit_note` publishes exactly `MAX_NOTE_BYTES` with 5,001 checkboxes: 5,000 rows, `tasks_truncated = true`; the gate and the derivation run in a worker thread, never on the event loop's thread (a structural test records the thread each runs on; no wall-clock bound, issue #401). The same for `write_file` at its `.md` cap. A file grown past the cap by an outside writer before the re-check: the re-read fails and the outcome is `superseded`.
 5. **A 10 MiB adversarial gate input** (`- - - …`, `> > > …`, digits with no delimiter): `may_hold_tasks` returns within 2 s.
 6. **The gate's superset property.** No input on which the extractor finds a task and the gate says no. Inputs to cover: CRLF and lone CR, U+0000 inside the brackets, a BOM, blockquote and callout prefixes, ordered markers, a code span directly after `]`, and a last line without a terminator.
@@ -375,3 +375,4 @@ Implementation review, round 1, at `1c53083` (Codex `FAIL`, 1 MAJOR, 1 NOTE; the
 3. **The cancellation clauses (lease, unchanged rows) were untested** (verifier). Integration test with a real held row lock, and an offline lease test in `queue` mode.
 4. **The 100 ms event-loop bound was unmeasurable** (verifier). Replaced by the structural requirement that the gate and the derivation run in a worker thread, tested by recording their threads.
 
+Implementation review, round 2, at `b55bb5a` (Codex `PASS`, 1 MINOR): the cancellation clause claimed the task rows stay unchanged, which is false for a cancellation arriving during or after the refresh's `COMMIT`. Narrowed to "unchanged or fully replaced, never partial" (D4, the spec's cancellation clause); no code change.

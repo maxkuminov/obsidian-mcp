@@ -77,7 +77,7 @@ This is one slice: the files overlap in `tools.py`, so there is no fan-out.
 ## 5. Gates
 
 - [x] 5.1 `openspec validate task-refresh-on-write --strict`.
-- [ ] 5.2 `openspec-verifier`, then the adversarial Codex pass. Both are mandatory: this change touches the write tools.
+- [x] 5.2 `openspec-verifier`, then the adversarial Codex pass. Both are mandatory: this change touches the write tools.
 - [ ] 5.3 After deploy, exercise these against the live server (an MCP-side change, so no `user-representative` pass):
   - `list_tasks` → `edit_note` → `list_tasks`;
   - `set_frontmatter` → `list_tasks`;

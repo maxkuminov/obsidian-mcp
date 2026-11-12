@@ -680,6 +680,27 @@ def test_the_gate_is_linear(unit):
     assert time.monotonic() - started < 2.0
 
 
+def test_a_refresh_writes_its_task_rows_in_one_transaction_with_one_commit():
+    """#432, review r2: a cancellation during or after the commit can leave
+    the new rows committed, but never a partial set, because every task-row
+    write of a refresh (both forms) runs in one session with one commit."""
+    tree = _module_tree(task_index)
+    commits = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "commit"
+    ]
+    assert len(commits) == 1
+    run_locked = next(n for n in ast.walk(tree)
+                      if isinstance(n, ast.AsyncFunctionDef) and n.name == "_run_locked")
+    assert commits[0] in list(ast.walk(run_locked))
+    # Sessions are opened only there, so the writes in `_refresh_locked` and
+    # `_stamp` (handed that one session) cannot land in another transaction.
+    opened = [n for n in ast.walk(tree)
+              if isinstance(n, ast.Attribute) and n.attr == "async_session"]
+    assert len(opened) == 1 and opened[0] in list(ast.walk(run_locked))
+
+
 def test_the_generic_refresh_helper_never_takes_the_generation_lock():
     from src.mcp_server import tools
 

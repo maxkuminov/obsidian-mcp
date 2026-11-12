@@ -117,7 +117,7 @@ A call cancelled during its refresh SHALL leave:
 
 - the publication standing;
 - its change-feed event recorded;
-- the task rows unchanged;
+- the task rows either unchanged (cancelled before the refresh's commit began) or fully replaced by the rows derived from the published bytes (cancelled during or after that commit), never a partial set;
 - no response and no usage row;
 - its concurrency lease released.
 
@@ -136,7 +136,13 @@ The three task write tools SHALL keep their order: publication, refresh, event.
 #### Scenario: A cancelled call keeps its write and its event
 - **WHEN** `edit_note` publishes, records its event, and is cancelled while its refresh waits for the row lock
 - **THEN** the file SHALL carry the edit and the event SHALL be recorded
-- **AND** the task rows SHALL be unchanged, no usage row SHALL be written, and the call's lease SHALL be released
+- **AND** the task rows SHALL be unchanged, because the cancellation came before the refresh's commit began
+- **AND** no usage row SHALL be written, and the call's lease SHALL be released
+
+#### Scenario: A cancellation can never leave a partial set of task rows
+- **WHEN** a call is cancelled at any point of its refresh, including during or after the refresh's commit
+- **THEN** the note's task rows SHALL be either the rows from before the refresh or exactly the rows derived from the published bytes (none, for a delete)
+- **AND** every task-row write of the refresh SHALL happen in one database transaction with a single commit
 
 ### Requirement: A generic writer SHALL attempt at most one bounded task refresh per call
 
