@@ -1306,7 +1306,7 @@ quarantine's. The full contract is in
   excluded files are discovered, so a root holding only conflict copies is
   determinate (D8).
 - **Reporting.** One INFO line at startup, one per pass with a non-zero
-  count, and one INFO removal line naming at most five paths. These rows are
+  count, and one INFO removal line naming the paths through `_format_skips` (up to 20, then `, and N more`). These rows are
   kept out of the D7 WARNING. `IndexPassResult.excluded` carries the count,
   and `not_indexable` excludes it. `indexer.excluded_conflict_copies[scope]`
   (process memory) feeds the dashboard. **Never `indexer_runs.error`**:
@@ -1316,7 +1316,11 @@ quarantine's. The full contract is in
   (`tools.CONFLICT_EXCLUSION_NOTICE`). Their output is byte-identical with
   the setting off or a non-matching name. `move_note` does not remove the
   row it re-keys; the next pass does (L10). Byte-transport writers give no
-  notice (L11). Task scopes are defined over indexed notes (L12).
+  notice (L11). Task scopes are defined over indexed notes (L12). A
+  `move_note(rewrite_links=True)` out of an excluded name cannot discover
+  backlinks (they are keyed on the removed row), so it succeeds and appends
+  `tools.CONFLICT_REWRITE_NOTICE` (L14). It is just as silent today for any
+  source the index does not hold, and that case is unchanged.
 
 ## A pass does not prune what it could not see (#309)
 

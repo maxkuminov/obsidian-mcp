@@ -8,7 +8,7 @@ Refs #392. Read `proposal.md`, `design.md` (D1–D10, L1–L8, the adversarial s
   - `CONFLICT_PATTERNS`: P1–P6 from design D2, compiled, each preceded by a comment citing its source;
   - `is_conflict_copy(name: str) -> bool`: `fullmatch` on the basename, with `[0-9]` digit classes only.
 - [x] 1.2 `src/config.py`: `index_exclude_conflict_files: bool = False`, beside the other `INDEX_*` settings, with a comment pointing to the module and design.
-- [x] 1.3 `tests/test_conflict_copies.py`:
+- [x] 1.3 `tests/test_issue_392_conflict_copies.py` (the matcher table):
   - every positive example in the index-integrity spec;
   - every look-alike in scenario 7 / the spec;
   - the U+2019 apostrophe in P4;
@@ -22,26 +22,29 @@ Refs #392. Read `proposal.md`, `design.md` (D1–D10, L1–L8, the adversarial s
   - `_scan_vault(…, exclude_conflicts: bool = False)` classifies after `_path_not_indexable_reason` and before any stat, with no `_warn_not_indexable`;
   - `_index_vault_pinned` reads the setting once and passes it (quarantine restarts reuse the scan, so the value is fixed per invocation).
 - [x] 2.2 In `_index_vault_attempt`:
-  - split `not_indexable_rows` for logging: the existing WARNING covers only non-excluded reasons, and a new INFO removal line covers excluded rows (five paths, `(+N more)`);
+  - split `not_indexable_rows` for logging: the existing WARNING covers only non-excluded reasons, and a new INFO removal line covers excluded rows (`_format_skips`: up to `SKIP_REPORT_LIMIT` = 20 paths, then `, and N more`);
   - add the per-pass INFO count line when `excluded > 0`;
   - `IndexPassResult.excluded`;
   - `not_indexable` excludes `EXCLUDED_CONFLICT_COPY`.
 - [x] 2.3 Amend the comments that say a name-decided not-indexable path "can have no row" (the C4 loop, `_collect_feed_events`). No branch change is expected there; add one only if a test proves it necessary, and say so in the design.
 - [x] 2.4 In-process `excluded_conflict_copies: dict[int | None, int]`, set after each committed pass; the lifespan's startup INFO line when the setting is on.
 - [x] 2.5 Offline tests (extend the existing scan and pass tests, mocked session where they already are):
-  - an excluded path is in `seen` and `not_indexable`, and is never statted or read (a spy on `_read_and_hash` / `_stat_follow`);
-  - with the setting off, it is indexed;
+  - an excluded path is in `seen` and `not_indexable`, and is never statted or read (spies on `read_note_at` / `_stat_follow`);
+  - with the setting off, the scan is unchanged;
   - `excluded` and `not_indexable` counts;
   - no WARNING for excluded paths;
-  - the backstop clock advances;
-  - a quarantine entry at an excluded path is cleared.
+  - the startup line (`main._log_index_exclusion`), logged only when on;
+  - the backstop clock advancing and a quarantine entry at an excluded path being cleared are integration cases (2.6), not offline ones.
 - [x] 2.6 Integration (`tests/integration/`, real Postgres; port 55446, container `omcp-it-index-exclude-conflicts`). Trace design scenarios 1, 2, 4, 5, 6, 9 and 10:
   - rows, embeddings, task rows and the inbound link deleted or dangling on toggle-on;
   - the original's row untouched;
   - `created` on toggle-off;
   - no move pairing to a conflict path, also across a forced `PoisonNote` restart;
   - a protected row kept beneath an unlistable directory;
-  - a re-derive records;
+  - a re-derive over conflict-copy rows records (review r1, D);
+  - a quarantine entry at an excluded path, and a quarantined note renamed onto one, are cleared (review r1, E);
+  - the backstop clock advances on the toggle pass, with the seeding pass's record cleared first (review r1, F);
+  - the removal line (`_format_skips`: 20 paths, then `, and N more`) and the per-pass count line, captured (review r1, B);
   - a second pass writes nothing.
 
 ## 3. Change feed
@@ -65,6 +68,8 @@ Refs #392. Read `proposal.md`, `design.md` (D1–D10, L1–L8, the adversarial s
   - byte-identical output when the setting is off, or the name does not match;
   - the integration path `read_note` / `edit_note` / `move_note` out of an excluded name;
   - `move_note` onto an excluded name: the row stays until the next pass, which removes the row, vectors, links and task rows.
+
+- [x] 3b.3 Review r1, A: `CONFLICT_REWRITE_NOTICE` on a fully successful `move_note(rewrite_links=True)` whose SOURCE is an excluded name, ahead of the destination notice. Integration-tested: links not rewritten, both notices once, no notice when off, when `rewrite_links=False`, or when the source does not match.
 
 ## 4. Dashboard (panel template; owner browser pass)
 

@@ -117,6 +117,12 @@ While the setting is true, the following tools SHALL behave on an excluded path 
 
 For `create_note` the note is the created path, and for `move_note` the destination. With the setting false, or a basename that matches no pattern, both results SHALL be byte-identical to their form before this change. `write_file`, `import_from_url` and the transfer upload are byte transport and SHALL carry no notice (limitation L11).
 
+**The rewrite notice.** Backlink discovery is keyed on the source's index row, which the exclusion removes. So when the setting is true, `rewrite_links=True`, and the **source** basename matches a conflict pattern, `move_note`'s fully successful result SHALL carry one more line, after a single `\n`, with exactly this text:
+
+`note: the source name matches the sync-conflict exclusion (INDEX_EXCLUDE_CONFLICT_FILES), so it is not in the index and links to its old name may not have been found or rewritten; search for the old name and fix any by hand.`
+
+When both notices apply (a move from one excluded name to another), the rewrite notice SHALL come first and the exclusion notice last, each exactly once. The move SHALL NOT be refused (limitation L14). With the setting false, `rewrite_links=False`, or a non-matching source name, the result SHALL carry no rewrite notice.
+
 No tool's name, input schema, title, annotations or description SHALL change, and `tests/fixtures/tools_list_full_v2.json` SHALL stay byte-identical.
 
 #### Scenario: Recovering the only surviving version
@@ -128,6 +134,13 @@ No tool's name, input schema, title, annotations or description SHALL change, an
 
 - **WHEN** the setting is true and `move_note` moves the indexed `E.md` to `E (conflict 2026-05-29-19-45-39).md`
 - **THEN** the move SHALL succeed, its result SHALL end with the notice line, the row SHALL be at the destination path until the next pass, and after the next pass no row, vector, outgoing link or task row SHALL exist for either path
+
+#### Scenario: A link-rewriting move out of an excluded name
+
+- **WHEN** the setting is true, `B.md` links to `[[A (conflict 2026-05-29-19-45-39)]]`, a pass has removed the copy's row, and `move_note` moves the copy to `A.md` with `rewrite_links=True`
+- **THEN** the move SHALL succeed, `B.md` SHALL be unchanged, and the result SHALL end with `\n` and the rewrite notice line
+- **AND WHEN** the same move targets another excluded name
+- **THEN** the result SHALL end with the rewrite notice line and then the exclusion notice line, each once
 
 #### Scenario: Creating a note at an excluded name
 
@@ -145,7 +158,7 @@ The system SHALL report the exclusion in the log as follows while the setting is
 
 - the lifespan SHALL log one INFO line at startup stating that sync-conflict copies are not indexed and naming `INDEX_EXCLUDE_CONFLICT_FILES`;
 - a pass with a non-zero `excluded` count SHALL log one INFO line stating the count and naming the setting, and a pass with zero SHALL log no such line;
-- a pass that deleted rows because of the exclusion SHALL log one INFO line stating the count and naming at most five paths (`_format_skips`, `_loggable_path`), and those rows SHALL NOT be counted or named by the present-but-not-indexable WARNING;
+- a pass that deleted rows because of the exclusion SHALL log one INFO line stating the count and naming the paths through the existing `_format_skips` (at most `SKIP_REPORT_LIMIT`, 20, paths, then `, and N more`), and those rows SHALL NOT be counted or named by the present-but-not-indexable WARNING;
 - after each committed pass the indexer SHALL hold, in process memory, that scope's `excluded` count.
 
 The exclusion SHALL NOT write to `indexer_runs.error` and SHALL NOT change `/health`'s body, status or HTTP code.
@@ -157,5 +170,5 @@ The exclusion SHALL NOT write to `indexer_runs.error` and SHALL NOT change `/hea
 
 #### Scenario: The log names the removal once
 
-- **WHEN** a pass removes the rows of seven conflict copies
-- **THEN** exactly one INFO line SHALL state 7 and name five paths followed by `(+2 more)`, and no WARNING SHALL name any of the seven
+- **WHEN** a pass removes the rows of 23 conflict copies
+- **THEN** exactly one INFO line SHALL state 23 and name 20 paths followed by `, and 3 more`, and no WARNING SHALL name any of the 23

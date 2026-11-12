@@ -1350,6 +1350,10 @@ not listed) stays indexed, which is today's behaviour.
   `import_from_url` and transfer uploads are byte transport and say nothing.
 - A `move_note` that renames an indexed note onto such a name keeps it in
   the index until the next pass removes it.
+- A `move_note(rewrite_links=True)` *out of* such a name cannot find the
+  links pointing at it (the copy has no index row). The move succeeds, and
+  its result says so in one extra line: search for the old name and fix
+  those links by hand.
 - The setting is deployment-wide. In multi-user mode it applies to every
   user's vault; there is no per-user switch.
 
@@ -1358,7 +1362,7 @@ index row, with its vectors, links and task rows. `get_changes` records
 one `deleted … reason=not_indexable by human/sync` line per removed row
 ("still on disk but cannot be indexed"). New copies that never had a row
 record nothing. The pass logs `Removed the index row(s) of N excluded
-sync-conflict cop(y/ies)` (naming up to five) and, on every pass that
+sync-conflict cop(y/ies)` (naming up to 20, then `and N more`) and, on every pass that
 excludes any, `Excluded N sync-conflict cop(y/ies) from the index`. The
 dashboard shows `N sync-conflict copies not indexed` beside "Indexer last
 ran". The pass is not a failure, `/health` does not change, and nothing is
