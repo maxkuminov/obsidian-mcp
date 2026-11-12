@@ -115,7 +115,8 @@ async def test_single_user_scope_is_the_null_row(db):
     assert await row_count(db) == 1
     eff = await effective(db, None)
     assert eff.timezone == "UTC" and eff.configured_timezone is None
-    assert eff.excluded_folders == ()
+    # Absent: the stored folder is kept (an absent key never clears).
+    assert eff.excluded_folders == ("Archive/",)
     assert eff.set_done_date is True  # absent: the stored True is kept
     assert eff.set_created_date is False  # "default": NULL, the env default
     async with db() as session:
@@ -140,6 +141,69 @@ async def test_a_save_without_flags_never_switches_a_default_off(db):
     assert await save(db, seven, {"timezone": "Europe/Berlin"}) == []
     eff = await effective(db, seven)
     assert eff.set_done_date is False and eff.timezone == "Europe/Berlin"
+
+
+SCOPE_FORM = {
+    "timezone": "Asia/Tokyo",
+    "excluded_folders": "Archive\nTemplates",
+    "excluded_note_tags": "#private",
+}
+SCOPE_STORED = {
+    "timezone": "Asia/Tokyo",
+    "excluded_folders": ["Archive/", "Templates/"],
+    "excluded_note_tags": ["private"],
+}
+#: What a present, blank key stores: the server default zone (NULL) and no
+#: exclusions.
+SCOPE_CLEARED = {"timezone": None, "excluded_folders": [], "excluded_note_tags": []}
+
+
+async def stored_scope(maker, uid):
+    async with maker() as session:
+        row = await task_settings.stored(session, uid)
+        return {f: getattr(row, f) for f in task_settings.SCOPE_FIELDS}
+
+
+@pytest.mark.parametrize("field", task_settings.SCOPE_FIELDS)
+async def test_an_absent_scope_field_keeps_its_stored_value(db, field):
+    """A caller outside the panel saved one field and the owner's timezone
+    went back to the server default: an absent `timezone`, `excluded_folders`
+    or `excluded_note_tags` used to clear it. Absent now means unchanged."""
+    seven = await make_user(db, "seven")
+    assert await save(db, seven, SCOPE_FORM) == []
+    others = {f: v for f, v in SCOPE_FORM.items() if f != field}
+    assert await save(db, seven, {**others, "set_done_date": "off"}) == []
+    assert await stored_scope(db, seven) == SCOPE_STORED
+    # A save naming none of the three leaves all three.
+    assert await save(db, seven, {"set_created_date": "on"}) == []
+    assert await stored_scope(db, seven) == SCOPE_STORED
+
+
+@pytest.mark.parametrize("field", task_settings.SCOPE_FIELDS)
+async def test_a_present_empty_scope_field_clears_it(db, field):
+    seven = await make_user(db, "seven")
+    assert await save(db, seven, SCOPE_FORM) == []
+    assert await save(db, seven, {field: ""}) == []
+    expected = {**SCOPE_STORED, field: SCOPE_CLEARED[field]}
+    assert await stored_scope(db, seven) == expected
+
+
+@pytest.mark.parametrize("field", task_settings.SCOPE_FIELDS)
+async def test_a_present_scope_field_replaces_it(db, field):
+    seven = await make_user(db, "seven")
+    assert await save(db, seven, SCOPE_FORM) == []
+    new_form = {"timezone": "Europe/Berlin", "excluded_folders": "Inbox",
+                "excluded_note_tags": "draft"}
+    new_stored = {"timezone": "Europe/Berlin", "excluded_folders": ["Inbox/"],
+                  "excluded_note_tags": ["draft"]}
+    assert await save(db, seven, {field: new_form[field]}) == []
+    assert await stored_scope(db, seven) == {**SCOPE_STORED, field: new_stored[field]}
+
+
+async def test_a_first_save_without_scope_fields_inserts_the_defaults(db):
+    seven = await make_user(db, "seven")
+    assert await save(db, seven, {"set_done_date": "on"}) == []
+    assert await stored_scope(db, seven) == SCOPE_CLEARED
 
 
 async def test_scopes_never_see_each_other(db):

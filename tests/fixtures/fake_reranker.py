@@ -24,7 +24,7 @@ import uvicorn
 from src.services.rerank import PROBE_QUERY
 
 MODES = (
-    "correct", "inverted", "position", "tie", "drip", "sleep:<ms>", "status:<code>",
+    "correct", "inverted", "position", "tie", "drip", "sleep:<ms>", "hold", "status:<code>",
     "redirect", "not_json", "no_results", "short", "long", "dup_index", "oob_index",
     "bool_index", "nan", "inf", "string_score", "oversize", "sorted", "scores:<json>",
     "gzip", "cl_oversize", "chunked_oversize",
@@ -60,6 +60,11 @@ class FakeReranker:
         self._server: uvicorn.Server | None = None
         self._thread: threading.Thread | None = None
         self.disconnects = 0
+        #: `hold` mode: each request is held (connection open, no response
+        #: byte) until a test sets this event, then answered as `correct`.
+        #: An explicit release, so a test can occupy the client pool without
+        #: racing a wall-clock sleep (#401).
+        self.release = threading.Event()
 
     @property
     def url(self) -> str:
@@ -133,6 +138,10 @@ class FakeReranker:
             return await reply(200, results([0.5] * n))
         if mode.startswith("sleep:"):
             await asyncio.sleep(int(mode.split(":")[1]) / 1000)
+            return await reply(200, results([_overlap(query, d) for d in docs]))
+        if mode == "hold":
+            while not self.release.is_set():
+                await asyncio.sleep(0.005)
             return await reply(200, results([_overlap(query, d) for d in docs]))
         if mode.startswith("status:"):
             return await reply(int(mode.split(":")[1]),
@@ -227,6 +236,7 @@ class FakeReranker:
         return self
 
     def stop(self) -> None:
+        self.release.set()   # never leave a `hold` handler spinning
         if self._server is not None:
             self._server.should_exit = True
             self._server.force_exit = True

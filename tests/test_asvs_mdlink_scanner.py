@@ -35,6 +35,7 @@ import time
 import pytest
 
 from src.services.links import MDLINK_HREF_MAX, scan_md_links
+from tests._linearity import MAX_RATIO, SIZE_FACTOR, growth_ratio
 
 # ── the oracles ─────────────────────────────────────────────────────────────
 #
@@ -288,25 +289,23 @@ def _measure(fn, arg, *, clock=time.perf_counter):
 @pytest.mark.parametrize("scanner", sorted(SCANNERS))
 def test_pathological_input_is_scanned_in_linear_time(scanner, unit):
     fn = SCANNERS[scanner]
-    small = _repeat(unit, BENCH_N)
-    large = _repeat(unit, 2 * BENCH_N)
-
-    fn(small[:4096])  # warm the interpreter, not the measurement
-    # CPU time measures algorithmic growth without counting scheduler delays
-    # from other test/agent processes (#244). Absolute DoS ceilings below
-    # deliberately keep the default wall clock.
-    t_small, found_small = _measure(fn, small, clock=time.process_time)
-    t_large, found_large = _measure(fn, large, clock=time.process_time)
+    small = _repeat(unit, BENCH_N // SIZE_FACTOR)
+    large = _repeat(unit, BENCH_N)
 
     # None of these is a link. A "fast" run that started finding millions of
     # them would be a different bug wearing this test's clothes.
+    found_small, found_large = fn(small), fn(large)
     assert found_small == 0, f"{unit!r} produced {found_small} links"
     assert found_large == 0, f"{unit!r} produced {found_large} links"
 
-    ratio = t_large / max(t_small, 1e-6)
-    assert ratio < 4, (
+    # An 8x step, repeated and interleaved CPU-time measurements, so neither a
+    # sub-millisecond timing nor host load can fabricate a ratio (#244, #401;
+    # see `tests/_linearity.py`). The absolute DoS ceilings below deliberately
+    # keep the default wall clock.
+    ratio, t_small, t_large = growth_ratio(fn, small, large)
+    assert ratio < MAX_RATIO, (
         f"{scanner} on {unit!r}: ratio {ratio:.2f} "
-        f"(n={t_small:.4f}s, 2n={t_large:.4f}s) — superlinear"
+        f"(n={t_small:.5f}s, {SIZE_FACTOR}n={t_large:.5f}s) — superlinear"
     )
 
 

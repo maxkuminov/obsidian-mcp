@@ -72,6 +72,12 @@ _DEFAULT = "default"
 #: #434: the three task-rule fields; each absent key leaves its stored value.
 RULE_FIELDS = ("task_rule", "task_tags", "global_filter")
 
+#: The timezone and the default-scope lists. An absent key leaves its stored
+#: value, like every other field; a present, blank one clears it (NULL / an
+#: empty list). A caller outside the panel that saved one field used to reset
+#: the others — the owner's timezone to the server default among them.
+SCOPE_FIELDS = ("timezone", "excluded_folders", "excluded_note_tags")
+
 #: The four nullable write-behaviour fields, in the order the card shows them.
 BOOLEAN_FIELDS = (
     "set_done_date",
@@ -344,6 +350,9 @@ class ValidatedForm:
     unchanged: frozenset = frozenset()
     #: #434: the rule fields absent from the form, likewise left as stored.
     rule_unchanged: frozenset = frozenset()
+    #: The `SCOPE_FIELDS` absent from the form, likewise left as stored
+    #: (their value above is the blank one and is not written).
+    scope_unchanged: frozenset = frozenset()
 
 
 def validate(form: Mapping[str, Any]) -> tuple[ValidatedForm | None, list[str]]:
@@ -359,6 +368,7 @@ def validate(form: Mapping[str, Any]) -> tuple[ValidatedForm | None, list[str]]:
         form.get("excluded_note_tags"), normalise_tag, "excluded note tags"
     )
     errors += folder_errors + tag_errors
+    scope_unchanged = frozenset(f for f in SCOPE_FIELDS if f not in form)
     rule_values: dict[str, Any] = {}
     if "task_rule" in form:
         raw = form["task_rule"]
@@ -398,6 +408,7 @@ def validate(form: Mapping[str, Any]) -> tuple[ValidatedForm | None, list[str]]:
         excluded_note_tags=tags,
         unchanged=unchanged,
         rule_unchanged=rule_unchanged,
+        scope_unchanged=scope_unchanged,
         **flags,
         **rule_values,
     ), []
@@ -411,8 +422,9 @@ async def save(session, uid: int | None, form: Mapping[str, Any]) -> list[str]:
     in `BOOLEAN_FIELDS` (`"on"` / `"off"` / `"default"` = NULL, the
     environment default), and the task rule (#434): `task_rule`
     (`default` = NULL, `all`, `fields`, `filter`), `task_tags` (one per
-    line) and `global_filter` (blank = NULL). An absent boolean or rule key
-    leaves the stored value (NULL / empty for a scope with no row). Any error
+    line) and `global_filter` (blank = NULL). An absent key — the timezone,
+    either list, a boolean or a rule field — leaves the stored value (NULL /
+    empty for a scope with no row); a present, blank one clears it. Any error
     refuses the whole save with nothing written.
 
     Otherwise the scope's saves are serialised by a transaction advisory
@@ -440,7 +452,7 @@ async def save(session, uid: int | None, form: Mapping[str, Any]) -> list[str]:
         "task_tags": values.task_tags,
         "global_filter": values.global_filter,
     }
-    for name in values.unchanged | values.rule_unchanged:
+    for name in values.unchanged | values.rule_unchanged | values.scope_unchanged:
         del fields[name]
     await session.execute(
         text("SELECT pg_advisory_xact_lock(:ns, :key)"),

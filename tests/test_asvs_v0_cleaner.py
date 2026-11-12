@@ -20,11 +20,11 @@ import ast
 import pathlib
 import random
 import re
-import time
 
 import pytest
 
 from src.services.embeddings import _v0_clean, _v0_sub_fences
+from tests._linearity import MAX_RATIO, SIZE_FACTOR, growth_ratio
 
 # ── The oracle: v0 exactly as it was ────────────────────────────────────────
 
@@ -211,20 +211,14 @@ def test_existing_fixtures_are_byte_identical(module_name):
 # ── Linearity ───────────────────────────────────────────────────────────────
 
 
-def _time(fn, *args):
-    start = time.perf_counter()
-    fn(*args)
-    return time.perf_counter() - start
-
-
 def test_many_unclosed_openers_is_linear():
-    """160 KB vs 320 KB of `` ```x\\n ``. The oracle is quadratic here (this is
+    """40 KB vs 320 KB of `` ```x\\n ``. The oracle is quadratic here (this is
     the shape that made a note of unclosed fences a cross-tenant stall); the
     scanner must be linear, and must still agree with the oracle."""
     unit = "```x\n"
-    n = 160 * 1024
+    n = 40 * 1024
     small = unit * (n // len(unit))
-    large = unit * (2 * n // len(unit))
+    large = unit * (SIZE_FACTOR * n // len(unit))
 
     # Correctness first — a fast wrong answer is worse than a slow right one.
     # Against a 16 KB slice, not the 160 KB one: the oracle is the quadratic
@@ -234,26 +228,22 @@ def test_many_unclosed_openers_is_linear():
     oracle_sample = unit * (16 * 1024 // len(unit))
     assert _v0_clean(oracle_sample) == v0_clean_oracle(oracle_sample)
 
-    # Warm the interpreter, then take the best of three so a scheduler hiccup
-    # on a shared runner cannot fabricate a ratio.
-    _v0_clean(small)
-    t_small = min(_time(_v0_clean, small) for _ in range(3))
-    t_large = min(_time(_v0_clean, large) for _ in range(3))
-
+    # An 8x step, repeated and interleaved CPU-time measurements (#401): see
+    # `tests/_linearity.py` for why this cannot be fabricated by host load.
+    ratio, t_small, t_large = growth_ratio(_v0_clean, small, large)
     assert t_large < 4.0, f"{t_large:.3f}s for 320 KB of unclosed openers"
-    ratio = t_large / max(t_small, 1e-6)
-    assert ratio < 4, f"ratio {ratio:.2f} (n={t_small:.4f}s, 2n={t_large:.4f}s)"
+    assert ratio < MAX_RATIO, (
+        f"ratio {ratio:.2f} (n={t_small:.4f}s, {SIZE_FACTOR}n={t_large:.4f}s)"
+    )
 
 
 def test_one_pass_alone_is_linear_for_both_fence_characters():
     for fence in ("```", "~~~"):
         unit = f"{fence}x\n"
-        n = 160 * 1024
+        n = 40 * 1024
         small = unit * (n // len(unit))
-        large = unit * (2 * n // len(unit))
-        _v0_sub_fences(small, fence)
-        t_small = min(_time(_v0_sub_fences, small, fence) for _ in range(3))
-        t_large = min(_time(_v0_sub_fences, large, fence) for _ in range(3))
+        large = unit * (SIZE_FACTOR * n // len(unit))
+        ratio, _, t_large = growth_ratio(
+            lambda text, fence=fence: _v0_sub_fences(text, fence), small, large)
         assert t_large < 4.0, f"{fence}: {t_large:.3f}s"
-        ratio = t_large / max(t_small, 1e-6)
-        assert ratio < 4, f"{fence}: ratio {ratio:.2f}"
+        assert ratio < MAX_RATIO, f"{fence}: ratio {ratio:.2f}"

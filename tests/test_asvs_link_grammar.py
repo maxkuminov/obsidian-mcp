@@ -17,9 +17,10 @@ two grammars share, which did not change.
 
 This module pins the three things that fix has to be:
 
-1. **Linear** — a ratio benchmark (2n ÷ n < 4) over every pathological shape,
-   not a single wall-clock assertion, because a shared CI runner will flake
-   one of those sooner or later.
+1. **Linear** — a ratio benchmark (8n ÷ n < 20, `tests/_linearity.py`) over
+   every pathological shape, not a single wall-clock assertion, because a
+   shared CI runner will flake one of those sooner or later (#401: the old
+   2n ÷ n < 4 form did).
 2. **Behaviour-preserving except where enumerated** — the accepted
    differences are listed once, here, and asserted exactly.
 3. **Agreed between the two grammars** — with the two PRE-EXISTING
@@ -31,6 +32,7 @@ import time
 import pytest
 
 import src.mcp_server.tools as tools
+from tests._linearity import MAX_RATIO, SIZE_FACTOR, growth_ratio
 from src.auth.session import current_user_id
 from src.mcp_server.auth import current_permission
 from src.services import vault as vault_service
@@ -167,10 +169,13 @@ def test_pathological_input_is_parsed_in_linear_time(scanner, unit):
         f"{scanner} on {unit!r}: {t_large:.2f}s at {2 * BENCH_N} bytes "
         f"(ceiling {ceiling}s)"
     )
-    ratio = t_large / max(t_small, 1e-6)
-    assert ratio < 4, (
+    # The shape, load-tolerantly (#401): an 8x step, repeated and interleaved
+    # CPU-time measurements; see `tests/_linearity.py`.
+    ratio, r_small, r_large = growth_ratio(
+        fn, _repeat(unit, BENCH_N // SIZE_FACTOR), small)
+    assert ratio < MAX_RATIO, (
         f"{scanner} on {unit!r}: ratio {ratio:.2f} "
-        f"(n={t_small:.4f}s, 2n={t_large:.4f}s) — superlinear"
+        f"(n={r_small:.4f}s, {SIZE_FACTOR}n={r_large:.4f}s) — superlinear"
     )
 
 
@@ -573,10 +578,11 @@ def test_the_rewrite_splice_is_linear_in_the_note(monkeypatch):
     assert n_small == len(small) // len(SPLICE_UNIT)
     assert n_large == 2 * n_small
 
-    ratio = t_large / max(t_small, 1e-6)
-    assert ratio < 4, (
+    ratio, r_small, r_large = growth_ratio(
+        _run_rewrite, _dense(2 * SPLICE_N // SIZE_FACTOR), large)
+    assert ratio < MAX_RATIO, (
         f"rewrite splice: ratio {ratio:.2f} "
-        f"(n={t_small:.4f}s, 2n={t_large:.4f}s) — superlinear"
+        f"(n={r_small:.4f}s, {SIZE_FACTOR}n={r_large:.4f}s) — superlinear"
     )
     assert t_large < 4.0, f"rewrite splice: {t_large:.2f}s at {2 * SPLICE_N} bytes"
 

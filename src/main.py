@@ -104,6 +104,14 @@ async def _check_embedding_dim() -> None:
 
 MIN_PGVECTOR_VERSION = (0, 8, 0)
 
+#: Below this, the server starts but logs one WARNING (#348). pgvector 0.8.3
+#: fixed possible HNSW index corruption during vacuum, and 0.8.4 fixed the
+#: `hnsw graph not repaired` and insert errors during HNSW vacuum (pgvector
+#: CHANGELOG). The vector index is an HNSW index rewritten continuously by
+#: the indexer, so it is exposed. Advisory only: never an exit, never
+#: `/health`.
+PGVECTOR_HNSW_VACUUM_FIXED_VERSION = (0, 8, 4)
+
 
 def _parse_pgvector_version(raw: str) -> tuple[int, ...] | None:
     """`'0.8.2'` → `(0, 8, 2)`. None when the string is not parseable.
@@ -157,6 +165,20 @@ async def _check_pgvector_version() -> None:
             ".".join(str(p) for p in MIN_PGVECTOR_VERSION),
         )
         sys.exit(1)
+    if parsed < PGVECTOR_HNSW_VACUUM_FIXED_VERSION:
+        from src.services.vector_index import INDEX_NAME
+
+        logging.getLogger(__name__).warning(
+            "pgvector %s predates the HNSW vacuum fixes of 0.8.3 (possible "
+            "index corruption) and %s; this server's vector index is HNSW and "
+            "is vacuumed continuously. Upgrade the extension binaries (the "
+            "database image), run ALTER EXTENSION vector UPDATE, then rebuild "
+            "the vector index once: REINDEX INDEX CONCURRENTLY %s. Starting "
+            "anyway.",
+            row[0],
+            ".".join(str(p) for p in PGVECTOR_HNSW_VACUUM_FIXED_VERSION),
+            INDEX_NAME,
+        )
 
 
 def _configure_body_budget() -> None:

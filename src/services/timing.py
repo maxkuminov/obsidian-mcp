@@ -119,8 +119,22 @@ def _json_bytes(value) -> int:
     value" is read, the recorded list is within 2048 bytes. `ensure_ascii` is
     off so a non-ASCII path is measured in UTF-8, the encoding the column
     actually stores, and not in `\\uXXXX` escapes.
+
+    Total, like `source_path_value` (#334): a path holding an unpaired
+    surrogate (a non-UTF-8 filename decoded with surrogate-escape) cannot be
+    encoded as UTF-8, and a bare encode raised inside a read tool that had
+    already done its work. The value is therefore measured in the form the
+    usage row stores it: `usage_params` renders a value holding a surrogate or
+    NUL as a whole (every surrogate, NUL and backslash escaped) and returns any
+    other value unchanged, so the budget still bounds the stored bytes. The
+    final encode passes surrogates through so this never raises.
     """
-    return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+    # Imported here, not at module scope: `usage_params` pulls in the vault
+    # module, and this one must stay importable on its own.
+    from src.services.usage_params import render_usage_params
+
+    stored = render_usage_params(value)
+    return len(json.dumps(stored, ensure_ascii=False).encode("utf-8", "surrogatepass"))
 
 
 def fit_result_paths(paths: Iterable[str]) -> list[str]:

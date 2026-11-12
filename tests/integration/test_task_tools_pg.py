@@ -249,6 +249,12 @@ async def test_every_write_tool_and_its_dry_run(sessionmaker, vault):
     ):
         out = await call(name, path="w.md", dry_run=True, **args)
         assert out.startswith("Dry run — nothing was written."), (name, out)
+        # The heading says what would happen; no dry-run line asserts a write.
+        heading = out.splitlines()[1]
+        assert heading.startswith({"complete_task": "Would complete task in `w.md`",
+                                   "update_task": "Would update task in `w.md`",
+                                   "add_task": "Would add task to `w.md`"}[name]), (name, out)
+        assert not any(w in out for w in ("Completed task", "Updated task", "Added task"))
         assert "diff:" in out
         assert disk(vault, "w.md") == body.encode(), name
     assert await scalar(sessionmaker, "SELECT count(*) FROM note_events WHERE source = 'mcp'") == 0

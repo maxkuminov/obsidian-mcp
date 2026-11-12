@@ -21,6 +21,7 @@ Fully offline; the fake session is the one `test_search_phase_timing.py` uses.
 """
 
 import asyncio
+import json
 import os
 import tempfile
 
@@ -244,6 +245,47 @@ def test_result_count_is_the_full_count_not_the_logged_one():
 
     assert holder["result_count"] == 40
     assert len(holder["result_paths"]) == 10
+
+
+def test_a_lone_surrogate_path_is_recorded_not_raised_334():
+    """#334. A non-UTF-8 filename reaches a result list as a lone surrogate
+    (surrogate-escape). A bare UTF-8 encode raised inside `record_results`,
+    which failed the read tool as `tool_exception` after it had done its work.
+    """
+    from src.services.usage_params import render_usage_params
+
+    paths = ["a\udc80.md", "b.md"]
+    token = timing.begin()
+    try:
+        timing.record_results(paths)
+        holder = timing.current()
+    finally:
+        timing.clear(token)
+
+    assert holder["result_count"] == 2
+    assert holder["result_paths"] == paths
+    # Measured in the form the usage row stores (the rendered escape), so the
+    # budget is about the stored bytes: here the surrogate costs the six
+    # characters of its escape, not the three of a surrogate-pass encode.
+    stored = render_usage_params(paths)
+    assert stored == ["a\\udc80.md", "b.md"]
+    assert timing._json_bytes(paths) == len(json.dumps(stored).encode("utf-8"))
+
+
+def test_the_budget_bounds_the_rendered_form_of_a_surrogate_list_334():
+    """Once one path holds a surrogate, the renderer escapes the whole value —
+    every backslash in every path doubles. The budget must count that, or the
+    stored row exceeds 2,048 bytes."""
+    from src.services.usage_params import render_usage_params
+
+    paths = ["\\" * 600 + ".md", "x\udc80.md", "\\" * 600 + ".md"]
+    kept = timing.fit_result_paths(paths)
+    assert kept == paths[:len(kept)]
+    stored = render_usage_params(kept)
+    assert len(json.dumps(stored, ensure_ascii=False).encode("utf-8")) <= (
+        timing.MAX_RESULT_PATHS_BYTES
+    )
+    assert len(kept) < len(paths), "the rendered doubling must have bitten"
 
 
 def test_source_path_is_the_path_when_it_fits():

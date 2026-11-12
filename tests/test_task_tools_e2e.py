@@ -268,6 +268,9 @@ def test_a_recurring_completion_dry_run_writes_nothing(world):
     out = run(tools.complete_task_impl("A.md", key_of(note.rstrip("\n")), dry_run=True))
     assert code_of(out) is None
     assert out.startswith("Dry run — nothing was written.")
+    # No line of a dry run asserts a write.
+    assert out.splitlines()[1] == "Would complete task in `A.md`"
+    assert "Completed task" not in out
     assert "next occurrence, line 1 (above): - [ ] Rent 🔁 every month 📅 2026-12-01" in out
     assert "+- [ ] Rent 🔁 every month 📅 2026-12-01" in out  # the diff
     assert read(world, "A.md") == note
@@ -407,6 +410,9 @@ def test_add_task_dry_run_lists_similar_and_writes_nothing(world):
     write(world, "A.md", "- [ ] a\n")
     out = run(tools.add_task_impl("A.md", "b", dry_run=True))
     assert out.startswith("Dry run — nothing was written.")
+    # No line of a dry run asserts a write: it says what would be added.
+    assert out.splitlines()[1] == "Would add task to `A.md`"
+    assert "Added task" not in out
     assert "similar open tasks: none" in out and "+- [ ] b" in out
     assert read(world, "A.md") == "- [ ] a\n"
     assert world.events == []
@@ -424,6 +430,8 @@ def test_required_mode_is_satisfied_by_the_id(world, monkeypatch):
     assert code_of(out) == "stale_precondition"
     out = run(tools.add_task_impl("A.md", "c"))
     assert code_of(out) is None, out
+    # A real write keeps its heading, byte for byte.
+    assert out.splitlines()[0] == "Added task to `A.md`"
 
 
 # ── D2: the bounded retry ────────────────────────────────────────────────────
