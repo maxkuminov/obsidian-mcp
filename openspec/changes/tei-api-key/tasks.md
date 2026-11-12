@@ -46,6 +46,6 @@ Refs #426. Read `proposal.md`, `design.md` (D1–D6, the accepted limitations, T
 
 ## 5. Verification
 
-- [ ] 5.1 TC2 (and TC1 for the docs' wording) against `ghcr.io/huggingface/text-embeddings-inference:cpu-1.8` started with `--api-key`: without the key, `/info` answers 401 and the server keeps serving with embedding withheld; with the key, verified and embedding. **Not run:** the image is on the host, but no model is cached locally and starting TEI would download one (no downloads allowed for this change). TC1 and TC2 stay open; the docs do not claim either.
+- [ ] 5.1 TC2 (and TC1 for the docs' wording) against `ghcr.io/huggingface/text-embeddings-inference:cpu-1.8` started with `--api-key`: without the key, `/info` answers 401 and the server keeps serving with embedding withheld; with the key, verified and embedding. **Not run against a live server on this host:** the image is present, but no model is cached and starting TEI would download one. The documented behaviour (`/info` and `/embed` answer 401 without the exact `Bearer <key>`; `/health` is public) is taken from upstream `router/src/http/server.rs` at tag `v1.8.3`, commit `78502d8` (design, "Outcome (from source, not a live run)").
 - [x] 5.2 `openspec validate tei-api-key --strict`.
 - [ ] 5.3 `openspec-verifier`, then one adversarial Codex pass focused on disclosure of the key and on any request that carries it outside `TEI_URL`.

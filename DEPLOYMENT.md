@@ -432,7 +432,13 @@ Secret, never a ConfigMap). It is sent as `Authorization: Bearer <key>` on
 `POST /embed`, `GET /info` and the panel's `GET /health` to `TEI_URL`, and
 nowhere else: not to the reranker, not to Ollama or OpenAI, and never to a
 redirect target (embedding clients do not follow redirects). Leave it empty
-for a TEI without authentication; no header is sent then. What to expect:
+for a TEI without authentication; no header is sent then. In TEI's own
+router (v1.8.3, `router/src/http/server.rs`) the key guards `/info`, `/embed`
+and the other inference routes, which answer 401 to a missing or different
+`Authorization` value, while `/health` stays public. So the panel's
+reachability indicator can read "reachable" even when the key is wrong; the
+header on `/health` is there for a gateway that protects every path. What
+to expect:
 
 - A missing or wrong key does not stop the server. The startup check logs
   one CRITICAL line, `GET /info answered HTTP 401; TEI_API_KEY is not set`

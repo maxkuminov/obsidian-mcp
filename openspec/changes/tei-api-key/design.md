@@ -92,6 +92,12 @@ The sentinel must not occur in any captured log record (message, args and format
 - **TC1.** Whether TEI 1.8.x exempts `/health` and `/info` from `--api-key`. The design works either way (D1). The result goes into the docs' wording only.
 - **TC2.** A TEI started with `--api-key K` answers 401 to `/embed` without the header, and 200 with `Authorization: Bearer K`. To be run against `ghcr.io/huggingface/text-embeddings-inference:cpu-1.8`, as #425 task 7 did.
 
+**Outcome (from source, not a live run).** Read in upstream `router/src/http/server.rs` at tag `v1.8.3` (commit `78502d8`, the version #425 ran):
+- `/info`, `/embed` and the other inference routes are in `routes`. The auth middleware is layered on `routes` only, and answers `401 UNAUTHORIZED` unless the `Authorization` header equals `Bearer <api_key>` exactly.
+- `/health`, `/`, `/ping` and `/metrics` are in `public_routes` and are not authenticated.
+
+So TC1 is "`/info` is guarded, `/health` is public". TC2 is supported by the source. TEI itself never answers 403; a 403 can only come from a gateway. No TEI was run against this change, because there is no locally cached model (task 5.1).
+
 ## Accepted limitations
 
 - **L1. Restart to rotate.** The key is read at settings construction. A rotated key needs a restart, like every other setting, and until then every request fails as D3 describes.

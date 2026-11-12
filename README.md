@@ -1302,11 +1302,13 @@ replaced weights behind one name are not detected.
 If your TEI server was started with `--api-key` (or sits behind a gateway
 that wants a bearer token), set `TEI_API_KEY`. The server sends it as
 `Authorization: Bearer <key>` on `/embed`, the `/info` check and the panel's
-`/health` probe, and to no other host. Without it such a server answers 401:
+`/health` probe, and to no other host. Without it, such a server answers
+`/info` and `/embed` with 401:
 the startup check logs `GET /info answered HTTP 401; TEI_API_KEY is not set`
 (or `the server rejected TEI_API_KEY` when the key is wrong), the process
-keeps serving with embedding withheld, and it never exits over it. The key
-is never logged or shown. The `openai` provider against TEI's `/v1` route
+keeps serving with embedding withheld, and it never exits over it. TEI
+leaves `/health` public (as of v1.8.3), so the panel can show the server
+as reachable even with a wrong key. The key is never logged or shown. The `openai` provider against TEI's `/v1` route
 already sends `OPENAI_API_KEY` as its bearer token.
 
 The provider sends `truncate: true`, so a chunk or query longer than the
