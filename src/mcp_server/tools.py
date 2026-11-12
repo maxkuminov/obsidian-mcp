@@ -4488,9 +4488,9 @@ CONFLICT_EXCLUSION_NOTICE = (
 #: pinned by the index-integrity spec delta.
 CONFLICT_REWRITE_NOTICE = (
     "note: the source name matches the sync-conflict exclusion "
-    "(INDEX_EXCLUDE_CONFLICT_FILES), so it is not in the index and links to "
-    "its old name may not have been found or rewritten; search for the old "
-    "name and fix any by hand."
+    "(INDEX_EXCLUDE_CONFLICT_FILES), so it may no longer be in the index "
+    "and links to its old name may not have been found or rewritten; search "
+    "for the old name and fix any by hand."
 )
 
 

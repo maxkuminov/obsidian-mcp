@@ -276,6 +276,18 @@ def test_the_notice_text_is_the_spec_text():
     assert tools.CONFLICT_EXCLUSION_NOTICE == NOTICE_LINE
 
 
+def test_the_rewrite_notice_text_is_the_spec_text():
+    # Review r2: "may no longer be", because until the next pass removes the
+    # row the source is still indexed and its backlinks are rewritten.
+    assert tools.CONFLICT_REWRITE_NOTICE == (
+        "note: the source name matches the sync-conflict exclusion "
+        "(INDEX_EXCLUDE_CONFLICT_FILES), so it may no longer be in the index "
+        "and links to its old name may not have been found or rewritten; "
+        "search for the old name and fix any by hand."
+    )
+    assert "\n" not in tools.CONFLICT_REWRITE_NOTICE
+
+
 async def test_create_note_notice_only_when_on_and_matching(vault, monkeypatch):
     _setting(monkeypatch, False)
     off = await tools.create_note_impl(COPY, "body\n")

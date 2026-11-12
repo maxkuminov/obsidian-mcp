@@ -1351,7 +1351,7 @@ not listed) stays indexed, which is today's behaviour.
 - A `move_note` that renames an indexed note onto such a name keeps it in
   the index until the next pass removes it.
 - A `move_note(rewrite_links=True)` *out of* such a name cannot find the
-  links pointing at it (the copy has no index row). The move succeeds, and
+  links pointing at it once a pass has removed its index row. The move succeeds, and
   its result says so in one extra line: search for the old name and fix
   those links by hand.
 - The setting is deployment-wide. In multi-user mode it applies to every

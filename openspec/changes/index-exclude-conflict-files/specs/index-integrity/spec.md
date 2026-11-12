@@ -119,7 +119,7 @@ For `create_note` the note is the created path, and for `move_note` the destinat
 
 **The rewrite notice.** Backlink discovery is keyed on the source's index row, which the exclusion removes. So when the setting is true, `rewrite_links=True`, and the **source** basename matches a conflict pattern, `move_note`'s fully successful result SHALL carry one more line, after a single `\n`, with exactly this text:
 
-`note: the source name matches the sync-conflict exclusion (INDEX_EXCLUDE_CONFLICT_FILES), so it is not in the index and links to its old name may not have been found or rewritten; search for the old name and fix any by hand.`
+`note: the source name matches the sync-conflict exclusion (INDEX_EXCLUDE_CONFLICT_FILES), so it may no longer be in the index and links to its old name may not have been found or rewritten; search for the old name and fix any by hand.`
 
 When both notices apply (a move from one excluded name to another), the rewrite notice SHALL come first and the exclusion notice last, each exactly once. The move SHALL NOT be refused (limitation L14). With the setting false, `rewrite_links=False`, or a non-matching source name, the result SHALL carry no rewrite notice.
 

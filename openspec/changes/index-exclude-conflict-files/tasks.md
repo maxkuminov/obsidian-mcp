@@ -99,5 +99,5 @@ Refs #392. Read `proposal.md`, `design.md` (D1–D10, L1–L8, the adversarial s
 
 - [x] 6.1 `openspec validate index-exclude-conflict-files --strict`.
 - [x] 6.2 The offline suite (`OMCP_ALLOW_SKIP_TRANSFER_INTEGRATION=1 … pytest tests --ignore=tests/integration`) and the integration modules touched in 2.6 / 3.1 on port 55446.
-- [ ] 6.3 `openspec-verifier`, then the adversarial Codex pass, which is mandatory because this touches the indexing path. Give it design D3–D8 and scenarios 1–13.
+- [x] 6.3 `openspec-verifier`, then the adversarial Codex pass, which is mandatory because this touches the indexing path. Give it design D3–D8 and scenarios 1–13.
 - [ ] 6.4 End-to-end on the live server after deploy: with the setting on, `keyword_search` / `list_notes` omit a known conflict copy, `read_note` returns it, and `get_changes` shows its `deleted reason=not_indexable`. Report which tools were called.
