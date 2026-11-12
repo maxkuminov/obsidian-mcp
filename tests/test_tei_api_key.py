@@ -146,7 +146,14 @@ def panel(monkeypatch):
 # ══════════════════════════════════════════════════════════════════════════
 
 
-async def test_unset_requests_are_byte_identical(unkeyed):
+#: The three unset spellings, each taken through settings construction so the
+#: value the provider sees is the one an operator's environment produces.
+_UNSET = [None, "", "   "]
+
+
+@pytest.mark.parametrize("value", _UNSET, ids=repr)
+async def test_unset_requests_are_byte_identical(tei, monkeypatch, value):
+    monkeypatch.setattr(settings, "tei_api_key", _make(tei_api_key=value).tei_api_key)
     with respx.mock(base_url=URL) as mock:
         info = answer_info(mock)
         embed = mock.post("/embed").mock(side_effect=answer_per_input)
@@ -156,15 +163,23 @@ async def test_unset_requests_are_byte_identical(unkeyed):
     assert _headers(embed) == BEFORE["embed"]
 
 
-def test_unset_panel_probe_is_byte_identical(unkeyed, panel):
+@pytest.mark.parametrize("value", _UNSET, ids=repr)
+def test_unset_panel_probe_is_byte_identical(tei, panel, monkeypatch, value):
+    monkeypatch.setattr(settings, "tei_api_key", _make(tei_api_key=value).tei_api_key)
     panel()
     (request,) = panel.seen
     assert request.url == httpx.URL(f"{URL}/health")
     assert list(request.headers.multi_items()) == BEFORE["health"]
 
 
-@pytest.mark.parametrize("value", [None, "", "   ", "\n", " \t\r\n "], ids=repr)
+@pytest.mark.parametrize(
+    "value",
+    [None, "", "   ", "\n", " \t\r\n ", "\f", "\v", " ", "  \f\v\t "],
+    ids=repr,
+)
 def test_blank_means_unset(value):
+    """Any whitespace-only value, form feed, vertical tab and U+00A0 (the
+    no-break space) included."""
     assert _make(tei_api_key=value).tei_api_key is None
 
 
@@ -395,6 +410,30 @@ def test_another_provider_ignores_it():
 
 def test_sandbox_ignores_it():
     _make(mcp_sandbox_mode=True, tei_api_key="abc def")
+
+
+async def test_sandbox_sends_no_header_on_any_of_the_three(tei, panel, monkeypatch):
+    """Sandbox skips the format check, so the key is not sent either."""
+    unchecked = _make(mcp_sandbox_mode=True, tei_api_key="abc def").tei_api_key
+    monkeypatch.setattr(settings, "tei_api_key", unchecked)
+    monkeypatch.setattr(settings, "mcp_sandbox_mode", True)
+    with respx.mock(base_url=URL) as mock:
+        info = answer_info(mock)
+        embed = mock.post("/embed").mock(side_effect=answer_per_input)
+        await verify_tei_server()
+        await TeiProvider().embed_one("hello", kind="query")
+    panel()
+    requests = [info.calls[0].request, embed.calls[0].request, *panel.seen]
+    assert len(requests) == 3
+    assert all("authorization" not in r.headers for r in requests)
+
+
+@pytest.mark.parametrize(
+    "value", ["key\fx", "key x", " key"], ids=["ff-inside", "nbsp-inside", "nbsp-lead"]
+)
+def test_other_whitespace_inside_a_key_still_refuses(value):
+    with pytest.raises(ValidationError, match="TEI_API_KEY"):
+        _make(tei_api_key=value)
 
 
 def test_an_absent_key_never_refuses():

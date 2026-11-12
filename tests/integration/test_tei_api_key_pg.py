@@ -142,6 +142,70 @@ async def test_a_refused_key_is_named_but_never_shown(sessionmaker, vault, migra
         error_log.reset()
 
 
+def _vectors(request):
+    import json
+
+    inputs = json.loads(request.read())["inputs"]
+    return Response(200, json=[[1.0] + [0.0] * (DIM - 1) for _ in inputs])
+
+
+async def test_embed_note_on_an_embedded_note_keeps_its_vectors(sessionmaker, vault):
+    """The "/embed 401 mid-run" scenario on the real `embed_note`: a note that
+    already holds vectors, edited, then refused. `PROVIDER_FAILED`, the stored
+    message names the setting and not the value, and the old vectors stand."""
+    from src.models.db import NoteMetadata
+    from src.services.embeddings import NoteEmbedOutcome
+
+    (vault / "Kept.md").write_text("# Kept\n\nFirst body.\n", encoding="utf-8")
+    with respx.mock(base_url=TEI, assert_all_called=False) as mock:
+        mock.post("/embed").mock(side_effect=_vectors)
+        assert await indexer._index_pass_once(None) is True
+
+    async with sessionmaker() as session:
+        note = (await session.execute(select(NoteMetadata))).scalar_one()
+        before = (
+            await session.execute(
+                select(NoteEmbedding.id, NoteEmbedding.chunk_text, NoteEmbedding.embedding)
+                .where(NoteEmbedding.note_id == note.id)
+                .order_by(NoteEmbedding.id)
+            )
+        ).all()
+        certified = note.embedded_content_hash
+    assert before and certified
+
+    with respx.mock(base_url=TEI) as mock:
+        embed = mock.post("/embed").mock(return_value=Response(401, text=SENTINEL))
+        async with sessionmaker() as session:
+            note = (await session.execute(select(NoteMetadata))).scalar_one()
+            note.content_hash = "edited"
+            result = await embeddings_service.embed_note(
+                session, note, "# Kept\n\nAn edited body that needs new vectors.\n"
+            )
+            await session.commit()
+    assert embed.call_count == 1
+    assert result.outcome is NoteEmbedOutcome.PROVIDER_FAILED
+    assert result.failure.message == (
+        "TEI /embed answered HTTP 401; the server rejected TEI_API_KEY"
+    )
+    assert SENTINEL not in repr(result)
+
+    async with sessionmaker() as session:
+        after = (
+            await session.execute(
+                select(NoteEmbedding.id, NoteEmbedding.chunk_text, NoteEmbedding.embedding)
+                .where(NoteEmbedding.note_id == note.id)
+                .order_by(NoteEmbedding.id)
+            )
+        ).all()
+        hash_now = (
+            await session.execute(
+                select(NoteMetadata.embedded_content_hash).where(NoteMetadata.id == note.id)
+            )
+        ).scalar_one()
+    assert [(i, t, list(v)) for i, t, v in after] == [(i, t, list(v)) for i, t, v in before]
+    assert hash_now == certified, "the note stays certified for its previous content only"
+
+
 def _render_health(url: str, admin: User) -> str:
     overrides = dict(main.app.dependency_overrides)
 

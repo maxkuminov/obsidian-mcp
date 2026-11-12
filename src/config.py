@@ -53,8 +53,12 @@ def _blank_key_is_none(value: Any) -> Any:
     if value is None:
         return None
     if isinstance(value, str):
-        stripped = value.strip(_KEY_STRIP)
-        return stripped or None
+        # Any whitespace-only value is unset (form feed, vertical tab and
+        # U+00A0 included); only the ordinary four are stripped from a real
+        # key, so anything else left over is refused by the format check.
+        if not value or value.isspace():
+            return None
+        return value.strip(_KEY_STRIP) or None
     return value
 
 

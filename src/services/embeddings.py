@@ -1665,7 +1665,8 @@ def _tei_auth_headers() -> dict[str, str] | None:
     """`{"Authorization": "Bearer <key>"}` with `TEI_API_KEY` set, else `None`,
     which leaves each request exactly as it was before the setting existed."""
     key = settings.tei_api_key
-    if key is None:
+    # Sandbox mode skips the format check, so an unchecked key is never sent.
+    if key is None or settings.mcp_sandbox_mode:
         return None
     return {"Authorization": f"Bearer {key.get_secret_value()}"}
 
