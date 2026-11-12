@@ -82,7 +82,12 @@ vault-sync, embedding and transport sections below still apply there.
 - **PostgreSQL 16 with pgvector 0.8.0 or newer.** Older pgvector
   silently loses recall on filtered semantic search, so the server exits
   rather than run on it. `pgvector/pgvector:pg16` (what the bundled
-  compose files use) is fine.
+  compose files use) is fine. Below 0.8.4 the server still starts but logs
+  one WARNING, because pgvector 0.8.3 and 0.8.4 fixed HNSW index
+  corruption and errors during vacuum, and this server's vector index is
+  HNSW; the remedy is a current image, `ALTER EXTENSION vector UPDATE;` in
+  the app's database, then one `REINDEX INDEX CONCURRENTLY
+  ix_note_embeddings_embedding_halfvec_hnsw;`.
 - A domain or subdomain (e.g. `obsidian.example.com`) with an A record
   pointed at the VPS's public IP. DNS propagation takes a few minutes.
 - Ports 80 and 443 open on the VPS firewall, plus 22 for SSH.

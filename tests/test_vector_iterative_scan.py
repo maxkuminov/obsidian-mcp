@@ -562,6 +562,49 @@ async def test_supported_pgvector_passes(monkeypatch):
     await main_module._check_pgvector_version()
 
 
+def _advisories(caplog):
+    return [r for r in caplog.records
+            if r.name == main_module.__name__ and "HNSW vacuum fixes" in r.getMessage()]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", ["0.8.0", "0.8.2", "0.8.3", "0.8.1-rc1"])
+async def test_pgvector_before_the_hnsw_vacuum_fixes_warns_once_and_starts(
+        monkeypatch, caplog, version):
+    """#348: below 0.8.4 the server still starts (no SystemExit) and logs
+    exactly one WARNING naming the installed version and the remedy."""
+    _patch_version(monkeypatch, version)
+    with caplog.at_level("WARNING"):
+        await main_module._check_pgvector_version()
+    records = _advisories(caplog)
+    assert len(records) == 1
+    assert records[0].levelname == "WARNING"
+    message = records[0].getMessage()
+    assert f"pgvector {version} " in message
+    assert "ALTER EXTENSION vector UPDATE" in message
+    assert "REINDEX INDEX CONCURRENTLY ix_note_embeddings_embedding_halfvec_hnsw" in message
+    assert "0.8.4" in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", ["0.8.4", "0.8.7", "0.9.0", "0.10.0"])
+async def test_pgvector_with_the_hnsw_vacuum_fixes_is_silent(monkeypatch, caplog, version):
+    _patch_version(monkeypatch, version)
+    with caplog.at_level("DEBUG"):
+        await main_module._check_pgvector_version()
+    assert _advisories(caplog) == []
+    assert not [r for r in caplog.records if r.levelno >= 30]
+
+
+@pytest.mark.asyncio
+async def test_too_old_pgvector_exits_without_the_advisory(monkeypatch, caplog):
+    _patch_version(monkeypatch, "0.7.4")
+    with caplog.at_level("WARNING"):
+        with pytest.raises(SystemExit):
+            await main_module._check_pgvector_version()
+    assert _advisories(caplog) == []
+
+
 @pytest.mark.asyncio
 async def test_extension_absent_defers_to_migrations(monkeypatch):
     """A database that has not been migrated yet has no `vector` row; alembic
