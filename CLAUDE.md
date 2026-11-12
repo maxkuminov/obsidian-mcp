@@ -642,7 +642,7 @@ update it in the same change.** What stays here is the short list:
   or after its `scan_started_at` (R4), so every row converges and none is
   stuck. A refresh that cannot run leaves the write standing:
   `index: may lag (<code>)`. Since #432 `edit_note`, `set_frontmatter`
-  and a `write_file` that replaces a note also attempt the refresh, after
+  and every `write_file` to a note path also attempt the refresh, after
   their change-feed event, only when the replaced or published bytes may
   hold a checkbox (`tasks.may_hold_tasks`, a superset of the extractor),
   and silently: their output is unchanged, and a refresh that cannot run
