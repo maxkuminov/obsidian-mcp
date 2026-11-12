@@ -4,11 +4,11 @@ Refs #392. Read `proposal.md`, `design.md` (D1–D10, L1–L8, the adversarial s
 
 ## 1. Patterns and setting
 
-- [ ] 1.1 `src/services/conflict_copies.py` (new, pure, stdlib `re` only):
+- [x] 1.1 `src/services/conflict_copies.py` (new, pure, stdlib `re` only):
   - `CONFLICT_PATTERNS`: P1–P6 from design D2, compiled, each preceded by a comment citing its source;
   - `is_conflict_copy(name: str) -> bool`: `fullmatch` on the basename, with `[0-9]` digit classes only.
-- [ ] 1.2 `src/config.py`: `index_exclude_conflict_files: bool = False`, beside the other `INDEX_*` settings, with a comment pointing to the module and design.
-- [ ] 1.3 `tests/test_conflict_copies.py`:
+- [x] 1.2 `src/config.py`: `index_exclude_conflict_files: bool = False`, beside the other `INDEX_*` settings, with a comment pointing to the module and design.
+- [x] 1.3 `tests/test_conflict_copies.py`:
   - every positive example in the index-integrity spec;
   - every look-alike in scenario 7 / the spec;
   - the U+2019 apostrophe in P4;
@@ -17,25 +17,25 @@ Refs #392. Read `proposal.md`, `design.md` (D1–D10, L1–L8, the adversarial s
 
 ## 2. Scan and pass
 
-- [ ] 2.1 `src/services/indexer.py`:
+- [x] 2.1 `src/services/indexer.py`:
   - `EXCLUDED_CONFLICT_COPY` reason constant;
   - `_scan_vault(…, exclude_conflicts: bool = False)` classifies after `_path_not_indexable_reason` and before any stat, with no `_warn_not_indexable`;
   - `_index_vault_pinned` reads the setting once and passes it (quarantine restarts reuse the scan, so the value is fixed per invocation).
-- [ ] 2.2 In `_index_vault_attempt`:
+- [x] 2.2 In `_index_vault_attempt`:
   - split `not_indexable_rows` for logging: the existing WARNING covers only non-excluded reasons, and a new INFO removal line covers excluded rows (five paths, `(+N more)`);
   - add the per-pass INFO count line when `excluded > 0`;
   - `IndexPassResult.excluded`;
   - `not_indexable` excludes `EXCLUDED_CONFLICT_COPY`.
-- [ ] 2.3 Amend the comments that say a name-decided not-indexable path "can have no row" (the C4 loop, `_collect_feed_events`). No branch change is expected there; add one only if a test proves it necessary, and say so in the design.
-- [ ] 2.4 In-process `excluded_conflict_copies: dict[int | None, int]`, set after each committed pass; the lifespan's startup INFO line when the setting is on.
-- [ ] 2.5 Offline tests (extend the existing scan and pass tests, mocked session where they already are):
+- [x] 2.3 Amend the comments that say a name-decided not-indexable path "can have no row" (the C4 loop, `_collect_feed_events`). No branch change is expected there; add one only if a test proves it necessary, and say so in the design.
+- [x] 2.4 In-process `excluded_conflict_copies: dict[int | None, int]`, set after each committed pass; the lifespan's startup INFO line when the setting is on.
+- [x] 2.5 Offline tests (extend the existing scan and pass tests, mocked session where they already are):
   - an excluded path is in `seen` and `not_indexable`, and is never statted or read (a spy on `_read_and_hash` / `_stat_follow`);
   - with the setting off, it is indexed;
   - `excluded` and `not_indexable` counts;
   - no WARNING for excluded paths;
   - the backstop clock advances;
   - a quarantine entry at an excluded path is cleared.
-- [ ] 2.6 Integration (`tests/integration/`, real Postgres; port 55446, container `omcp-it-index-exclude-conflicts`). Trace design scenarios 1, 2, 4, 5, 6, 9 and 10:
+- [x] 2.6 Integration (`tests/integration/`, real Postgres; port 55446, container `omcp-it-index-exclude-conflicts`). Trace design scenarios 1, 2, 4, 5, 6, 9 and 10:
   - rows, embeddings, task rows and the inbound link deleted or dangling on toggle-on;
   - the original's row untouched;
   - `created` on toggle-off;
@@ -46,21 +46,21 @@ Refs #392. Read `proposal.md`, `design.md` (D1–D10, L1–L8, the adversarial s
 
 ## 3. Change feed
 
-- [ ] 3.1 Tests (integration, with 2.6):
+- [x] 3.1 Tests (integration, with 2.6):
   - toggle-on gives exactly one `deleted reason=not_indexable by human/sync` per removed row and nothing for row-less excluded paths;
   - the following pass records nothing;
   - toggle-off gives `created` with the hash;
   - a tool `edit_note` on an excluded path records its own `modified` and the pass adds nothing;
   - `get_changes` renders the lines with the existing format.
 
-- [ ] 3.2 Pin the limitations as tests:
+- [x] 3.2 Pin the limitations as tests:
   - L9: an `edit_note` on an excluded copy, then toggle-off, gives an upserted row and no event;
   - L13: toggle-off over a scope with no rows gives one `reset`.
 
 ## 3b. Tool notices (spec review r1)
 
-- [ ] 3b.1 `src/mcp_server/tools.py`: one constant `CONFLICT_EXCLUSION_NOTICE` (exact spec text) and a helper that appends `"\n" + notice` when the setting is on and `is_conflict_copy(basename)` holds. Apply it to `create_note`'s success string and to `move_note`'s fully successful `return message` only.
-- [ ] 3b.2 Tests:
+- [x] 3b.1 `src/mcp_server/tools.py`: one constant `CONFLICT_EXCLUSION_NOTICE` (exact spec text) and a helper that appends `"\n" + notice` when the setting is on and `is_conflict_copy(basename)` holds. Apply it to `create_note`'s success string and to `move_note`'s fully successful `return message` only.
+- [x] 3b.2 Tests:
   - the notice for both tools when the setting is on and the name matches;
   - byte-identical output when the setting is off, or the name does not match;
   - the integration path `read_note` / `edit_note` / `move_note` out of an excluded name;
@@ -68,9 +68,9 @@ Refs #392. Read `proposal.md`, `design.md` (D1–D10, L1–L8, the adversarial s
 
 ## 4. Dashboard (panel template; owner browser pass)
 
-- [ ] 4.1 `src/control_panel/routes.py` dashboard handler: pass `excluded_conflicts` (the viewer scope's count, or `None` when the setting is off or nothing is counted yet).
-- [ ] 4.2 `src/control_panel/templates/dashboard.html`: one Jinja line beside "Last run", with existing utility classes only. No script, no `style=`, no `on*=`, no new class.
-- [ ] 4.3 Tests:
+- [x] 4.1 `src/control_panel/routes.py` dashboard handler: pass `excluded_conflicts` (the viewer scope's count, or `None` when the setting is off or nothing is counted yet).
+- [x] 4.2 `src/control_panel/templates/dashboard.html`: one Jinja line beside "Last run", with existing utility classes only. No script, no `style=`, no `on*=`, no new class.
+- [x] 4.3 Tests:
   - the render with the setting off is unchanged for the same data;
   - the singular and plural lines;
   - a multi-user viewer sees only their own scope's count;
@@ -79,20 +79,20 @@ Refs #392. Read `proposal.md`, `design.md` (D1–D10, L1–L8, the adversarial s
 
 ## 5. Documentation
 
-- [ ] 5.1 `README.md`: a settings-table row for `INDEX_EXCLUDE_CONFLICT_FILES` (`false`), and two sentences: what is excluded, that files are never touched and stay readable by path.
-- [ ] 5.2 `.env.example`: the setting, commented, under `# Indexer`, with the tools covered.
-- [ ] 5.3 `DEPLOYMENT.md`, a short section:
+- [x] 5.1 `README.md`: a settings-table row for `INDEX_EXCLUDE_CONFLICT_FILES` (`false`), and two sentences: what is excluded, that files are never touched and stay readable by path.
+- [x] 5.2 `.env.example`: the setting, commented, under `# Indexer`, with the tools covered.
+- [x] 5.3 `DEPLOYMENT.md`, a short section:
   - turning it on (restart; the first pass removes the rows and the feed records `deleted reason=not_indexable`);
   - turning it off (`created` on the next pass);
   - recovering a conflict copy (`read_note`, then `move_note` to an ordinary name, or merge by `edit_note`);
   - deployment-wide in multi-user mode;
   - look-alike titles (L1) and unmatched variants (L2);
   - the dashboard line and the log lines.
-- [ ] 5.4 `docs/architecture/indexing-and-embeddings.md`: a subsection under the #308 not-indexable section, "Excluded sync-conflict copies (#392)", with D3, D5, D6, D8 and the L-list. Add a CLAUDE.md Key-decisions bullet only if the owner wants one (it is one more not-indexable reason, not a new invariant).
+- [x] 5.4 `docs/architecture/indexing-and-embeddings.md`: a subsection under the #308 not-indexable section, "Excluded sync-conflict copies (#392)", with D3, D5, D6, D8 and the L-list. Add a CLAUDE.md Key-decisions bullet only if the owner wants one (it is one more not-indexable reason, not a new invariant).
 
 ## 6. Gates
 
-- [ ] 6.1 `openspec validate index-exclude-conflict-files --strict`.
-- [ ] 6.2 The offline suite (`OMCP_ALLOW_SKIP_TRANSFER_INTEGRATION=1 … pytest tests --ignore=tests/integration`) and the integration modules touched in 2.6 / 3.1 on port 55446.
+- [x] 6.1 `openspec validate index-exclude-conflict-files --strict`.
+- [x] 6.2 The offline suite (`OMCP_ALLOW_SKIP_TRANSFER_INTEGRATION=1 … pytest tests --ignore=tests/integration`) and the integration modules touched in 2.6 / 3.1 on port 55446.
 - [ ] 6.3 `openspec-verifier`, then the adversarial Codex pass, which is mandatory because this touches the indexing path. Give it design D3–D8 and scenarios 1–13.
 - [ ] 6.4 End-to-end on the live server after deploy: with the setting on, `keyword_search` / `list_notes` omit a known conflict copy, `read_note` returns it, and `get_changes` shows its `deleted reason=not_indexable`. Report which tools were called.

@@ -1259,6 +1259,65 @@ next unforeseen value costs one note rather than its owner's whole index.
   `notes_metadata.tasks_failed` — and never raises `PoisonNote`. The four
   sites above are the whole set; see "Task extraction (#350)" below.
 
+### Excluded sync-conflict copies (#392)
+
+`INDEX_EXCLUDE_CONFLICT_FILES` (default `false`, deployment-wide) adds a
+**third not-indexable reason**, `EXCLUDED_CONFLICT_COPY`, beside D7's and the
+quarantine's. The full contract is in
+`openspec/changes/index-exclude-conflict-files/design.md` (D1–D10, L1–L13).
+
+- **One matcher, by basename.** `src/services/conflict_copies.py` holds six
+  source-cited patterns (Syncthing, Nextcloud current and legacy, Dropbox,
+  Obsidian Sync, and the unidentified `(conflict YYYY-MM-DD-HH-MM-SS)` form).
+  They are `fullmatch`, case-sensitive, `[0-9]` digits only, with a literal
+  marker plus a full timestamp right before `.md`. A miss leaves a copy
+  indexed, which is the behaviour without the setting. A title that exactly
+  matches is excluded by design (L1). Folder names are never matched.
+  **Not a glob list** (D1): a glob cannot state "marker + full timestamp",
+  and a loose one hides real notes.
+- **Decided at the scan, by name, before any stat or read.** `_scan_vault`
+  gets the setting as `exclude_conflicts`, read once per invocation (so
+  quarantine restarts see one value), and checks it right after the
+  path-encodability test. The path goes into `not_indexable`, so everything
+  D7 says holds: it stays in `seen` (never vanished, never a move source),
+  it is never in `files` (never upserted, never a move destination), its row
+  is deleted after move detection with cascades (inbound links dangle), and
+  it is **not a skip**. That means no withheld re-derive stamp, no blocked
+  backstop clock, no `walk_incomplete`, no `indexer_health` counter.
+- **Unlike D7's name reasons, it can have a row** (from before the setting
+  was turned on). C4 never re-reads it (it is not in `files`), and its
+  locked row is deleted whatever it now holds. A vanished row at a
+  conflict-shaped path is an ordinary vanished row: it is paired with a
+  same-hash new path or pruned `removed`. That is true, because the file is
+  gone. An indexed note renamed *onto* a conflict name loses its pairing and
+  is pruned `removed` (L3).
+- **Excluding at the walk was rejected.** "Not seen" would prune the row as
+  `removed` (false), and could pair it as a move source with an unrelated
+  same-hash file, which is #309's failure.
+- **Change feed.** A removed row records `deleted reason=not_indexable`. The
+  reason set is CHECK-constrained (033), and `get_changes` already defines
+  that reason as "still on disk but cannot be indexed". A row-less excluded
+  path records nothing (`created reason=not_indexable` stays reserved for
+  undecodable content). Toggling off yields ordinary `created`, a `reset`
+  over an empty scope, or nothing when an agent's same-hash MCP event is the
+  latest at the path (L9, pinned by a test).
+- **#309 interplay.** A conflict-copy row beneath an unlisted directory is
+  protected like any other (L6). The empty-root predicate is unchanged:
+  excluded files are discovered, so a root holding only conflict copies is
+  determinate (D8).
+- **Reporting.** One INFO line at startup, one per pass with a non-zero
+  count, and one INFO removal line naming at most five paths. These rows are
+  kept out of the D7 WARNING. `IndexPassResult.excluded` carries the count,
+  and `not_indexable` excludes it. `indexer.excluded_conflict_copies[scope]`
+  (process memory) feeds the dashboard. **Never `indexer_runs.error`**:
+  `run_outcome` would label the run failed. `/health` is unchanged.
+- **Tools.** Exact-path tools are unchanged. `create_note`, and a fully
+  successful `move_note` onto a conflict name, append one notice line
+  (`tools.CONFLICT_EXCLUSION_NOTICE`). Their output is byte-identical with
+  the setting off or a non-matching name. `move_note` does not remove the
+  row it re-keys; the next pass does (L10). Byte-transport writers give no
+  notice (L11). Task scopes are defined over indexed notes (L12).
+
 ## A pass does not prune what it could not see (#309)
 
 The prune set used to be `existing − seen`, and "not seen" was read as "gone

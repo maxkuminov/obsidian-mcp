@@ -551,6 +551,21 @@ update it in the same change.** What stays here is the short list:
   The provenance discard is the stated exception. A wrong but non-empty
   mount is not detected (L1) — see
   [indexing and embeddings](docs/architecture/indexing-and-embeddings.md).
+- **Sync-conflict copies can be left out of the index, opt-in** (#392,
+  no migration). `INDEX_EXCLUDE_CONFLICT_FILES` (default false,
+  deployment-wide) matches a **basename** against the six source-cited
+  patterns in `src/services/conflict_copies.py`. The match is strict: a
+  literal marker plus a full timestamp right before `.md`. An exact-match
+  title is excluded too (L1). It is a third not-indexable reason, decided
+  at the scan before any stat or read: seen (never a move source), never
+  upserted or a move destination, any row pruned with cascades, and never
+  a skip, a pass failure, a `walk incomplete`, or a `/health` change. The
+  feed records `deleted reason=not_indexable` (CHECK-fixed reasons), and
+  nothing for a row-less copy. The files stay readable and writable by
+  path. `create_note` and a successful `move_note` onto such a name append
+  one notice line, byte-identical when off. See
+  [indexing and embeddings](docs/architecture/indexing-and-embeddings.md),
+  "Excluded sync-conflict copies (#392)".
 - **Every tool publishes a `title` and all four `ToolAnnotations` hints
   explicitly** (#343). Nineteen read tools are read-only/idempotent/closed;
   the destructive set is the write-bucket set minus `create_note` and

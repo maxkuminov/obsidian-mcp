@@ -2035,6 +2035,7 @@ reason.
 | `VAULT_PATH` | `/obsidian` | In-container vault mount |
 | `SECRET_KEY` | — | itsdangerous signer key |
 | `INDEX_INTERVAL_SECONDS` | `300` | Periodic reindex cadence |
+| `INDEX_EXCLUDE_CONFLICT_FILES` | `false` | Leave sync-conflict copies (Syncthing `.sync-conflict-…`, Nextcloud `(conflicted copy …)` and `_conflict-…`, Dropbox `(…'s conflicted copy …)`, Obsidian Sync `(Conflicted copy …)`, `(conflict YYYY-MM-DD-HH-MM-SS)`) out of the index, so they stop appearing as duplicates in search and listings. A note whose own name exactly matches one of these shapes is excluded too. The files are never touched and stay readable and writable by exact path. Deployment-wide. See [DEPLOYMENT.md](DEPLOYMENT.md#leaving-sync-conflict-copies-out-of-the-index-optional-392). |
 | `CHANGE_FEED_RETENTION_DAYS` | `90` | How long `get_changes` history is kept, in days (1–3650). `null` (or empty) disables the age limit; `0` is refused at startup. Pruned by the periodic tick, never during a pass; a cursor older than what survives reads `history_truncated: true`. |
 | `CHANGE_FEED_MAX_EVENTS_PER_SCOPE` | `100000` | The most change-feed events kept per user (minimum 1,000). Always applies, even with the age limit off, so the table stays bounded; a scope's newest event is never pruned. |
 | `CHANGE_FEED_MAX_EVENTS_PER_PASS` | `2000` | Events one index pass itemises per user (100–50,000); the rest become one `gap` line pointing at `get_recent(order_by="content_changed", since=…)`. |
