@@ -1,5 +1,10 @@
 # Core
-fastapi==0.141.1
+# 0.162: an omitted `bool` form field takes its declared default (0.147–0.161
+# read it as False). The panel's checkboxes are `str` form parameters parsed
+# by their handlers, and tests/test_form_omitted_fields.py refuses a `bool`
+# one. Since 0.142 fastapi requires opentelemetry-api (no-op without an SDK;
+# exporter auto-setup is opt-in since 0.143 and not enabled here).
+fastapi==0.162.0
 uvicorn[standard]==0.52.3
 # CVE-2026-53539 (fixable HIGH flagged by the Trivy deploy gate) was fixed in
 # 0.0.30 and remains fixed here.
