@@ -31,7 +31,7 @@ Refs #426. Read `proposal.md`, `design.md` (D1–D6, the accepted limitations, T
 - [x] 3.8 The sentinel secrecy test of design §"Secrecy test", including the positive control.
 - [x] 3.8a An index pass against a verified TEI answering 401 with the sentinel key: read the persisted `indexer_runs.error` row and render `/admin/health`; the sentinel is absent from both and the row names `TEI_API_KEY` (a database-backed integration test).
 - [x] 3.9 Fingerprints: both are unchanged by setting the key.
-- [ ] 3.10 Run the TEI, transport and config modules (`tests/test_tei_provider.py`, `tests/test_tei_identity.py`, `tests/test_internal_transport_*.py`, `tests/test_config_validation.py`, `tests/test_perf_provider_batching.py`, `tests/test_issue_309_panel_confirm_empty.py`), then the whole offline suite once.
+- [x] 3.10 Run the TEI, transport and config modules (`tests/test_tei_provider.py`, `tests/test_tei_identity.py`, `tests/test_internal_transport_*.py`, `tests/test_config_validation.py`, `tests/test_perf_provider_batching.py`, `tests/test_issue_309_panel_confirm_empty.py`), then the whole offline suite once.
 
 ## 4. Documentation
 
