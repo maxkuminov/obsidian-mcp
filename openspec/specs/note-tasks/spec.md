@@ -152,17 +152,18 @@ The index pass SHALL store tasks in `note_tasks`, keyed by `note_id` with a fore
 - delete the note's task rows and insert the rows extracted from the body the scan buffered;
 - set `tasks_source_hash` to the buffered body's canonical hash and clear `tasks_refreshed_at`.
 
-The exception is a row whose `tasks_refreshed_at` is at or after the attempt's scan start and whose `tasks_source_hash` differs from the buffered hash: its task rows SHALL be kept, because a task tool wrote them from bytes published after the scan began.
+The exception is a row whose `tasks_refreshed_at` is at or after the attempt's scan start and whose `tasks_source_hash` differs from the buffered hash: its task rows SHALL be kept, because a write-time refresh (by a task tool or a generic note writer) or a delete clear wrote them after the scan began.
 
 **Reading.** The pass SHALL NOT read a file outside the scan. The scan SHALL read every row whose `tasks_source_hash` differs from its `content_hash`, regardless of the stat shortcut. A changed path with no buffered body or no index row SHALL be recorded as a skip that withholds a re-derive's record.
 
-**The only other writer** of a note's task rows SHALL be the write-time task refresh of the `task-write` capability. It holds that note's row lock and derives only from the bytes its own call published.
+**The only other writer** of a note's task rows SHALL be the write-time task refresh of the `task-write` capability, called by the task write tools and by the generic note writers that capability names, including its absence form after `delete_note`. It holds that note's row lock and derives only from the bytes its own call published, or, in the absence form, writes no task row after confirming that nothing is at the path.
 
 **Savepoints and isolation.** Each note's task deletion and insertion SHALL run in their own savepoint. A task-derivation failure SHALL be isolated to that note's task rows, as the `index-integrity` requirement on task-derivation isolation states.
 
 **Lifecycle.**
 
 - Deleting a note's row by any route (prune, quarantine removal, provenance discard, user deletion) SHALL remove its task rows.
+- `delete_note` SHALL attempt to remove the deleted note's task rows in the same call through the delete clear of the `task-write` capability; the pass SHALL later prune the row itself, and SHALL remove the task rows if the clear could not run.
 - A row protected from the prune by an unlistable directory SHALL keep its task rows.
 - An id-preserving move SHALL leave the rows attached to the moved note.
 - `CURRENT_EXTRACTION_VERSION` SHALL be 5, with versions 4 and 5 sharing version 3's embedding cleaner, so that neither bump re-embeds anything.
@@ -194,6 +195,14 @@ The exception is a row whose `tasks_refreshed_at` is at or after the attempt's s
 #### Scenario: A pass that read older bytes keeps a tool's newer task rows
 - **WHEN** a pass begins its scan, a task tool then publishes and refreshes a note, and the pass then derives that note from bytes it read before the publication
 - **THEN** the pass SHALL keep the tool's task rows, and a later pass whose scan starts after the refresh SHALL re-derive the note from disk, leaving `tasks_source_hash` equal to `content_hash`
+
+#### Scenario: A pass that read older bytes keeps a generic writer's newer task rows
+- **WHEN** a pass begins its scan, `edit_note` then publishes and refreshes a note, and the pass then derives that note from bytes it read before the publication
+- **THEN** the pass SHALL keep the refreshed task rows, and a later pass whose scan starts after the refresh SHALL re-derive the note from disk, leaving `tasks_source_hash` equal to `content_hash`
+
+#### Scenario: A pass that read a deleted note keeps the delete clear
+- **WHEN** a pass begins its scan and buffers a note with tasks, `delete_note` then deletes it and clears its task rows, and the pass then reaches that note
+- **THEN** the pass SHALL keep the cleared (empty) task set, and the next pass SHALL prune the row
 
 ### Requirement: `list_tasks` SHALL answer task queries from the index in one bounded, owner-scoped call
 
