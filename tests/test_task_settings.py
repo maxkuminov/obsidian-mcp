@@ -276,6 +276,32 @@ def test_an_absent_flag_is_left_unchanged_not_switched_off():
     assert values.set_done_date is True
 
 
+@pytest.mark.parametrize("field", ["timezone", "excluded_folders", "excluded_note_tags"])
+def test_an_absent_scope_field_is_left_unchanged_and_a_blank_one_clears(field):
+    """An absent timezone or exclusion list used to clear the stored value
+    (a caller saving one field reset the owner's timezone to UTC). Absent is
+    now `scope_unchanged`; present and blank still clears; present replaces."""
+    assert task_settings.SCOPE_FIELDS == (
+        "timezone", "excluded_folders", "excluded_note_tags")
+    absent = _ok({"set_done_date": "on"})
+    assert absent.scope_unchanged == frozenset(task_settings.SCOPE_FIELDS)
+
+    others = {f: "" for f in task_settings.SCOPE_FIELDS if f != field}
+    assert _ok(others).scope_unchanged == frozenset({field})
+
+    blank = _ok({field: ""})
+    assert field not in blank.scope_unchanged
+    assert getattr(blank, field) in (None, [])
+
+    present = {"timezone": "Europe/Berlin", "excluded_folders": "Archive",
+               "excluded_note_tags": "#Ticket"}
+    expected = {"timezone": "Europe/Berlin", "excluded_folders": ["Archive/"],
+                "excluded_note_tags": ["ticket"]}
+    values = _ok({field: present[field]})
+    assert field not in values.scope_unchanged
+    assert getattr(values, field) == expected[field]
+
+
 def test_the_panel_cards_three_options_are_all_explicit():
     values = _ok({"set_done_date": "default", "set_cancelled_date": "on",
                   "set_created_date": "off", "next_recurrence_below": "default"})
