@@ -467,6 +467,38 @@ async def test_a_page_boundary_between_undated_tasks(db, seed):
     assert next_of(third) is None
 
 
+async def test_undated_tasks_sort_last_under_due_and_done_393(db, seed):
+    """#393. Undated rows sit where path and line would put them *first*
+    (`a.md`, line 1), so only the date key can move them to the end: under
+    the default `due` order an undated task follows every dated one, and
+    under `done` (most recent first) a done task with no done date follows
+    every dated one — on one page and across a page boundary alike."""
+    await seed.note("a.md", [
+        {"text": "undated-open"},
+        {"text": "undated-done", "status_char": "x", "state": "done"},
+    ])
+    await seed.note("z.md", [
+        {"text": "due-late", "due": D(2026, 12, 1)},
+        {"text": "due-early", "due": D(2026, 1, 1)},
+        {"text": "done-old", "status_char": "x", "state": "done",
+         "done_on": D(2026, 1, 5), "due": D(2026, 6, 1)},
+        {"text": "done-new", "status_char": "x", "state": "done",
+         "done_on": D(2026, 11, 9), "due": D(2026, 3, 1)},
+    ])
+
+    by_due = ["due-early", "done-new", "done-old", "due-late",
+              "undated-open", "undated-done"]
+    assert texts(await call(db, status="all")) == by_due, "due is the default order"
+    assert texts(await call(db, status="all", order_by="due")) == by_due
+    seen, _ = await follow(db, status="all", order_by="due", limit=1)
+    assert [ln.rsplit("text: ", 1)[1] for ln in seen] == by_due
+
+    by_done = ["done-new", "done-old", "undated-done"]
+    assert texts(await call(db, status="done", order_by="done")) == by_done
+    seen, _ = await follow(db, status="done", order_by="done", limit=1)
+    assert [ln.rsplit("text: ", 1)[1] for ln in seen] == by_done
+
+
 async def test_the_compact_cursor_resolves_a_long_multibyte_path(db, seed):
     path = "語" * 1024
     await seed.note(path, [{"text": "one"}, {"text": "two"}])
