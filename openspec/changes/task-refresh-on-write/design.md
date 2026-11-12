@@ -329,7 +329,7 @@ Trace each through the code as implemented, against the expected outcome given.
   - byte-identical responses for every refresh code;
   - the usage key present or absent;
   - the cancellation outcome.
-- **Integration, `tests/integration/test_task_refresh_pg.py`, extended:**
+- **Integration, `tests/integration/test_task_refresh_generic_pg.py` (new, through the registered tools; `test_task_refresh_pg.py` keeps the R1 cases):**
   - list → write → list with no pass between, for `edit_note`, `set_frontmatter` and `write_file`;
   - an edit that removes the last checkbox removes the rows;
   - `delete_note` → list, soft and permanent;
