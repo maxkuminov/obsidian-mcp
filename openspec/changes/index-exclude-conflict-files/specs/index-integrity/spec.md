@@ -88,6 +88,13 @@ An excluded path SHALL NOT be logged by the per-path not-indexable WARNING. `Ind
 - **WHEN** the setting is true, `sub/` cannot be listed and holds the row `sub/C (conflict 2026-05-29-19-45-39).md`, and `D (conflict 2026-05-29-19-45-39).md` at the root holds a row
 - **THEN** the `sub/` row SHALL be kept, `D`'s row SHALL be deleted, and the run's `walk incomplete` text SHALL be the same as it would be without the setting
 
+#### Scenario: The empty-root guard counts excluded files as discovered
+
+- **WHEN** the setting is true and the root holds no `.md` file at all over an existing index
+- **THEN** the pass SHALL be indeterminate and delete nothing, exactly as before this change
+- **AND WHEN** instead the root's only `.md` files are conflict copies over an existing index
+- **THEN** the pass SHALL be determinate, and SHALL delete every row: the copies' rows as excluded, the others as vanished
+
 #### Scenario: A re-derive with exclusions records
 
 - **WHEN** a re-deriving pass runs with the setting true over a scope holding conflict-copy rows and no other skip
@@ -100,9 +107,17 @@ An excluded path SHALL NOT be logged by the per-path not-indexable WARNING. `Ind
 
 ### Requirement: Tools that address a file by exact path SHALL work on an excluded conflict copy, and index-backed tools SHALL NOT show it
 
-While the setting is true, the following tools SHALL behave on an excluded path exactly as on any note or file: `read_note`, `read_file`, `edit_note`, `set_frontmatter`, `create_note`, `move_note`, `delete_note`, `list_files`, `complete_task`, `update_task` and `add_task`. When a task write's write-time refresh finds no row at the path, it SHALL report `index: may lag (not_indexed)`.
+While the setting is true, the following tools SHALL behave on an excluded path exactly as on any note or file, except for the notice below: `read_note`, `read_file`, `edit_note`, `set_frontmatter`, `create_note`, `move_note`, `delete_note`, `list_files`, `write_file`, `import_from_url`, the transfer upload, `complete_task`, `update_task` and `add_task`. When a task write's write-time refresh finds no row at the path, it SHALL report `index: may lag (not_indexed)`.
 
-`list_notes`, `get_recent`, `get_tags`, `keyword_search`, `semantic_search`, `hybrid_search`, `find_related`, `find_orphans`, `get_backlinks`, `get_neighborhood`, `get_links`, `list_tasks` and `task_agenda` SHALL NOT return an excluded note as a note, and `add_task`'s index-side duplicate check SHALL NOT consider it. No tool's name, input schema, title, annotations or description SHALL change, and `tests/fixtures/tools_list_full_v2.json` SHALL stay byte-identical.
+**Once a pass has completed after the path became excluded**, the following SHALL NOT return an excluded note as a note: `list_notes`, `get_recent`, `get_tags`, `keyword_search`, `semantic_search`, `hybrid_search`, `find_related`, `find_orphans`, `get_backlinks`, `get_neighborhood`, `get_links`, `list_tasks` and `task_agenda`. `add_task`'s index-side duplicate check SHALL NOT consider it either. Before that pass, a row that `move_note` re-keyed onto an excluded name SHALL remain indexed, together with its vectors, links and task rows (limitation L10). `move_note` SHALL NOT remove the row itself.
+
+**The notice.** When the setting is true and the basename of the note a call published matches a conflict pattern, `create_note`'s success result and `move_note`'s fully successful result (not its partial or refused outcomes) SHALL end with one extra line, after a single `\n`, with exactly this text:
+
+`note: this name matches the sync-conflict exclusion (INDEX_EXCLUDE_CONFLICT_FILES); the note is stored but not indexed, so searches and listings will not return it once the next index pass has run. Read it by exact path.`
+
+For `create_note` the note is the created path, and for `move_note` the destination. With the setting false, or a basename that matches no pattern, both results SHALL be byte-identical to their form before this change. `write_file`, `import_from_url` and the transfer upload are byte transport and SHALL carry no notice (limitation L11).
+
+No tool's name, input schema, title, annotations or description SHALL change, and `tests/fixtures/tools_list_full_v2.json` SHALL stay byte-identical.
 
 #### Scenario: Recovering the only surviving version
 
@@ -112,7 +127,17 @@ While the setting is true, the following tools SHALL behave on an excluded path 
 #### Scenario: Moving an indexed note to a conflict-shaped name
 
 - **WHEN** the setting is true and `move_note` moves the indexed `E.md` to `E (conflict 2026-05-29-19-45-39).md`
-- **THEN** the move SHALL succeed as today, and after the next pass no row SHALL exist at either path
+- **THEN** the move SHALL succeed, its result SHALL end with the notice line, the row SHALL be at the destination path until the next pass, and after the next pass no row, vector, outgoing link or task row SHALL exist for either path
+
+#### Scenario: Creating a note at an excluded name
+
+- **WHEN** the setting is true and `create_note` creates `Review (conflict 2026-05-29-19-45-39).md`
+- **THEN** the result SHALL be today's result followed by `\n` and the notice line, and `read_note` on that path SHALL return the content
+
+#### Scenario: The notice is absent otherwise
+
+- **WHEN** the setting is false and `create_note` / `move_note` publish a conflict-shaped name, or the setting is true and they publish `Review.md`
+- **THEN** each result SHALL be byte-identical to its form before this change
 
 ### Requirement: The exclusion SHALL be reported in the log and SHALL NOT change `/health`
 

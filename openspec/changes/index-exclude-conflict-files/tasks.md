@@ -53,6 +53,19 @@ Refs #392. Read `proposal.md`, `design.md` (D1–D10, L1–L8, the adversarial s
   - a tool `edit_note` on an excluded path records its own `modified` and the pass adds nothing;
   - `get_changes` renders the lines with the existing format.
 
+- [ ] 3.2 Pin the limitations as tests:
+  - L9: an `edit_note` on an excluded copy, then toggle-off, gives an upserted row and no event;
+  - L13: toggle-off over a scope with no rows gives one `reset`.
+
+## 3b. Tool notices (spec review r1)
+
+- [ ] 3b.1 `src/mcp_server/tools.py`: one constant `CONFLICT_EXCLUSION_NOTICE` (exact spec text) and a helper that appends `"\n" + notice` when the setting is on and `is_conflict_copy(basename)` holds. Apply it to `create_note`'s success string and to `move_note`'s fully successful `return message` only.
+- [ ] 3b.2 Tests:
+  - the notice for both tools when the setting is on and the name matches;
+  - byte-identical output when the setting is off, or the name does not match;
+  - the integration path `read_note` / `edit_note` / `move_note` out of an excluded name;
+  - `move_note` onto an excluded name: the row stays until the next pass, which removes the row, vectors, links and task rows.
+
 ## 4. Dashboard (panel template; owner browser pass)
 
 - [ ] 4.1 `src/control_panel/routes.py` dashboard handler: pass `excluded_conflicts` (the viewer scope's count, or `None` when the setting is off or nothing is counted yet).

@@ -35,7 +35,10 @@ None.
 
 - `index-integrity`: the conflict-copy exclusion, its matching rule, its place in the scan and prune, and its non-effect on pass outcome, the backstop, the re-derive, the quarantine and `/health`.
 - `change-feed`: the event an exclusion removal records, and the toggle-off creations.
-- `panel-ops-health`: the dashboard's excluded-count line.
+- `panel-ops-health`: the dashboard's excluded-count line, for the viewer's own vault scope.
+- `note-tasks`: every task scope, `scope="all"` included, is defined over indexed notes.
+
+After the spec review (r1), `create_note` and a fully successful `move_note` that publish a conflict-shaped name while the setting is on end with one fixed notice line. Their output is otherwise unchanged, and byte-identical when the setting is off.
 
 ## Impact
 
