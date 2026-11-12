@@ -62,8 +62,8 @@ CONFLICT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         r".+ \(Conflicted copy .+ [0-9]{12}\)\.md"
     )),
     # P6 The form reported in #392 and found in the reference vault. Its
-    # producer is unidentified (no primary documentation found); kept by owner
-    # decision because it is the form the issue reports.
+    # producer is unidentified (no primary documentation found); kept because
+    # it is the form the issue reports.
     ("observed", re.compile(
         r".+ \(conflict [0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}-[0-9]{2}\)\.md"
     )),

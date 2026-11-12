@@ -196,7 +196,10 @@ Validation: pydantic's boolean parsing. No cross-field rule.
 12. **Concurrency with `move_note`.** A `move_note` from an ordinary path to a conflict-shaped path commits between the snapshot and the lock. The locked row is at the conflict path and the walk saw the file as excluded (or did not see it: C5 defers). Expect: the row is deleted with `not_indexable`, or deferred to the next pass, and is never upserted.
 13. **Multi-user.** Two tenants, setting on: both tenants' copies are excluded, each tenant's feed records only its own removals, and each dashboard shows only the viewer's count.
 
-## Owner decisions (spec review r1, 2026-11-12)
+## Decisions taken during implementation (spec review r1, 2026-11-12)
+
+These were taken by the implementing session's supervisor, not by the owner,
+and are listed in the pull request for the owner to confirm or overrule.
 
 - P6 is kept; its producer is unidentified.
 - The removal reuses `not_indexable` (no new reason, no migration).
