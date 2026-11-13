@@ -277,6 +277,17 @@
   boundary, not reusing `--border` because it looks right in dark** — the
   full matrix is enumerated per control in the change's `checks/contrast.py`.
 
+- **Text tokens are named for the surface they sit on, not for the accent.**
+  `--consent-primary-text` is text on the Approve button's solid
+  `--consent-primary-dim` fill, so it is white in light. The selected
+  `/authorize` radio card is a faint `--consent-option-active` tint over the
+  white `.card`, and its title has its own token,
+  `--consent-option-active-text` (dark `#e0d9f8`, unchanged; light `#573ab0`,
+  the light `--consent-primary-dim`, 6.74:1 on the composited tint). Reusing
+  the button token there rendered the selected title white on lavender at
+  1.18:1 (#445); `tests/test_consent_selected_title_contrast.py` pins ≥ 4.5:1
+  for every theme block.
+
 - **`<meta name="theme-color">` keeps a static default *and* a
   `data-theme-color-token` attribute.** The bootstrap overwrites the content
   on every load, but the static value is what a JS-off visitor gets, so it
