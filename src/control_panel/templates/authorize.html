@@ -255,14 +255,18 @@
            blocks (never grouped with a selector that must keep working): a
            browser without `:has()` treats the whole selector list as invalid
            and drops the rule, falling back to the native radio dot — which
-           `accent-color` below styles and which stays the baseline signal. */
+           `accent-color` below styles and which stays the baseline signal.
+           The selected title uses `--consent-option-active-text`, a token
+           for text on the selected card's tint — never
+           `--consent-primary-text`, which is for text on the Approve
+           button's solid fill and is white in light (#445). */
         .scope-option:has(input[type="radio"]:checked) {
             border-color: var(--consent-primary-dim);
             background: var(--consent-option-active);
         }
 
         .scope-option:has(input[type="radio"]:checked) .scope-option-title {
-            color: var(--consent-primary-text);
+            color: var(--consent-option-active-text);
         }
 
         .scope-option input[type="radio"] {

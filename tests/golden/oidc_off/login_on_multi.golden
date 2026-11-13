@@ -149,6 +149,7 @@ content-security-policy: default-src 'self'; script-src 'nonce-<NONCE>'; style-s
         --consent-surface-border: rgba(139,111,223,0.18);
         --consent-option-hover: rgba(139,111,223,0.04);
         --consent-option-active: rgba(139,111,223,0.10);
+        --consent-option-active-text: #e0d9f8;
         --consent-gem-facet: rgba(139,111,223,0.18);
         --consent-gem-facet-2: rgba(139,111,223,0.05);
         --consent-primary-glow: rgba(139,111,223,0.3);
@@ -284,6 +285,7 @@ content-security-policy: default-src 'self'; script-src 'nonce-<NONCE>'; style-s
         --consent-surface-border: rgba(100,64,200,0.22);
         --consent-option-hover: rgba(100,64,200,0.05);
         --consent-option-active: rgba(100,64,200,0.11);
+        --consent-option-active-text: #573ab0;
         --consent-gem-facet: rgba(100,64,200,0.28);
         --consent-gem-facet-2: rgba(100,64,200,0.10);
         --consent-primary-glow: rgba(100,64,200,0.30);
@@ -419,6 +421,7 @@ content-security-policy: default-src 'self'; script-src 'nonce-<NONCE>'; style-s
             --consent-surface-border: rgba(100,64,200,0.22);
             --consent-option-hover: rgba(100,64,200,0.05);
             --consent-option-active: rgba(100,64,200,0.11);
+            --consent-option-active-text: #573ab0;
             --consent-gem-facet: rgba(100,64,200,0.28);
             --consent-gem-facet-2: rgba(100,64,200,0.10);
             --consent-primary-glow: rgba(100,64,200,0.30);
