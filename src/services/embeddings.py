@@ -1420,6 +1420,7 @@ async def _post_with_retries(
     base_delay: float,
     parse: Callable[[httpx.Response], list[list[float]]],
     input_limit: Callable[[httpx.Response], Exception | None] | None,
+    refuse: Callable[[httpx.Response], Exception | None] | None = None,
 ) -> list[list[float]]:
     """POST `payload`, retrying 429/5xx and transport errors with exponential
     backoff; the loop the OpenAI and TEI providers share.
@@ -1429,6 +1430,8 @@ async def _post_with_retries(
     never retried as if it were a network fault. `input_limit` returns the
     exception to raise for an input the provider refuses, or `None`; pass
     `None` instead of a callable for a provider with no such refusal.
+    `refuse` has the same shape, for any other non-retried status a provider
+    explains in its own words (TEI's 401/403, #426); OpenAI passes none.
     """
     last_exc: Exception | None = None
     for attempt in range(1, max_attempts + 1):
@@ -1455,6 +1458,10 @@ async def _post_with_retries(
         # ordering is what keeps that true if one ever becomes so.
         if input_limit is not None:
             refusal = input_limit(response)
+            if refusal is not None:
+                raise refusal
+        if refuse is not None:
+            refusal = refuse(response)
             if refusal is not None:
                 raise refusal
 
@@ -1641,6 +1648,60 @@ class OpenAIProvider:
         return out
 
 
+# ── TEI_API_KEY (#426) ──────────────────────────────────────────────────────
+#
+# The key goes on exactly three requests to `TEI_URL` (`/embed`, `/info` and
+# the panel's `/health`), passed **per request** by `_tei_auth_headers`, never
+# as a client default and never in `embedding_http_client`, which the Ollama
+# and OpenAI clients share. The value is read there and nowhere else. No
+# message below carries it: the 401/403 text names the setting only.
+
+#: What an authenticating TEI, or a gateway in front of one, answers a
+#: missing or wrong bearer token with.
+TEI_AUTH_STATUSES = frozenset({401, 403})
+
+
+def _tei_auth_headers() -> dict[str, str] | None:
+    """`{"Authorization": "Bearer <key>"}` with `TEI_API_KEY` set, else `None`,
+    which leaves each request exactly as it was before the setting existed."""
+    key = settings.tei_api_key
+    # Sandbox mode skips the format check, so an unchecked key is never sent.
+    if key is None or settings.mcp_sandbox_mode:
+        return None
+    return {"Authorization": f"Bearer {key.get_secret_value()}"}
+
+
+def _tei_auth_cause() -> str:
+    """What a 401/403 most likely means, naming the setting, never its value."""
+    if settings.tei_api_key is None:
+        return "TEI_API_KEY is not set"
+    return "the server rejected TEI_API_KEY"
+
+
+class _TeiAuthLog:
+    """One ERROR line per run of `/embed` auth failures, re-armed by a 200."""
+
+    logged: bool = False
+
+
+_TEI_AUTH_LOG = _TeiAuthLog()
+
+
+def _tei_embed_refusal(response: httpx.Response) -> Exception | None:
+    """The `/embed` 401/403 failure: no URL, header or body, never retried.
+    It leaves the verified state alone, because an auth failure says nothing
+    about the model."""
+    if response.status_code not in TEI_AUTH_STATUSES:
+        return None
+    message = (
+        f"TEI /embed answered HTTP {response.status_code}; {_tei_auth_cause()}"
+    )
+    if not _TEI_AUTH_LOG.logged:
+        _TEI_AUTH_LOG.logged = True
+        logger.error("%s", message)
+    return RuntimeError(message)
+
+
 def _tei_reported(value: object) -> str:
     """A value the TEI server chose, bounded then escaped: it goes into a log
     line and into the failure text stored for a note."""
@@ -1653,6 +1714,10 @@ class TeiServerCheck:
 
     status: Literal["ok", "mismatch", "inconclusive"]
     reason: str
+    #: A 401/403 (#426). Its reason is part of the logged verdict, so the
+    #: CRITICAL naming `TEI_API_KEY` is not swallowed by an earlier
+    #: inconclusive line.
+    auth: bool = False
 
 
 @dataclass
@@ -1678,6 +1743,7 @@ _TEI_VERIFICATION = _TeiVerification()
 async def _tei_info_exchange() -> httpx.Response:
     return await _tei_client().get(
         f"{settings.tei_url.rstrip('/')}/info",
+        headers=_tei_auth_headers(),
         timeout=TEI_INFO_TIMEOUT_SECONDS,
     )
 
@@ -1686,6 +1752,14 @@ def _judge_tei_info(response: httpx.Response) -> TeiServerCheck:
     """The verdict on one answered `/info`. The rule (design D1): a mismatch
     needs positive evidence, and so does a match; everything else is
     inconclusive."""
+    if response.status_code in TEI_AUTH_STATUSES:
+        # Never a mismatch (#426): a refused key proves nothing about the
+        # model, so the process keeps serving with embedding withheld.
+        return TeiServerCheck(
+            "inconclusive",
+            f"GET /info answered HTTP {response.status_code}; {_tei_auth_cause()}",
+            auth=True,
+        )
     if response.status_code != 200:
         return TeiServerCheck(
             "inconclusive", f"GET /info answered HTTP {response.status_code}"
@@ -1762,7 +1836,12 @@ async def verify_tei_server() -> TeiServerCheck:
     # Only a mismatch's text is part of its verdict: an inconclusive reason
     # flips between refused, 503 and timeout while a server starts, and that
     # must not be a CRITICAL line every 30 s.
-    verdict = (result.status, result.reason if result.status == "mismatch" else "")
+    if result.auth:
+        verdict = ("inconclusive-auth", result.reason)
+    else:
+        verdict = (
+            result.status, result.reason if result.status == "mismatch" else ""
+        )
     if verdict != state.logged_verdict:
         state.logged_verdict = verdict
         if result.status == "mismatch":
@@ -1830,6 +1909,14 @@ def _parse_tei_vectors(
     return vectors
 
 
+def _parse_tei_vectors_rearming(
+    response: httpx.Response, expected: int
+) -> list[list[float]]:
+    """`_parse_tei_vectors`; any 200 from `/embed` re-arms the auth ERROR line."""
+    _TEI_AUTH_LOG.logged = False
+    return _parse_tei_vectors(response, expected)
+
+
 class TeiProvider:
     """Hugging Face Text Embeddings Inference, native protocol.
 
@@ -1853,13 +1940,16 @@ class TeiProvider:
             _tei_client(),
             f"{settings.tei_url.rstrip('/')}/embed",
             label="TEI",
-            headers=None,
+            headers=_tei_auth_headers(),
             payload={"inputs": inputs, "truncate": True},
             timeout=TEI_REQUEST_TIMEOUT_SECONDS,
             max_attempts=self.MAX_ATTEMPTS,
             base_delay=self.BASE_DELAY,
-            parse=lambda response: _parse_tei_vectors(response, len(inputs)),
+            parse=lambda response: _parse_tei_vectors_rearming(
+                response, len(inputs)
+            ),
             input_limit=None,
+            refuse=_tei_embed_refusal,
         )
 
     async def _post_slice(self, inputs: list[str]) -> list[list[float]]:

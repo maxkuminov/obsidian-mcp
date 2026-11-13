@@ -84,6 +84,12 @@
           "description": "Inputs per TEI /embed request (1-256). A value above the server's max_client_batch_size refuses startup.",
           "isRequired": false,
           "default": "16"
+        },
+        {
+          "name": "TEI_API_KEY",
+          "description": "Bearer token for a TEI server started with --api-key; sent only to TEI_URL (/embed, /info, the panel's /health). Empty means no Authorization header.",
+          "isRequired": false,
+          "isSecret": true
         }
       ]
     }

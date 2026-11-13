@@ -79,6 +79,7 @@ SETTINGS_ENV_KEYS = (
     "TEI_URL",
     "TEI_EMBEDDING_MODEL",
     "TEI_EMBED_BATCH_SIZE",
+    "TEI_API_KEY",
     # Embedding transport (#185).
     "EMBEDDING_ALLOW_PLAINTEXT",
     "EMBEDDING_CA_FILE",

@@ -10,6 +10,7 @@ from pydantic import (
     BeforeValidator,
     Field,
     PrivateAttr,
+    SecretStr,
     field_validator,
     model_validator,
 )
@@ -35,6 +36,37 @@ def _off_means_none(value: Any) -> Any:
     if isinstance(value, str) and value.strip().casefold() in _OFF_SPELLINGS:
         return None
     return value
+
+
+#: Surrounding whitespace stripped from `TEI_API_KEY` (#426, design D2): a
+#: Secret created from a file usually ends in a newline, and TEI compares the
+#: token exactly.
+_KEY_STRIP = " \t\r\n"
+
+
+def _blank_key_is_none(value: Any) -> Any:
+    """`TEI_API_KEY`: unset, empty or whitespace-only is `None`; anything
+    else loses its surrounding whitespace. The format check is a model
+    validator, because it applies only under the `tei` provider."""
+    if isinstance(value, SecretStr):
+        value = value.get_secret_value()
+    if value is None:
+        return None
+    if isinstance(value, str):
+        # Any whitespace-only value is unset (form feed, vertical tab and
+        # U+00A0 included); only the ordinary four are stripped from a real
+        # key, so anything else left over is refused by the format check.
+        if not value or value.isspace():
+            return None
+        return value.strip(_KEY_STRIP) or None
+    return value
+
+
+def tei_api_key_is_well_formed(key: str) -> bool:
+    """Visible ASCII only, U+0021 to U+007E: no space, no control character,
+    nothing outside ASCII. A bearer token holds none of those, and a newline
+    in a header would be an injection vector."""
+    return bool(key) and all(0x21 <= ord(ch) <= 0x7E for ch in key)
 
 
 #: Upper bound on every limiter *count* — the rates, the bursts and the
@@ -693,6 +725,17 @@ class Settings(BaseSettings):
     # default matches Ollama's safe 16; the limit stays available for a
     # faster endpoint.
     tei_embed_batch_size: int = Field(16, ge=1, le=256)
+    # Bearer token for a TEI started with `--api-key` / `API_KEY`, or one
+    # behind a gateway that wants one (#426). **A secret**: keep it in a
+    # secret store (a Kubernetes Secret, never a ConfigMap). With the `tei`
+    # provider it goes as `Authorization: Bearer <key>` on exactly three
+    # requests to `TEI_URL` (`POST /embed`, `GET /info`, the panel's
+    # `GET /health`) and nowhere else. Empty or whitespace-only means unset,
+    # which sends no header at all; surrounding whitespace is stripped, and
+    # anything but visible ASCII refuses startup (under `tei` only). It is in
+    # no fingerprint, so a change needs no reset. Read only through
+    # `embeddings._tei_auth_headers()`.
+    tei_api_key: Annotated[SecretStr | None, BeforeValidator(_blank_key_is_none)] = None
     # ── Embedding transport (#185) ─────────────────────────────────────────
     #
     # The **active** provider's URL (`OLLAMA_URL`, `OPENAI_BASE_URL`, or
@@ -1986,6 +2029,29 @@ class Settings(BaseSettings):
         if self.embedding_provider == "openai" and not (self.openai_api_key or "").strip():
             raise ValueError(
                 "OPENAI_API_KEY is required when EMBEDDING_PROVIDER=openai"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_tei_api_key(self) -> "Settings":
+        """#426 (design D2): a set `TEI_API_KEY` must be visible ASCII.
+
+        Only under `tei` and outside sandbox, like the URL policy: an inactive
+        provider's setting is never sent. Pure, no I/O, and an absent key is
+        always valid, so the migration init container (which imports this
+        class) starts without the Secret. The message is fixed text and
+        `hide_input_in_errors` keeps pydantic from echoing the input.
+        """
+        if (
+            self.embedding_provider != "tei"
+            or self.mcp_sandbox_mode
+            or self.tei_api_key is None
+        ):
+            return self
+        if not tei_api_key_is_well_formed(self.tei_api_key.get_secret_value()):
+            raise ValueError(
+                "TEI_API_KEY must be visible ASCII with no spaces or control "
+                "characters"
             )
         return self
 

@@ -107,6 +107,8 @@ kubectl -n obsidian-mcp create secret generic obsidian-mcp-secrets \
   --from-literal=DATABASE_URL="postgresql+asyncpg://obsidian_mcp:${APP_PW}@postgres:5432/obsidian_mcp" \
   --from-literal=SECRET_KEY="$(openssl rand -hex 32)" \
   --from-literal=OPENAI_API_KEY='sk-...'
+#    With EMBEDDING_PROVIDER=tei and a TEI started with --api-key, add
+#    --from-literal=TEI_API_KEY='...' to the Secret (never the ConfigMap).
 
 # 4. Your overlay: image, hostname, ingress namespace, vault storage.
 cp -r deploy/kubernetes/overlays/example ../my-obsidian-mcp   # outside the repo
@@ -261,6 +263,7 @@ List-valued settings: `TRUSTED_PROXY_IPS`, `FTS_CONFIGS` and
 | `OLLAMA_EMBED_BATCH_SIZE` | `16` | Chunks per `/api/embed` request (1 to 256). |
 | `TEI_URL` | `http://tei:80` | TEI endpoint for the native `/embed` API. Same transport rule as `OLLAMA_URL`. |
 | `TEI_EMBEDDING_MODEL` | `BAAI/bge-m3` | Must equal the `model_id` TEI reports at `GET /info`, exactly, including a local path; a different value refuses startup. Recorded in the fingerprint; a change needs a reset. Replacing the weights behind the same name also needs the reset, and no startup check detects that case. |
+| `TEI_API_KEY` | unset | **Secret, never in the ConfigMap.** Bearer token for a TEI started with `--api-key`; sent only to `TEI_URL` (`/embed`, `/info`, the panel's `/health`). A 401/403 logs a line naming the setting; the server keeps serving with embedding withheld. Rotating it needs a rollout restart, not a reset. |
 | `TEI_EMBED_BATCH_SIZE` | `16` | Inputs per `/embed` request (1 to 256). A value above TEI's `--max-client-batch-size` (32 on TEI 1.8.3 unless set) refuses startup; 16 avoids the request timeout on a shared GPU. |
 | `EMBEDDING_ALLOW_PLAINTEXT` | `false` | Acknowledge a plaintext `http://` embedding URL to a non-loopback host. |
 | `EMBEDDING_CA_FILE` | unset | PEM CA for an `https` embedding endpoint behind a private CA. Replaces the default bundle. |
