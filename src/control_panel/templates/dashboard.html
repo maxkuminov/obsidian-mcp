@@ -37,7 +37,8 @@
             Indexer last ran
             <span class="u-color-text-2 u-font-weight-500">{{ last_run_rel }}</span>
             {% if last_run_ok is false %}<span class="badge badge-yellow u-margin-left-6px">last pass failed</span>{% endif %}
-            <span class="u-opacity-0_75">· last change detected {{ last_indexed_rel }}</span>
+            <span class="u-opacity-0_75">· last change detected {{ last_indexed_rel }}</span>{% if excluded_conflicts is integer %}
+            <span class="u-opacity-0_75">· {{ excluded_conflicts }} sync-conflict cop{{ 'y' if excluded_conflicts == 1 else 'ies' }} not indexed (INDEX_EXCLUDE_CONFLICT_FILES)</span>{% endif %}
         </div>
     </div>
     <div class="page-actions">

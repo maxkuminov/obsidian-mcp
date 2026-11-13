@@ -1243,6 +1243,15 @@ async def dashboard(
     # about the server, and every panel user sees the same one.
     last_run_at = _indexer.last_index_run_at
     last_run_ok = _indexer.last_index_run_ok
+    # #392: the viewer's OWN vault scope's excluded sync-conflict count. Not
+    # `uid`: `_scope_user_id` returns None ("no filter") for an administrator,
+    # which here would read the single-user scope and show an administrator
+    # nothing for their own vault. None hides the line (setting off, or no
+    # committed pass has counted this scope since the process started).
+    excluded_conflicts = None
+    if settings.index_exclude_conflict_files:
+        own_scope = user.id if settings.multi_user_mode else None
+        excluded_conflicts = _indexer.excluded_conflict_copies.get(own_scope)
 
     # The persisted counterpart to the heartbeat above: last recorded pass,
     # backup age, errors since process start. Survives a restart, which the
@@ -1267,6 +1276,7 @@ async def dashboard(
         "last_run_iso": last_run_at.isoformat() if last_run_at else None,
         "last_run_rel": _humanize_delta(last_run_at),
         "last_run_ok": last_run_ok,
+        "excluded_conflicts": excluded_conflicts,
         "index_interval": settings.index_interval_seconds,
         "graph": graph,
         "graph_backfill_running": link_backfill_in_progress,

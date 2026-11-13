@@ -95,6 +95,7 @@ from src.services import (
 )
 from src.services import task_settings as task_settings_service
 from src.services.note_hash import canonical_note_hash
+from src.services.conflict_copies import is_conflict_copy
 from src.services.vault import (
     MAX_PATH_CHARS,
     VAULT_ROOT_NOT_READY_ERROR,
@@ -4472,6 +4473,40 @@ def _is_in_call_conflict(exc: BaseException) -> bool:
     )
 
 
+#: #392: the one line `create_note` and a fully successful `move_note` append
+#: when the note they published has a sync-conflict name the index excludes.
+#: Exact text pinned by the index-integrity spec delta.
+CONFLICT_EXCLUSION_NOTICE = (
+    "note: this name matches the sync-conflict exclusion "
+    "(INDEX_EXCLUDE_CONFLICT_FILES); the note is stored but not indexed, so "
+    "searches and listings will not return it once the next index pass has "
+    "run. Read it by exact path."
+)
+
+#: #392 r1: the line a fully successful `move_note(rewrite_links=True)`
+#: appends when its SOURCE has an excluded sync-conflict name. Exact text
+#: pinned by the index-integrity spec delta.
+CONFLICT_REWRITE_NOTICE = (
+    "note: the source name matches the sync-conflict exclusion "
+    "(INDEX_EXCLUDE_CONFLICT_FILES), so it may no longer be in the index "
+    "and links to its old name may not have been found or rewritten; search "
+    "for the old name and fix any by hand."
+)
+
+
+def _with_conflict_notice(message: str, rel: str) -> str:
+    """`message`, plus the exclusion notice line when it applies (#392).
+
+    Byte-identical to `message` while `INDEX_EXCLUDE_CONFLICT_FILES` is off or
+    the basename of `rel` matches no conflict pattern.
+    """
+    if settings.index_exclude_conflict_files and is_conflict_copy(
+        rel.rsplit("/", 1)[-1]
+    ):
+        return f"{message}\n{CONFLICT_EXCLUSION_NOTICE}"
+    return message
+
+
 def _published_hash_clause(data: bytes) -> str:
     """The `content_hash` a successful note write ends its result with (D9).
 
@@ -4612,8 +4647,10 @@ async def create_note_impl(
             )
             # D9: the bytes this call published, which `_atomic_write_at`
             # encoded exactly this way.
-            return f"Created note: {path}" + _published_hash_clause(
-                content.encode("utf-8")
+            return _with_conflict_notice(
+                f"Created note: {path}"
+                + _published_hash_clause(content.encode("utf-8")),
+                target.rel,
             )
         except FileExistsError:
             # No-clobber `link` refuses a plain file, a directory *and* a
@@ -7062,7 +7099,19 @@ async def _move_note_locked(
             return _body_refusal(
                 message, partial_marker or "partial_completion", disposition="partial"
             )
-        return message
+        # #392: a fully successful move onto an excluded sync-conflict name
+        # says so; partial and refused outcomes are unchanged.
+        # #392 r1: backlink discovery is keyed on the source's index row,
+        # which the exclusion removed, so a link rewrite out of an excluded
+        # name cannot find the links to it. Say so rather than refuse the
+        # recovery move. Then the destination notice, if that name matches.
+        if (
+            rewrite_links
+            and settings.index_exclude_conflict_files
+            and is_conflict_copy(from_rel.rsplit("/", 1)[-1])
+        ):
+            message = f"{message}\n{CONFLICT_REWRITE_NOTICE}"
+        return _with_conflict_notice(message, to_rel)
     finally:
         for opened in targets:
             opened.close()

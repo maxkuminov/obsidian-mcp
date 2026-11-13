@@ -96,6 +96,7 @@ from src.services.tasks import (
     frontmatter_line_offset,
     note_task_row,
 )
+from src.services.conflict_copies import is_conflict_copy
 from src.services.note_hash import canonical_note_text_strict, text_hash
 from src.services import vault_overlap
 from src.services.transfer import canonical_vault_root
@@ -131,6 +132,12 @@ link_backfill_in_progress: bool = False
 # which the first pass has genuinely not finished yet.
 last_index_run_at: datetime | None = None
 last_index_run_ok: bool | None = None
+
+#: #392: each scope's count of sync-conflict copies its last committed pass
+#: excluded, for the dashboard. Keyed like every in-process per-scope map
+#: (user id, None in single-user mode). Process memory only: a restart
+#: forgets it until the startup pass; never exposed by `/health`.
+excluded_conflict_copies: dict[int | None, int] = {}
 
 
 def _record_index_run(ok: bool) -> None:
@@ -1811,6 +1818,15 @@ def _loggable_path(rel: str) -> str:
 #: The reason `_scan_vault` records for bytes that are not valid UTF-8.
 NOT_UTF8_CONTENT = "content is not valid UTF-8"
 
+#: The reason `_scan_vault` records for a sync-conflict copy excluded by
+#: `INDEX_EXCLUDE_CONFLICT_FILES` (#392). Decided by name, before any stat or
+#: read, so — unlike the two name reasons above — a row CAN exist at such a
+#: path (from before the setting was turned on); the ordinary not-indexable
+#: prune deletes it. No per-path WARNING: the operator chose this.
+EXCLUDED_CONFLICT_COPY = (
+    "excluded as a sync-conflict copy (INDEX_EXCLUDE_CONFLICT_FILES)"
+)
+
 
 def _path_not_indexable_reason(rel: str) -> str | None:
     """Why `rel` itself can never be a `file_path`, or None if it can."""
@@ -2344,6 +2360,7 @@ def _scan_vault(
     stop: threading.Event,
     facts: "RootFacts | None" = None,
     keep_bodies: bool = False,
+    exclude_conflicts: bool = False,
 ) -> ScanResult:
     """Walk, stat, read and hash the pinned root. **Runs on a worker thread.**
 
@@ -2384,6 +2401,14 @@ def _scan_vault(
             if reason is not None:
                 _warn_not_indexable(rel, reason)
                 result.not_indexable[rel] = reason
+                continue
+            # #392: an excluded sync-conflict copy is present but not
+            # indexable by its *name*, decided before the stat or the read —
+            # the indexer never opens it. It stays in `seen` (never a vanished
+            # file, never a move source) and out of `files` (never upserted,
+            # never a move destination); a row at it is pruned under the lock.
+            if exclude_conflicts and is_conflict_copy(found.name):
+                result.not_indexable[rel] = EXCLUDED_CONFLICT_COPY
                 continue
             row = snapshot.get(rel)
             if (
@@ -2477,6 +2502,7 @@ async def _run_scan(
     re_derive: bool,
     facts: "RootFacts | None" = None,
     keep_bodies: bool = False,
+    exclude_conflicts: bool = False,
 ) -> ScanResult:
     """`_scan_vault` in a worker thread, with stop-on-cancel.
 
@@ -2496,6 +2522,7 @@ async def _run_scan(
             stop=stop,
             facts=facts,
             keep_bodies=keep_bodies,
+            exclude_conflicts=exclude_conflicts,
         )
     )
     try:
@@ -2700,7 +2727,10 @@ class IndexPassResult(tuple):
       withheld the stamp (D8) — the per-scope condition failure accounting
       counts toward degradation.
     - `not_indexable`: how many discovered paths were present but not
-      indexable (D7), quarantined paths not included.
+      indexable (D7), quarantined paths and excluded conflict copies not
+      included.
+    - `excluded`: how many discovered paths were excluded as sync-conflict
+      copies (#392, `INDEX_EXCLUDE_CONFLICT_FILES`).
     - `quarantined`: the sorted paths this pass excluded because they are
       quarantined (D3) — newly or from an earlier pass. The run record names
       them (D5); they do not make the pass a failure.
@@ -2716,6 +2746,7 @@ class IndexPassResult(tuple):
 
     rederive: str | None
     not_indexable: int
+    excluded: int
     quarantined: tuple[str, ...]
     walk_failed: tuple[str, ...]
     walk_protected: int
@@ -2728,6 +2759,7 @@ class IndexPassResult(tuple):
         *,
         rederive: str | None = None,
         not_indexable: int = 0,
+        excluded: int = 0,
         quarantined: tuple[str, ...] = (),
         walk_failed: tuple[str, ...] = (),
         walk_protected: int = 0,
@@ -2737,6 +2769,7 @@ class IndexPassResult(tuple):
         obj.rederive_pending = rederive_pending
         obj.rederive = rederive
         obj.not_indexable = not_indexable
+        obj.excluded = excluded
         obj.quarantined = tuple(quarantined)
         obj.walk_failed = tuple(walk_failed)
         obj.walk_protected = walk_protected
@@ -3047,6 +3080,9 @@ async def _index_vault_pinned(
         # The full-hash pass keeps every body for the input-digest backstop
         # (#355, D3a) — a re-derive's memory shape, once per interval.
         keep_bodies=backstop,
+        # #392: read once per invocation, so the attempt and every quarantine
+        # restart act on one value.
+        exclude_conflicts=bool(settings.index_exclude_conflict_files),
     )
     skips.extend(scan.skips)
     # Backstop-blocking failures (D12). From the scan: walk failures and read
@@ -3372,7 +3408,10 @@ async def _index_vault_attempt(
             # A path decided not indexable by its *content* is re-read like a
             # decoded one: its row moved under the walk, so the walk's verdict
             # is not the one to apply (D7). A path not indexable by its *name*
-            # can have no row, so it never reaches here.
+            # is never re-read: an unencodable or over-long one can have no
+            # row, and an excluded sync-conflict copy's row (#392) is deleted
+            # below whatever it now holds, because `existing` is the locked
+            # rows.
             undecodable = scan.not_indexable.get(rel) == NOT_UTF8_CONTENT
             if rel not in scan.files and not undecodable:
                 continue
@@ -3853,13 +3892,34 @@ async def _index_vault_attempt(
         not_indexable_rows = {p for p in scan.not_indexable if p in existing}
         if not_indexable_rows:
             deleted_paths |= not_indexable_rows
-            logger.warning(
-                "Removing the index row(s) of %d present-but-not-indexable "
-                "path(s)%s: %s",
-                len(not_indexable_rows),
-                log_suffix,
-                _format_skips(sorted(not_indexable_rows)),
+            # #392: an excluded sync-conflict copy is the operator's choice,
+            # not a fault, so its removal is one INFO line of its own and is
+            # kept out of the WARNING below.
+            excluded_rows = sorted(
+                p for p in not_indexable_rows
+                if scan.not_indexable[p] == EXCLUDED_CONFLICT_COPY
             )
+            faulty_rows = sorted(
+                p for p in not_indexable_rows
+                if scan.not_indexable[p] != EXCLUDED_CONFLICT_COPY
+            )
+            if excluded_rows:
+                logger.info(
+                    "Removed the index row(s) of %d excluded sync-conflict "
+                    "cop%s%s: %s",
+                    len(excluded_rows),
+                    "y" if len(excluded_rows) == 1 else "ies",
+                    log_suffix,
+                    _format_skips(excluded_rows),
+                )
+            if faulty_rows:
+                logger.warning(
+                    "Removing the index row(s) of %d present-but-not-indexable "
+                    "path(s)%s: %s",
+                    len(faulty_rows),
+                    log_suffix,
+                    _format_skips(faulty_rows),
+                )
 
         # Upsert changed files
         if to_upsert:
@@ -4500,6 +4560,25 @@ async def _index_vault_attempt(
         if rel in written or rel not in seen or rel in scan.not_indexable:
             clear_quarantine(user_id, rel)
 
+    # #392: the count of excluded sync-conflict copies, logged when non-zero
+    # and kept per scope in process memory for the dashboard. Set only here,
+    # after the attempt committed.
+    excluded = sum(
+        1 for r in scan.not_indexable.values() if r == EXCLUDED_CONFLICT_COPY
+    )
+    if excluded:
+        logger.info(
+            "Excluded %d sync-conflict cop%s from the index "
+            "(INDEX_EXCLUDE_CONFLICT_FILES)%s",
+            excluded,
+            "y" if excluded == 1 else "ies",
+            log_suffix,
+        )
+    if settings.index_exclude_conflict_files:
+        excluded_conflict_copies[user_id] = excluded
+    else:
+        excluded_conflict_copies.pop(user_id, None)
+
     logger.info(f"Vault index scan complete{log_suffix}")
     # For the run recorder: what the walk saw, and what this pass wrote. The
     # moved paths count as indexed — the id-preserving branch rewrote those
@@ -4509,7 +4588,8 @@ async def _index_vault_attempt(
         len(seen),
         len(to_upsert) + len(moved_new_paths),
         rederive=rederive,
-        not_indexable=len(scan.not_indexable) - len(quarantined_now),
+        not_indexable=len(scan.not_indexable) - len(quarantined_now) - excluded,
+        excluded=excluded,
         quarantined=tuple(quarantined_now),
         walk_failed=tuple(walk_failed),
         walk_protected=len(protected),
@@ -4543,7 +4623,9 @@ def _collect_feed_events(
     - `created reason=not_indexable`: a path whose *content* cannot be indexed
       and that has no row (suppressed under the lock once the feed already
       says so). A path not indexable by its *name* cannot be stored in a feed
-      row either, so it has no event.
+      row either, so it has no event. An excluded sync-conflict copy (#392)
+      with no row has none either (the operator's choice, not a fault); one
+      with a row gets the `deleted reason=not_indexable` above.
 
     Nothing for protected (#309) or C5-deferred rows: this pass does not
     change them. A scope with no rows at the attempt's start is a baseline:

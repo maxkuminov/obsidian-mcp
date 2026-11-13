@@ -214,7 +214,7 @@ The MCP server SHALL expose a read tool `list_tasks`, registered with a title an
 
 **`tags` and `exclude_tags`.** Each entry is stripped of one leading `#` and SHALL be 1–128 characters. It is then normalised exactly like a stored tag prefix (lower-cased, `/` runs collapsed, a trailing `/` stripped, so `work/` means `work`), and the result SHALL match `[a-z][a-z0-9_/-]*`. There are at most 32 entries. A row awaiting the version-5 backfill is matched by the same rule over its stored tags. `tags` SHALL require every entry and `exclude_tags` SHALL reject every entry. Both match hierarchically by `/` segment and case-insensitively against the task's own tags, so `waiting-for` matches `waiting-for` and `Waiting-For/x` but not `waiting-forever`. Note-level tags are not consulted.
 
-**`scope`.** `scope="default"` SHALL exclude tasks in notes under the caller's excluded folders, or whose note tags hierarchically match an excluded note tag, after one leading `#` is stripped from a stored note tag. `scope="all"` SHALL exclude nothing.
+**`scope`.** `scope="default"` SHALL exclude tasks in notes under the caller's excluded folders, or whose note tags hierarchically match an excluded note tag, after one leading `#` is stripped from a stored note tag. `scope="all"` SHALL exclude nothing within the indexed notes. Every scope is defined over indexed notes only: a note the index does not hold (for example a sync-conflict copy excluded under `INDEX_EXCLUDE_CONFLICT_FILES`) contributes no task rows under either scope, and the response SHALL carry no line about it.
 
 **Other arguments.**
 - `limit` SHALL be clamped to 1–500.
@@ -271,6 +271,10 @@ The MCP server SHALL expose a read tool `list_tasks`, registered with a title an
 - **WHEN** the caller's settings exclude `Work/Tickets/`, which holds 40 open tasks, and `list_tasks()` is called
 - **THEN** none of those tasks SHALL be returned, and the header SHALL state `scope: default` and `excluded by scope: 40 tasks`
 - **AND** `list_tasks(scope="all")` SHALL return them
+
+#### Scenario: A task in an excluded conflict copy
+- **WHEN** `INDEX_EXCLUDE_CONFLICT_FILES` is true and the only open task matching a query sits in `N (conflict 2026-05-29-19-45-39).md`
+- **THEN** `list_tasks(scope="all")` SHALL return no task for it, and the response SHALL be byte-identical to the same query over an index that never held that note
 
 ### Requirement: `list_tasks` SHALL page with a keyset cursor bound to its filters and SHALL never exceed the read-response cap
 

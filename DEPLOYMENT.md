@@ -1447,6 +1447,78 @@ argument is new and optional. Rolling back is a redeploy of the previous
 image; a client still sending `rerank` is then refused by the
 unknown-argument rule.
 
+### Leaving sync-conflict copies out of the index (optional, #392)
+
+When two devices edit the same note, sync tools keep both versions: one
+at the note's path and a copy beside it under a marked name. The index
+treats each copy as a note, so it shows up as a near-duplicate in every
+search, `list_notes`, `find_related`, the task listings and the link graph.
+`INDEX_EXCLUDE_CONFLICT_FILES=true` leaves those copies out of the index.
+It is **off by default**: a conflict copy can hold the only good version of
+an edit, because the sync tool picks the winner by time or device, not by
+content.
+
+**What counts as a copy.** A Markdown file whose **name** (never a folder
+name) matches one of these patterns exactly. Matching is case-sensitive and
+needs the full timestamp:
+
+| Tool | Name shape |
+| --- | --- |
+| Syncthing | `Note.sync-conflict-20260529-194539-ABC2DEF.md` (device id may be empty) |
+| Nextcloud desktop | `Note (conflicted copy 2026-05-29 194539).md`, optionally with a user name before the date |
+| Nextcloud / ownCloud (legacy) | `Note_conflict-20260529-194539.md` |
+| Dropbox | `Note (Alice's conflicted copy 2026-05-29).md`, optionally with ` (1)` before the closing parenthesis |
+| Obsidian Sync ("Create conflict file") | `Note (Conflicted copy MyLaptop 202605291945).md` |
+| Unidentified producer, seen in practice | `Note (conflict 2026-05-29-19-45-39).md` |
+
+**A note whose own title exactly matches one of these shapes is excluded
+too.** The server cannot tell it from a sync tool's copy. Check your naming
+before turning the setting on, and rename such a note if you want it
+indexed. A sync tool's copy in any other shape (a localised client, a tool
+not listed) stays indexed, which is today's behaviour.
+
+**What it does.**
+- The files are never modified, renamed or deleted. `read_note`,
+  `edit_note`, `move_note`, `delete_note`, `list_files` and the task write
+  tools keep working on a copy by its exact path.
+- Index-backed tools stop returning it once the next index pass has run:
+  the searches, `list_notes`, `get_recent`, `get_tags`, the graph tools,
+  `list_tasks` (both scopes) and `task_agenda`. A link pointing at a copy
+  shows as dangling.
+- `create_note`, and a `move_note` onto such a name, end their result with a
+  one-line notice that the note is stored but not indexed. `write_file`,
+  `import_from_url` and transfer uploads are byte transport and say nothing.
+- A `move_note` that renames an indexed note onto such a name keeps it in
+  the index until the next pass removes it.
+- A `move_note(rewrite_links=True)` *out of* such a name cannot find the
+  links pointing at it once a pass has removed its index row. The move succeeds, and
+  its result says so in one extra line: search for the old name and fix
+  those links by hand.
+- The setting is deployment-wide. In multi-user mode it applies to every
+  user's vault; there is no per-user switch.
+
+**Turning it on.** Set it and restart. The first pass removes each copy's
+index row, with its vectors, links and task rows. `get_changes` records
+one `deleted … reason=not_indexable by human/sync` line per removed row
+("still on disk but cannot be indexed"). New copies that never had a row
+record nothing. The pass logs `Removed the index row(s) of N excluded
+sync-conflict cop(y/ies)` (naming up to 20, then `and N more`) and, on every pass that
+excludes any, `Excluded N sync-conflict cop(y/ies) from the index`. The
+dashboard shows `N sync-conflict copies not indexed` beside "Indexer last
+ran". The pass is not a failure, `/health` does not change, and nothing is
+written to the run history's error column.
+
+**Turning it off.** Set it to false and restart. The next pass indexes the
+copies as new notes and records them as `created`, or as one `reset` if the
+user's index was otherwise empty. If an agent edited a copy by path while
+it was excluded, that copy reappears in the index without a `created` line,
+because the agent's own `modified` line already describes those bytes.
+
+**Recovering a copy.** Read it with `read_note` and its exact path (or
+`list_files` to find it). Then merge the content into the original with
+`edit_note`, or `move_note` it to an ordinary name, after which the next
+pass indexes it.
+
 ## Upgrading across migration 040 (task rule, #434)
 
 This release adds a per-user **task rule**: which markdown checkboxes count

@@ -921,6 +921,27 @@ action is how an administrator says it was on purpose.
   per-pass budget, which is deliberately *not* written into the pass record's
   `error` because it is a decision rather than a fault.
 
+## The excluded sync-conflict count (#392)
+
+While `INDEX_EXCLUDE_CONFLICT_FILES` is on, the dashboard shows
+`N sync-conflict cop{y|ies} not indexed (INDEX_EXCLUDE_CONFLICT_FILES)` beside
+"Indexer last ran", read from `indexer.excluded_conflict_copies` (process
+memory, the last committed pass's count).
+
+- **Its scope is the viewer's own vault, not `_scope_user_id`.** That helper
+  returns `None` for an administrator, meaning "no filter" on the aggregate
+  queries, but `None` is also the single-user *scope key*, so an
+  administrator would have read nothing for their own vault (spec review r1).
+  The route uses `user.id` in multi-user mode, administrators included, and
+  `None` only in single-user mode.
+- **Template-only.** One Jinja conditional appended after the existing
+  `</span>` on the same line, using the existing `u-opacity-0_75` class. No
+  script, no `style=`, no handler, no new class. The test is `is integer`, so
+  a context without the key (or `None`: setting off, nothing counted yet)
+  renders byte-identically to the page before the change. Like every panel
+  template change, it needs the owner's devtools walk with zero CSP
+  violations.
+
 
 ## The last-admin guard
 

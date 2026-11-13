@@ -506,6 +506,17 @@ async def _warn_oidc_lockout() -> None:
         log.critical(OIDC_LOCKOUT_MESSAGE)
 
 
+def _log_index_exclusion() -> None:
+    """#392: say once at startup, where the operator looks, that the index
+    leaves sync-conflict copies out (the files themselves are untouched).
+    Nothing is logged while `INDEX_EXCLUDE_CONFLICT_FILES` is off."""
+    if settings.index_exclude_conflict_files:
+        logging.getLogger(__name__).info(
+            "Index exclusion: sync-conflict copies are not indexed "
+            "(INDEX_EXCLUDE_CONFLICT_FILES=true)"
+        )
+
+
 def _log_retrieval_fingerprint() -> None:
     """One INFO line naming the non-stored retrieval fingerprint (heading-chunks
     D7): the embedding fingerprint's fields, the chunking version and the
@@ -683,6 +694,7 @@ async def lifespan(app: FastAPI):
         await check_database_role()
         log_embedding_transport()
         _log_retrieval_fingerprint()
+        _log_index_exclusion()
         await _check_embedding_dim()
         await _check_pgvector_version()
         await _validate_fts_configs()
