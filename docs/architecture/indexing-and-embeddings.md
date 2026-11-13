@@ -1656,9 +1656,12 @@ not on membership in the changed set: the version-4 bump makes every row
 ### What `list_tasks` can and cannot see
 
 It reads only the index, so it is one pass behind an edit (L5,
-`INDEX_INTERVAL_SECONDS`), except an edit made by a task tool, which
-refreshes that note's task rows at once (#428, the next section). `edit_note`
-and the other generic writers do not. Rows stamped below version 4 have not been scanned
+`INDEX_INTERVAL_SECONDS`), except a write whose refresh ran: the task tools
+(#428, the next section), and since #432 `edit_note`, `set_frontmatter`, a
+`write_file` to a note path, and `delete_note` (a clear). A refresh that
+cannot run, a new note (`create_note`, a `write_file` creation — its refresh
+finds no index row — an import or an upload) and `move_note`'s link rewrites
+wait for the next pass. Rows stamped below version 4 have not been scanned
 for tasks; the tool counts them in every header (`not yet scanned for tasks`)
 rather than reporting "no tasks", alongside `tasks could not be indexed`
 (`tasks_failed`) and `over the task cap` (`tasks_truncated`). The rendering and
@@ -1752,7 +1755,10 @@ a row is task-dirty, R3 forces a read on every pass, so no row stays stale.
 A superseded refresh writes nothing and leaves the rows as they were. The
 newer bytes came from a later publication P2: if P2 was a task tool, its own
 refresh queues on the same row lock; if it was a generic writer, it changed
-the stat, or the row is already task-dirty and R3 reads it regardless. A
+the stat, or the row is already task-dirty and R3 reads it regardless — and
+since #432 a generic writer (`edit_note`, `set_frontmatter`, `write_file`,
+`delete_note`) may have refreshed the rows itself, through the same lock and
+re-check, which leaves the same two cases. A
 refresh that passes the still-current check and is then followed, before its
 commit, by another publication leaves the ordinary task-dirty state, which the
 same two rules cover. Integration tests interleave a pass's scan, a tool
@@ -1784,10 +1790,49 @@ outcome classification. The order is publish → refresh → change-feed event,
 so a consumer reacting to the event sees the new state in `list_tasks`; the
 event is recorded whatever the refresh did.
 
-**What generic writers do not do (L5).** `edit_note`, `set_frontmatter`,
-`move_note`, `write_file` and transfer uploads do not refresh task rows, so
-their changes appear after the next pass. Adding the hook to one of them is a
-one-line follow-up, deliberately out of scope. Two residuals are accepted: the
+**Generic writers (#432, task-refresh-on-write).** #428's L5 ("generic
+writers do not refresh") is narrowed:
+
+- **Refresh:** `edit_note`, `set_frontmatter` (a block that changes size
+  moves every task's line number) and every `write_file` publication to a
+  note path (`change_feed.is_note_path`). `write_file` never keys this on
+  its pre-publication existence sample: a note moved onto the path between
+  the sample and the publication would be overwritten without a refresh
+  (impl review r1); a genuine creation finds no index row and the refresh
+  is a no-op (`not_indexed`). Each calls
+  the same `refresh_note_tasks`, at most once, **after** its change-feed
+  event — today's publish → event order is untouched, and a call cancelled
+  during the refresh has already recorded its attributed event (the task
+  tools keep publish → refresh → event). The refresh runs only when the
+  bytes the call published, or the bytes it replaced, may hold a task:
+  `tasks.may_hold_tasks`, the extractor's checkbox prefix (`_CHECKBOX_RE`
+  without its trailing lookahead) at any line start of the canonical text.
+  It is a **superset** of the extractor — the original line equals the
+  masked one through `]` (the #218 rule) — and the lookahead is left out
+  because the extractor evaluates it on masked text, where a code span right
+  after `]` reads as spaces (a property test pins the superset). Bytes not
+  UTF-8 count as "may hold"; replaced bytes the call never held (every
+  `write_file` but a guarded overwrite) are assumed to; a call that knows the replaced bytes and
+  published the same ones does nothing. No second read, no database read.
+- **Clear:** `delete_note`, after **every** confirmed delete, ungated (the
+  incumbent is read before the delete, which removes whatever stands at the
+  leaf by then), through the absence form `published=ABSENT`: under the row
+  lock it confirms nothing is at the path (else `superseded`, so a recreated
+  note is never cleared), deletes the task rows and stamps
+  `tasks_source_hash` with the empty note's canonical hash. The pass prunes
+  the row; R4 keeps the cleared set against a pass that read the note first.
+- **Silent and best effort.** The writers' responses are byte-identical; a
+  refresh that cannot run (`lock_timeout`, `superseded`, …) leaves the rows
+  to the next pass, exactly as before, and only the usage row's
+  `task_refresh` says so (present only when a refresh was attempted).
+- **Excluded:** `create_note` (no index row yet), `move_note` (a plain move re-keys the row and the tasks follow it;
+  link rewrites wait for the pass — a stale id there only makes a task write
+  refuse with `task_not_found`), `import_from_url` and uploads (they never
+  hold the bytes, and a re-read would break R1), `delete_file` (refuses
+  `.md`).
+
+The pass is unchanged: R3/R4 cover every refreshing writer exactly as a task
+tool's. Two residuals are accepted: the
 refresh's root re-check is not under a lock, so a reassignment between the
 check and the write stores rows under the old scope's row, which the
 provenance discard then purges (L21); and a clean row may keep a non-NULL

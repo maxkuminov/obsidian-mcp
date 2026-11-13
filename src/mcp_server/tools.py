@@ -94,6 +94,7 @@ from src.services import (
     task_write,
 )
 from src.services import task_settings as task_settings_service
+from src.services import tasks as tasks_service
 from src.services.note_hash import canonical_note_hash
 from src.services.conflict_copies import is_conflict_copy
 from src.services.vault import (
@@ -1042,6 +1043,58 @@ async def _record_note_events(uid: int | None, events) -> None:
     await change_feed.record_tool_events(
         list(events), root=root, session_factory=async_session, user_id=uid
     )
+
+
+#: `replaced=` for a call that replaced an incumbent whose bytes it never read
+#: (an unguarded `write_file` overwrite, an over-cap incumbent): the gate
+#: assumes such bytes may have held a task (#432, design D2).
+_UNKNOWN_BYTES = object()
+
+
+def _gate_may_hold_tasks(replaced, published) -> bool:
+    """D2, both sides in one pass (run off the loop by the caller)."""
+    if published is not None and tasks_service.may_hold_tasks(published):
+        return True
+    if replaced is _UNKNOWN_BYTES:
+        return True
+    return replaced is not None and tasks_service.may_hold_tasks(replaced)
+
+
+async def _refresh_after_write(uid: int | None, target, *, replaced, published) -> None:
+    """A generic writer's best-effort task refresh (#432, design D1–D5).
+
+    Called after the confirmed publication **and after its change-feed
+    event**, inside the tool's `with target:` block, at most once per call.
+    `published` is the bytes published, or `task_index.ABSENT` after a
+    confirmed delete (the absence form, never gated). `replaced` is the
+    incumbent's bytes when the call read them, `_UNKNOWN_BYTES` when an
+    incumbent stood that it did not read, or None when there was none.
+
+    **Silent and never raises** (an `Exception`): the tool's response,
+    outcome and event are identical whatever happens here. Only the usage
+    row learns of it, through `task_refresh`, and only when a refresh was
+    attempted. A refresh that cannot run leaves the rows to the next pass.
+    """
+    try:
+        if published is not task_index.ABSENT:
+            if (
+                replaced is not None
+                and replaced is not _UNKNOWN_BYTES
+                and bytes(replaced) == bytes(published)
+            ):
+                return
+            try:
+                go = await asyncio.to_thread(_gate_may_hold_tasks, replaced, published)
+            except Exception:  # noqa: BLE001 - a gate fault costs a refresh
+                go = True
+            if not go:
+                return
+        refresh = await _refresh_task_rows(uid, target, published)
+        timing.record("task_refresh", refresh.usage)
+    except Exception:  # noqa: BLE001 - the write and its event stand regardless
+        # `refresh_note_tasks` never raises and logs its own lag; nothing else
+        # here can fail but `timing.record`. The next pass converges.
+        pass
 
 
 #: Exception type -> `(caller-facing message, usage_logs marker, event reason)`
@@ -5700,6 +5753,11 @@ async def edit_note_impl(
             await _record_note_events(
                 uid, [_content_event("modified", target.rel, new_content.encode("utf-8"))]
             )
+            # #432: after the event, best effort and silent.
+            await _refresh_after_write(
+                uid, target, replaced=existing_bytes,
+                published=new_content.encode("utf-8"),
+            )
         return success_message + _published_hash_clause(
             new_content.encode("utf-8")
         )
@@ -7211,6 +7269,11 @@ async def delete_note_impl(
             await _record_note_events(uid, [change_feed.Event(
                 "deleted", path=target.rel, reason=change_feed.REASON_REMOVED
             )])
+            # #432 D3: the absence form, after every confirmed delete (never
+            # gated: the unlink removed whatever stood at the leaf by then).
+            await _refresh_after_write(
+                uid, target, replaced=None, published=task_index.ABSENT
+            )
             return f"Permanently deleted: {path}"
 
         # One `renameat2(RENAME_NOREPLACE)` from the note's own parent
@@ -7257,6 +7320,10 @@ async def delete_note_impl(
         await _record_note_events(uid, [change_feed.Event(
             "deleted", path=target.rel, reason=change_feed.REASON_REMOVED
         )])
+        # #432 D3: the absence form, after every confirmed delete.
+        await _refresh_after_write(
+            uid, target, replaced=None, published=task_index.ABSENT
+        )
         return f"Soft-deleted: {path} → {dest}"
 
 
@@ -7534,6 +7601,11 @@ async def set_frontmatter_impl(
         await _record_note_events(
             uid, [_content_event("modified", target.rel, new_raw.encode("utf-8"))]
         )
+        # #432: after the event, best effort and silent. A block that changes
+        # size moves every task's line number.
+        await _refresh_after_write(
+            uid, target, replaced=raw_bytes, published=new_raw.encode("utf-8")
+        )
         summary: list[str] = []
         if set_keys:
             summary.append(f"set: {', '.join(set_keys)}")
@@ -7810,6 +7882,19 @@ async def write_file_impl(
             await _record_note_events(uid, [_content_event(
                 "modified" if had_incumbent else "created", target.rel, data
             )])
+            # #432: after the event, best effort and silent, after EVERY
+            # publication to a note path. Never keyed on `had_incumbent`:
+            # that is sampled before the publication, and a note moved onto
+            # the path in between would be overwritten without a refresh
+            # (impl review r1). The replaced bytes are known only when the
+            # publication was bound to them (`expected=incumbent`); otherwise
+            # they are unknown and assumed to have held a task. A genuine
+            # creation finds no index row: `not_indexed`, nothing written.
+            await _refresh_after_write(
+                uid, target,
+                replaced=incumbent if incumbent is not None else _UNKNOWN_BYTES,
+                published=data,
+            )
         result = f"Wrote {len(data):,} bytes to {path}"
         if over_cap or len(data) > read_cap:
             return result + (

@@ -56,11 +56,13 @@ per-note derivation, and any third one added next to these (the
 
 A third derivation is one more call after `_update_tasks_for_changed`.
 
-**The write-time refresh exception (#428, design D10).** Rule 3 has exactly
-one exception: a task tool's write-time refresh
-(`src.services.task_index.refresh_note_tasks`) may rewrite one note's task
-rows outside the pass, under that note's `notes_metadata` row lock, from the
-bytes its own call published and from nothing else. It records which bytes
+**The write-time refresh exception (#428, design D10; #432).** Rule 3 has
+exactly one exception: a write-time refresh, by a task tool or by a generic
+note writer (`edit_note`, `set_frontmatter`, a `write_file` to a note path,
+`delete_note`; #432), through `src.services.task_index.refresh_note_tasks`,
+may rewrite one note's task rows outside the pass, under that note's
+`notes_metadata` row lock, from the bytes its own call published, or, after
+`delete_note`, from the absence it caused, and from nothing else. It records which bytes
 the rows describe in `notes_metadata.tasks_source_hash`; the pass reads every
 row whose `tasks_source_hash` differs from its `content_hash` and keeps a
 refresh's rows only when they were written after its scan began (R2-R4).
@@ -134,10 +136,23 @@ _LINE_BREAK_RE = re.compile(r"\r\n|\n|\r")
 
 # Anchored by `.match(text, pos, endpos)` at each line start, so no `^`.
 # Possessive throughout: no class can be re-entered by backtracking.
-_CHECKBOX_RE = re.compile(
+#: Everything through the closing `]`. Split from the lookahead only so the
+#: write-time gate (`may_hold_tasks`) is built from the same string.
+_CHECKBOX_PREFIX = (
     r"(?:[ \t]*+>)*+[ \t]*+(?:[-*+]|[0-9]{1,9}[.)])[ \t]++"
-    r"\[(?P<s> |[^\s\[\]])\](?=[ \t]|$)"
+    r"\[(?P<s> |[^\s\[\]])\]"
 )
+_CHECKBOX_LOOKAHEAD = r"(?=[ \t]|$)"
+_CHECKBOX_RE = re.compile(_CHECKBOX_PREFIX + _CHECKBOX_LOOKAHEAD)
+
+#: The gate of the generic writers' task refresh (#432, design D2): the
+#: checkbox prefix at any line start of the canonical text. The lookahead is
+#: deliberately absent: the extractor evaluates it on the MASKED text, where a
+#: code span directly after `]` reads as spaces, so the original line need not
+#: satisfy it. The prefix itself the original always satisfies (the #218 rule:
+#: original and masked are equal through `]`), which is what makes this a
+#: superset of the extractor.
+_CHECKBOX_GATE_RE = re.compile("^" + _CHECKBOX_PREFIX, re.MULTILINE)
 _FOLLOWING_SPACE_RE = re.compile(r"[ \t]*+")
 
 _DATE_TAIL = r"️?(?:[ \t]*+(?P<y>[0-9]{4})-(?P<m>[0-9]{2})-(?P<d>[0-9]{2})(?![0-9]))?"
@@ -538,3 +553,23 @@ def tasks_from_note_text(
     return extract_tasks_bounded(
         body, line_offset=frontmatter_line_offset(text, body), max_tasks=max_tasks
     )
+
+
+def may_hold_tasks(data: bytes) -> bool:
+    """Whether `data` may hold a task (#432, design D2): the generic writers'
+    refresh gate.
+
+    True when `data` is not UTF-8 (the refresh then reports `not_utf8`), else
+    whether the extractor's checkbox prefix matches at any line start of the
+    canonical text, frontmatter included. A **superset** of
+    `tasks_from_note_text`: every input on which it finds a task makes this
+    true (pinned by a property test). It over-matches checkboxes in code and
+    in frontmatter, which costs a refresh, never a wrong answer. Linear time
+    (possessive quantifiers); reads nothing but its argument.
+    """
+    from src.services.note_hash import canonical_note_text
+
+    text = canonical_note_text(bytes(data))
+    if text is None:
+        return True
+    return _CHECKBOX_GATE_RE.search(text) is not None

@@ -566,3 +566,145 @@ def test_refresh_result_renders_the_d16_and_d17_forms():
     lag = task_index.RefreshResult(task_index.LAGGED, task_index.LAG_SUPERSEDED)
     assert lag.usage == "lagged:superseded"
     assert lag.line == "index: may lag (superseded)"
+
+
+# ── #432: the generic writers' refresh gate (`may_hold_tasks`, design D2) ──
+
+
+import random  # noqa: E402
+
+from src.services.tasks import may_hold_tasks, tasks_from_note_text  # noqa: E402
+
+#: Task-shaped fragments. A generated line is a prefix, a marker, a gap, a
+#: bracketed status and a tail, each drawn from these, so most generated notes
+#: hold tasks — and the near misses (masked code, a missing gap, a code span
+#: right after `]`) are exactly where a gate could fall short.
+_GEN_PREFIX = ["", "", " ", "  ", "    ", "\t", "> ", ">", "> > ", ">\t", "> [!note] ",
+               " ", "　", "`", "``", " > "]
+_GEN_MARKER = ["-", "*", "+", "1.", "7)", "123456789.", "0)", "1234567890.", "a.", "--"]
+_GEN_GAP = [" ", "  ", "\t", "", " ", " \t"]
+_GEN_STATUS = ["[ ]", "[x]", "[X]", "[/]", "[-]", "[>]", "[é]", "[\U0001F600]",
+               "[ ]", "[]", "[  ]", "[[]", "[x", "[\x00x]", "[x\x00]"]
+_GEN_TAIL = ["", " task", "\ttask", " `code` x", "`code` x", " \U0001F4C5 2026-01-01",
+             " #tag", "x", " [[link]]", "]", " %%c%%"]
+_GEN_BLOCK = ["```\n", "~~~\n", "    code\n", "---\n", "title: x\n", "# Head\n", "\n",
+              "text `inline\n", "`\n", "<!-- c -->\n", "%%\n"]
+_GEN_EOL = ["\n", "\n", "\r\n", "\r", ""]
+
+
+def _generated_notes(count: int, seed: int = 432):
+    rng = random.Random(seed)
+    for _ in range(count):
+        parts = []
+        if rng.random() < 0.2:
+            parts.append("---\n" + rng.choice(["a: 1\n", "tags: [x]\n", "- [ ] y\n"]) + "---\n")
+        for _ in range(rng.randint(1, 12)):
+            roll = rng.random()
+            if roll < 0.1:
+                # Real nesting: a parent item, then indented child tasks.
+                parent = rng.choice(["- ", "* ", "1. ", "- [ ] "]) + "parent\n"
+                kids = "".join(
+                    rng.choice(["  ", "    ", "\t", "      "]) + rng.choice(_GEN_MARKER)
+                    + " " + rng.choice(_GEN_STATUS) + rng.choice(_GEN_TAIL) + "\n"
+                    for _ in range(rng.randint(1, 4))
+                )
+                parts.append(parent + kids)
+            elif roll < 0.2:
+                # A multi-line callout: header, then quoted task lines.
+                head = rng.choice(["> [!note]", "> [!todo]- Folded", ">[!tip] Title"]) + "\n"
+                body = "".join(
+                    rng.choice(["> ", ">", "> > ", ">  "]) + rng.choice(_GEN_MARKER) + " "
+                    + rng.choice(_GEN_STATUS) + rng.choice(_GEN_TAIL) + "\n"
+                    for _ in range(rng.randint(1, 4))
+                )
+                parts.append(head + body)
+            elif roll < 0.4:
+                parts.append(rng.choice(_GEN_BLOCK))
+            else:
+                parts.append(
+                    rng.choice(_GEN_PREFIX) + rng.choice(_GEN_MARKER) + rng.choice(_GEN_GAP)
+                    + rng.choice(_GEN_STATUS) + rng.choice(_GEN_TAIL) + rng.choice(_GEN_EOL)
+                )
+        text = "".join(parts)
+        if rng.random() < 0.05:
+            text = "﻿" + text
+        yield text.encode("utf-8")
+
+
+def test_the_gate_is_a_superset_of_the_extractor():
+    """Deterministic property test: wherever the extractor finds a task, the
+    gate says so. The generator must produce thousands of task-holding notes,
+    or the property is vacuous."""
+    with_tasks = 0
+    misses = []
+    for data in _generated_notes(12_000):
+        found, _ = tasks_from_note_text(data)
+        if found:
+            with_tasks += 1
+            if not may_hold_tasks(data):
+                misses.append(data)
+    assert with_tasks >= 3_000, with_tasks
+    assert misses == [], misses[:3]
+
+
+def test_the_gate_matches_a_code_span_directly_after_the_bracket():
+    # The extractor tests its lookahead on MASKED text, where the code span
+    # reads as spaces; a gate that kept the lookahead would miss this task.
+    data = b"- [ ]`code` rest\n"
+    assert tasks_from_note_text(data)[0]
+    assert may_hold_tasks(data)
+
+
+def test_the_gate_cases():
+    assert may_hold_tasks(b"- [ ] a")
+    assert may_hold_tasks(b"x\r\n> 1. [x] done\r\n")
+    assert may_hold_tasks(b"- [\x00x] a")  # NUL removed -> `[x]`
+    assert may_hold_tasks(b"\xff\xfe")  # not UTF-8: the refresh decides
+    assert not may_hold_tasks(b"")
+    assert not may_hold_tasks(b"# Title\n\nPlain text with [a] link [1].\n- item\n")
+    assert not may_hold_tasks(b"-[ ] no gap\n")
+
+
+def test_the_gate_is_built_from_the_extractor_pattern():
+    assert task_mod._CHECKBOX_RE.pattern == (
+        task_mod._CHECKBOX_PREFIX + task_mod._CHECKBOX_LOOKAHEAD
+    )
+    assert task_mod._CHECKBOX_GATE_RE.pattern == "^" + task_mod._CHECKBOX_PREFIX
+
+
+@pytest.mark.parametrize("unit", ["- ", "> ", "7", " ", "-\t", "1)"])
+def test_the_gate_is_linear(unit):
+    data = (unit * (10 * 1024 * 1024 // len(unit))).encode()
+    started = time.monotonic()
+    may_hold_tasks(data)
+    assert time.monotonic() - started < 2.0
+
+
+def test_a_refresh_writes_its_task_rows_in_one_transaction_with_one_commit():
+    """#432, review r2: a cancellation during or after the commit can leave
+    the new rows committed, but never a partial set, because every task-row
+    write of a refresh (both forms) runs in one session with one commit."""
+    tree = _module_tree(task_index)
+    commits = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "commit"
+    ]
+    assert len(commits) == 1
+    run_locked = next(n for n in ast.walk(tree)
+                      if isinstance(n, ast.AsyncFunctionDef) and n.name == "_run_locked")
+    assert commits[0] in list(ast.walk(run_locked))
+    # Sessions are opened only there, so the writes in `_refresh_locked` and
+    # `_stamp` (handed that one session) cannot land in another transaction.
+    opened = [n for n in ast.walk(tree)
+              if isinstance(n, ast.Attribute) and n.attr == "async_session"]
+    assert len(opened) == 1 and opened[0] in list(ast.walk(run_locked))
+
+
+def test_the_generic_refresh_helper_never_takes_the_generation_lock():
+    from src.mcp_server import tools
+
+    for fn in (tools._refresh_after_write, tools._gate_may_hold_tasks,
+               tools._refresh_task_rows):
+        source = inspect.getsource(fn)
+        assert "generation" not in source and "advisory" not in source, fn.__name__
