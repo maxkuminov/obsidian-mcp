@@ -216,13 +216,13 @@ async def test_published_mode_follows_the_umask_rather_than_a_hardcoded_644(
         vault_fs._default_file_mode_cache = None
 
 
-async def test_overwrite_resets_the_incumbent_mode_to_server_policy(vault):
-    """Declared policy, not an accident: publication swaps in the staged inode,
-    so an overwrite lands the umask default even over a restrictive incumbent.
+async def test_overwrite_keeps_the_incumbent_mode(vault):
+    """An overwrite token keeps the replaced file's permissions (#447).
 
-    The note path (`vault._atomic_write_at`) has always behaved this way; the
-    two publish paths agreeing is the point of #95. Preserving incumbent bits
-    instead would be a product decision affecting both.
+    This test used to pin the opposite — the umask default over a restrictive
+    incumbent — and that policy was the bug: a 0600 file became 0644 on every
+    replacement. Both publish paths now keep the replaced file's bits, ACL and
+    group, so they still agree, which was the point of #95.
     """
     target = vault / "Attachments" / "secret.png"
     target.write_bytes(b"old")
@@ -247,7 +247,7 @@ async def test_overwrite_resets_the_incumbent_mode_to_server_policy(vault):
         deadline=deadline_in(30),
     )
     assert target.read_bytes() == PNG
-    assert target.stat().st_mode & 0o777 == vault_fs.default_file_mode()
+    assert target.stat().st_mode & 0o777 == 0o600
 
 
 async def test_stream_creates_missing_parent_directories(vault):
@@ -455,6 +455,12 @@ async def test_the_destination_is_resolved_at_publish_time_not_at_open_time(vaul
     — so publishing through it would write somewhere the token never named.
     Bytes are staged under `.transfer-tmp/` and the destination parent is
     re-walked from the root inside the gate.
+
+    Since #447 the staged inode already carries the create rule of the folder
+    it was computed from, so a gate that resolves a *different* folder at the
+    path refuses with a `Conflict` (409, claim released) instead of
+    publishing there with another folder's permissions. The property this
+    test exists for is unchanged: nothing follows the renamed folder.
     """
     moved = vault / "Moved-Away"
 
@@ -467,16 +473,16 @@ async def test_the_destination_is_resolved_at_publish_time_not_at_open_time(vaul
 
     gate = RenamingGate(allow=True)
     row = FakeRow(str(vault), "Attachments/a.bin")
-    await stream_to_vault(
-        row,
-        chunks_of(b"payload"),
-        max_bytes=100,
-        deadline=deadline_in(30),
-        before_publish=gate,
-    )
-    # Published at the path the token committed to, as it resolves now.
-    assert (vault / "Attachments" / "a.bin").read_bytes() == b"payload"
+    with pytest.raises(Conflict, match="folder was replaced"):
+        await stream_to_vault(
+            row,
+            chunks_of(b"payload"),
+            max_bytes=100,
+            deadline=deadline_in(30),
+            before_publish=gate,
+        )
     assert not (moved / "a.bin").exists()
+    assert not (vault / "Attachments" / "a.bin").exists()
     assert temps_under(vault) == []
 
 
