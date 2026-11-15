@@ -657,6 +657,7 @@ def open_dir_beneath(
     *,
     create: bool = False,
     created: list[str] | None = None,
+    follow_default_acl: bool = True,
 ) -> int:
     """Open a directory below `root_fd` with one beneath-root lookup.
 
@@ -708,6 +709,11 @@ def open_dir_beneath(
     new folder and with it a file the caller was told about. A component that
     was already there — or that another creator won the race to — is not
     listed: it is not this call's entry to make durable.
+
+    **`follow_default_acl`** chooses the `mkdirat` mode under a parent with a
+    default ACL (`_create_descent`). Only `open_staging_dir` turns it off:
+    `.transfer-tmp` is made 0o755 as it always was and tightened to 0700
+    straight after, never briefly group-writable through a folder's ACL.
     """
     parts = _split(rel_dir)
     try:
@@ -715,12 +721,19 @@ def open_dir_beneath(
     except FileNotFoundError:
         if not create:
             raise
-    _create_descent(root_fd, parts, rel_dir, created)
+    _create_descent(
+        root_fd, parts, rel_dir, created, follow_default_acl=follow_default_acl
+    )
     return _lookup_dir(root_fd, parts, rel_dir)
 
 
 def _create_descent(
-    root_fd: int, parts: list[str], rel_dir, created: list[str] | None = None
+    root_fd: int,
+    parts: list[str],
+    rel_dir,
+    created: list[str] | None = None,
+    *,
+    follow_default_acl: bool = True,
 ) -> None:
     """Create the missing components of `parts`, carrying no descriptor across.
 
@@ -749,7 +762,8 @@ def _create_descent(
     for depth in range(len(parts)):
         prefix_fd = _lookup_dir(root_fd, parts[:depth], rel_dir)
         try:
-            os.mkdir(parts[depth], _new_directory_mode(prefix_fd), dir_fd=prefix_fd)
+            mode = _new_directory_mode(prefix_fd) if follow_default_acl else 0o755
+            os.mkdir(parts[depth], mode, dir_fd=prefix_fd)
         except FileExistsError:
             pass
         else:
@@ -1266,7 +1280,9 @@ def open_staging_dir(root_fd: int, *, create: bool = True) -> int:
     `mkdirat` produces: the parent's default ACL where it has one, otherwise
     the ordinary 0755 under the umask (`_create_descent`).
     """
-    fd = open_dir_beneath(root_fd, STAGING_DIR, create=create)
+    fd = open_dir_beneath(
+        root_fd, STAGING_DIR, create=create, follow_default_acl=False
+    )
     try:
         st = os.fstat(fd)
         if st.st_uid != os.geteuid():

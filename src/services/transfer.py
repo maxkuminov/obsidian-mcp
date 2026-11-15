@@ -1686,7 +1686,11 @@ def _parent_rel(rel_path: str) -> str:
 
 
 def _apply_publication_permissions(
-    root_fd: int, row, staged_fd: int, staged_st: os.stat_result
+    root_fd: int,
+    staging_fd: int,
+    row,
+    staged_fd: int,
+    staged_st: os.stat_result,
 ) -> tuple[int, int] | None:
     """Capture the bound path's permission rule once and apply it (#447, D5).
 
@@ -1717,6 +1721,12 @@ def _apply_publication_permissions(
         directory = vault_fs.capture_dir(dst_fd)
         fp = row.expected_fingerprint if row.overwrite else None
         if fp is not None:
+            # A destination that came to sit on another mount since the mint
+            # would also fail the fingerprint comparison below; classify it as
+            # the mount boundary it is, exactly as the gate would, rather than
+            # as a changed target. Both refuse before publication.
+            vault_fs.require_same_mount(staging_fd, dst_fd, row.path)
+            vault_fs.require_leaf_on_same_mount(staging_fd, dst_fd, name, row.path)
             try:
                 leaf = vault_fs.capture_leaf(dst_fd, name)
             except vault_fs.CaptureChanged:
@@ -1992,7 +2002,7 @@ async def _stream_locked(
             # through which to reach them at all. In the named mode the staged
             # descriptor is still open here; it closes after the flush.
             captured_dir = _apply_publication_permissions(
-                root_fd, row, staged_fd, staged_st
+                root_fd, staging_fd, row, staged_fd, staged_st
             )
             # Durability, before the gate and off the loop — see
             # `_flush_staged_payload`. The body is complete at this point and

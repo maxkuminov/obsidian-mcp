@@ -873,10 +873,21 @@ async def test_a_new_folder_with_no_default_acl_is_unchanged(notes, umask):
     assert stat.S_IMODE(os.lstat(notes / "New").st_mode) == 0o755
 
 
-async def test_the_staging_directory_stays_owner_only(acl_fs):
-    """Scenario: The staging directory stays owner-only."""
+async def test_the_staging_directory_stays_owner_only(acl_fs, monkeypatch):
+    """Scenario: The staging directory stays owner-only — made with the same
+    0o755 as before (never 0o777 through the root's default ACL), then 0700."""
     set_acl(acl_fs, group_rwx_default())
-    await upload(acl_fs, "drop.bin")
+    modes: dict[str, int] = {}
+    real_mkdir = os.mkdir
+
+    def recording_mkdir(path, mode=0o777, *args, **kwargs):
+        modes[str(path)] = mode
+        return real_mkdir(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "mkdir", recording_mkdir)
+    await upload(acl_fs, "New/drop.bin")
+    assert modes[vault_fs.STAGING_DIR] == 0o755
+    assert modes["New"] == 0o777
     assert stat.S_IMODE(os.lstat(acl_fs / vault_fs.STAGING_DIR).st_mode) == 0o700
 
 
