@@ -15,29 +15,36 @@ The owner's decision for this change, in his words: "keep a note's existing perm
 
 ## What Changes
 
-- **Edit rule.** A publication that replaces an existing regular file leaves the published file with the replaced file's permission bits (`0o777`) and POSIX access ACL, read from that file through a descriptor. setuid, setgid and sticky are never carried. The server tries to keep the replaced file's gid on the staged inode. When it cannot, the publication gets the create rule instead, so group-class permissions are never handed to another group. The owner uid is never changed: the new inode belongs to the server.
-- **Create rule.** A publication at a name that did not exist gets exactly what `open(O_CREAT, 0o666)` gets in that directory: the directory's default ACL where it has one (umask not applied), otherwise `0o666 & ~umask`. This holds for uploads too, which stage in `.transfer-tmp` rather than in the destination directory.
-- **Directories** the server creates in the vault are made with mode argument 0o777, so the kernel applies the parent's default ACL or the umask exactly as `mkdir` does. Today they are made 0o755, which under a group-`rwx` default ACL gives `mask::r-x`: the group cannot create files in a folder the server made. `.transfer-tmp` stays 0o700.
-- **Never broader, never silent.** `ENODATA`, `EOPNOTSUPP` and `ENOTSUP` from the ACL calls mean "no POSIX ACL here": such filesystems keep today's mode-only behaviour. Any other failure to apply the rule refuses the write and publishes nothing: `io_failure` from the tools, a released claim for an upload.
-- **Staging stays private.** Staged inodes are still created 0600. The rule is applied before the existing payload flush, and captured again at the publish point from the descriptor the `expected=` comparison reads. It is re-applied and flushed a second time only when the destination changed in between.
+- **Edit rule.** A publication that replaces an existing regular file keeps the replaced file's permission bits (`0o777`), POSIX access ACL and gid. The bits and ACL are read from that file through a descriptor. setuid, setgid and sticky are never carried. The owner uid is never changed: the new inode belongs to the server.
+- **Create rule.** A publication at a name that did not exist gets exactly what `open(O_CREAT, 0o666)` gets in that directory: the directory's default ACL where it has one (umask not applied), otherwise `0o666 & ~umask`, and the gid an ordinary create gets. This holds for uploads too, which stage in `.transfer-tmp` rather than in the destination directory.
+- **Group translation.** Both rules use it when the server cannot give the new inode the wanted gid (a group it is not in). The owning-group entry becomes `---`, and a named entry for the wanted group carries its permissions. On a filesystem without ACLs, the group bits are cleared and the other bits are capped by them. For every principal other than the server and the file's previous owner, the result is never broader than the rule (proved in the design).
+- **Directories under a default ACL.** These are made with mode argument 0o777, so the kernel applies the default ACL exactly as `mkdir` does. Today 0o755 gives `mask::r-x`, so the group cannot create files in a folder the server made. Without a default ACL, folders stay 0o755, byte-identical to today. `.transfer-tmp` stays 0o700.
+- **Never broader, never silent.**
+  - `ENODATA`, `EOPNOTSUPP` and `ENOTSUP` from the ACL calls mean "no POSIX ACL here": such filesystems keep the mode-only behaviour.
+  - Any other failure to apply the rule refuses the write and publishes nothing: `io_failure` from the tools, a released claim for an upload.
+- **Staging stays private; one flush.**
+  - Staged inodes are still created 0600. The rule is captured once and applied before the existing payload flush.
+  - A note overwrite captures the leaf again at the publish point, from the descriptor the `expected=` comparison reads. A difference there is the existing in-call conflict (`concurrent_write`), with nothing published.
+  - An upload's capture is bound to the token's fingerprint.
 - **No new setting, no migration, no new refusal code, no tool schema or description change.**
 
 ## Non-goals
 
 - Repairing files that earlier releases already narrowed or widened.
 - NFSv4 and richacl ACLs. Other extended attributes (`user.*`, security labels), which are lost on edit as before. Hard links, which a rename breaks as before.
-- Changing the owner uid of a replaced file (works only for a root deployment, see design D4).
+- Changing the owner uid of a replaced file, or refusing when it differs (design D4).
+- The directory mode outside a default ACL (left at 0o755; a follow-up issue).
 - Changing what `move_note` does to the moved file: a rename keeps its inode, mode and ACL, as `mv` does.
 
 ## Capabilities
 
 ### New Capabilities
 
-- `file-permissions`: the edit rule, the group fallback, the create rule, directory creation, mode-only filesystems, the failure policy, and private staging with the publish-point binding.
+- `file-permissions`: the edit rule, group translation, the create rule, directory creation under a default ACL, mode-only filesystems, the failure policy, and coherent capture with the publish-point conflict.
 
 ### Modified Capabilities
 
-- `file-transfer`: the upload requirement's step (5) stops relaxing the staged file to the umask default and applies the `file-permissions` rule instead. Step (6) re-captures inside the publish gate and refuses an overwrite whose target is not the file the fingerprint names.
+- `file-transfer`: the upload requirement's step (5) stops relaxing the staged file to the umask default and applies the `file-permissions` rule instead. The capture is bound to the fingerprint. Step (6) refuses when the gate's destination folder is not the one captured, and never captures or flushes a second time.
 
 ## Impact
 
@@ -48,7 +55,9 @@ The owner's decision for this change, in his words: "keep a note's existing perm
 - **Tests:** a real-filesystem module with control-file oracles. A CI env var turns the no-ACL skip into a failure. One existing test that pins the old policy is inverted.
 - **Behaviour:**
   - Edited files keep their mode and ACL.
-  - New files and folders match what any other program would create there.
+  - New files match what any other program would create there.
+  - Folders under a default ACL do too; other folders are unchanged.
   - Under umask 022 with no ACLs (the reference container), nothing visible changes for new files and folders.
+  - An unguarded `write_file(overwrite=True)` whose target changes identity or permissions mid-call now answers `concurrent_write`.
   - A host where an ACL call fails for a reason other than "unsupported" now refuses writes instead of publishing with the wrong permissions.
 - **Docs:** `docs/architecture/vault-tools.md`, `docs/architecture/file-transfer.md`, `CLAUDE.md`, `README.md` (1.5.1 upgrade note), release notes.
