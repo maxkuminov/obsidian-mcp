@@ -17,15 +17,15 @@ Refs #447. Read `proposal.md`, `design.md` (K1–K7, D1–D9, the scope inventor
   - `ENODATA`, `EOPNOTSUPP` and `ENOTSUP` mean no ACL. Any other errno raises `PermissionsNotApplied`.
 - [ ] 1.4 `edit_plan(leaf)` and `create_plan(dir, staged_gid)` per D1. Never `os.getegid()`. `Plan` is a frozen dataclass.
 - [ ] 1.5 `translate(plan, staged_gid, acl_capable)` per D3: the ACL form (pre-existing named entry left alone, mask rule, sort order) and the mode-only form.
-- [ ] 1.6 `apply_plan(staged_fd, plan, acl_capable)` per D2. Order: gid, then (on `EPERM`/`EINVAL`) translate, then ACL, then mode. `EOPNOTSUPP`/`ENOTSUP` on writing a *translated* ACL takes the mode-only form. Every other failure raises `PermissionsNotApplied`. Never `fchown` the uid.
+- [ ] 1.6 `apply_plan(staged_fd, plan, acl_capable)` per D2. Order: gid, then (on `EPERM`/`EINVAL`) translate, then ACL, then mode. `EOPNOTSUPP`/`ENOTSUP` on writing a *translated* ACL takes the mode-only form only when the rule has no ACL. For a rule with an ACL, that and every other failure raises `PermissionsNotApplied`. Never `fchown` the uid.
 - [ ] 1.7 `_create_descent` (D8): read the parent's default ACL through the prefix descriptor. Use mode 0o777 when it exists, and 0o755 when there is none or any read error. `open_staging_dir` is untouched.
 - [ ] 1.8 Rewrite the docstrings that describe the #95 relax step: `default_file_mode`, `create_temp`, `open_staging_dir`.
 
 ## 2. Note and raw-file writes (`src/services/vault.py`)
 
 - [ ] 2.1 P1: replace the `fchmod` at `:2452` with capture (leaf on the overwrite branch only, and the directory), plan and `apply_plan`, before the existing `fsync`. `CaptureChanged` raises `RuntimeError("File changed while editing: <name>")`.
-- [ ] 2.2 P2, overwrite branch only. Replace the `_read_fd_bytes(…, max_bytes=len(expected))` comparison with a helper that keeps its descriptor, with the same bound and errors, and capture the leaf through it. With no `expected`, capture through `O_PATH` immediately before `_require_staged_name`. Any difference from P1 raises `RuntimeError("File changed while editing: <name>")`: identity, gid, mode bits, ACL bytes, or a regular file appeared or vanished. There is no re-apply and no second `fsync`.
-- [ ] 2.3 Update the `_atomic_write_at` docstring's ordering list for P1 and P2, and state that the compare-to-rename window is unchanged.
+- [ ] 2.2 P2, overwrite branch only. Replace the `_read_fd_bytes(…, max_bytes=len(expected))` comparison with a helper that keeps its descriptor, with the same bound and errors, and capture the leaf through it **before** reading and comparing the bytes, so nothing is added between the comparison and the rename. With no `expected`, capture through `O_PATH` immediately before `_require_staged_name`. Any difference from P1 raises `RuntimeError("File changed while editing: <name>")`: identity, gid, mode bits, ACL bytes, or a regular file appeared or vanished. There is no re-apply and no second `fsync`.
+- [ ] 2.3 Update the `_atomic_write_at` docstring's ordering list for P1 and P2, and state that the compare-to-rename window is exactly today's.
 
 ## 3. Uploads and imports (`src/services/transfer.py`)
 
@@ -41,7 +41,7 @@ Refs #447. Read `proposal.md`, `design.md` (K1–K7, D1–D9, the scope inventor
 
 - [ ] 4.1 `tests/test_preserve_file_permissions.py` (new), per design "Test plan":
   - the probe fixture with the `OMCP_TEST_REQUIRE_POSIX_ACL` skip-to-failure switch;
-  - control oracles including `st_gid`;
+  - control oracles with `st_gid` in the group-kept case, and the staged gid plus effective access in translation cases;
   - the effective-access helper (K7) for translation cases;
   - every case listed there.
 - [ ] 4.2 Invert `tests/test_transfer_service.py::test_overwrite_resets_the_incumbent_mode_to_server_policy`: the incumbent's 0600 is kept. Rename it and rewrite its docstring. Keep `test_written_note_keeps_the_umask_default_mode` and the umask-following upload test as they are.

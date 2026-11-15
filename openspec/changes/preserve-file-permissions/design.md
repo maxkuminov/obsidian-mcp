@@ -54,6 +54,7 @@ Before writing any permission, every publication computes a plan `(wanted_gid, m
 - **Edit plan.** Used when the overwrite branch finds a regular file at the name. It is the replaced file's `(st_gid, st_mode & 0o777, access ACL or None)`.
 - **Create plan.** Used for no-clobber, for an absent name, and for a non-regular leaf.
   - `wanted_gid`: the directory's `st_gid` when the directory is setgid; otherwise `fstat(staged).st_gid`, which by K1 is what an ordinary create gets: for notes it was staged in that directory, for uploads `.transfer-tmp` is not setgid. Never `os.getegid()`.
+  - Equality with an ordinary create, gid included, holds for writes staged in the destination directory (notes and raw files) and for an upload whose group is kept. An upload whose group is not kept keeps the staged gid and gets the translation. On a filesystem without ACLs, an upload into a setgid folder whose group the server is not in therefore gives that group only other-class access (L13).
   - From a default ACL: AND `USER_OBJ`, `MASK` (or `GROUP_OBJ`) and `OTHER` with 6, and keep named entries. `mode` follows from the result. `acl` is `None` when only the three base entries remain.
   - Without a default ACL: `mode = default_file_mode()` and `acl = None`.
 
@@ -89,7 +90,7 @@ Let `G` be the wanted gid and `G'` the staged inode's gid, which stays. Let `R` 
 - Entries stay in sort order.
 - `mode` becomes `u<<6 | mask<<3 | o`, numerically the rule's mode.
 
-**Mode-only.** This applies when the ACL capture reported no ACL support, or when writing `T` fails with `EOPNOTSUPP`/`ENOTSUP`. The mode becomes the rule's mode with the group bits cleared and `o' = o & g`.
+**Mode-only.** This applies only when the rule has no ACL, so it has no named entries: its source had no access ACL xattr, or the filesystem reported ACLs unsupported. It is taken when the filesystem has no POSIX ACLs, or when writing `T` for such a rule fails with `EOPNOTSUPP`/`ENOTSUP`. The mode becomes the rule's mode with the group bits cleared and `o' = o & g`. **When the rule has an ACL and writing `T` fails for any reason, that is the D6 refusal.** A mode cannot express a denying named entry (round 2, R2-1: `g:<g2>:---` with `o::rw-` would publish `rw-` to `<g2>` through other).
 
 **Property.** Let `S` be the server's uid and `O` the replaced file's previous owner (for a create, `O = S`). Consider an unprivileged principal `p ∉ {S, O}`, with no `CAP_DAC_*`. Its access to the published file is a subset of its access under the rule:
 
@@ -116,7 +117,13 @@ Both get a subset.
   - `p ∉ G ∪ G'`: the set is unchanged.
 - **Step 4.** `OTHER` is unchanged and is reached by the same principals, except (a).
 
-*Mode-only:* `p ∈ G'` gets nothing. Any other `p` gets `o & g`, which is a subset of both `g` (what a member of `G` had) and `o` (what everyone else had). Subset for all; equality is not claimed. ∎
+*Mode-only (rule without ACL only).* Before: owner `O` with `u`, group `G` with `g`, other `o`, and no named entries. After: owner `S` with `u`, group `G'` with `---`, other `o & g`. For `p ∉ {S, O}`:
+
+- **Owner class:** `p` is in it neither before nor after.
+- **Group class after** (`p ∈ G'`): `p` gets nothing, a subset of anything.
+- **Otherwise,** `p` is in the other class after and gets `o & g`. That is a subset of `g` if `p ∈ G` (it had the group class) and a subset of `o` if not (it had the other class).
+
+Subset for all; equality is not claimed. ∎
 
 The issue's private-file case: the server's own 0600 file with gid `G`, edited under a permissive default ACL. Before the fix, that edit published 0644. A create-plan fallback would publish the folder's grants. Translation publishes `group::---`, `group:G:---`, `mask::---` and `other::---`, which grants nothing to anyone but the owner.
 
@@ -134,14 +141,14 @@ The published inode belongs to the server's uid. The gid is the wanted one, or `
 
 - **Coherent leaf capture.** `fstat`, read the access ACL (through the comparison's descriptor or `/proc/self/fd/<n>` of an `O_PATH | O_NOFOLLOW` one, K4), then `fstat` again. A different `(st_dev, st_ino, st_ctime_ns)` is the in-call conflict: `RuntimeError("File changed while editing: <name>")` in `vault`, `vault_fs.Conflict` on uploads. A directory capture reads `fstat` (setgid bit, gid, identity) and the default ACL, which are independent facts. It is not ctime-checked, because entry churn changes a directory's ctime.
 - **Notes and raw files, P1.** After the payload is written and before the existing `fsync`, capture the leaf (overwrite branch only) and the directory through `target.dir_fd`, plan, and apply. This replaces `vault.py:2452`. The one `fsync` covers the permissions, since `fsync` flushes the inode's metadata and xattrs.
-- **Notes and raw files, P2** (overwrite branch only). `_read_fd_bytes` is replaced by a helper that keeps its descriptor. The `expected=` comparison reads the bytes, then the leaf is captured again through that descriptor. With no `expected=`, it is captured through a fresh `O_PATH | O_NOFOLLOW` descriptor immediately before `_require_staged_name`. Any difference from P1 is the in-call conflict, so nothing is published and the tools' existing `concurrent_write` handling and retries apply, with or without `expected=`. A difference is any of:
+- **Notes and raw files, P2** (overwrite branch only). `_read_fd_bytes` is replaced by a helper that keeps its descriptor. The leaf is captured again (`fstat`, ACL, `fstat`) through that descriptor **before** the `expected=` comparison reads and compares the bytes. With no `expected=`, it is captured through a fresh `O_PATH | O_NOFOLLOW` descriptor immediately before `_require_staged_name`. Any difference from P1 is the in-call conflict, so nothing is published and the tools' existing `concurrent_write` handling and retries apply, with or without `expected=`. A difference is any of:
   - identity;
   - gid;
   - mode bits;
   - ACL bytes;
   - a regular file having appeared or vanished.
 
-  There is no re-apply and no second `fsync`. **The pre-existing compare-to-rename window is unchanged**: P2 adds one `fstat` and one xattr read between the comparison and `_require_staged_name`, and nothing slower. A permission change after P2 is lost with the replaced inode (L7), like a content write in the same window today.
+  There is no re-apply and no second `fsync`. **The compare-to-rename window is exactly today's**: nothing is added between the byte comparison and `_require_staged_name` / the rename. Without `expected=`, the `O_PATH` capture sits where the comparison would. A permission change after the P2 capture is lost with the replaced inode (L7). A content write after the comparison is overwritten, as today.
 - **Uploads.** One capture, after `_drain` and before `_flush_staged_payload`, replacing `transfer.py:1904`. The destination parent is opened with `open_parent(…, create=False)`. A missing parent is a `Conflict` (409, claim released): the up-front walk created it, so it vanished during the stream.
   - For an overwrite token with a fingerprint, the leaf capture's `(st_dev, st_ino, st_ctime_ns)` must equal the fingerprint's, or `Conflict("Target changed since the token was minted: …")`. `publish`'s own fingerprint re-check inside the gate covers every later change.
   - For a create plan, the gate compares `fstat(dst_fd)`'s `(st_dev, st_ino)` with the captured directory's, and a mismatch is `Conflict`. This is an identity check, not a second capture.
@@ -164,7 +171,7 @@ The published inode belongs to the server's uid. The gid is the wanted one, or `
 **Not failures:**
 
 - `EPERM` and `EINVAL` from the gid `fchown` (D3).
-- `EOPNOTSUPP` and `ENOTSUP` from writing a translated ACL. These take the mode-only translation.
+- `EOPNOTSUPP` and `ENOTSUP` from writing a translated ACL **for a rule with no ACL**. These take the mode-only translation. For a rule with an ACL, they are a failure.
 
 A required non-translated ACL write refused with `EOPNOTSUPP`/`ENOTSUP` **is** a failure: the directory reported an ACL on the same filesystem, and dropping it would remove named entries.
 
@@ -174,7 +181,7 @@ A required non-translated ACL write refused with `EOPNOTSUPP`/`ENOTSUP` **is** a
 - Directory read unsupported: `0o666 & ~umask`.
 - Removal is a no-op.
 - `apply` is `fchown` (if needed) plus `fchmod`.
-- A group not kept takes the mode-only translation.
+- A group not kept takes the mode-only translation (the rule has no ACL here by construction).
 
 ### D8. Directories, only under a default ACL
 
@@ -226,6 +233,7 @@ No other writer creates vault files. The indexer, the panel and the change feed 
 - **L10.** A directory's default ACL changed during a call is not seen by that call's create plan.
 - **L11.** A default ACL removed between the directory read and the `mkdirat` gives a folder of `0o777 & ~umask`.
 - **L12.** The upload refusal for D6 is a generic HTTP 500 with the claim released.
+- **L13.** On a filesystem without POSIX ACLs, an upload into a setgid folder whose group the server is not in is published with the server's gid and the mode-only translation, so the folder's group gets only other-class access. That is exactly what it gets today on that input, so nothing regresses and nothing is broadened. Notes and raw files are unaffected, because they stage in the destination directory and inherit its gid. The fix, staging uploads in the destination directory, is a redesign of transfer staging. A follow-up issue will be filed.
 
 ## Risks / Trade-offs
 
@@ -242,7 +250,7 @@ New module `tests/test_preserve_file_permissions.py`, on the real filesystem und
 
 **Oracles:**
 
-- Create: a control from `os.open(name, O_CREAT|O_WRONLY, 0o666, dir_fd=…)` in the same directory has the same `st_mode & 0o777`, `st_gid` and access ACL value (bytes, or `ENODATA`).
+- Create: a control from `os.open(name, O_CREAT|O_WRONLY, 0o666, dir_fd=…)` in the same directory has the same `st_mode & 0o777` and access ACL value (bytes, or `ENODATA`), and, wherever the group is kept, the same `st_gid`. Translation cases instead assert the specified gid (the staged inode's) and effective access through the helper.
 - Edit: `(st_mode & 0o777, st_gid, ACL value)` before equals after.
 - Directory: a control from `os.mkdir(…, 0o777)` has the same mode, access ACL and default ACL. With no default ACL, 0o755 under umask 0.
 - **Translation cases** use an effective-access helper. It computes read/write for a given `(uid, groups)` from owner, gid, mode and ACL by K7. Members of the old group, of the new owning group, of both and of neither are compared with before (edit) or with the control (create).
@@ -254,7 +262,8 @@ New module `tests/test_preserve_file_permissions.py`, on the real filesystem und
 - `stream_to_vault`: create, overwrite token, chmod after mint giving 409, setgid folder translation through a monkeypatched `fchown` returning `EPERM`, folder replaced before the gate giving 409.
 - Directories, under a default ACL and without one (umask 0), and `.transfer-tmp`.
 - Edit translation (monkeypatched `fchown` returning `EPERM`), including F1's private-file input. A supplementary-group keep where the process has one.
-- Mode-only through monkeypatched `EOPNOTSUPP`, including the mode-only translation.
+- Mode-only through monkeypatched `EOPNOTSUPP`, including the mode-only translation and L13's 0o604 upload.
+- R2-1: a rule with a denying named entry whose translated ACL write fails with `EOPNOTSUPP` gives `io_failure`, nothing published.
 - `EIO` on `fsetxattr` giving `io_failure` with nothing changed, and a released claim for an upload.
 - A chmod between P1 and P2 giving the conflict, with nothing published. An ACL changed mid-capture (hook between `fstat` and the read) giving the conflict.
 - Exactly one staged `fsync` per write.
@@ -273,3 +282,10 @@ Codex spec review, round 1: FAIL, with 1 BLOCKER, 4 MAJOR and 3 MINOR findings. 
 - **F7 MINOR.** `getegid` is not the creating gid. **Accepted.** The creating gid is the setgid directory's, else the staged inode's (D1).
 - **F8 MINOR.** The create oracle ignored the gid. **Accepted.** `st_gid` is compared, and translation is tested with an effective-access helper.
 - **D6, the refusal policy, kept** as ruled.
+
+Codex spec review, round 2: FAIL, with 1 BLOCKER, 1 MAJOR and 2 MINOR findings. Codex confirmed that the ACL translation itself is sound. Dispositions:
+
+- **R2-1 BLOCKER.** The mode-only fallback after an unsupported translated-ACL write can drop a denying named entry. **Accepted.** Mode-only is allowed only for a rule without an ACL; otherwise the D6 refusal applies (D3, D6).
+- **R2-2 MAJOR.** On a filesystem without ACLs, an upload into a foreign setgid folder lacks the folder's group access. **Declined as a fix.** Recorded as L13, the create requirement states the narrower result, and a follow-up issue will be filed.
+- **R2-3 MINOR.** The P2 metadata read sat between the comparison and the rename. **Accepted.** It is taken before the bytes are compared, and the window is exactly today's (D5).
+- **R2-4 MINOR.** The create oracle's gid equality was unqualified. **Accepted.** It is qualified to the group-kept case, and translation cases assert the staged gid and effective access.

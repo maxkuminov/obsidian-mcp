@@ -45,7 +45,7 @@ Every publication that replaces an existing regular file SHALL leave the publish
 - `MASK`: the rule's mask when it has one. Otherwise, the OR of the new ACL's group-class entries.
 - Entries in the kernel's sort order.
 
-**On a filesystem without POSIX ACLs**, the published mode SHALL be the rule's mode with the group bits cleared and the other bits ANDed with the rule's group bits.
+**Mode-only translation**, permitted only when the rule has no ACL (its source had no access ACL xattr, or the filesystem reported ACLs unsupported, so there are no named entries): when the filesystem has no POSIX ACLs, or writing the translated ACL is refused with `EOPNOTSUPP`/`ENOTSUP`, the published mode SHALL be the rule's mode with the group bits cleared and the other bits ANDed with the rule's group bits. When the rule has an ACL and writing the translated ACL fails for any reason, the write SHALL be refused and nothing published, per the failure requirement.
 
 For every unprivileged principal other than the server's uid and the replaced file's previous owner, the access the published file grants SHALL be a subset of the access its rule grants.
 
@@ -77,6 +77,7 @@ A publication that creates a name SHALL leave the published file with the permis
 - The rule SHALL hold whatever directory the bytes were staged in, including `.transfer-tmp`.
 - The wanted gid SHALL be the directory's gid when the directory has the setgid bit, and otherwise the gid observed on the staged inode the process just created. It SHALL NOT be derived from the process's effective gid.
 - When the wanted gid cannot be set, the group translation requirement SHALL apply.
+- Equality with the control file, `st_gid` included, SHALL hold for every write staged in the destination directory (notes and raw files), and for an upload wherever the wanted gid is kept. For an upload whose group is not kept, the published `st_gid` SHALL be the staged inode's, and on a filesystem with POSIX ACLs the translation SHALL give the wanted group the access the control file gives it. **On a filesystem without POSIX ACLs, an upload into a setgid directory whose group the server cannot set SHALL be published with the server's gid and the mode-only translation, so the directory's group gets only the other-class access** — narrower than an ordinary create, and the same as before this change.
 
 #### Scenario: Group-writable default ACL
 
@@ -97,6 +98,11 @@ A publication that creates a name SHALL leave the published file with the permis
 
 - **WHEN** `write_file(overwrite=True)` writes a name that does not exist, in a directory whose default ACL grants a named group `rwx`
 - **THEN** the file's mode bits, `st_gid` and ACL bytes SHALL equal those of the control file
+
+#### Scenario: Upload into a foreign setgid folder on a filesystem without ACLs
+
+- **WHEN** every xattr call fails with `EOPNOTSUPP`, the umask is 0o002, and a no-overwrite upload is published into a setgid directory with gid `<g>` that the server cannot set
+- **THEN** the published file's `st_gid` SHALL be the staged inode's and its `st_mode & 0o777` SHALL be 0o604
 
 #### Scenario: Upload staged under a different default ACL
 
@@ -143,7 +149,7 @@ Any other failure while capturing or applying the permission rule SHALL publish 
 - `fchown` failing with anything other than `EPERM` or `EINVAL`;
 - `fsetxattr`, `fremovexattr` or `fchmod`;
 - an unparsable ACL;
-- a required ACL write refused with `EOPNOTSUPP` or `ENOTSUP`.
+- a required ACL write refused with `EOPNOTSUPP` or `ENOTSUP`, including a translated ACL for a rule that has an ACL.
 
 A note or file tool SHALL answer it as an `io_failure` refusal whose text says that the permissions could not be applied and that nothing was written. An upload SHALL treat it as a pre-publication failure: the claim is released and the token is `pending` again.
 
@@ -151,6 +157,11 @@ A note or file tool SHALL answer it as an `io_failure` refusal whose text says t
 
 - **WHEN** `edit_note` runs and setting `system.posix_acl_access` on the staged inode fails with `EIO`
 - **THEN** the response SHALL end with `MCP-REFUSAL {"code":"io_failure"}`, its text SHALL say that nothing was written, and the note's bytes, `st_mode` and ACL bytes SHALL equal those before the call
+
+#### Scenario: A translated ACL refused as unsupported when the rule has an ACL
+
+- **WHEN** `edit_note` replaces a note whose access ACL is `u::rw-,g::rw-,g:<g2>:---,m::rw-,o::rw-`, the server cannot set the note's gid, and writing the translated ACL fails with `EOPNOTSUPP`
+- **THEN** the response SHALL be the `io_failure` refusal, nothing SHALL be published, and the note's bytes, `st_mode` and ACL bytes SHALL be unchanged
 
 #### Scenario: An ACL write fails during an upload
 
@@ -163,7 +174,7 @@ Staging inodes SHALL still be created with mode 0o600. Every write SHALL capture
 
 **Leaf captures.** A capture of a leaf SHALL be `fstat`, then a read of the access ACL, then `fstat` again. A changed `(st_dev, st_ino, st_ctime_ns)` between the two SHALL be an in-call conflict.
 
-**Note and raw-file overwrites.** In this branch the server SHALL capture the leaf again immediately before publication: through the descriptor the `expected=` comparison read the bytes from, or through a fresh `O_PATH | O_NOFOLLOW` descriptor where there is no comparison. Any difference from the first capture SHALL publish nothing and SHALL raise the existing in-call conflict, `File changed while editing: <name>`, with or without `expected=`. A difference is any of:
+**Note and raw-file overwrites.** In this branch the server SHALL capture the leaf again immediately before publication: through the descriptor the `expected=` comparison reads the bytes from, taken **before** the bytes are read and compared, or through a fresh `O_PATH | O_NOFOLLOW` descriptor where there is no comparison. Nothing SHALL be added between the byte comparison and the rename. Any difference from the first capture SHALL publish nothing and SHALL raise the existing in-call conflict, `File changed while editing: <name>`, with or without `expected=`. A difference is any of:
 
 - identity;
 - gid;
