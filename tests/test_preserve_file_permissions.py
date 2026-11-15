@@ -275,19 +275,30 @@ def no_xattrs(monkeypatch):
         monkeypatch.setattr(os, name, unsupported)
 
 
+@pytest.fixture(autouse=True)
+def _container_umask(monkeypatch):
+    """Every test runs under umask 0o022, the reference container's.
+
+    Not cosmetic: under a developer's 0o002 the old fixed mode was 0o664,
+    which happens to give a group-`rwx` folder `mask::rw-`, so the bug this
+    module exists for would not reproduce.
+    """
+    previous = os.umask(0o022)
+    monkeypatch.setattr(vault_fs, "_default_file_mode_cache", None)
+    yield
+    os.umask(previous)
+    vault_fs._default_file_mode_cache = None
+
+
 @pytest.fixture
-def umask(monkeypatch):
-    """Set the process umask for one test, with the cached default reset."""
-    saved: list[int] = []
+def umask(monkeypatch, _container_umask):
+    """Set another process umask for one test, with the cached default reset."""
 
     def set_to(value: int) -> None:
-        saved.append(os.umask(value))
+        os.umask(value)
         monkeypatch.setattr(vault_fs, "_default_file_mode_cache", None)
 
-    yield set_to
-    if saved:
-        os.umask(saved[0])
-    vault_fs._default_file_mode_cache = None
+    return set_to
 
 
 @dataclass

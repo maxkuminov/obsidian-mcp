@@ -99,6 +99,10 @@ jobs:
           # inflection pair to one the snowball stemmer collapses in both
           # directions (huset/hus; datasenteret/datasenter was not).
           TEST_DATABASE_URL: postgresql+asyncpg://postgres:test@localhost:5432/postgres
+          # tests/test_preserve_file_permissions.py (#447) skips on a
+          # filesystem without POSIX ACLs; here that skip is a failure, so the
+          # permission tests cannot silently stop running.
+          OMCP_TEST_REQUIRE_POSIX_ACL: "1"
         run: pytest -q -rs --junitxml=pytest-report.xml
 
       # House rule: a gate that silently skips is not a gate. The namespace
