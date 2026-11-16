@@ -1435,6 +1435,55 @@ too.
 Pull, then `make deploy` (or rebuild your compose stack); migrations
 run on start.
 
+Across the file-permissions release (1.5.1, #447):
+
+- **Files the server writes keep their permissions on edit and follow
+  their folder on create.** Before 1.5.1 every file the server wrote,
+  through any tool, upload or import, got mode `0o666 & ~umask`. Under a
+  folder default ACL that cut a group's access to read-only (`mask::r--`),
+  and every edit turned a 0600 file into 0644. Now an edit keeps the file's
+  permission bits, POSIX access ACL and group, and a new file gets exactly
+  what any other program creating it in that folder would get: the folder's
+  default ACL where it has one, otherwise `0o666 & ~umask`. A new note
+  follows its folder's default ACL exactly, so in a folder whose default
+  ACL grants write to "other" the note is world-writable, like any other
+  file created there; tighten that folder's default ACL if you do not want
+  that.
+- **New folders under a default ACL follow it too** (they were created
+  with `mask::r-x`, so the group could not create files in them). Folders
+  outside a default ACL are unchanged (0755).
+- **With umask 022 and no ACLs (the published image), new files and
+  folders look exactly as before**; only an edit of a file whose mode or
+  group differs from what a new file would get behaves differently.
+- **When the server cannot give a file its group** (a group it is not a
+  member of), the file keeps the server's group and the original group's
+  permissions move to a named entry: `getfacl` shows `group::---` and
+  `group:<group>:rw-`. On a filesystem without ACLs the group bits are
+  cleared instead and the "other" bits capped by them. Nobody gains access
+  by this.
+- **A permission step that fails for any reason other than "no ACLs on
+  this filesystem" now refuses the write** (`io_failure`, "nothing was
+  written"; an upload answers 500 and the link can be retried) and logs
+  one ERROR line, `file permissions not applied; nothing was written`,
+  naming the step and the error. An unguarded
+  `write_file(overwrite=True)` whose target's permissions change during
+  the call now answers `concurrent_write`.
+- **Files earlier versions already narrowed or widened are not repaired.**
+  To find files and folders whose ACL mask lost write, and review the list
+  before changing anything:
+
+  ```sh
+  find <vault> \( -type f -o -type d \) -exec sh -c \
+    'getfacl -cp "$1" 2>/dev/null | grep -Eqx "mask::r-[-x]" && echo "$1"' _ {} \;
+  ```
+
+  Restore write on one you confirm (`rw` for a file, `rwx` for a folder):
+  `setfacl -m m::rw <file>`, `setfacl -m m::rwx <folder>`. A file that was
+  private before an edit cannot be told apart from one created readable;
+  `find <vault> -type f -perm -o=r` lists the world-readable ones, and
+  `chmod 600 <file>` (or `chmod 640`) restores one you know should be
+  private. No setting, no migration.
+
 Across the task-rule release (migration 040, #434):
 
 - **Nothing changes until a rule is chosen.** The default rule, `all`,

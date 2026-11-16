@@ -50,16 +50,16 @@ Refs #447. Read `proposal.md`, `design.md` (K1–K7, D1–D9, the scope inventor
 
 ## 5. Docs (last commits of the feature branch)
 
-- [ ] 5.1 `docs/architecture/vault-tools.md`: a "Published file permissions (#447)" section covering:
+- [x] 5.1 `docs/architecture/vault-tools.md`: a "Published file permissions (#447)" section covering:
   - the two rules, group translation with the D3 property, and P1/P2 as a conflict;
   - the failure policy and directories under a default ACL;
   - L1–L12, one line each;
   - "do not reintroduce a fixed mode or a create-plan fallback for edits".
-- [ ] 5.2 `docs/architecture/file-transfer.md`: staging in `.transfer-tmp`, so the ACL is written explicitly; one capture bound to the fingerprint; the gate's directory-identity check; replace the "beside the `os.fchmod`" wording.
-- [ ] 5.3 `CLAUDE.md`: one key-decision bullet. Quote the owner's sentence, state both rules, translation, the never-broader refusal, and directories only under a default ACL, and point to the vault-tools note.
-- [ ] 5.4 `README.md`: 1.5.1 upgrade note.
+- [x] 5.2 `docs/architecture/file-transfer.md`: staging in `.transfer-tmp`, so the ACL is written explicitly; one capture bound to the fingerprint; the gate's directory-identity check; replace the "beside the `os.fchmod`" wording.
+- [x] 5.3 `CLAUDE.md`: one key-decision bullet. Quote the owner's sentence, state both rules, translation, the never-broader refusal, and directories only under a default ACL, and point to the vault-tools note.
+- [x] 5.4 `README.md`: 1.5.1 upgrade note.
   - The server does not repair files already narrowed or widened.
   - How an operator can find and fix them with `getfacl`/`setfacl` and `chmod`, using placeholders only.
   - Edits of files whose group the server is not in now carry a named group entry.
-- [ ] 5.5 Release-notes input for 1.5.1.
-- [ ] 5.6 Before the PR: grep for host paths, hostnames, usernames and vault note names; the repo is public.
+- [x] 5.5 Release-notes input for 1.5.1.
+- [x] 5.6 Before the PR: grep for host paths, hostnames, usernames and vault note names; the repo is public.

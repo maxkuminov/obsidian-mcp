@@ -154,6 +154,23 @@ update it in the same change.** What stays here is the short list:
 - API keys use `omcp_` prefix, stored as SHA-256 hashes
 - Panel/OAuth passwords: direct `bcrypt` (`$2b$`, cost 12); both hash and verify truncate the UTF-8 encoding at 72 bytes and reject NUL bytes — passlib's historical semantics — so existing hashes stay valid; don't "fix" the truncation.
 - Vault mounted read-write at /obsidian in container
+- **A published file's permissions come from a rule, never a fixed mode**
+  (#447; owner, in his words: "keep a note's existing permissions on edit").
+  Every write publishes a new inode staged at 0600, so `vault_fs.apply_plan`
+  writes the plan onto it before the one payload `fsync`. **Edit** (a
+  regular file is replaced): its bits (`0o777`), POSIX access ACL and gid.
+  **Create**: what `open(O_CREAT, 0o666)` gets in the destination folder
+  (its default ACL, umask not applied; else `0o666 & ~umask`), computed for
+  uploads although they stage in `.transfer-tmp`. A gid the server cannot
+  set (`EPERM`/`EINVAL`) moves the owning group's permissions to a named
+  group entry, never broader; any other failure is `PermissionsNotApplied`
+  → `io_failure` / pre-publication 500, nothing published; no fallback to
+  the other rule, no uid `fchown`. The overwrite branch re-captures before
+  the `expected=` comparison (a difference is `concurrent_write`), so the
+  compare-to-rename window is unchanged. New folders get `mkdirat` 0o777
+  only under a default ACL, else 0o755; `.transfer-tmp` stays 0700. See
+  [vault tools](docs/architecture/vault-tools.md), "Published file
+  permissions (#447)".
 - Read responses are capped in characters (`MAX_READ_RESPONSE_CHARS`, default
   40,000) independently of the byte caps on disk I/O — see "Three kinds of size cap"
   in [vault tools](docs/architecture/vault-tools.md). Tool output is model
