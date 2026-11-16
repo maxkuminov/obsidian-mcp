@@ -4712,7 +4712,14 @@ async def create_note_impl(
             return _leaf_state_error(target, path) or (
                 _body_refusal(f"Note already exists: {path}. Use edit_note to modify it.", "already_exists")
             )
-        except (ValueError, vault_fs.VaultFSError) as e:
+        except (ValueError, RuntimeError, vault_fs.VaultFSError) as e:
+            # #447: under VAULT_ALLOW_NAMED_STAGING_FALLBACK the staged copy
+            # has a name, and bytes altered at it before publication are the
+            # in-call conflict — the only way a no-clobber write meets one.
+            if _is_in_call_conflict(e):
+                return _concurrent_write_refusal(str(e), path)
+            if isinstance(e, RuntimeError):
+                raise
             return _body_refusal(str(e), "validation_failed")
         except OSError as e:
             return _body_refusal(f"Failed to write {path}: {e}", "io_failure")

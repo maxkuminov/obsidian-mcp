@@ -1444,7 +1444,10 @@ Across the file-permissions release (1.5.1, #447):
   and every edit turned a 0600 file into 0644. Now an edit keeps the file's
   permission bits, POSIX access ACL and group, and a new file gets exactly
   what any other program creating it in that folder would get: the folder's
-  default ACL where it has one, otherwise `0o666 & ~umask`. A new note
+  default ACL where it has one, otherwise `0o666 & ~umask` (one exception:
+  on a filesystem without POSIX ACLs, an upload into a setgid folder whose
+  group the server is not in keeps the server's group, so that group gets
+  only the "other" access, as before 1.5.1). A new note
   follows its folder's default ACL exactly, so in a folder whose default
   ACL grants write to "other" the note is world-writable, like any other
   file created there; tighten that folder's default ACL if you do not want

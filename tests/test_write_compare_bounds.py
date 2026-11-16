@@ -47,9 +47,10 @@ def test_shared_comparison_keeps_conflict_and_leaf_error_behavior(root, monkeypa
         return original(target, dir_fd, name, max_bytes, before)
 
     monkeypatch.setattr(vault, '_read_fd_bytes_checking_leaf', changed)
-    # A directory where the regular file was is "a regular file having
-    # vanished" since #447: the in-call conflict, no longer `ValueError`.
-    error = OSError if change == 'symlink' else RuntimeError
+    # A directory or a symlink where the regular file was is "a regular file
+    # having vanished" since #447: the in-call conflict, no longer
+    # `ValueError` / `ELOOP`.
+    error = RuntimeError
     with pytest.raises(error) as caught:
         if raw:
             vault.write_bytes(path.name, b'replacement', overwrite=True, expected=b'old')

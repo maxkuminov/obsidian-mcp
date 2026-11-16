@@ -156,6 +156,7 @@ The published inode belongs to the server's uid. The gid is the wanted one, or `
   - For a create plan, the gate compares `fstat(dst_fd)`'s `(st_dev, st_ino)` with the captured directory's, and a mismatch is `Conflict`. This is an identity check, not a second capture.
   - The named-mode staged descriptor is still open at this point (it closes after the flush), so nothing is reopened.
 - **Create plans** are captured once. A change to the directory's default ACL during the call is not seen (L10).
+- **Staged-bytes verification** (named staging only: note and raw-file overwrites, and the named no-clobber fallback). From `apply_plan` on, a staging name in the destination directory carries the note's own permissions, so a principal they let write the note can also write the `.tmp-*`, and the staged-name check proves identity, not bytes. After the single `fsync` and **before** P2 and the comparison, the name must still be the staged regular inode, of the payload's size, holding exactly the payload: compared in bounded chunks against a `memoryview`, read back through the staging descriptor (opened read-write at creation, so a kept mode without owner read cannot make the read fail). A difference is the in-call conflict. It sits before the comparison so the compare-to-rename window stays exactly today's; what remains after it is L14. Uploads need none of this: their named staging is in `.transfer-tmp` (0700) and their unnamed staging has no name.
 
 **Durability.** Every published file's permissions were flushed with its payload before the `link`/`rename` that published it. A crash shows the old file, or the new file with its final permissions.
 
@@ -237,6 +238,8 @@ No other writer creates vault files. The indexer, the panel and the change feed 
 - **L12.** The upload refusal for D6 is a generic HTTP 500 with the claim released.
 - **L13.** On a filesystem without POSIX ACLs, an upload into a setgid folder whose group the server is not in is published with the server's gid and the mode-only translation, so the folder's group gets only other-class access. That is exactly what it gets today on that input, so nothing regresses and nothing is broadened. Notes and raw files are unaffected, because they stage in the destination directory and inherit its gid. The fix, staging uploads in the destination directory, is a redesign of transfer staging. A follow-up issue will be filed.
 
+- **L14.** From the staged-bytes verification to the rename (the publish-point capture and the bounded comparison read), a named staged copy can still be altered by a principal the published permissions let write the note; that principal can write the note itself at any time. Closing it fully means staging overwrites namelessly or in a private directory; a follow-up issue will be filed.
+
 ## Risks / Trade-offs
 
 - **ACL calls failing for another reason now refuse writes** (D6). The refusal is loud and names the step.
@@ -293,3 +296,5 @@ Codex spec review, round 2: FAIL, with 1 BLOCKER, 1 MAJOR and 2 MINOR findings. 
 - **R2-4 MINOR.** The create oracle's gid equality was unqualified. **Accepted.** It is qualified to the group-kept case, and translation cases assert the staged gid and effective access.
 
 Implementation review round 1 (Codex): FAIL, 1 MAJOR (ACL capture required /proc). Accepted, fixed.
+
+Implementation review round 2 (Codex): FAIL — 1 BLOCKER (named staged copy writable under its final permissions before publication): accepted as staged-bytes verification, residual recorded as L14; 1 MAJOR: symlink mapping accepted, FIFO open declined as pre-existing with a follow-up issue; 1 MINOR (README) accepted.

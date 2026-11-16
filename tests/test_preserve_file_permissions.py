@@ -1374,3 +1374,123 @@ async def test_the_destination_folder_replaced_during_the_upload(
     assert not (vault / "Attachments" / "shot.png").exists()
     assert not (vault / "Moved" / "shot.png").exists()
     assert temp_files(vault / vault_fs.STAGING_DIR) == []
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Implementation review round 2: the named staged copy, and a symlink at P2
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def _alter_staged_copy(directory: Path, how: str):
+    """Rewrite the `.tmp-*` staging file in `directory` as a peer could."""
+
+    def action():
+        (staged,) = [p for p in directory.iterdir() if p.name.startswith(".tmp-")]
+        fd = os.open(staged, os.O_WRONLY | (os.O_APPEND if how == "longer" else 0))
+        try:
+            if how == "longer":
+                os.write(fd, b"\nappended by a peer\n")
+            else:
+                size = os.fstat(fd).st_size
+                os.pwrite(fd, b"X" * size, 0)
+        finally:
+            os.close(fd)
+
+    return action
+
+
+@pytest.mark.parametrize("how", ["same length", "longer"])
+async def test_a_staged_copy_altered_before_publication(notes, acl_fs, monkeypatch, how):
+    """Scenario: A staged copy altered before publication — an edit in a
+    group-ACL folder, whose staged copy carries the note's group write."""
+    d = notes / "Shared"
+    d.mkdir()
+    set_acl(d, group_rwx_default())
+    note = note_in(d, "ticket.md")
+    before = snapshot(note)
+    fired = _after_the_staged_flush(monkeypatch, _alter_staged_copy(d, how))
+
+    result = await tools.edit_note_impl("Shared/ticket.md", "after, ours\n")
+
+    assert fired == [True]
+    assert refusal_code(result) == "concurrent_write", result
+    assert "File changed while editing: ticket.md" in result
+    assert snapshot(note) == before
+    assert [p.name for p in d.iterdir() if p.name.startswith(".tmp-")] == []
+
+
+async def test_a_staged_copy_altered_under_an_unguarded_overwrite(notes, monkeypatch):
+    """Scenario: A staged copy altered before publication — `write_file
+    (overwrite=True)` without `expected_hash`, and at an absent name."""
+    f = notes / "f.bin"
+    f.write_bytes(b"old")
+    _after_the_staged_flush(monkeypatch, _alter_staged_copy(notes, "same length"))
+    result = await tools.write_file_impl("f.bin", "new", encoding="text", overwrite=True)
+    assert refusal_code(result) == "concurrent_write", result
+    assert f.read_bytes() == b"old"
+
+    # A second hook wraps the spent first one.
+    _after_the_staged_flush(monkeypatch, _alter_staged_copy(notes, "longer"))
+    result = await tools.write_file_impl("g.bin", "new", encoding="text", overwrite=True)
+    assert refusal_code(result) == "concurrent_write", result
+    assert not (notes / "g.bin").exists()
+    assert [p.name for p in notes.iterdir() if p.name.startswith(".tmp-")] == []
+
+
+async def test_a_staged_copy_altered_under_named_no_clobber_staging(notes, monkeypatch):
+    """Scenario: A staged copy altered before publication — the
+    `VAULT_ALLOW_NAMED_STAGING_FALLBACK` no-clobber path (`create_note`)."""
+
+    def no_tmpfile(_dir_fd):
+        raise vault_fs.UnsupportedFilesystem("O_TMPFILE refused (test)")
+
+    monkeypatch.setattr(vault_service, "_create_nameless_temp", no_tmpfile)
+    monkeypatch.setattr(vault_service.settings, "vault_allow_named_staging_fallback", True)
+    _after_the_staged_flush(monkeypatch, _alter_staged_copy(notes, "same length"))
+
+    result = await tools.create_note_impl("new.md", "ours")
+
+    assert refusal_code(result) == "concurrent_write", result
+    assert not (notes / "new.md").exists()
+    assert [p.name for p in notes.iterdir() if p.name.startswith(".tmp-")] == []
+
+
+async def test_named_staging_still_publishes_with_one_flush(notes, acl_fs, monkeypatch):
+    """The verification reads the staged copy back; it never flushes again."""
+    set_acl(notes, group_rwx_default())
+    note = note_in(notes, "e.md")
+    raw = notes / "r.bin"
+    raw.write_bytes(b"old")
+    os.chmod(raw, 0o200)  # no owner read: the read-back must not reopen by name
+    fsyncs = _count_file_fsyncs(monkeypatch)
+
+    assert refusal_code(await tools.edit_note_impl("e.md", "x" * 3_000_000)) is None
+    assert fsyncs == [os.lstat(note).st_ino]
+    assert note.read_text() == "x" * 3_000_000
+
+    fsyncs.clear()
+    result = await tools.write_file_impl("r.bin", "new", encoding="text", overwrite=True)
+    assert refusal_code(result) is None, result
+    assert fsyncs == [os.lstat(raw).st_ino]
+    assert stat.S_IMODE(os.lstat(raw).st_mode) == 0o200
+
+
+async def test_a_symlink_swapped_in_before_the_comparison_is_a_conflict(notes, monkeypatch):
+    """R2-2(a): a symlink at the name when the `expected=` comparison opens it
+    is the regular file having vanished — `concurrent_write`, not `io_failure`."""
+    note = notes / "n.md"
+    note.write_text("before\n")
+    elsewhere = notes / "elsewhere.md"
+    elsewhere.write_text("untouched\n")
+
+    def swap():
+        note.unlink()
+        note.symlink_to(elsewhere)
+
+    _after_the_staged_flush(monkeypatch, swap)
+
+    result = await tools.edit_note_impl("n.md", "after\n")
+
+    assert refusal_code(result) == "concurrent_write", result
+    assert note.is_symlink()
+    assert elsewhere.read_text() == "untouched\n"

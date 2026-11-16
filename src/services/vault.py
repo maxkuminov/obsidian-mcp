@@ -2143,7 +2143,9 @@ def _create_temp_exclusively(dir_fd: int, name: str) -> tuple[int, str]:
     name in the directory at all.
     """
     flags = (
-        os.O_WRONLY
+        # Read-write: `_require_staged_bytes` reads the payload back through
+        # this descriptor before publication (#447).
+        os.O_RDWR
         | os.O_CREAT
         | os.O_EXCL
         | getattr(os, "O_NOFOLLOW", 0)
@@ -2479,6 +2481,14 @@ def _atomic_write_at(
             target, vault_fs.apply_plan, fd, plan, directory.acl_capable
         )
         os.fsync(fd)
+        if tmp is not None:
+            # From `apply_plan` on, a named staging file carries the
+            # permissions the note will have, so whoever may write the note
+            # may also write the `.tmp-*` beside it. Verify the bytes at that
+            # name are exactly ours **before** P2 and the comparison, so
+            # nothing is added between the comparison and the rename (#447,
+            # D5; the remaining interval is L14).
+            _require_staged_bytes(fd, dir_fd, tmp, staged, payload, name)
 
         if overwrite and expected is not None:
             # P2 through the comparison's own descriptor, taken **before** the
@@ -2608,6 +2618,46 @@ def _discard_temp(
     vault_fs.discard_staged_name(dir_fd, tmp, staged, published=published)
 
 
+# Bytes per read when verifying a staged copy against its payload.
+_STAGED_VERIFY_CHUNK = 1024 * 1024
+
+
+def _require_staged_bytes(
+    fd: int,
+    dir_fd: int,
+    tmp: str,
+    staged: os.stat_result,
+    payload: bytes,
+    name: str,
+) -> None:
+    """Refuse unless the staging name holds exactly `payload` (#447, D5).
+
+    The name must still be our inode (`_require_staged_name`), of the
+    payload's size, and its content is compared in bounded chunks against a `memoryview` of the
+    payload, so a large write is never held twice. The content is read through
+    the staging descriptor itself (opened read-write at creation, while the
+    inode was 0600) once the name is proven to be that inode: a reopen by name
+    would fail `EACCES` for an edit that keeps a mode without owner read. Any
+    difference is the in-call conflict; nothing has been published.
+    """
+    # A different inode at the name — or none — is the existing substitution
+    # refusal (`vault_fs.Conflict`, "The staged copy was replaced"), whose
+    # cleanup leaves the substitute in place; only then are the bytes read.
+    _require_staged_name(dir_fd, tmp, staged)
+    conflict = RuntimeError(f"File changed while editing: {name}")
+    if os.fstat(fd).st_size != len(payload):
+        raise conflict
+    view = memoryview(payload)
+    offset = 0
+    while offset < len(view):
+        chunk = os.pread(fd, min(_STAGED_VERIFY_CHUNK, len(view) - offset), offset)
+        if not chunk or chunk != view[offset : offset + len(chunk)]:
+            raise conflict
+        offset += len(chunk)
+    if os.pread(fd, 1, offset):
+        raise conflict
+
+
 def _permissions_step(target: MutableTarget, step, *args):
     """Run one permission step; log a `PermissionsNotApplied` once, re-raise.
 
@@ -2671,6 +2721,12 @@ def _read_fd_bytes_checking_leaf(
         fd = os.open(name, flags, dir_fd=dir_fd)
     except FileNotFoundError:
         raise RuntimeError(f"File changed while editing: {name}") from None
+    except OSError as exc:
+        # A symlink swapped in at the name since P1 is the regular file
+        # having vanished — the in-call conflict, not an I/O failure.
+        if getattr(exc, "errno", None) == errno.ELOOP:
+            raise RuntimeError(f"File changed while editing: {name}") from None
+        raise
     try:
         _require_same_leaf(
             before, _capture_leaf_or_conflict(target, dir_fd, name, fd=fd), name
