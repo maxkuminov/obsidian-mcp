@@ -165,7 +165,10 @@ update it in the same change.** What stays here is the short list:
   set (`EPERM`/`EINVAL`) moves the owning group's permissions to a named
   group entry, never broader; any other failure is `PermissionsNotApplied`
   → `io_failure` / pre-publication 500, nothing published; no fallback to
-  the other rule, no uid `fchown`. The overwrite branch re-captures before
+  the other rule, no uid `fchown`. A named staged copy carries those
+  permissions from then on, so its bytes are compared with the payload
+  after the `fsync` (`_require_staged_bytes`; a difference is
+  `concurrent_write`). The overwrite branch re-captures before
   the `expected=` comparison (a difference is `concurrent_write`), so the
   compare-to-rename window is unchanged. New folders get `mkdirat` 0o777
   only under a default ACL, else 0o755; `.transfer-tmp` stays 0700. See
