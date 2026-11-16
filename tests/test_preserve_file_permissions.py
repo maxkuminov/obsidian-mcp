@@ -223,15 +223,19 @@ def other_gid():
     """A supplementary group of this process, other than its effective gid.
 
     Lets a test give a file a gid the staged inode does not get by itself,
-    which is what makes the server call `fchown` at all.
+    which is what makes the server call `fchown` at all. Its absence is a
+    property of the test user, not of the filesystem, so it is always a skip —
+    `OMCP_TEST_REQUIRE_POSIX_ACL` is about ACL support only. The translation
+    itself stays covered without one: `test_apply_plan_translates_when_the_
+    kernel_refuses_the_group` asks the kernel for a group nobody holds.
     """
     egid = os.getegid()
     candidates = sorted(g for g in os.getgroups() if g != egid)
     if not candidates:
-        message = "the test process has no supplementary group"
-        if os.environ.get(REQUIRE_ACL_ENV) == "1":
-            pytest.fail(f"{message}, and {REQUIRE_ACL_ENV}=1")
-        pytest.skip(message)
+        pytest.skip(
+            "the test user has no supplementary group to give a file a gid "
+            "other than the one a new file gets"
+        )
     return candidates[0]
 
 
@@ -976,9 +980,130 @@ async def test_a_translated_acl_refused_as_unsupported_when_the_rule_has_an_acl(
 
     result = await tools.edit_note_impl("guarded.md", "after\n")
 
+    assert group_not_kept == [other_gid], "the translation path was not taken"
     assert refusal_code(result) == "io_failure", result
     assert "nothing was written" in result
     assert snapshot(note) == before
+
+
+async def test_a_translated_acl_unsupported_for_a_rule_without_an_acl_takes_mode_only(
+    notes, acl_fs, other_gid, group_not_kept, monkeypatch
+):
+    """Mode-only translation when writing the translated ACL is refused
+    `EOPNOTSUPP` and the rule has no ACL (group translation requirement)."""
+    note = notes / "plain.md"
+    note.write_text("before\n")
+    strip_acl(note)
+    os.chmod(note, 0o664)
+    os.chown(note, -1, other_gid)
+    calls = _fail_staged_setxattr(monkeypatch, errno.EOPNOTSUPP)
+
+    result = await tools.edit_note_impl("plain.md", "after\n")
+
+    assert refusal_code(result) is None, result
+    assert group_not_kept == [other_gid]
+    assert calls == [ACCESS]
+    assert note.read_text() == "after\n"
+    assert stat.S_IMODE(os.lstat(note).st_mode) == 0o604
+    assert os.lstat(note).st_gid == os.getegid()
+    assert xattr(note) is None
+
+
+@pytest.mark.parametrize("filesystem", ["acl", "mode-only"])
+def test_apply_plan_translates_when_the_kernel_refuses_the_group(
+    acl_fs, monkeypatch, filesystem
+):
+    """Group translation with the kernel's own `EPERM` (K5): a wanted gid no
+    supplementary group of this process holds. Needs no supplementary group."""
+    if os.geteuid() == 0:
+        pytest.skip("root may set any group, so the kernel never refuses")
+    foreign = max(os.getgroups() + [os.getegid()]) + 4_000_000
+    if filesystem == "mode-only":
+        def unsupported(*args, **kwargs):
+            raise OSError(errno.EOPNOTSUPP, "Operation not supported")
+
+        for name in ("getxattr", "setxattr", "removexattr"):
+            monkeypatch.setattr(os, name, unsupported)
+    staged = acl_fs / "staged.bin"
+    fd = os.open(staged, os.O_CREAT | os.O_RDWR | os.O_EXCL, 0o600)
+    try:
+        applied = vault_fs.apply_plan(
+            fd, vault_fs.Plan(wanted_gid=foreign, mode=0o664, acl=None),
+            acl_capable=filesystem == "acl",
+        )
+    finally:
+        os.close(fd)
+    assert os.lstat(staged).st_gid == os.getegid()
+    if filesystem == "acl":
+        assert stat.S_IMODE(os.lstat(staged).st_mode) == 0o664
+        entries = vault_fs.parse_acl(_getxattr(str(staged), ACCESS))
+        assert entries == applied.acl
+        assert (ACL_GROUP_OBJ, 0, U) in entries
+        assert (ACL_GROUP, 6, foreign) in entries
+        assert (ACL_MASK, 6, U) in entries
+    else:
+        assert stat.S_IMODE(os.lstat(staged).st_mode) == 0o604
+        assert applied.acl is None
+
+
+def _without_proc(monkeypatch) -> None:
+    """A host with no `/proc/self/fd`: the probe says so, and a path through
+    it does not resolve."""
+    monkeypatch.setattr(vault_fs, "proc_fd_available", lambda: False)
+    real = os.getxattr
+
+    def no_proc(target, *args, **kwargs):
+        if isinstance(target, str) and target.startswith("/proc/self/fd/"):
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", target)
+        return real(target, *args, **kwargs)
+
+    monkeypatch.setattr(os, "getxattr", no_proc)
+
+
+async def test_edits_without_proc_keep_mode_and_acl(notes, acl_fs, monkeypatch):
+    """Implementation review round 1: the leaf's ACL is read without `/proc`
+    through a readable descriptor, so overwrites of an ordinary note — guarded
+    (`edit_note`) and unguarded (`write_file(overwrite=True)`) — still keep its
+    mode and ACL."""
+    d = notes / "Shared"
+    d.mkdir()
+    set_acl(d, group_rwx_default())
+    note = note_in(d, "ticket.md")
+    raw = note_in(d, "data.bin")
+    os.chmod(raw, 0o640)
+    before_note, before_raw = perms(note), perms(raw)
+    assert before_note[2] is not None and before_raw[2] is not None
+    _without_proc(monkeypatch)
+
+    result = await tools.edit_note_impl("Shared/ticket.md", "after\n")
+    assert refusal_code(result) is None, result
+    result = await tools.write_file_impl(
+        "Shared/data.bin", "new", encoding="text", overwrite=True
+    )
+    assert refusal_code(result) is None, result
+
+    assert note.read_text() == "after\n" and raw.read_bytes() == b"new"
+    assert perms(note) == before_note
+    assert perms(raw) == before_raw
+
+
+async def test_an_unreadable_file_without_proc_is_refused(notes, monkeypatch):
+    """Without `/proc` an unreadable leaf's ACL cannot be read at all: the
+    write is the `io_failure` refusal and nothing is written."""
+    if os.geteuid() == 0:
+        pytest.skip("root reads any file")
+    f = notes / "locked.bin"
+    f.write_bytes(b"old")
+    os.chmod(f, 0o200)
+    _without_proc(monkeypatch)
+
+    result = await tools.write_file_impl("locked.bin", "new", encoding="text", overwrite=True)
+
+    assert refusal_code(result) == "io_failure", result
+    assert "nothing was written" in result
+    os.chmod(f, 0o600)
+    assert f.read_bytes() == b"old"
+    assert [p.name for p in notes.iterdir() if p.name.startswith(".tmp-")] == []
 
 
 async def test_an_acl_write_failing_during_an_upload_releases_the_claim(

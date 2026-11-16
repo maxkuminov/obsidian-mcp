@@ -1628,9 +1628,13 @@ def capture_leaf(dir_fd: int, name: str, *, fd: int | None = None) -> Leaf | Non
     Through `fd` when the caller already holds one on the leaf (the `expected=`
     comparison's descriptor), otherwise through an `O_PATH | O_NOFOLLOW` open
     of `name` in `dir_fd`. `fgetxattr` on an `O_PATH` descriptor fails `EBADF`
-    (K4), so that read goes through `/proc/self/fd/<n>`, which the no-clobber
-    publish already requires; a `system.*` read needs no permission on the
-    file, so this works on notes the server cannot read.
+    (K4), so that read goes through `/proc/self/fd/<n>`; a `system.*` read
+    needs no permission on the file, so this works on notes the server cannot
+    read. **Without `/proc`** (a host where the probe selected named staging)
+    the read goes through a second, `O_RDONLY | O_NONBLOCK` open of the same
+    name instead, required to be the inode the `O_PATH` descriptor names
+    (`_read_acl_without_proc`). Only a file the server cannot open for reading
+    is then refused — there is no other way to read its ACL.
 
     `None` for no file at the name, or one that is not a regular file — the
     create rule applies there. A `(dev, ino, ctime_ns)` that changed between
@@ -1654,8 +1658,14 @@ def capture_leaf(dir_fd: int, name: str, *, fd: int | None = None) -> Leaf | Non
         first = _fstat(handle, repr(name))
         if not stat.S_ISREG(first.st_mode):
             return None
-        target: int | str = handle if own is None else f"/proc/self/fd/{handle}"
-        raw, capable = _read_acl(target, ACL_ACCESS_XATTR, repr(name))
+        if own is None:
+            raw, capable = _read_acl(handle, ACL_ACCESS_XATTR, repr(name))
+        elif proc_fd_available():
+            raw, capable = _read_acl(
+                f"/proc/self/fd/{handle}", ACL_ACCESS_XATTR, repr(name)
+            )
+        else:
+            raw, capable = _read_acl_without_proc(dir_fd, name, first)
         second = _fstat(handle, repr(name))
         if (first.st_dev, first.st_ino, first.st_ctime_ns) != (
             second.st_dev,
@@ -1676,6 +1686,40 @@ def capture_leaf(dir_fd: int, name: str, *, fd: int | None = None) -> Leaf | Non
     finally:
         if own is not None:
             close_quietly(own, f"permissions capture of {name!r}")
+
+
+def _read_acl_without_proc(
+    dir_fd: int, name: str, expected: os.stat_result
+) -> tuple[bytes | None, bool]:
+    """`capture_leaf`'s ACL read where `/proc/self/fd` is unavailable.
+
+    A readable descriptor is the only other handle `fgetxattr` accepts.
+    `O_NONBLOCK` keeps the open from hanging if the name became a FIFO since
+    the `O_PATH` `fstat`; the identity check refuses anything that is not the
+    inode that `fstat` saw (`CaptureChanged`). An open that fails — `EACCES` on
+    a file the server cannot read — is `PermissionsNotApplied`.
+    """
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        fd = os.open(name, flags, dir_fd=dir_fd)
+    except OSError as exc:
+        if getattr(exc, "errno", None) in (errno.ENOENT, errno.ELOOP, errno.ENXIO):
+            # Gone, or replaced by a symlink or a socket since the `O_PATH`
+            # `fstat`: the leaf changed under the capture.
+            raise CaptureChanged(
+                f"File changed while its permissions were read: {name}"
+            ) from exc
+        raise PermissionsNotApplied(
+            f"open {name!r} to read its ACL without /proc",
+            getattr(exc, "errno", None),
+        ) from exc
+    try:
+        st = _fstat(fd, repr(name))
+        if (st.st_dev, st.st_ino) != (expected.st_dev, expected.st_ino):
+            raise CaptureChanged(f"File changed while its permissions were read: {name}")
+        return _read_acl(fd, ACL_ACCESS_XATTR, repr(name))
+    finally:
+        close_quietly(fd, f"ACL read of {name!r}")
 
 
 def capture_dir(dir_fd: int) -> Dir:
