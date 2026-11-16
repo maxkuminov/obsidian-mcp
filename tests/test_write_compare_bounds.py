@@ -24,10 +24,14 @@ def root(tmp_path, monkeypatch):
 def test_shared_comparison_keeps_conflict_and_leaf_error_behavior(root, monkeypatch, raw, change):
     path = root / ('data.bin' if raw else 'note.md')
     path.write_bytes(b'old')
-    original = vault._read_fd_bytes
+    # #447: the overwrite branch's comparison reads through
+    # `_read_fd_bytes_checking_leaf`, which keeps its descriptor so the P2
+    # permission capture and the bytes are of one inode. Same bound, same
+    # conflicts; the hook moved with it.
+    original = vault._read_fd_bytes_checking_leaf
     calls = []
 
-    def changed(dir_fd, name, max_bytes=None):
+    def changed(target, dir_fd, name, max_bytes, before):
         calls.append(max_bytes)
         if change == 'larger':
             path.write_bytes(b'external bytes')
@@ -40,10 +44,13 @@ def test_shared_comparison_keeps_conflict_and_leaf_error_behavior(root, monkeypa
             elif change == 'symlink':
                 (root / 'outside').write_bytes(b'untouched')
                 path.symlink_to(root / 'outside')
-        return original(dir_fd, name, max_bytes=max_bytes)
+        return original(target, dir_fd, name, max_bytes, before)
 
-    monkeypatch.setattr(vault, '_read_fd_bytes', changed)
-    error = ValueError if change == 'directory' else OSError if change == 'symlink' else RuntimeError
+    monkeypatch.setattr(vault, '_read_fd_bytes_checking_leaf', changed)
+    # A directory or a symlink where the regular file was is "a regular file
+    # having vanished" since #447: the in-call conflict, no longer
+    # `ValueError` / `ELOOP`.
+    error = RuntimeError
     with pytest.raises(error) as caught:
         if raw:
             vault.write_bytes(path.name, b'replacement', overwrite=True, expected=b'old')
@@ -74,12 +81,23 @@ def test_growth_after_fstat_reads_only_expectation_plus_one(root, monkeypatch, i
     real_fdopen = os.fdopen
     reads = []
     target_inode = path.stat().st_ino
+    # Armed only inside the bounded read, so the growth lands between *its*
+    # `fstat` and its read — the window this test is about — and not inside
+    # the permission captures (#447), which would refuse it earlier.
+    armed = []
+    real_bound_read = vault._bound_read
+
+    def armed_bound_read(*args, **kwargs):
+        armed.append(True)
+        return real_bound_read(*args, **kwargs)
 
     def grow_after_stat(fd):
         info = real_fstat(fd)
-        if info.st_ino == target_inode:
+        if armed and info.st_ino == target_inode:
             path.write_bytes(b'x' * 100_000)
         return info
+
+    monkeypatch.setattr(vault, '_bound_read', armed_bound_read)
 
     class BoundedStream:
         def __init__(self, stream):

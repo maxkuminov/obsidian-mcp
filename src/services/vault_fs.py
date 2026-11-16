@@ -79,6 +79,7 @@ import os
 import platform
 import secrets
 import stat
+import struct
 import threading
 import time
 from collections.abc import Iterable
@@ -656,6 +657,7 @@ def open_dir_beneath(
     *,
     create: bool = False,
     created: list[str] | None = None,
+    follow_default_acl: bool = True,
 ) -> int:
     """Open a directory below `root_fd` with one beneath-root lookup.
 
@@ -707,6 +709,11 @@ def open_dir_beneath(
     new folder and with it a file the caller was told about. A component that
     was already there — or that another creator won the race to — is not
     listed: it is not this call's entry to make durable.
+
+    **`follow_default_acl`** chooses the `mkdirat` mode under a parent with a
+    default ACL (`_create_descent`). Only `open_staging_dir` turns it off:
+    `.transfer-tmp` is made 0o755 as it always was and tightened to 0700
+    straight after, never briefly group-writable through a folder's ACL.
     """
     parts = _split(rel_dir)
     try:
@@ -714,12 +721,19 @@ def open_dir_beneath(
     except FileNotFoundError:
         if not create:
             raise
-    _create_descent(root_fd, parts, rel_dir, created)
+    _create_descent(
+        root_fd, parts, rel_dir, created, follow_default_acl=follow_default_acl
+    )
     return _lookup_dir(root_fd, parts, rel_dir)
 
 
 def _create_descent(
-    root_fd: int, parts: list[str], rel_dir, created: list[str] | None = None
+    root_fd: int,
+    parts: list[str],
+    rel_dir,
+    created: list[str] | None = None,
+    *,
+    follow_default_acl: bool = True,
 ) -> None:
     """Create the missing components of `parts`, carrying no descriptor across.
 
@@ -737,11 +751,19 @@ def _create_descent(
     It is also why `EEXIST` does **not** record the component in `created`: the
     entry this call has to make durable is one this call wrote, and a directory
     somebody else created is theirs to flush.
+
+    **The mode argument depends on the parent (#447, D8).** Under a default
+    ACL the kernel ignores the umask and ANDs the inherited ACL with the mode
+    argument, so 0o755 gave a group-`rwx` folder `mask::r-x` and the group
+    could not create files in a folder the server made. There it is 0o777,
+    exactly what `mkdir(1)` passes. Anywhere else it stays 0o755, byte for
+    byte what it was.
     """
     for depth in range(len(parts)):
         prefix_fd = _lookup_dir(root_fd, parts[:depth], rel_dir)
         try:
-            os.mkdir(parts[depth], 0o755, dir_fd=prefix_fd)
+            mode = _new_directory_mode(prefix_fd) if follow_default_acl else 0o755
+            os.mkdir(parts[depth], mode, dir_fd=prefix_fd)
         except FileExistsError:
             pass
         else:
@@ -1222,15 +1244,20 @@ def open_staging_dir(root_fd: int, *, create: bool = True) -> int:
     allocated on, so `.transfer-tmp` is still what selects where staged bytes
     live (D19). What went away is its contents.
 
-    Staged bytes are relaxed to `default_file_mode()` before publication, so
-    the directory — not the file — is what keeps an in-flight upload private.
-    That matters because staging is the window in which the bytes exist but
-    the publish gate has not yet revalidated the credential: a body that is
-    about to be *refused* is on disk for the duration, and under a
-    group-writable umask a peer could also alter it after `_drain` computed
-    its digest, so the server would publish bytes that do not match the
-    sha256 it reports. 0700 removes both, whatever the staged file's own mode
-    and whatever the operator's umask.
+    Staged bytes are given their publication permissions (`apply_plan`, #447)
+    before the gate opens, so the directory — not the file — is what keeps an
+    in-flight upload private. That matters because staging is the window in
+    which the bytes exist but the publish gate has not yet revalidated the
+    credential: a body that is about to be *refused* is on disk for the
+    duration, and with a group-writable destination a peer could also alter
+    it after `_drain` computed its digest, so the server would publish bytes
+    that do not match the sha256 it reports. 0700 removes both, whatever the
+    staged file's own mode and whatever the operator's umask.
+
+    It is also why this directory is never setgid: `stat.S_IMODE` includes
+    the setgid bit, so a setgid `.transfer-tmp` is corrected to plain 0700
+    below, and a staged upload inode carries the process's own filesystem gid.
+    `create_plan` relies on that.
 
     **What the 0700 is now for.** In the unnamed mode it is no longer the only
     thing protecting staged bytes — an inode with no directory entry cannot be
@@ -1249,10 +1276,13 @@ def open_staging_dir(root_fd: int, *, create: bool = True) -> int:
     rename in between.
 
     Destination directories are deliberately *not* treated this way — they hold
-    published vault content and get the ordinary 0755 that
-    `open_dir_beneath(create=True)`'s `mkdirat` produces under the umask.
+    published vault content and get what `open_dir_beneath(create=True)`'s
+    `mkdirat` produces: the parent's default ACL where it has one, otherwise
+    the ordinary 0755 under the umask (`_create_descent`).
     """
-    fd = open_dir_beneath(root_fd, STAGING_DIR, create=create)
+    fd = open_dir_beneath(
+        root_fd, STAGING_DIR, create=create, follow_default_acl=False
+    )
     try:
         st = os.fstat(fd)
         if st.st_uid != os.geteuid():
@@ -1272,8 +1302,8 @@ def open_staging_dir(root_fd: int, *, create: bool = True) -> int:
             # does not apply it (or applies it partially) would otherwise leave
             # the isolation guarantee false while every call reported success —
             # and that guarantee is the only thing protecting a staged upload,
-            # because the staged file itself is relaxed to the umask default
-            # before the publish gate. Same posture as the publication and
+            # because the staged file itself is given its publication
+            # permissions before the publish gate. Same posture as the publication and
             # trash probes: refuse the operation rather than degrade silently.
             effective = stat.S_IMODE(os.fstat(fd).st_mode)
             if effective != STAGING_DIR_MODE:
@@ -1296,21 +1326,23 @@ _default_file_mode_cache: int | None = None
 
 
 def default_file_mode() -> int:
-    """The mode a plain `open(..., "w")` would give a new file: 0o666 & ~umask.
+    """The mode a plain `open(..., "w")` gives a new file **in a directory with
+    no default ACL**: 0o666 & ~umask.
 
     Every staging descriptor in this package is created at 0o600 so the
     content is never readable by anyone else while it is being written, and
     publication is a `linkat`/`rename` of that same inode — so the staging
-    mode *is* the published mode unless a writer relaxes it first. Without
-    that step a file the server wrote silently drops from the umask default
-    (0o644 on the container) to 0o600 and becomes unreadable to anything else
-    sharing the vault: another container, a backup agent, a sync client (#95).
+    mode *is* the published mode unless a writer changes it first. Left at
+    0o600, a file the server wrote becomes unreadable to anything else sharing
+    the vault: another container, a backup agent, a sync client (#95).
 
-    Both writers call this immediately before publishing — `vault`'s
-    `_atomic_write_at` for notes and raw file writes, `transfer`'s
-    `stream_to_vault` for uploads and imports. It lives here because `vault`
-    and `transfer` both depend on this module and neither depends on the
-    other; a second copy is how the two paths drifted apart in the first place.
+    #95's fix applied this mode to every published file, which assumed the
+    umask alone decides a new file's mode. Under a default ACL the kernel
+    ignores the umask, and a `chmod` on an inode carrying an ACL rewrites its
+    mask, so every edit cut a group's access to read-only — and an edit also
+    replaced whatever mode the file had (#447). This value is now used in one
+    place only: `create_plan` for a directory with no default ACL. Edits keep
+    the replaced file's permissions (`edit_plan`).
 
     Read from `/proc/self/status` where available; the `os.umask` read-restore
     dance is the portable fallback and is only reached once.
@@ -1333,14 +1365,546 @@ def default_file_mode() -> int:
     return _default_file_mode_cache
 
 
+# ── publication permissions (#447) ──────────────────────────────────────────
+#
+# Every publication puts a *new* inode at the name, so whatever permissions the
+# file should have must be written onto the staged inode before it is
+# published. Two rules decide what they are (design D1):
+#
+# * **edit** — a regular file is being replaced: keep its permission bits
+#   (`0o777`, never setuid/setgid/sticky), its POSIX access ACL and its gid;
+# * **create** — the name did not exist: exactly what `open(O_CREAT, 0o666)`
+#   would get in that directory, whatever directory the bytes were staged in.
+#
+# Where the wanted gid cannot be set (a group the server is not in), the
+# owning group's permissions move to a named group entry (`translate`, D3),
+# which is never broader for anyone but the server and the previous owner.
+# Anything else that goes wrong refuses the write (`PermissionsNotApplied`,
+# D6): no fallback is provably never broader, and silently narrowing a
+# group's access is the bug this exists to fix.
+#
+# Do not reintroduce a fixed mode for edits, or a create-plan fallback for an
+# edit whose group cannot be kept: the first is #447, the second can publish a
+# private note with its folder's grants.
+
+ACL_USER_OBJ = 0x01
+ACL_USER = 0x02
+ACL_GROUP_OBJ = 0x04
+ACL_GROUP = 0x08
+ACL_MASK = 0x10
+ACL_OTHER = 0x20
+ACL_UNDEFINED_ID = 0xFFFFFFFF
+
+ACL_ACCESS_XATTR = "system.posix_acl_access"
+ACL_DEFAULT_XATTR = "system.posix_acl_default"
+
+_ACL_VERSION = 2
+_ACL_HEADER = struct.Struct("<I")
+_ACL_ENTRY = struct.Struct("<HHI")
+_ACL_TAGS = frozenset(
+    (ACL_USER_OBJ, ACL_USER, ACL_GROUP_OBJ, ACL_GROUP, ACL_MASK, ACL_OTHER)
+)
+_ACL_BASE_TAGS = (ACL_USER_OBJ, ACL_GROUP_OBJ, ACL_OTHER)
+
+# "No POSIX ACL here", from a read or a removal: the attribute is absent
+# (`ENODATA`) or the filesystem has no ACLs at all. Never a failure (D7).
+_NO_ACL_ERRNOS = frozenset({errno.ENODATA, errno.EOPNOTSUPP, errno.ENOTSUP})
+_ACL_UNSUPPORTED_ERRNOS = frozenset({errno.EOPNOTSUPP, errno.ENOTSUP})
+
+# A tuple of `(tag, perm, id)`, in the kernel's sort order.
+AclEntries = tuple[tuple[int, int, int], ...]
+
+
+class PermissionsNotApplied(OSError):
+    """The permission rule could not be captured or applied; nothing published.
+
+    Deliberately an `OSError` and **not** a `VaultFSError` (D6): the write
+    tools map a `VaultFSError` to `validation_failed`, which would tell an
+    agent its arguments were wrong. Through their `except OSError` this is an
+    `io_failure` whose text names the step and the errno and says nothing was
+    written; on an upload it is the generic pre-publication branch, which
+    releases the claim.
+    """
+
+    def __init__(self, step: str, code: int | None):
+        self.step = step
+        self.code = code if code is not None else errno.EIO
+        label = errno.errorcode.get(self.code, str(self.code))
+        super().__init__(
+            self.code,
+            f"Could not apply the file's permissions ({step}: {label}); "
+            "nothing was written",
+        )
+
+
+class CaptureChanged(Conflict):
+    """A leaf changed between the two `fstat`s around its ACL read (D5).
+
+    A signal, not a message: each writer maps it to its own in-call conflict —
+    `File changed while editing: <name>` in `vault`, a 409 on uploads. A
+    `Conflict` subclass so that a caller which forgot to map it still refuses
+    as a conflict rather than as something retrying cannot fix.
+    """
+
+
+def parse_acl(raw: bytes) -> AclEntries:
+    """Decode a `system.posix_acl_*` value; refuse anything malformed.
+
+    Little-endian `u32` version 2, then 8-byte `<HHI` entries. Refused: a wrong
+    version, a length not `4 + 8n`, an unknown tag, a permission outside
+    `rwx`, a missing or repeated base entry, named entries without a mask,
+    and entries out of the kernel's sort order (tag, then id). The kernel never
+    hands back such a value; one that arrives anyway is not something to
+    guess about, so the caller turns the refusal into `PermissionsNotApplied`.
+    """
+    if len(raw) < _ACL_HEADER.size or (len(raw) - _ACL_HEADER.size) % _ACL_ENTRY.size:
+        raise ValueError(f"ACL value has a bad length ({len(raw)} bytes)")
+    (version,) = _ACL_HEADER.unpack_from(raw, 0)
+    if version != _ACL_VERSION:
+        raise ValueError(f"ACL value has version {version}, not {_ACL_VERSION}")
+    entries = tuple(
+        _ACL_ENTRY.unpack_from(raw, offset)
+        for offset in range(_ACL_HEADER.size, len(raw), _ACL_ENTRY.size)
+    )
+    previous: tuple[int, int] | None = None
+    for tag, perm, ident in entries:
+        if tag not in _ACL_TAGS:
+            raise ValueError(f"ACL entry has an unknown tag 0x{tag:x}")
+        if perm & ~0o7:
+            raise ValueError(f"ACL entry has permissions 0o{perm:o} outside rwx")
+        key = (tag, ident if tag in (ACL_USER, ACL_GROUP) else 0)
+        # Strictly increasing: also refuses a repeated base entry or name.
+        if previous is not None and key <= previous:
+            raise ValueError("ACL entries are out of order or repeated")
+        previous = key
+    tags = [tag for tag, _perm, _ident in entries]
+    for base in _ACL_BASE_TAGS:
+        if base not in tags:
+            raise ValueError(f"ACL lacks its base entry 0x{base:x}")
+    if (ACL_USER in tags or ACL_GROUP in tags) and ACL_MASK not in tags:
+        raise ValueError("ACL has named entries but no mask")
+    return entries
+
+
+def _acl_sort_key(entry: tuple[int, int, int]) -> tuple[int, int]:
+    tag, _perm, ident = entry
+    return (tag, ident if tag in (ACL_USER, ACL_GROUP) else 0)
+
+
+def pack_acl(entries: Iterable[tuple[int, int, int]]) -> bytes:
+    """Encode entries as a `system.posix_acl_*` value, in the kernel's order."""
+    ordered = sorted(entries, key=_acl_sort_key)
+    return _ACL_HEADER.pack(_ACL_VERSION) + b"".join(
+        _ACL_ENTRY.pack(tag, perm, ident) for tag, perm, ident in ordered
+    )
+
+
+def is_minimal(entries: AclEntries) -> bool:
+    """Only the three base entries: what a mode alone expresses (K3)."""
+    return sorted(tag for tag, _perm, _ident in entries) == sorted(_ACL_BASE_TAGS)
+
+
+def minimal_acl(mode: int) -> AclEntries:
+    """The ACL a mode is equivalent to."""
+    return (
+        (ACL_USER_OBJ, (mode >> 6) & 0o7, ACL_UNDEFINED_ID),
+        (ACL_GROUP_OBJ, (mode >> 3) & 0o7, ACL_UNDEFINED_ID),
+        (ACL_OTHER, mode & 0o7, ACL_UNDEFINED_ID),
+    )
+
+
+def _acl_perm(entries: AclEntries, tag: int, ident: int | None = None) -> int | None:
+    for e_tag, perm, e_ident in entries:
+        if e_tag == tag and (ident is None or e_ident == ident):
+            return perm
+    return None
+
+
+def acl_mode(entries: AclEntries) -> int:
+    """The permission bits an ACL implies: owner, mask (or group), other."""
+    group = _acl_perm(entries, ACL_MASK)
+    if group is None:
+        group = _acl_perm(entries, ACL_GROUP_OBJ) or 0
+    return (
+        ((_acl_perm(entries, ACL_USER_OBJ) or 0) << 6)
+        | (group << 3)
+        | (_acl_perm(entries, ACL_OTHER) or 0)
+    )
+
+
+def _read_acl(target: int | str, xattr: str, label: str) -> tuple[bytes | None, bool]:
+    """`(value or None, filesystem has ACLs)` for one ACL attribute.
+
+    `ENODATA` is "no ACL on this inode"; `EOPNOTSUPP`/`ENOTSUP` is "no ACLs on
+    this filesystem". Anything else — `EIO`, an LSM denial — is a failure: a
+    rule that could not be read cannot be kept.
+    """
+    try:
+        return os.getxattr(target, xattr), True
+    except OSError as exc:
+        code = getattr(exc, "errno", None)
+        if code == errno.ENODATA:
+            return None, True
+        if code in _ACL_UNSUPPORTED_ERRNOS:
+            return None, False
+        raise PermissionsNotApplied(f"read {xattr} of {label}", code) from exc
+
+
+def _parsed(raw: bytes | None, xattr: str, label: str) -> AclEntries | None:
+    if raw is None:
+        return None
+    try:
+        return parse_acl(raw)
+    except ValueError as exc:
+        raise PermissionsNotApplied(f"parse {xattr} of {label}", errno.EINVAL) from exc
+
+
+def _fstat(fd: int, label: str) -> os.stat_result:
+    try:
+        return os.fstat(fd)
+    except OSError as exc:
+        raise PermissionsNotApplied(f"fstat {label}", getattr(exc, "errno", None)) from exc
+
+
+@dataclass(frozen=True)
+class Leaf:
+    """A regular file's permissions, captured coherently (D5).
+
+    `acl_raw` is the attribute exactly as read, which is what the publish-point
+    comparison compares; `acl` is the same value decoded.
+    """
+
+    dev: int
+    ino: int
+    ctime_ns: int
+    gid: int
+    mode: int
+    acl_raw: bytes | None
+    acl: AclEntries | None
+    acl_capable: bool
+
+    def signature(self) -> tuple:
+        """What the publish-point capture must find unchanged (D5)."""
+        return (self.dev, self.ino, self.gid, self.mode, self.acl_raw)
+
+
+def leaf_signature(leaf: Leaf | None) -> tuple | None:
+    """`Leaf.signature`, with `None` for "no regular file at the name"."""
+    return None if leaf is None else leaf.signature()
+
+
+@dataclass(frozen=True)
+class Dir:
+    """A destination directory's create-rule facts (D1, D5).
+
+    Independent facts, read once: entry churn changes a directory's ctime, so
+    unlike a leaf it is not ctime-checked.
+    """
+
+    dev: int
+    ino: int
+    setgid: bool
+    gid: int
+    default_acl: AclEntries | None
+    acl_capable: bool
+
+
+@dataclass(frozen=True)
+class Plan:
+    """What a published inode gets: `(wanted_gid, mode, acl | None)` (D1).
+
+    `acl` is `None` when the mode says everything; it is then *removed* from
+    the staged inode, which may have inherited one, never left alone.
+    """
+
+    wanted_gid: int
+    mode: int
+    acl: AclEntries | None
+
+
+def capture_leaf(dir_fd: int, name: str, *, fd: int | None = None) -> Leaf | None:
+    """`fstat`, ACL read, `fstat`: the permissions of the regular file at `name`.
+
+    Through `fd` when the caller already holds one on the leaf (the `expected=`
+    comparison's descriptor), otherwise through an `O_PATH | O_NOFOLLOW` open
+    of `name` in `dir_fd`. `fgetxattr` on an `O_PATH` descriptor fails `EBADF`
+    (K4), so that read goes through `/proc/self/fd/<n>`; a `system.*` read
+    needs no permission on the file, so this works on notes the server cannot
+    read. **Without `/proc`** (a host where the probe selected named staging)
+    the read goes through a second, `O_RDONLY | O_NONBLOCK` open of the same
+    name instead, required to be the inode the `O_PATH` descriptor names
+    (`_read_acl_without_proc`). Only a file the server cannot open for reading
+    is then refused — there is no other way to read its ACL.
+
+    `None` for no file at the name, or one that is not a regular file — the
+    create rule applies there. A `(dev, ino, ctime_ns)` that changed between
+    the two `fstat`s raises `CaptureChanged`: the ACL read may belong to
+    neither state. Any other failure is `PermissionsNotApplied`.
+    """
+    own: int | None = None
+    if fd is None:
+        try:
+            own = os.open(
+                name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise PermissionsNotApplied(
+                f"open {name!r} for its permissions", getattr(exc, "errno", None)
+            ) from exc
+    handle = fd if own is None else own
+    try:
+        first = _fstat(handle, repr(name))
+        if not stat.S_ISREG(first.st_mode):
+            return None
+        if own is None:
+            raw, capable = _read_acl(handle, ACL_ACCESS_XATTR, repr(name))
+        elif proc_fd_available():
+            raw, capable = _read_acl(
+                f"/proc/self/fd/{handle}", ACL_ACCESS_XATTR, repr(name)
+            )
+        else:
+            raw, capable = _read_acl_without_proc(dir_fd, name, first)
+        second = _fstat(handle, repr(name))
+        if (first.st_dev, first.st_ino, first.st_ctime_ns) != (
+            second.st_dev,
+            second.st_ino,
+            second.st_ctime_ns,
+        ):
+            raise CaptureChanged(f"File changed while its permissions were read: {name}")
+        return Leaf(
+            dev=second.st_dev,
+            ino=second.st_ino,
+            ctime_ns=second.st_ctime_ns,
+            gid=second.st_gid,
+            mode=stat.S_IMODE(second.st_mode) & 0o777,
+            acl_raw=raw,
+            acl=_parsed(raw, ACL_ACCESS_XATTR, repr(name)),
+            acl_capable=capable,
+        )
+    finally:
+        if own is not None:
+            close_quietly(own, f"permissions capture of {name!r}")
+
+
+def _read_acl_without_proc(
+    dir_fd: int, name: str, expected: os.stat_result
+) -> tuple[bytes | None, bool]:
+    """`capture_leaf`'s ACL read where `/proc/self/fd` is unavailable.
+
+    A readable descriptor is the only other handle `fgetxattr` accepts.
+    `O_NONBLOCK` keeps the open from hanging if the name became a FIFO since
+    the `O_PATH` `fstat`; the identity check refuses anything that is not the
+    inode that `fstat` saw (`CaptureChanged`). An open that fails — `EACCES` on
+    a file the server cannot read — is `PermissionsNotApplied`.
+    """
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    try:
+        fd = os.open(name, flags, dir_fd=dir_fd)
+    except OSError as exc:
+        if getattr(exc, "errno", None) in (errno.ENOENT, errno.ELOOP, errno.ENXIO):
+            # Gone, or replaced by a symlink or a socket since the `O_PATH`
+            # `fstat`: the leaf changed under the capture.
+            raise CaptureChanged(
+                f"File changed while its permissions were read: {name}"
+            ) from exc
+        raise PermissionsNotApplied(
+            f"open {name!r} to read its ACL without /proc",
+            getattr(exc, "errno", None),
+        ) from exc
+    try:
+        st = _fstat(fd, repr(name))
+        if (st.st_dev, st.st_ino) != (expected.st_dev, expected.st_ino):
+            raise CaptureChanged(f"File changed while its permissions were read: {name}")
+        return _read_acl(fd, ACL_ACCESS_XATTR, repr(name))
+    finally:
+        close_quietly(fd, f"ACL read of {name!r}")
+
+
+def capture_dir(dir_fd: int) -> Dir:
+    """The directory facts the create rule needs: setgid, gid, default ACL."""
+    st = _fstat(dir_fd, "the destination directory")
+    raw, capable = _read_acl(dir_fd, ACL_DEFAULT_XATTR, "the destination directory")
+    return Dir(
+        dev=st.st_dev,
+        ino=st.st_ino,
+        setgid=bool(st.st_mode & stat.S_ISGID),
+        gid=st.st_gid,
+        default_acl=_parsed(raw, ACL_DEFAULT_XATTR, "the destination directory"),
+        acl_capable=capable,
+    )
+
+
+def edit_plan(leaf: Leaf) -> Plan:
+    """Keep the replaced file's gid, permission bits and access ACL (D1).
+
+    The bits come from `st_mode & 0o777`, so setuid, setgid and sticky are
+    never carried. A replaced file with no ACL gives a plan with none, which
+    `apply_plan` turns into a *removal* of whatever the staged inode inherited.
+    """
+    acl = leaf.acl
+    if acl is not None and is_minimal(acl):
+        acl = None
+    return Plan(wanted_gid=leaf.gid, mode=leaf.mode, acl=acl)
+
+
+def create_plan(directory: Dir, staged_gid: int) -> Plan:
+    """What `open(O_CREAT, 0o666)` gets in `directory` (D1, K1).
+
+    The gid is the directory's when it is setgid, otherwise the one observed on
+    the inode this call just created — for a note that is exactly the gid an
+    ordinary create in that directory gets; for an upload `.transfer-tmp` is
+    never setgid, so it is the process's filesystem gid. Never `getegid()`.
+
+    From a default ACL: `USER_OBJ`, `MASK` (or `GROUP_OBJ` without one) and
+    `OTHER` ANDed with `rw-`, named entries copied, the umask not applied —
+    the kernel's own create rule. Without one, `0o666 & ~umask`.
+    """
+    wanted = directory.gid if directory.setgid else staged_gid
+    if directory.default_acl is None:
+        return Plan(wanted_gid=wanted, mode=default_file_mode(), acl=None)
+    has_mask = _acl_perm(directory.default_acl, ACL_MASK) is not None
+    masked = {ACL_USER_OBJ, ACL_OTHER, ACL_MASK if has_mask else ACL_GROUP_OBJ}
+    entries = tuple(
+        (tag, perm & 0o6 if tag in masked else perm, ident)
+        for tag, perm, ident in directory.default_acl
+    )
+    return Plan(
+        wanted_gid=wanted,
+        mode=acl_mode(entries),
+        acl=None if is_minimal(entries) else entries,
+    )
+
+
+def translate(plan: Plan, staged_gid: int, acl_capable: bool) -> Plan:
+    """The rule for a staged inode that must keep `staged_gid` (D3).
+
+    **ACL form** — used whenever the filesystem has ACLs or the rule has one:
+    the rule's ACL (or the minimal ACL of its mode) with `GROUP_OBJ` set to
+    `---`, a named entry for the wanted gid carrying `GROUP_OBJ`'s permissions
+    — left exactly as it is when the rule already names that gid, because the
+    kernel grants a request only when one matching entry holds all of it and a
+    union could grant what neither entry did — and the rule's mask, or the OR
+    of the group-class entries when it had none. The mode it implies is
+    numerically the rule's.
+
+    **Mode-only form** — only for a rule with no ACL on a filesystem without
+    ACLs: group bits cleared, other bits ANDed with them. A mode cannot express
+    a denying named entry, so a rule *with* an ACL never takes this form.
+    """
+    if acl_capable or plan.acl is not None:
+        rule = plan.acl if plan.acl is not None else minimal_acl(plan.mode)
+        group_perm = _acl_perm(rule, ACL_GROUP_OBJ) or 0
+        entries = [
+            (tag, 0 if tag == ACL_GROUP_OBJ else perm, ident)
+            for tag, perm, ident in rule
+            if tag != ACL_MASK
+        ]
+        if _acl_perm(rule, ACL_GROUP, plan.wanted_gid) is None:
+            entries.append((ACL_GROUP, group_perm, plan.wanted_gid))
+        mask = _acl_perm(rule, ACL_MASK)
+        if mask is None:
+            mask = 0
+            for tag, perm, _ident in entries:
+                if tag in (ACL_GROUP_OBJ, ACL_GROUP):
+                    mask |= perm
+        entries.append((ACL_MASK, mask, ACL_UNDEFINED_ID))
+        ordered = tuple(sorted(entries, key=_acl_sort_key))
+        return Plan(wanted_gid=staged_gid, mode=acl_mode(ordered), acl=ordered)
+    owner = plan.mode & 0o700
+    group = (plan.mode >> 3) & 0o7
+    return Plan(
+        wanted_gid=staged_gid, mode=owner | (plan.mode & 0o7 & group), acl=None
+    )
+
+
+def apply_plan(staged_fd: int, plan: Plan, acl_capable: bool) -> Plan:
+    """Write `plan` onto the private staged inode: gid, then ACL, then mode (D2).
+
+    1. **Group.** `fchown(fd, -1, gid)` when the staged gid differs. `EPERM` or
+       `EINVAL` (not in that group, or unmapped in a user namespace) means the
+       group is not kept, and the plan is translated (`translate`). Never the
+       uid: the new inode is the server's (D4).
+    2. **ACL.** Written explicitly when the plan has one, removed otherwise —
+       never left to inheritance, because an upload's staged inode inherited
+       `.transfer-tmp`'s entries, not the destination's.
+    3. **Mode.** `fchmod`, consistent with the ACL by K2/K3; the whole step on
+       a filesystem without ACLs.
+
+    Returns the plan actually applied. Every other failure raises
+    `PermissionsNotApplied` before anything is published; the caller's one
+    payload flush then covers these writes too.
+    """
+    staged_gid = _fstat(staged_fd, "the staged copy").st_gid
+    rule = plan
+    translated = False
+    if staged_gid != plan.wanted_gid:
+        try:
+            os.fchown(staged_fd, -1, plan.wanted_gid)
+        except OSError as exc:
+            code = getattr(exc, "errno", None)
+            if code not in (errno.EPERM, errno.EINVAL):
+                raise PermissionsNotApplied("fchown the staged copy", code) from exc
+            plan = translate(rule, staged_gid, acl_capable)
+            translated = True
+    if plan.acl is not None:
+        try:
+            os.setxattr(staged_fd, ACL_ACCESS_XATTR, pack_acl(plan.acl))
+        except OSError as exc:
+            code = getattr(exc, "errno", None)
+            if not (
+                translated and rule.acl is None and code in _ACL_UNSUPPORTED_ERRNOS
+            ):
+                # Including `EOPNOTSUPP` for a rule that has an ACL: the
+                # directory or the replaced file reported one on this very
+                # filesystem, and dropping it would drop its named entries.
+                raise PermissionsNotApplied(
+                    f"set {ACL_ACCESS_XATTR} on the staged copy", code
+                ) from exc
+            plan = translate(rule, staged_gid, acl_capable=False)
+    if plan.acl is None:
+        try:
+            os.removexattr(staged_fd, ACL_ACCESS_XATTR)
+        except OSError as exc:
+            code = getattr(exc, "errno", None)
+            if code not in _NO_ACL_ERRNOS:
+                raise PermissionsNotApplied(
+                    f"remove {ACL_ACCESS_XATTR} from the staged copy", code
+                ) from exc
+    try:
+        os.fchmod(staged_fd, plan.mode)
+    except OSError as exc:
+        raise PermissionsNotApplied(
+            "fchmod the staged copy", getattr(exc, "errno", None)
+        ) from exc
+    return plan
+
+
+def _new_directory_mode(parent_fd: int) -> int:
+    """`mkdirat`'s mode argument under `parent_fd` (D8).
+
+    0o777 when the parent has a default ACL, so the kernel applies it exactly
+    as `mkdir(1)` does; 0o755 otherwise — and also when the read fails for any
+    reason, because the directory path never refuses and 0o755 is today's
+    mode, never broader.
+    """
+    try:
+        raw = os.getxattr(parent_fd, ACL_DEFAULT_XATTR)
+    except OSError:
+        return 0o755
+    return 0o777 if raw else 0o755
+
+
 def create_temp(dir_fd: int) -> tuple[int, str]:
     """Create an exclusive `.tmp-<32 hex>` file in `dir_fd`; return (fd, name).
 
     Mode 0600 and `O_EXCL|O_NOFOLLOW`: the name cannot pre-exist, cannot be a
     symlink, and the content is never world-readable while it is being written.
     That 0600 is for the *staging* window only — publication links this inode
-    into place, so the caller must relax the mode with `default_file_mode()`
-    before publishing or the file lands unreadable to everything else (#95).
+    into place, so the caller must give it its publication permissions with
+    `apply_plan` before the payload flush, or the file lands unreadable to
+    everything else (#95) or with the wrong group access (#447).
     The `.tmp-` prefix keeps it invisible to the indexer and to every dot-dir
     guarded tool, so a crashed upload leaves nothing an agent can see.
     """

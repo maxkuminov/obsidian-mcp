@@ -2143,7 +2143,9 @@ def _create_temp_exclusively(dir_fd: int, name: str) -> tuple[int, str]:
     name in the directory at all.
     """
     flags = (
-        os.O_WRONLY
+        # Read-write: `_require_staged_bytes` reads the payload back through
+        # this descriptor before publication (#447).
+        os.O_RDWR
         | os.O_CREAT
         | os.O_EXCL
         | getattr(os, "O_NOFOLLOW", 0)
@@ -2385,17 +2387,32 @@ def _atomic_write_at(
 
     Ordering, and why each step is where it is:
 
-    1. staging (above); the descriptor is then held until publication, as the
-       only handle on the bytes that no rename or unlink can take away;
-    2. the payload is written and **`fsync`ed before publication**. A crash
-       between the two leaves the destination untouched; without the `fsync` a
-       crash just after the rename could leave the destination published but
-       its data blocks unwritten, which is the truncation this is supposed to
+    1. staging (above), at 0600; the descriptor is then held until
+       publication, as the only handle on the bytes that no rename or unlink
+       can take away;
+    2. the payload is written;
+    3. **P1** (#447): the publication's permissions are captured — the
+       replaced file's on the overwrite branch, the directory's create rule
+       otherwise — and written onto the staged inode (`vault_fs.apply_plan`).
+       A failure there is `PermissionsNotApplied`, before anything exists at
+       the name;
+    4. the staged inode is **`fsync`ed before publication**, once, covering
+       its payload and its permissions. A crash between the flush and the
+       publish leaves the destination untouched; without the `fsync` a crash
+       just after the rename could leave the destination published but its
+       data blocks unwritten, which is the truncation this is supposed to
        make impossible;
-    3. `expected` (when given) is compared against the current bytes read
-       through the same descriptor — optimistic conflict detection, immediately
-       before publication;
-    4. the destination directory — and the parent of every directory this call
+    5. **P2**, overwrite branch only: the leaf is captured again — through the
+       descriptor the `expected=` comparison then reads, before the bytes are
+       read, or through an `O_PATH` descriptor where the comparison would be
+       when there is none. Any difference from P1 (identity, gid, mode bits,
+       ACL bytes, a regular file appearing or vanishing) is the in-call
+       conflict. Nothing is re-applied and nothing is flushed again;
+    6. `expected` (when given) is compared against the current bytes read
+       through that descriptor — optimistic conflict detection, immediately
+       before publication. **The compare-to-rename window is exactly what it
+       was before #447**: P2 sits before the comparison, never after it;
+    7. the destination directory — and the parent of every directory this call
        created — is **`fsync`ed after publication** (#97). The payload's flush
        makes the contents durable and says nothing about the entry that names
        them, so without this a crash can lose the write entirely. A failure of
@@ -2449,10 +2466,40 @@ def _atomic_write_at(
         with os.fdopen(fd, "wb", closefd=False) as stream:
             stream.write(payload)
             stream.flush()
-        os.fchmod(fd, vault_fs.default_file_mode())
+        # P1 (#447): the permissions this publication must carry, written onto
+        # the private staged inode before its one flush, which then covers
+        # them too. Only the overwrite branch can replace a file, so only it
+        # reads the leaf; every branch reads the directory for the create rule.
+        leaf = _capture_leaf_or_conflict(target, dir_fd, name) if overwrite else None
+        directory = _permissions_step(target, vault_fs.capture_dir, dir_fd)
+        plan = (
+            vault_fs.edit_plan(leaf)
+            if leaf is not None
+            else vault_fs.create_plan(directory, staged.st_gid)
+        )
+        applied = _permissions_step(
+            target, vault_fs.apply_plan, fd, plan, directory.acl_capable
+        )
         os.fsync(fd)
+        if tmp is not None:
+            # From `apply_plan` on, a named staging file carries the
+            # permissions the note will have, so whoever may write the note
+            # may also write the `.tmp-*` beside it. Verify the bytes at that
+            # name are exactly ours **before** P2 and the comparison, so
+            # nothing is added between the comparison and the rename (#447,
+            # D5; the remaining interval is L14).
+            _require_staged_bytes(fd, dir_fd, tmp, staged, payload, name, applied)
 
-        if expected is not None:
+        if overwrite and expected is not None:
+            # P2 through the comparison's own descriptor, taken **before** the
+            # bytes are read and compared, so nothing is added between the
+            # comparison and the rename (D5).
+            current = _read_fd_bytes_checking_leaf(
+                target, dir_fd, name, len(expected), leaf
+            )
+            if current != expected:
+                raise RuntimeError(f"File changed while editing: {name}")
+        elif expected is not None:
             try:
                 # A larger file cannot equal expected. Bound the comparison
                 # too: a concurrent writer may have grown this leaf since the
@@ -2462,6 +2509,12 @@ def _atomic_write_at(
                 raise RuntimeError(f"File changed while editing: {name}") from None
             if current != expected:
                 raise RuntimeError(f"File changed while editing: {name}")
+        elif overwrite:
+            # P2 with no comparison: an `O_PATH` capture where the comparison
+            # would be, immediately before the staged-name check.
+            _require_same_leaf(
+                leaf, _capture_leaf_or_conflict(target, dir_fd, name), name
+            )
 
         if tmp is not None:
             _require_staged_name(dir_fd, tmp, staged)
@@ -2563,6 +2616,139 @@ def _discard_temp(
     name in the directory in the first place — see `_link_staged_name`.
     """
     vault_fs.discard_staged_name(dir_fd, tmp, staged, published=published)
+
+
+# Bytes per read when verifying a staged copy against its payload.
+_STAGED_VERIFY_CHUNK = 1024 * 1024
+
+
+def _require_staged_bytes(
+    fd: int,
+    dir_fd: int,
+    tmp: str,
+    staged: os.stat_result,
+    payload: bytes,
+    name: str,
+    applied: vault_fs.Plan,
+) -> None:
+    """Refuse unless the staging name holds exactly `payload` (#447, D5).
+
+    The name must still be our inode (`_require_staged_name`), of the
+    payload's size, and its content is compared in bounded chunks against a `memoryview` of the
+    payload, so a large write is never held twice. The content is read through
+    the staging descriptor itself (opened read-write at creation, while the
+    inode was 0600) once the name is proven to be that inode: a reopen by name
+    would fail `EACCES` for an edit that keeps a mode without owner read. Any
+    difference is the in-call conflict; nothing has been published.
+    """
+    # A different inode at the name — or none — is the existing substitution
+    # refusal (`vault_fs.Conflict`, "The staged copy was replaced"), whose
+    # cleanup leaves the substitute in place; only then are the bytes read.
+    _require_staged_name(dir_fd, tmp, staged)
+    conflict = RuntimeError(f"File changed while editing: {name}")
+    if os.fstat(fd).st_size != len(payload):
+        raise conflict
+    view = memoryview(payload)
+    offset = 0
+    try:
+        while offset < len(view):
+            chunk = os.pread(fd, min(_STAGED_VERIFY_CHUNK, len(view) - offset), offset)
+            if not chunk or chunk != view[offset : offset + len(chunk)]:
+                raise conflict
+            offset += len(chunk)
+        if os.pread(fd, 1, offset):
+            raise conflict
+    except PermissionError:
+        # A network filesystem that re-checks every read may refuse the
+        # read-back (L15). The comparison is skipped only for a copy the
+        # applied plan itself made unreadable to its owner; identity and size
+        # are checked above. Otherwise the refusal stands (`io_failure`,
+        # nothing published): a read revoked by someone else must not switch
+        # the comparison off.
+        if applied.mode & 0o400:
+            raise
+        return
+
+
+def _permissions_step(target: MutableTarget, step, *args):
+    """Run one permission step; log a `PermissionsNotApplied` once, re-raise.
+
+    The refusal itself reaches the tools as an `OSError` (`io_failure`); the
+    log line is where an operator finds the step, the errno and the path.
+    """
+    try:
+        return step(*args)
+    except vault_fs.PermissionsNotApplied as exc:
+        logger.error(
+            "file permissions not applied; nothing was written: step=%s "
+            "errno=%s path=%s",
+            exc.step,
+            errno.errorcode.get(exc.code, exc.code),
+            target.rel,
+        )
+        raise
+
+
+def _capture_leaf_or_conflict(
+    target: MutableTarget, dir_fd: int, name: str, *, fd: int | None = None
+) -> vault_fs.Leaf | None:
+    """`vault_fs.capture_leaf`, with a mid-capture change as the in-call conflict."""
+    try:
+        return _permissions_step(
+            target, lambda: vault_fs.capture_leaf(dir_fd, name, fd=fd)
+        )
+    except vault_fs.CaptureChanged:
+        raise RuntimeError(f"File changed while editing: {name}") from None
+
+
+def _require_same_leaf(
+    before: vault_fs.Leaf | None, now: vault_fs.Leaf | None, name: str
+) -> None:
+    """P1 versus P2 (D5): any difference is the in-call conflict, never a re-apply.
+
+    Re-applying would mean a second flush inside the compare-to-rename window;
+    refusing costs the agent one retry and publishes nothing.
+    """
+    if vault_fs.leaf_signature(before) != vault_fs.leaf_signature(now):
+        raise RuntimeError(f"File changed while editing: {name}")
+
+
+def _read_fd_bytes_checking_leaf(
+    target: MutableTarget,
+    dir_fd: int,
+    name: str,
+    max_bytes: int,
+    before: vault_fs.Leaf | None,
+) -> bytes:
+    """`_read_fd_bytes` for the `expected=` comparison, with P2 on its descriptor.
+
+    Same open, same bound, same conflicts as `_read_fd_bytes`; the difference
+    is that the descriptor stays open long enough for the leaf's permissions
+    to be captured through it **before** its bytes are read, so the capture
+    and the comparison are of the same inode and nothing lands between the
+    comparison and the rename.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(name, flags, dir_fd=dir_fd)
+    except FileNotFoundError:
+        raise RuntimeError(f"File changed while editing: {name}") from None
+    except OSError as exc:
+        # A symlink swapped in at the name since P1 is the regular file
+        # having vanished — the in-call conflict, not an I/O failure.
+        if getattr(exc, "errno", None) == errno.ELOOP:
+            raise RuntimeError(f"File changed while editing: {name}") from None
+        raise
+    try:
+        _require_same_leaf(
+            before, _capture_leaf_or_conflict(target, dir_fd, name, fd=fd), name
+        )
+        try:
+            return _bound_read(fd, name, max_bytes)
+        except _ReadLimitExceeded:
+            raise RuntimeError(f"File changed while editing: {name}") from None
+    finally:
+        os.close(fd)
 
 
 class _ReadLimitExceeded(ValueError):

@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime
+import errno
 import hashlib
 import ipaddress
 import logging
@@ -1684,6 +1685,80 @@ def _parent_rel(rel_path: str) -> str:
     return "" if parent == "." else parent
 
 
+def _apply_publication_permissions(
+    root_fd: int,
+    staging_fd: int,
+    row,
+    staged_fd: int,
+    staged_st: os.stat_result,
+) -> tuple[int, int] | None:
+    """Capture the bound path's permission rule once and apply it (#447, D5).
+
+    The destination parent is opened **without** creating it: the up-front
+    walk in `_stream_locked` already did, so a missing folder here vanished
+    during the stream and the upload is a `Conflict` (409, claim released).
+
+    * **Overwrite token with a fingerprint** — the edit rule, from a leaf whose
+      `(st_dev, st_ino, st_ctime_ns)` must be the fingerprint's. A `chmod` or
+      an ACL change after the mint moves the ctime, so it is refused here with
+      the same message `publish` would give; `publish`'s own re-check inside
+      the gate covers everything later. Returns `None`.
+    * **Otherwise** — the create rule from the destination folder, whose
+      `(st_dev, st_ino)` is returned for the gate's identity check.
+
+    Every raise here is before publication (`state["published"]` is false): a
+    `Conflict` is a 409 and `PermissionsNotApplied` the route's generic
+    pre-publication branch, both with the claim released.
+    """
+    try:
+        dst_fd, name = vault_fs.open_parent(root_fd, row.path, create=False)
+    except FileNotFoundError:
+        raise vault_fs.Conflict(
+            "The destination folder disappeared during the upload; nothing "
+            f"was written: {row.path}"
+        ) from None
+    try:
+        directory = vault_fs.capture_dir(dst_fd)
+        fp = row.expected_fingerprint if row.overwrite else None
+        if fp is not None:
+            # A destination that came to sit on another mount since the mint
+            # would also fail the fingerprint comparison below; classify it as
+            # the mount boundary it is, exactly as the gate would, rather than
+            # as a changed target. Both refuse before publication.
+            vault_fs.require_same_mount(staging_fd, dst_fd, row.path)
+            vault_fs.require_leaf_on_same_mount(staging_fd, dst_fd, name, row.path)
+            try:
+                leaf = vault_fs.capture_leaf(dst_fd, name)
+            except vault_fs.CaptureChanged:
+                leaf = None
+            if leaf is None or (leaf.dev, leaf.ino, leaf.ctime_ns) != (
+                fp.get("dev"),
+                fp.get("inode"),
+                fp.get("ctime_ns"),
+            ):
+                raise vault_fs.Conflict(
+                    f"Target changed since the token was minted: {name}"
+                )
+            plan = vault_fs.edit_plan(leaf)
+            identity = None
+        else:
+            plan = vault_fs.create_plan(directory, staged_st.st_gid)
+            identity = (directory.dev, directory.ino)
+        vault_fs.apply_plan(staged_fd, plan, directory.acl_capable)
+        return identity
+    except vault_fs.PermissionsNotApplied as exc:
+        logger.error(
+            "file permissions not applied; nothing was written: step=%s "
+            "errno=%s path=%s",
+            exc.step,
+            errno.errorcode.get(exc.code, exc.code),
+            row.path,
+        )
+        raise
+    finally:
+        _close_quietly(dst_fd, f"permissions capture for {row.path}")
+
+
 def _publish_into_current_parent(
     root_fd: int,
     staging_fd: int,
@@ -1694,6 +1769,7 @@ def _publish_into_current_parent(
     *,
     staged_fd: int | None = None,
     staged_st: os.stat_result | None = None,
+    captured_dir: tuple[int, int] | None = None,
 ):
     """Resolve the destination parent *now* and link the staged file into it.
 
@@ -1748,6 +1824,14 @@ def _publish_into_current_parent(
     is what `publish`'s identity check compares against. Everything else on this
     path — the fresh lookup, the gate, the flushes, the callback ordering — is
     the same code on both branches.
+
+    `captured_dir` is the `(st_dev, st_ino)` of the folder whose create rule
+    the staged inode already carries (#447). When it is given, the folder this
+    lookup resolved must be that folder, or the upload is a `Conflict`: the
+    permissions were computed for a directory that is no longer at the path.
+    An identity check, not a second capture — nothing is re-applied and the
+    staged file is not flushed again. An edit plan passes `None`; `publish`'s
+    fingerprint check covers its leaf.
     """
     dst_fd, name = vault_fs.open_parent(
         root_fd, row.path, create=True, created=created
@@ -1770,6 +1854,13 @@ def _publish_into_current_parent(
             # A bind mount on the destination *file* leaves the parent check
             # above satisfied and still fails the rename with `EBUSY`.
             vault_fs.require_leaf_on_same_mount(staging_fd, dst_fd, name, row.path)
+        if captured_dir is not None:
+            dst_st = os.fstat(dst_fd)
+            if (dst_st.st_dev, dst_st.st_ino) != captured_dir:
+                raise vault_fs.Conflict(
+                    "The destination folder was replaced during the upload; "
+                    f"nothing was written: {row.path}"
+                )
         outcome = vault_fs.publish(
             staging_fd,
             tmp_name,
@@ -1824,6 +1915,9 @@ async def _stream_locked(
     # and records nothing — collecting from both is what keeps the flush from
     # silently covering nothing (#97).
     created_dirs: list[str] = []
+    # The destination folder's identity as `_apply_publication_permissions`
+    # captured it, for the gate's check (`None` for an edit plan).
+    captured_dir: tuple[int, int] | None = None
     # **Before the staging block, so it exists from before `tmp_name` can.**
     # The outer cleanup reads it to tell a name its publish consumed from one
     # that disappeared while the write was still in flight (#115), and that
@@ -1891,17 +1985,25 @@ async def _stream_locked(
                 note_hasher=note_hasher,
             )
             # Publication links this very inode into place, so the 0600 it was
-            # created with would become the published mode. Relax it to what a
-            # plain write would have produced, exactly as
-            # `vault._atomic_write_at` does — an upload must not land less
-            # readable than the note beside it (#95).
+            # created with would become the published mode (#95). It gets the
+            # permissions the `file-permissions` rules give the bound path
+            # instead (#447): the replaced file's for an overwrite token, what
+            # an ordinary create gets in the destination folder otherwise —
+            # computed from that folder, never inherited, because this inode
+            # was created in `.transfer-tmp` and carries *its* default ACL.
             #
-            # Relaxing it here rather than at publish time means the bytes are
-            # group/world-readable for as long as the gate takes, which can be
-            # minutes; `open_staging_dir` holds `.transfer-tmp` at 0700 so that
-            # window is not reachable — and in the unnamed mode there is no name
-            # through which to reach them at all.
-            os.fchmod(staged_fd, vault_fs.default_file_mode())
+            # Captured once, here, so the one payload flush below covers it and
+            # the gate never flushes; the gate only checks that it is
+            # publishing into the folder this captured (`captured_dir`).
+            # Applying it before the gate means the bytes carry their final
+            # permissions for as long as the gate takes, which can be minutes;
+            # `open_staging_dir` holds `.transfer-tmp` at 0700 so that window
+            # is not reachable — and in the unnamed mode there is no name
+            # through which to reach them at all. In the named mode the staged
+            # descriptor is still open here; it closes after the flush.
+            captured_dir = _apply_publication_permissions(
+                root_fd, staging_fd, row, staged_fd, staged_st
+            )
             # Durability, before the gate and off the loop — see
             # `_flush_staged_payload`. The body is complete at this point and
             # nothing has been published, so a failure here is a plain
@@ -1945,6 +2047,7 @@ async def _stream_locked(
                     created_dirs,
                     staged_fd=staged_fd,
                     staged_st=staged_st,
+                    captured_dir=captured_dir,
                 )
                 tmp_name = None  # publish owns cleanup from here
             else:
@@ -1974,6 +2077,7 @@ async def _stream_locked(
                         created_dirs,
                         staged_fd=staged_fd,
                         staged_st=staged_st,
+                        captured_dir=captured_dir,
                     )
                     tmp_name = None
                     # Inside the context, so completion commits with the locks.

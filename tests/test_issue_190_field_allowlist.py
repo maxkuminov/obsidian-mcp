@@ -535,6 +535,22 @@ _STAGING_CLEANUP = (
     "the destructive publication path stays unchanged"
 )
 
+#: #447 (design D6): the permission rule of a write could not be captured or
+#: applied, so the write was refused *before* publication. Not a staging
+#: cleanup and not post-publication, so it has its own text — but the same R10
+#: reasoning: it fires only when the vault's own filesystem refuses an
+#: operation on an inode the server owns (EIO, ENOSPC, an LSM denial), every
+#: call that reaches it is charged to the write bucket, and threading the
+#: suppressor through the write path would change the destructive path to
+#: bound something the bucket already bounds. The line is the operator's only
+#: record of which step failed on which path.
+_PERMISSIONS_NOT_APPLIED = (
+    "pre-publication refusal because the vault filesystem rejected a "
+    "permission step (D6, #447); one line per refused write, bounded by the "
+    "write bucket; not routed through the suppressor to keep the destructive "
+    "publication path unchanged"
+)
+
 _BARE_LOGGER_EXEMPTIONS: dict[str, dict[str, str]] = {
     "src/control_panel/routes.py": {
         "Skipping HNSW index": (
@@ -574,6 +590,7 @@ _BARE_LOGGER_EXEMPTIONS: dict[str, dict[str, str]] = {
         # three times per publication, so a caller reaches it directly. The
         # exemption stands — on the accurate reason.
         "Could not close the %s descriptor": _POST_PUBLICATION,
+        "file permissions not applied; nothing was written": _PERMISSIONS_NOT_APPLIED,
     },
     # R10 — the post-publication flush and the staging cleanup. Every entry
     # here is reachable from a foreground tool call (create/edit/move/delete a
@@ -618,6 +635,7 @@ _BARE_LOGGER_EXEMPTIONS: dict[str, dict[str, str]] = {
         # already released the root descriptor. Design D18 already named this
         # site as staying on the bare logger; R10 is why.
         "Published %s but could not flush the directories above it": _POST_PUBLICATION,
+        "file permissions not applied; nothing was written": _PERMISSIONS_NOT_APPLIED,
     },
     "src/services/vault_overlap.py": {
         # The detection pass. Its entry points are startup, the indexer tick,
@@ -725,12 +743,14 @@ def test_the_exemption_list_is_exactly_what_the_design_says_it_is():
         "Rollback after the failed fingerprint record failed",
     }
     assert set(_BARE_LOGGER_EXEMPTIONS["src/services/transfer.py"]) == {
-        "Could not close the %s descriptor"
+        "Could not close the %s descriptor",
+        "file permissions not applied; nothing was written",
     }
     assert len(_BARE_LOGGER_EXEMPTIONS["src/services/vault_overlap.py"]) == 5
     assert len(_BARE_LOGGER_EXEMPTIONS["src/services/vault_fs.py"]) == 9
     assert set(_BARE_LOGGER_EXEMPTIONS["src/services/vault.py"]) == {
-        "Published %s but could not flush the directories above it"
+        "Published %s but could not flush the directories above it",
+        "file permissions not applied; nothing was written",
     }
 
 
