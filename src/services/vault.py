@@ -2649,13 +2649,21 @@ def _require_staged_bytes(
         raise conflict
     view = memoryview(payload)
     offset = 0
-    while offset < len(view):
-        chunk = os.pread(fd, min(_STAGED_VERIFY_CHUNK, len(view) - offset), offset)
-        if not chunk or chunk != view[offset : offset + len(chunk)]:
+    try:
+        while offset < len(view):
+            chunk = os.pread(fd, min(_STAGED_VERIFY_CHUNK, len(view) - offset), offset)
+            if not chunk or chunk != view[offset : offset + len(chunk)]:
+                raise conflict
+            offset += len(chunk)
+        if os.pread(fd, 1, offset):
             raise conflict
-        offset += len(chunk)
-    if os.pread(fd, 1, offset):
-        raise conflict
+    except PermissionError:
+        # A network filesystem that re-checks every read refused the read-back
+        # of a kept mode without owner read (L15). Identity and size are
+        # checked above; the content comparison is skipped, not the write.
+        # Only the owner can change this inode's mode, so nobody else can
+        # cause this to switch the comparison off.
+        return
 
 
 def _permissions_step(target: MutableTarget, step, *args):

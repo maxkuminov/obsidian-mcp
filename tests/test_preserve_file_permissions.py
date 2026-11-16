@@ -1448,7 +1448,11 @@ async def test_a_staged_copy_altered_under_named_no_clobber_staging(notes, monke
     monkeypatch.setattr(vault_service.settings, "vault_allow_named_staging_fallback", True)
     _after_the_staged_flush(monkeypatch, _alter_staged_copy(notes, "same length"))
 
-    result = await tools.create_note_impl("new.md", "ours")
+    try:
+        result = await tools.create_note_impl("new.md", "ours")
+    finally:
+        # Process state set on first exercise; later modules assume it clear.
+        vault_fs.reset_named_staging_state()
 
     assert refusal_code(result) == "concurrent_write", result
     assert not (notes / "new.md").exists()
@@ -1494,3 +1498,51 @@ async def test_a_symlink_swapped_in_before_the_comparison_is_a_conflict(notes, m
     assert refusal_code(result) == "concurrent_write", result
     assert note.is_symlink()
     assert elsewhere.read_text() == "untouched\n"
+
+
+def _refuse_staged_read_back(monkeypatch) -> list[int]:
+    """`pread` on a `.tmp-*` staging descriptor fails `EACCES`, as on a network
+    filesystem that re-checks permissions on every read (L15)."""
+    refused: list[int] = []
+    real = os.pread
+
+    def pread(fd, n, offset):
+        if Path(os.readlink(f"/proc/self/fd/{fd}")).name.startswith(".tmp-"):
+            refused.append(fd)
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return real(fd, n, offset)
+
+    monkeypatch.setattr(os, "pread", pread)
+    return refused
+
+
+async def test_a_refused_read_back_skips_the_comparison_not_the_write(notes, monkeypatch):
+    """L15: where the staged copy cannot be read back, the content comparison
+    is skipped and the write proceeds, keeping the replaced file's mode."""
+    f = notes / "drop.bin"
+    f.write_bytes(b"old")
+    os.chmod(f, 0o200)
+    refused = _refuse_staged_read_back(monkeypatch)
+
+    result = await tools.write_file_impl("drop.bin", "new", encoding="text", overwrite=True)
+
+    assert refusal_code(result) is None, result
+    assert refused, "the read-back was never attempted"
+    assert stat.S_IMODE(os.lstat(f).st_mode) == 0o200
+    os.chmod(f, 0o600)
+    assert f.read_bytes() == b"new"
+
+
+async def test_a_refused_read_back_still_checks_the_size(notes, monkeypatch):
+    """L15: identity and size are still checked before the read-back, so a
+    staged copy of another length is the in-call conflict."""
+    f = notes / "drop.bin"
+    f.write_bytes(b"old")
+    _refuse_staged_read_back(monkeypatch)
+    _after_the_staged_flush(monkeypatch, _alter_staged_copy(notes, "longer"))
+
+    result = await tools.write_file_impl("drop.bin", "new", encoding="text", overwrite=True)
+
+    assert refusal_code(result) == "concurrent_write", result
+    assert f.read_bytes() == b"old"
+    assert [p.name for p in notes.iterdir() if p.name.startswith(".tmp-")] == []
