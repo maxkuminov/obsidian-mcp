@@ -63,10 +63,12 @@ ACL encoding: a little-endian `u32` version 2, then 8-byte `<HHI` entries (tag, 
 - a wrong version;
 - a length not `4 + 8n`;
 - an unknown tag;
+- permission bits outside `rwx`;
 - a missing base entry;
-- entries out of sort order.
+- named entries without a `MASK`;
+- entries out of sort order, or repeated.
 
-A refusal is a D6 failure.
+The kernel never returns the last four. A refusal is a D6 failure.
 
 ### D2. Apply: group, then translation if needed, then ACL, then mode
 
@@ -150,7 +152,7 @@ The published inode belongs to the server's uid. The gid is the wanted one, or `
 
   There is no re-apply and no second `fsync`. **The compare-to-rename window is exactly today's**: nothing is added between the byte comparison and `_require_staged_name` / the rename. Without `expected=`, the `O_PATH` capture sits where the comparison would. A permission change after the P2 capture is lost with the replaced inode (L7). A content write after the comparison is overwritten, as today.
 - **Uploads.** One capture, after `_drain` and before `_flush_staged_payload`, replacing `transfer.py:1904`. The destination parent is opened with `open_parent(…, create=False)`. A missing parent is a `Conflict` (409, claim released): the up-front walk created it, so it vanished during the stream.
-  - For an overwrite token with a fingerprint, the leaf capture's `(st_dev, st_ino, st_ctime_ns)` must equal the fingerprint's, or `Conflict("Target changed since the token was minted: …")`. `publish`'s own fingerprint re-check inside the gate covers every later change.
+  - For an overwrite token with a fingerprint, the leaf capture's `(st_dev, st_ino, st_ctime_ns)` must equal the fingerprint's, or `Conflict("Target changed since the token was minted: …")`. `publish`'s own fingerprint re-check inside the gate covers every later change. The existing mount-boundary checks (`require_same_mount`, `require_leaf_on_same_mount`) run before that comparison, so a destination or leaf bind-mounted after the mint is still refused as a `MountBoundary` (503, claim released), not as a 409 "Target changed".
   - For a create plan, the gate compares `fstat(dst_fd)`'s `(st_dev, st_ino)` with the captured directory's, and a mismatch is `Conflict`. This is an identity check, not a second capture.
   - The named-mode staged descriptor is still open at this point (it closes after the flush), so nothing is reopened.
 - **Create plans** are captured once. A change to the directory's default ACL during the call is not seen (L10).
@@ -189,7 +191,7 @@ A required non-translated ACL write refused with `EOPNOTSUPP`/`ENOTSUP` **is** a
 
 - **Parent has a default ACL:** read it through the prefix descriptor before each `mkdirat` and pass mode 0o777. The kernel ignores the umask there and applies the default ACL, exactly as `mkdir` does.
 - **No default ACL, or it cannot be read for any reason:** 0o755, byte-identical to today, never broader, and the directory path never refuses.
-- **`.transfer-tmp`:** unchanged.
+- **`.transfer-tmp`:** unchanged. `open_staging_dir` calls `open_dir_beneath(follow_default_acl=False)`, so its `mkdirat` mode argument stays 0o755 even when the vault root has a default ACL, and the folder is never created group-writable before its `fchmod(0o700)`.
 
 The non-ACL directory mode (0o755 versus `mkdir(1)`'s `0o777 & ~umask`) is deliberately left alone here. A separate issue will be filed. If a default ACL is removed between the read and the `mkdirat`, the new folder is `0o777 & ~umask` (L11).
 
@@ -214,7 +216,7 @@ Verified at 85e8df5: every caller of `vault_fs.default_file_mode()` and every pu
 | soft delete to `.trash/` | `renameat2` | **Unchanged** |
 | permanent delete | `unlinkat` | **Unchanged** |
 | `open_dir_beneath(create=True)`: parents for writes, moves, both upload descents, the `.trash/` tree | `mkdirat` (`vault_fs.py:744`) | **0o777 under a default ACL**, else 0o755 as today |
-| `open_staging_dir`: `.transfer-tmp` | `mkdirat` + `fchmod(0o700)` | **Unchanged** |
+| `open_staging_dir`: `.transfer-tmp` | `mkdirat` + `fchmod(0o700)` | **Unchanged**: mode argument 0o755 even under a default ACL (`follow_default_acl=False`) |
 | `probe_publication`, `probe_trash`, `prune_stale_staging` | transient files / `unlinkat` | **Unchanged** |
 
 No other writer creates vault files. The indexer, the panel and the change feed write only to the database.

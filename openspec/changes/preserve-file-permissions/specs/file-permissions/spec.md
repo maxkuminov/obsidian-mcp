@@ -111,7 +111,7 @@ A publication that creates a name SHALL leave the published file with the permis
 
 ### Requirement: A directory the server creates under a default ACL SHALL get what an ordinary mkdir gets there
 
-When the parent directory has a default ACL, a vault directory the server creates (for `create_note`, `write_file`, `move_note`, an upload or import into a new folder, or the soft-delete tree under `.trash/`) SHALL be created with mode argument 0o777, so the kernel applies the default ACL exactly as for `mkdir(path, 0o777)`. When the parent has no default ACL, or its default ACL cannot be read for any reason, the mode argument SHALL stay 0o755, as before this change, and the directory path SHALL NOT refuse. `.transfer-tmp` SHALL be unchanged: created 0o700 and held at 0o700 on every open.
+When the parent directory has a default ACL, a vault directory the server creates (for `create_note`, `write_file`, `move_note`, an upload or import into a new folder, or the soft-delete tree under `.trash/`) SHALL be created with mode argument 0o777, so the kernel applies the default ACL exactly as for `mkdir(path, 0o777)`. When the parent has no default ACL, or its default ACL cannot be read for any reason, the mode argument SHALL stay 0o755, as before this change, and the directory path SHALL NOT refuse. `.transfer-tmp` SHALL be unchanged: its `mkdirat` mode argument SHALL stay 0o755 even when its parent has a default ACL, so it is never created group-writable, and it SHALL be set to and held at 0o700 on every open.
 
 #### Scenario: A new folder under a group-writable default ACL
 
