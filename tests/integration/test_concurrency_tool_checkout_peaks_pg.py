@@ -211,6 +211,9 @@ CALLS = [
     ('complete_task', 'complete_task_impl', lambda s: (('new.md', _task_id(s['add_task'])), {})),
     ('update_task', 'update_task_impl',
      lambda s: (('new.md', _task_id(s['complete_task'])), {'priority': 'high'})),
+    # #430: move the task just updated into `a.md` (two publications).
+    ('move_task', 'move_task_impl',
+     lambda s: (('new.md', _task_id(s['update_task']), 'a.md'), {})),
     ('task_agenda', 'task_agenda_impl', lambda s: ((), {})),
     ('edit_note', 'edit_note_impl', lambda s: (('new.md', 'second\n'), {})),
     ('set_frontmatter', 'set_frontmatter_impl',

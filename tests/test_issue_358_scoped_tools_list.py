@@ -1,19 +1,22 @@
 """#358 — `tools/list` scoped by the authorization presented on the request.
 
 An OAuth grant without `readwrite` lists 20 tools: the full list minus the
-twelve names in `tool_permissions.WRITE_REQUIRED_TOOLS`, the one registry that
+thirteen names in `tool_permissions.WRITE_REQUIRED_TOOLS`, the one registry that
 also drives `_tracked`'s body-boundary write gate. Everyone else — API keys of
 either permission, `readwrite` grants, sandbox mode, in-process callers —
-lists all 32. Enforcement is unchanged in outcome.
+lists all 33. Enforcement is unchanged in outcome.
 
-**The oracle.** `tests/fixtures/tools_list_full_v2.json` is the complete
-`tools/list` result (all 32 tools, every serialised field) captured over the
-Streamable HTTP transport for a `readwrite` API-key principal; the task-tools
-change (#428) generated it deliberately. `tests/fixtures/tools_list_full_v1.json`
-is the 1.0 contract-freeze fixture (28 tools, captured on c491326 + spec
-commits), kept unedited: `test_v1_derives_from_v2` proves v2 minus the four
-task-tools entries equals it, apart from `list_tasks`'s description and its
-added optional input properties. The 5a391ca / additions / amendments
+**The oracle.** `tests/fixtures/tools_list_full_v3.json` is the complete
+`tools/list` result (all 33 tools, every serialised field) captured over the
+Streamable HTTP transport for a `readwrite` API-key principal; the task-move
+change (#430) generated it deliberately. `tests/fixtures/tools_list_full_v2.json`
+(32 tools, the task-tools change's oracle, #428) is kept unedited as the 1.3
+record: `test_v2_derives_from_v3` proves v3 minus `move_task` equals it byte for
+byte. `tests/fixtures/tools_list_full_v1.json` is the 1.0 contract-freeze
+fixture (28 tools, captured on c491326 + spec commits), kept unedited:
+`test_v1_derives_from_v2` proves v2 minus the four task-tools entries equals
+it, apart from `list_tasks`'s description and its added optional input
+properties. The 5a391ca / additions / amendments
 fixtures pin only names and schemas. Comparison is byte identity of
 the canonical serialisation (UTF-8, keys sorted, no insignificant whitespace);
 the file itself is stored indented for review. Regenerate — only for a change
@@ -49,15 +52,17 @@ from src.mcp_server.server import SERVER_INSTRUCTIONS, mcp
 from src.services import rate_limits
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
-ORACLE = FIXTURES / "tools_list_full_v2.json"
+ORACLE = FIXTURES / "tools_list_full_v3.json"
+V2 = FIXTURES / "tools_list_full_v2.json"
 V1 = FIXTURES / "tools_list_full_v1.json"
 READONLY = FIXTURES / "tools_list_readonly_oauth.json"
 REPO = Path(__file__).resolve().parent.parent
 
-TWELVE = {
+THIRTEEN = {
     "create_note", "edit_note", "move_note", "delete_note", "set_frontmatter",
     "write_file", "delete_file", "import_from_url", "request_upload",
     "complete_task", "update_task", "add_task",  # #428
+    "move_task",  # #430
 }
 #: The four tools the task-tools change (#428) appended, in order.
 TASK_TOOLS = ("task_agenda", "complete_task", "update_task", "add_task")
@@ -110,11 +115,11 @@ async def test_oracle_capture(vault_root):
     )
 
 
-def test_the_oracle_is_the_complete_32_tool_result():
+def test_the_oracle_is_the_complete_33_tool_result():
     result = oracle()
     names = [t["name"] for t in result["tools"]]
-    assert len(names) == 32 and len(set(names)) == 32
-    assert tuple(names[-4:]) == TASK_TOOLS
+    assert len(names) == 33 and len(set(names)) == 33
+    assert tuple(names[-5:-1]) == TASK_TOOLS and names[-1] == "move_task"
     assert "nextCursor" not in result
     for tool in result["tools"]:
         assert {"name", "title", "description", "inputSchema", "annotations"} <= tool.keys()
@@ -134,13 +139,24 @@ async def test_the_full_list_is_byte_identical_to_the_oracle(cred, vault_root):
 # ══════════════════════════════════════════════════════════════════════════
 
 
+def test_v2_derives_from_v3():
+    """The 1.3 oracle is kept unedited (#430, owner decision Q9): v3 with the
+    `move_task` entry removed equals v2 byte for byte under the canonical
+    serialisation, so no existing tool's entry changed."""
+    v2 = json.loads(V2.read_text(encoding="utf-8"))
+    v3 = oracle()
+    kept = [t for t in v3["tools"] if t["name"] != "move_task"]
+    assert len(kept) == len(v3["tools"]) - 1 == 32
+    assert h.canonical({**v3, "tools": kept}) == h.canonical(v2)
+
+
 def test_v1_derives_from_v2():
     """The 1.0 oracle is kept unedited (#428 D15): v2 minus the four task-tools
     entries equals v1, except `list_tasks`'s description and its added
     optional input properties — every v1 property kept with the same schema,
     `required` unchanged."""
     v1 = json.loads(V1.read_text(encoding="utf-8"))
-    v2 = oracle()
+    v2 = json.loads(V2.read_text(encoding="utf-8"))
     kept = [t for t in v2["tools"] if t["name"] not in TASK_TOOLS]
     assert [t["name"] for t in kept] == [t["name"] for t in v1["tools"]]
     by_name = {t["name"]: t for t in v1["tools"]}
@@ -164,8 +180,8 @@ def test_v1_derives_from_v2():
     assert h.canonical({**v2, "tools": derived}) == h.canonical(v1)
 
 
-def test_the_readonly_fixture_is_the_oracle_minus_the_twelve():
-    expected = [t["name"] for t in oracle()["tools"] if t["name"] not in TWELVE]
+def test_the_readonly_fixture_is_the_oracle_minus_the_thirteen():
+    expected = [t["name"] for t in oracle()["tools"] if t["name"] not in THIRTEEN]
     assert readonly_names() == expected
     assert len(expected) == 20
 
@@ -183,7 +199,7 @@ async def test_a_readonly_grant_lists_20_entries_identical_to_the_oracle(cred, v
 
 @pytest.mark.parametrize(
     "cred,count",
-    [(h.READ_GRANT, 20), (h.READ_KEY, 32), (h.READWRITE_KEY, 32), (h.READWRITE_GRANT, 32)],
+    [(h.READ_GRANT, 20), (h.READ_KEY, 33), (h.READWRITE_KEY, 33), (h.READWRITE_GRANT, 33)],
     ids=lambda v: getattr(v, "bearer", str(v)),
 )
 async def test_a_cursor_does_not_change_the_result(cred, count, vault_root):
@@ -209,11 +225,11 @@ def _reset(tokens):
     "principal,permission,count",
     [
         (("oauth", "g"), "read", 20),
-        (("oauth", "g"), "readwrite", 32),
-        (("api_key", 1), "read", 32),
-        (("api_key", 1), "readwrite", 32),
-        (None, "read", 32),
-        (None, "readwrite", 32),
+        (("oauth", "g"), "readwrite", 33),
+        (("api_key", 1), "read", 33),
+        (("api_key", 1), "readwrite", 33),
+        (None, "read", 33),
+        (None, "readwrite", 33),
     ],
 )
 async def test_in_process_listing_per_principal(principal, permission, count):
@@ -223,7 +239,7 @@ async def test_in_process_listing_per_principal(principal, permission, count):
     finally:
         _reset(tokens)
     assert len(listed) == count
-    if count == 32:
+    if count == 33:
         # The same order and schemas as the oracle and the #343 fixtures.
         assert [t.name for t in listed] == [t["name"] for t in oracle()["tools"]]
         for tool, row in zip(listed, oracle()["tools"]):
@@ -330,7 +346,7 @@ async def test_no_credential_is_refused_before_the_handler(monkeypatch):
     assert spy.calls == 0
 
 
-async def test_sandbox_mode_lists_all_32(monkeypatch, vault_root):
+async def test_sandbox_mode_lists_all_33(monkeypatch, vault_root):
     """The real middleware in sandbox mode passes straight through with no
     principal set, so the registry introspection a sandbox exists for sees
     every tool."""
@@ -518,8 +534,8 @@ async def test_l5_a_pre_permission_refusal_is_now_permission_denied_for_a_readon
 # ══════════════════════════════════════════════════════════════════════════
 
 
-def test_the_registry_is_the_twelve():
-    assert tool_permissions.WRITE_REQUIRED_TOOLS == TWELVE
+def test_the_registry_is_the_thirteen():
+    assert tool_permissions.WRITE_REQUIRED_TOOLS == THIRTEEN
     assert tool_permissions.hidden_names() is tool_permissions.WRITE_REQUIRED_TOOLS
 
 
@@ -557,7 +573,7 @@ def _minimal_args(tool) -> dict:
 
 
 async def test_every_tool_under_a_readonly_grant_is_refused_iff_in_the_registry(read_only_in_process, monkeypatch):
-    """All 32, called through the server with a read-only OAuth principal.
+    """All 33, called through the server with a read-only OAuth principal.
     Anything that would reach the database fails fast instead; only the
     `permission_denied` set matters here."""
 

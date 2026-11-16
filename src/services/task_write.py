@@ -2553,8 +2553,10 @@ def _ref(row, score: float | None = None) -> TaskRef:
 
 
 __all__ = [
-    "AddArgs", "CompleteArgs", "Expect", "Inserted", "Intent", "NewLine", "Plan",
-    "Span", "TaskRef", "TaskWriteRefusal", "UpdateArgs", "continuation_block",
-    "contains", "duplicate_scan", "extracted_task_at", "jaccard", "plan_add", "plan_complete", "plan_update",
-    "resolve", "similarity_terms", "term_set", "verify",
+    "AddArgs", "CompleteArgs", "Expect", "Inserted", "Intent", "MoveArgs", "MovePlan",
+    "MovedBlock", "NewLine", "Plan", "Span", "TaskRef", "TaskWriteRefusal", "UpdateArgs",
+    "continuation_block", "contains", "destination_still_holds", "duplicate_scan",
+    "extracted_task_at", "jaccard", "plan_add", "plan_complete", "plan_move", "plan_move_within",
+    "plan_relocated_removal", "plan_update", "resolve", "similarity_terms", "term_set", "verify",
+    "verify_move_insert", "verify_removal",
 ]

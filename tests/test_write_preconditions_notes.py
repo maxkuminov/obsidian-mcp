@@ -975,6 +975,8 @@ async def _call_without_hash(tool, path):
         return await tools.update_task_impl(path, "0123456789ab", due="today")
     if tool == "add_task":
         return await tools.add_task_impl(path, "a task")
+    if tool == "move_task":
+        return await tools.move_task_impl(path, "0123456789ab", "elsewhere.md")
     return await tools.move_note_impl(path, "elsewhere.md")
 
 
@@ -999,6 +1001,8 @@ async def _call_with_hash(tool, path, value):
         )
     if tool == "add_task":
         return await tools.add_task_impl(path, "a task", expected_hash=value)
+    if tool == "move_task":
+        return await tools.move_task_impl(path, "0123456789ab", "elsewhere.md", expected_hash=value)
     return await tools.move_note_impl(path, "elsewhere.md", expected_hash=value)
 
 
@@ -1012,6 +1016,7 @@ SLICE_B_TOOLS = [
     "complete_task",
     "update_task",
     "add_task",
+    "move_task",  # #430: both notes' ladders, at the same position
 ]
 
 

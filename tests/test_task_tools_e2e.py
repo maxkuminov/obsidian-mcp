@@ -592,8 +592,9 @@ def test_descriptions_and_instructions_are_within_their_bounds():
 
 def test_registration_order_titles_and_annotations():
     names = [t.name for t in server.mcp._tool_manager.list_tools()]
-    assert names[-7:] == ["list_tasks", "get_changes", "hybrid_search", "task_agenda",
-                          "complete_task", "update_task", "add_task"]
+    # #430 appends `move_task` after `add_task`; the seven before it keep their order.
+    assert names[-8:] == ["list_tasks", "get_changes", "hybrid_search", "task_agenda",
+                          "complete_task", "update_task", "add_task", "move_task"]
     listed = {t.name: t for t in server.mcp._tool_manager.list_tools()}
     assert listed["task_agenda"].title == "Task agenda"
     assert listed["task_agenda"].annotations == server._READ_ONLY

@@ -1286,3 +1286,121 @@ def test_terminators_follow_the_destination(world):
     out = run(tools.move_task_impl("S.md", key_of("- [ ] x"), "D.md"))
     assert code_of(out) is None, out
     assert read(world, "S.md") == "Intro\r\nEnd\r\n" and read(world, "D.md") == "Notes\n- [ ] x\n    - ctx\n"
+
+
+# ── rate limits (Q7): one write token per move ──────────────────────────────
+
+
+@pytest.fixture
+def write_burst(monkeypatch):
+    from src.auth.session import current_principal
+    from src.services import rate_limits
+
+    def configure(burst: int):
+        monkeypatch.setattr(tools.settings, "mcp_write_rate_limit_per_minute", 1)
+        monkeypatch.setattr(tools.settings, "mcp_write_rate_limit_burst", burst)
+        rate_limits.reset_state_for_tests()
+
+    token = current_principal.set(("api_key", 4301))
+    yield configure
+    current_principal.reset(token)
+    rate_limits.reset_state_for_tests()
+
+
+def test_one_write_token_per_move(world, write_burst):
+    """Scenario: One write token per move (a burst of 2 admits two two-note
+    moves); mcp-rate-limits Scenario: Write tools pass both buckets (the
+    third is refused under the write scope while a read tool still runs)."""
+    from src.services import refusals
+
+    write_burst(2)
+    write(world, "A.md", "- [ ] one\n- [ ] two\n- [ ] three\n")
+    write(world, "B.md", "")
+    for line in ("- [ ] one", "- [ ] two"):
+        out = run(tools.move_task_impl("A.md", key_of(line), "B.md"))
+        assert code_of(out) is None, out
+    out = run(tools.move_task_impl("A.md", key_of("- [ ] three"), "B.md"))
+    assert code_of(out) == "rate_limited"
+    assert payload_of(out)["scope"] == refusals.SCOPE_PRINCIPAL_WRITE
+    assert read(world, "A.md") == "- [ ] three\n"
+    note = run(tools.read_note_impl("B.md"))  # a read tool is still admitted
+    assert "- [ ] two" in note.content
+
+
+def test_a_two_note_move_takes_exactly_one_write_token(world, write_burst):
+    """mcp-rate-limits Scenario: A two-note move takes one write token."""
+    from src.auth.session import current_principal
+    from src.services import rate_limits, refusals
+
+    write_burst(1)
+    write(world, "A.md", "- [ ] one\n")
+    write(world, "B.md", "")
+    out = run(tools.move_task_impl("A.md", key_of("- [ ] one"), "B.md"))
+    assert code_of(out) is None, out
+    assert read(world, "A.md") == "" and read(world, "B.md") == "- [ ] one"
+    admitted, _retry = rate_limits.take(current_principal.get(), refusals.SCOPE_PRINCIPAL_WRITE)
+    assert not admitted, "the bucket should be empty after one move"
+
+
+# ── the published surface (D17, D18) ────────────────────────────────────────
+
+
+def test_move_task_is_registered_last_destructive_with_its_contract_first():
+    from src.mcp_server import server
+
+    listed = {t.name: t for t in server.mcp._tool_manager.list_tools()}
+    names = list(listed)
+    assert names[-2:] == ["add_task", "move_task"]
+    tool = listed["move_task"]
+    assert tool.title == "Move task" and tool.annotations == server._DESTRUCTIVE
+    text = " ".join(tool.description.split())
+    assert len(tool.description) <= 4000
+    for needle in ("readwrite", "`to_expected_hash`", "top-level, unquoted",
+                   "destination is written first", "`task_move_incomplete`", "`complete with:`",
+                   "`resume=true`", "One window remains", "`dry_run=true`", "`resume_unmatched`",
+                   "`block_id_conflict`"):
+        assert needle in text, needle
+
+
+def test_the_instructions_name_move_task_within_their_caps():
+    """vault-guide Scenario: The instructions name the task tools within their
+    caps (D17: the lead byte-identical, the total ≤ 2,000)."""
+    from src.mcp_server import server
+
+    text = server.SERVER_INSTRUCTIONS
+    assert len(text) <= 2000
+    assert "`move_task` moves one, with the lines indented under it, to another note or section." in text
+    assert text.index("`move_task`") > 512
+
+
+def test_the_primer_names_move_task_neutrally(world):
+    """vault-guide Scenario: The primer names the task tools."""
+    result = run(tools.get_vault_guide_impl())
+    tasks = result.split("## Tasks", 1)[1].split("\n## ", 1)[0]
+    flat = " ".join(tasks.split())
+    for name in ("list_tasks", "task_agenda", "complete_task", "update_task", "add_task", "move_task"):
+        assert f"`{name}`" in tasks, name
+    assert "`move_task` moves one task, with the lines indented under it, to another note or section" in flat
+    for word in ("MUST", "IMPORTANT", "always use", "primary"):
+        assert word not in tasks
+
+
+def test_the_refusal_shape_checks():
+    """D11: the four move fields only on `task_move_incomplete`, which needs a
+    declared reason and never carries `nothing_written`; absent-not-null."""
+    from src.services import refusals
+
+    with pytest.raises(refusals.RefusalShapeError):
+        refusals.Refusal("io_failure", reason="io_failure")
+    with pytest.raises(refusals.RefusalShapeError):
+        refusals.Refusal("task_move_incomplete")
+    with pytest.raises(refusals.RefusalShapeError):
+        refusals.Refusal("task_move_incomplete", reason="made_up")
+    with pytest.raises(refusals.RefusalShapeError):
+        refusals.Refusal("task_move_incomplete", reason="io_failure", nothing_written=True)
+    r = refusals.Refusal("task_move_incomplete", path="A.md", destination_path="B.md",
+                         source_id="0123456789ab", reason="destination_changed")
+    assert refusals.sentinel_line(r) == (
+        'MCP-REFUSAL {"code":"task_move_incomplete","path":"A.md","destination_path":"B.md",'
+        '"source_id":"0123456789ab","reason":"destination_changed"}')
+    assert refusals.Refusal("not_found").as_payload() == {"code": "not_found"}

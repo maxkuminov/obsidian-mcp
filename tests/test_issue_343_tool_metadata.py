@@ -106,8 +106,9 @@ READ_TOOLS = frozenset({
     "task_agenda",  # #428
 })
 #: The task write tools (#428 D15): in the write bucket; `add_task` is
-#: additive (it removes no byte), the other two destructive.
-TASK_WRITE_TOOLS = ("complete_task", "update_task", "add_task")
+#: additive (it removes no byte), the others destructive (`move_task`, #430,
+#: removes lines from its source note).
+TASK_WRITE_TOOLS = ("complete_task", "update_task", "add_task", "move_task")
 RESTRUCTURED_WRITE_TOOLS = ("edit_note", "move_note", "set_frontmatter")
 # The refusal statement is qualified in every description that makes one: the
 # three restructured tools plus `create_note` and `delete_note`, whose
@@ -202,11 +203,12 @@ def tool_shaped_references(text: str, words: frozenset[str]) -> set[str]:
 # ── 1. completeness ──────────────────────────────────────────────────────────
 
 
-def test_exactly_32_tools():
+def test_exactly_33_tools():
     # 25 → 26: `list_tasks` (#350); 26 → 27: `get_changes` (#351);
     # 27 → 28: `hybrid_search` (#354); 28 → 32: `task_agenda`,
-    # `complete_task`, `update_task`, `add_task` (#428).
-    assert len(listed()) == 32
+    # `complete_task`, `update_task`, `add_task` (#428); 32 → 33:
+    # `move_task` (#430).
+    assert len(listed()) == 33
 
 
 @pytest.mark.parametrize("tool", listed(), ids=lambda t: t.name)
@@ -244,7 +246,7 @@ def test_the_write_bucket_set_is_the_production_one():
     w = tools.production_write_bucket_tools()
     assert w == frozenset(t for t, c in concurrency.TOOL_CLASSES.items() if c == "write")
     assert w <= registered_names()
-    assert len(w) == 11
+    assert len(w) == 12
 
 
 def test_destructive_is_the_write_bucket_minus_the_additive_writers_plus_request_upload():
@@ -254,7 +256,8 @@ def test_destructive_is_the_write_bucket_minus_the_additive_writers_plus_request
     assert _set(lambda a: a.destructiveHint) == (w - {"create_note", "add_task"}) | {"request_upload"}
     assert _set(lambda a: a.destructiveHint) == {
         "edit_note", "move_note", "delete_note", "set_frontmatter", "write_file",
-        "delete_file", "import_from_url", "complete_task", "update_task", "request_upload",
+        "delete_file", "import_from_url", "complete_task", "update_task", "move_task",
+        "request_upload",
     }
     assert _set(lambda a: not a.readOnlyHint) == w | {"request_upload", "request_download"}
     assert _set(lambda a: a.openWorldHint) == {"import_from_url"}
@@ -280,6 +283,7 @@ def test_a_test_probe_cannot_pollute_the_write_bucket_set():
         "create_note", "edit_note", "move_note", "delete_note", "set_frontmatter",
         "write_file", "delete_file", "import_from_url",
         "complete_task", "update_task", "add_task",  # #428
+        "move_task",  # #430
     })
 
 
@@ -329,6 +333,8 @@ LEAD_BEFORE_428 = (
     "it refuses an unguarded edit (`precondition_required`). Round trips: only `content` from a complete whole-note `read_note` "
 )
 TASK_TOOL_NAMES = ("list_tasks", "task_agenda", "complete_task", "update_task", "add_task")
+#: The instructions' task sentence also names `move_task` (#430).
+INSTRUCTION_TASK_NAMES = TASK_TOOL_NAMES + ("move_task",)
 
 
 def test_the_instructions_name_the_task_tools_in_one_sentence_outside_the_lead():
@@ -341,7 +347,7 @@ def test_the_instructions_name_the_task_tools_in_one_sentence_outside_the_lead()
     assert start >= INSTRUCTIONS_LEAD
     sentence = text[start:]
     assert sentence.endswith(".") and sentence.count(". ") == 0, sentence
-    for name in TASK_TOOL_NAMES:
+    for name in INSTRUCTION_TASK_NAMES:
         assert f"`{name}`" in sentence, name
         assert name not in text[:INSTRUCTIONS_LEAD], name
     assert "`path`" in sentence and "task id" in sentence
@@ -532,6 +538,7 @@ async def test_names_order_and_schemas_match_the_5a391ca_fixture():
     assert [row["name"] for row in additions] == [
         "list_tasks", "get_changes", "hybrid_search",
         "task_agenda", "complete_task", "update_task", "add_task",  # #428
+        "move_task",  # #430
     ]
     fixture = [amendments.get(row["name"], row) for row in frozen] + additions
     live = await mcp.list_tools()
@@ -678,7 +685,7 @@ def test_the_list_tasks_amendment_is_additive():
 
 def test_every_new_task_tool_returns_str_with_the_sdk_wrapper():
     additions = {row["name"]: row for row in json.loads(ADDITIONS.read_text(encoding="utf-8"))}
-    for name in ("task_agenda", "complete_task", "update_task", "add_task"):
+    for name in ("task_agenda", "complete_task", "update_task", "add_task", "move_task"):
         out = additions[name]["outputSchema"]
         assert out["properties"] == {"result": {"title": "Result", "type": "string"}}, name
 
