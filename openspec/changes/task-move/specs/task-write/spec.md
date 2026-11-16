@@ -1,12 +1,13 @@
 ## ADDED Requirements
 
-### Requirement: `move_task` SHALL move one task, with its whole continuation block, resolved from the source note's current bytes
+### Requirement: `move_task` SHALL move one top-level task, with its whole continuation block, resolved from the source note's current bytes
 
 `move_task(path, id, to_path, to_section=None, allow_duplicate=False, resume=False, dry_run=False, expected_hash=None, to_expected_hash=None)` SHALL move the task that `id` names in the note `path`, together with its uncapped continuation block (every following line with a greater blockquote depth, or the same blockquote prefix and a greater indentation width, crossing blank lines), to the note `to_path`, which may equal `path`.
 
 - The task SHALL be resolved exactly as `complete_task` resolves one: from the source's bytes read through the anchored descriptor that will be published to, with `task_not_found`, `task_ambiguous`, `task_changed`, the suffixed-id `precondition_required` before any read, and `size_limit` over the per-note task cap. No line number from the index or a listing SHALL be used.
 - Any checkbox SHALL be movable whatever its status (open, done, cancelled or a custom marker) and whatever the caller's task rule.
-- A task that has sub-tasks SHALL move with its whole subtree. A task nested inside another task's continuation block SHALL move with its own subtree, leaving its parent and siblings in place. A task line SHALL never be moved without its continuation block.
+- A task that has sub-tasks SHALL move with its whole subtree. A task line SHALL never be moved without its continuation block.
+- The moved task SHALL be a top-level, unquoted task: indentation width 0 and no blockquote prefix. A task nested inside another task's continuation block, and a task carrying a blockquote prefix (a callout task), SHALL be refused with `task_malformed`, writing nothing in either note, and the refusal SHALL say that `edit_note` can make the move by hand.
 - `to_path` SHALL name an existing note; `move_task` SHALL never create one.
 - The moved lines SHALL NOT be edited: no field, tag, status, rule text, block link or trailing whitespace SHALL change, and no global filter text SHALL be added.
 
@@ -18,23 +19,25 @@
 - **WHEN** `move_task` names `- [x] Paid rent 🔁 every month 📅 2026-11-01 ✅ 2026-11-02`
 - **THEN** the line SHALL arrive unchanged, no next occurrence SHALL be written, and the rule text SHALL NOT be parsed
 
-#### Scenario: A nested task leaves its parent in place
+#### Scenario: A nested task is refused
 - **WHEN** `- [ ] Project` is followed by `    - [ ] step one` and `    - [ ] step two`, and `move_task` names `step one`
-- **THEN** only `    - [ ] step one` SHALL leave the source, `- [ ] Project` and `    - [ ] step two` SHALL stay, and `step two` SHALL still belong to `Project`
+- **THEN** the call SHALL be refused with `task_malformed`, and neither note SHALL change
+
+#### Scenario: A callout task is refused
+- **WHEN** `move_task` names `> - [ ] Renew passport`
+- **THEN** the call SHALL be refused with `task_malformed`, and neither note SHALL change
 
 #### Scenario: A missing destination is never created
 - **WHEN** `to_path` names no note
 - **THEN** the call SHALL be refused with `not_found`, no file SHALL be created and the source SHALL be unchanged
 
-### Requirement: The moved lines SHALL be re-framed to the destination's top level by one byte-exact prefix rule, or the move SHALL be refused
+### Requirement: The moved lines SHALL arrive byte for byte at `add_task`'s placement, with the destination's terminators
 
-Every moved line SHALL be re-framed by one prefix substitution, or the move SHALL be refused.
+The content of every moved line SHALL be inserted exactly as it was read, without its terminator: no prefix SHALL be added or removed and each line's list marker SHALL be kept as written, with nothing renumbered.
 
-Let the source frame be the task line's text before its list marker (its blockquote prefix and indentation), and the destination frame be the blockquote prefix of the destination anchor (empty without one). Every line of the moved block that starts with the source frame SHALL become the destination frame followed by the rest of the line. A blank line that does not start with the source frame SHALL become the destination's blockquote prefix with trailing spaces and tabs removed. Any other line SHALL make the move refused with `task_malformed`, writing nothing in either note.
+The move SHALL be refused with `task_malformed`, writing nothing in either note, when the continuation block holds a line that, after its indentation, starts with `>` (a blockquote line), or that opens or closes a fenced code block (three or more backticks or tildes), whether that fence closes inside the block or not.
 
-When the two frames are equal, the moved lines SHALL arrive byte for byte. Each line's list marker SHALL be kept as written, and nothing SHALL be renumbered.
-
-**Placement** SHALL be `add_task`'s: in the `to_section` body (resolved with `add_task`'s selectors and refusals) or the whole body, after the full continuation block of the last task whose indentation after its blockquote prefix is zero (never a task of the moved block); with no such task, after the region's last non-blank line; in an empty region, after the heading or at the body's start.
+**Placement** SHALL be `add_task`'s: in the `to_section` body (resolved with `add_task`'s selectors and refusals) or the whole body, after the full continuation block of the last task whose indentation after its blockquote prefix is zero (never a task of the moved block); with no such task, after the region's last non-blank line; in an empty region, after the heading or at the body's start. When that last task carries a blockquote prefix, the move SHALL be refused with `task_malformed`, writing nothing in either note.
 
 **Terminators.** Every moved line SHALL end with the destination's terminator: that of the line it is inserted after, else the note's first terminator, else LF. A file without a final terminator SHALL keep none, at the destination and at the source. Exactly two pre-existing terminators SHALL change, and only in these cases:
 
@@ -44,19 +47,19 @@ When the two frames are equal, the moved lines SHALL arrive byte for byte. Each 
 An insertion into an empty body SHALL join the moved lines with the terminator and add none at the end.
 
 #### Scenario: A plain task arrives byte for byte
-- **WHEN** a top-level task with a two-line context block moves to a note whose tasks are top-level and unquoted
-- **THEN** the three inserted lines SHALL be byte-identical to the three removed ones
+- **WHEN** a top-level task with a two-line context block and an indented sub-task moves to a note whose tasks are top-level and unquoted
+- **THEN** the four inserted lines SHALL be byte-identical to the four removed ones, apart from terminators
 
-#### Scenario: A sub-task becomes a top-level task
-- **WHEN** a task indented four spaces under a parent, with a child indented eight spaces, moves to a note with no tasks after a paragraph
-- **THEN** it SHALL arrive at indentation 0 with its child at indentation 4, and both SHALL re-extract as tasks
+#### Scenario: A blockquote line in the block is refused
+- **WHEN** the line under a top-level task is `    > quoted context`
+- **THEN** the move SHALL be refused with `task_malformed` and neither note SHALL change
 
-#### Scenario: A callout task moves to a plain note and back
-- **WHEN** `> - [ ] Renew passport` followed by `>     - photo booked` moves to a plain note, and a plain task moves into a note whose last top-level task is `> - [ ] a`
-- **THEN** the first SHALL arrive as `- [ ] Renew passport` and `    - photo booked`, and the second SHALL arrive with the prefix `> ` on every line
+#### Scenario: A fence line in the block is refused
+- **WHEN** a fenced code block opens on an indented line under the task, whether it closes inside the block or after it
+- **THEN** the move SHALL be refused with `task_malformed` and neither note SHALL change
 
-#### Scenario: A mixed-indentation block is refused
-- **WHEN** the task line is indented with two spaces and a line under it is indented with a tab
+#### Scenario: A quoted destination anchor is refused
+- **WHEN** the destination's last top-level task is `> - [ ] a`
 - **THEN** the move SHALL be refused with `task_malformed` and neither note SHALL change
 
 #### Scenario: Terminators follow the destination
@@ -77,7 +80,7 @@ An insertion into an empty body SHALL join the moved lines with the terminator a
 
 ### Requirement: Every `move_task` plan SHALL be verified before it is shown or published, and a block that cannot move cleanly SHALL be refused
 
-The move SHALL be refused with `task_malformed`, writing nothing in either note, when the moved block contains an ATX heading line, or when removing or inserting it would change the code status of any line that is not moved.
+The move SHALL be refused with `task_malformed`, writing nothing in either note, when the moved block contains an ATX heading line.
 
 The move SHALL be refused with `block_id_conflict`, writing nothing in either note and naming the id and the destination line, when a moved line carries a `^block` id that, compared case-insensitively, already ends a line in the destination's body. A move within one note SHALL NOT run this check.
 
@@ -85,7 +88,7 @@ Before a dry-run answer and before each publication, the plan for that note SHAL
 
 **Destination:**
 1. the new text SHALL be the old text with exactly one whole-line insertion; every pre-existing line SHALL keep its content and its terminator, except that, for an insertion at the end of a destination without a final terminator, the old last line SHALL gain exactly the inserted terminator;
-2. the inserted lines SHALL equal the re-framed block;
+2. the inserted lines' contents SHALL equal the moved block's, line for line;
 3. every pre-existing task SHALL re-extract identically, shifted by the inserted count;
 4. the task set SHALL gain exactly the moved tasks, each re-extracting with the same text, key, status, dates, priority, tags and recurrence as at the source;
 5. no pre-existing line SHALL change its owning task, and each moved line SHALL be owned as planned;
@@ -104,10 +107,6 @@ Any other terminator change SHALL fail verification. A result over `MAX_NOTE_BYT
 - **WHEN** a task's continuation block contains the line `  # Notes`
 - **THEN** the move SHALL be refused with `task_malformed` and neither note SHALL change
 
-#### Scenario: A fence that closes outside the block is refused
-- **WHEN** a fence opens on an indented line under the task and its closer is a line after the block
-- **THEN** the move SHALL be refused, and neither note SHALL change
-
 #### Scenario: A block id that already exists at the destination is refused
 - **WHEN** the moved task ends in `^followup` and `Project.md` already holds another line ending in `^FollowUp`
 - **THEN** the move SHALL be refused with `block_id_conflict` naming `followup` and that line, and neither note SHALL change
@@ -122,6 +121,8 @@ The destination insert SHALL be published first, through the confirmed, descript
 
 The source removal SHALL be one confirmed publication whose synchronous step performs, with no suspension point between them: the root confirmation; **the destination presence check**, which re-reads the destination through its anchored target and requires the lines at the position where the moved lines were inserted (or found) to have exactly their contents; and the source write, with `expected=` the source bytes the removal was planned against. When the presence check fails, the source SHALL NOT be written. A destination task refresh that reports `superseded` SHALL never be followed by a source write unless that check, run afterwards, passes.
 
+Both publications replace an existing regular file, and each SHALL get the edit rule of the `file-permissions` capability: each note SHALL keep its own permission bits, POSIX access ACL and group, and neither SHALL ever be published under the create rule. A difference between the two permission captures of either publication, or in its staged copy, SHALL be that note's in-call conflict, handled exactly as a byte conflict on that note.
+
 #### Scenario: An older destination saved between the steps stops the move
 - **WHEN** after the destination publication an outside editor saves an older `Project.md` without the moved lines, so the destination refresh reports `superseded`
 - **THEN** `Inbox.md` SHALL be byte-identical, and the answer SHALL be `task_move_incomplete` with `reason` `destination_changed`, whose `destination:` line says the destination no longer holds the moved lines
@@ -132,12 +133,20 @@ The source removal SHALL be one confirmed publication whose synchronous step per
 
 #### Scenario: Nothing is removed when the destination did not publish
 - **WHEN** the destination publication is refused, or raises an OS error
-- **THEN** `Inbox.md` SHALL be byte-identical, and the answer SHALL be the refusal, or `publication_uncertain` without `nothing_written`
+- **THEN** `Inbox.md` SHALL be byte-identical, and the answer SHALL be the refusal, `io_failure` saying nothing was written for a permission rule that could not be applied, or `publication_uncertain` without `nothing_written` for any other OS error
+
+#### Scenario: Each note keeps its own permissions
+- **WHEN** `Inbox.md` has mode 0o600 and `Projects/Money.md` mode 0o664 with a named-group access ACL, and a task moves between them
+- **THEN** after the move `Inbox.md` SHALL still have mode 0o600 and `Projects/Money.md` mode 0o664 with the same ACL and group
+
+#### Scenario: A permission change during the move is a conflict, not a loss
+- **WHEN** the mode of `Inbox.md` changes after the destination publication of a move called without `expected_hash`, its bytes unchanged
+- **THEN** the source removal SHALL be retried, and the move SHALL complete with no line lost
 
 ### Requirement: Every failure after the destination publication SHALL be a named partial outcome that states only what the tool verified and names the call that completes the move
 
-- **Before the destination publication**, every refusal SHALL leave both notes byte-identical and carry `nothing_written: true`. A destination in-call conflict without `to_expected_hash` SHALL repeat the whole sequence from reading both notes, at most 3 attempts, then refuse with `concurrent_write`, nothing written.
-- **An OS error from the destination publication** SHALL leave the source untouched and SHALL be answered `publication_uncertain` as a partial outcome, saying the destination may hold the task and naming both completing calls (`resume=true` if `read_note` shows the lines there, the plain call otherwise).
+- **Before the destination publication**, every refusal SHALL leave both notes byte-identical, and SHALL carry `nothing_written: true` wherever its code carries it for the other task write tools (the task codes, the precondition codes and `concurrent_write`); a body code such as `invalid_argument`, `content_unsafe` or `io_failure` SHALL render as it does for those tools. A destination in-call conflict without `to_expected_hash` SHALL repeat the whole sequence from reading both notes, at most 3 attempts, then refuse with `concurrent_write`, nothing written.
+- **An OS error from the destination publication** SHALL leave the source untouched. A permission rule that could not be applied (`PermissionsNotApplied`, raised before anything is published) SHALL be answered `io_failure`, nothing written in either note. Any other OS error SHALL be answered `publication_uncertain` as a partial outcome, saying the destination may hold the task and naming both completing calls (`resume=true` if `read_note` shows the lines there, the plain call otherwise).
 - **After the destination publication**, a stop SHALL be answered with the code `task_move_incomplete`, a partial outcome that SHALL NOT carry `nothing_written`. Its prose SHALL carry a `destination:` line and a `source:` line, each stating only what this call verified, and a `complete with:` line naming the exact call that completes the move. It SHALL NOT say the source holds the task unless a re-read in this call found it there. Its `MCP-REFUSAL` line SHALL carry `path` (the source), `destination_path`, `source_id`, `destination_id` (absent for `destination_changed`) and `reason`.
 - **Reasons and their completing calls:**
 
@@ -149,7 +158,8 @@ The source removal SHALL be one confirmed publication whose synchronous step per
 | `source_changed` | a re-read found the key once with a different block | the call with the current id and `allow_duplicate=true` |
 | `source_ambiguous` | a re-read found the key on several tasks | `read_note` of the source, then the call with a suffixed id, `resume=true` and `expected_hash` |
 | `vault_assignment_changed`, `vault_anchor_lost_at_publish`, `vault_confirmation_unavailable` | the source publication was refused by the confirmation | the same call with `resume=true` once the assignment is restored |
-| `io_failure` | the source write raised an OS error | `read_note` of the source; if it still holds the task, the same call with `resume=true` |
+| `permissions_not_applied` | the source write could not apply the source's permission rule and published nothing; not retried | the same call with `resume=true` once the cause is fixed |
+| `io_failure` | the source write raised any other OS error | `read_note` of the source; if it still holds the task, the same call with `resume=true` |
 
 - **Source retry.** When the source write meets an in-call conflict and no `expected_hash` was supplied, the tool SHALL re-read the source, re-derive its tasks, and write the removal again (through the same presence check) only if the moved task's key resolves to exactly one task whose block is byte-identical to the block that was moved; at most 3 attempts. With `expected_hash` supplied it SHALL NOT retry.
 
@@ -169,6 +179,10 @@ The source removal SHALL be one confirmed publication whose synchronous step per
 - **WHEN** moves of one task from `A.md` to `B.md` and to `C.md` run at once and both publish their destination
 - **THEN** one SHALL succeed, the other SHALL answer `task_move_incomplete` with `reason` `source_missing` without claiming `A.md` holds the task, and no line SHALL be lost
 
+#### Scenario: A permission failure at the source write is partial
+- **WHEN** the source's permission rule cannot be applied after the destination publication
+- **THEN** `Inbox.md` SHALL be byte-identical, the answer SHALL be `task_move_incomplete` with `reason` `permissions_not_applied`, whose `source:` line says the source was not changed, and a `complete with:` line naming `resume=true`
+
 #### Scenario: A reassignment between the steps is partial
 - **WHEN** the caller's vault assignment changes after the destination publication
 - **THEN** the source publication SHALL be refused by the confirmation, and the answer SHALL be `task_move_incomplete` with `reason` `vault_assignment_changed` and a `complete with:` line naming `resume=true`
@@ -177,9 +191,9 @@ The source removal SHALL be one confirmed publication whose synchronous step per
 
 Before planning an insertion, the destination's current bytes SHALL be checked, never the index. The move SHALL be refused with `duplicate_task`, writing nothing in either note and naming up to 5 matches, when the destination holds a task with the moved task's key, whatever its block, a byte-identical block included, or, when the moved task is open, an open task with the same normalised description (`add_task`'s rule), unless `allow_duplicate=true`. When a match is byte-identical to the moved block, the refusal SHALL say so and name both `allow_duplicate=true` and `resume=true`. `allow_duplicate=true` SHALL only ever add lines.
 
-`resume=true` SHALL mean only: the destination already holds this exact block; insert nothing and remove the source copy. It SHALL require exactly one destination task with the moved key whose block, with frames removed, is byte-identical to the moved block, and SHALL otherwise be refused with `resume_unmatched`, writing nothing. It SHALL then write the source removal through the destination presence check aimed at that copy. It SHALL NOT be combinable with `allow_duplicate`, with `to_section`, or with a move within one note.
+`resume=true` SHALL mean only: the destination already holds this exact block; insert nothing and remove the source copy. It SHALL require exactly one destination task with the moved key whose block's line contents, terminators excluded, are byte-identical to the moved block's, and SHALL otherwise be refused with `resume_unmatched`, writing nothing. It SHALL then write the source removal through the destination presence check aimed at that copy. It SHALL NOT be combinable with `allow_duplicate`, with `to_section`, or with a move within one note.
 
-No sequence of `move_task` calls without `allow_duplicate` SHALL leave more than two copies of a moved block, and no call SHALL remove a source line whose bytes, re-framed, are not present at the destination at the moment of the presence check.
+No sequence of `move_task` calls without `allow_duplicate` SHALL leave more than two copies of a moved block, and no call SHALL remove a source line whose content is not present at the destination at the moment of the presence check.
 
 #### Scenario: An independent identical task at the destination is not deleted
 - **WHEN** `Inbox.md` and `Project.md` each hold an independent `- [ ] Call Alex` with identical context, before any move, and `move_task` moves the inbox task to `Project.md`
@@ -245,7 +259,9 @@ When `to_path` resolves to the source note, the removal and the insertion SHALL 
 - hold one `write` concurrency slot for the whole call;
 - after each confirmed publication, refresh that note's task rows with the write-time refresh, then record one `modified` change-feed event for that note with `tool = 'move_task'`, the destination's before the source removal is attempted;
 - never hold two database locks at once: each refresh SHALL run in its own transaction holding at most one `notes_metadata` row lock, ended before the next begins;
-- report each refresh as `index (destination): …` and `index (source): …` (one `index:` line for a same-note move); a source refresh that does not report `refreshed` SHALL never fail the move, and a destination refresh that does not report `refreshed` SHALL NOT stop the source removal (open question Q10 (a); under Q10 (b), it SHALL stop the move before the source is written, with `task_move_incomplete` and `reason` `destination_index_lagged`);
+- report each refresh as `index (destination): …` and `index (source): …` (one `index:` line for a same-note move); a source refresh that does not report `refreshed` SHALL never fail the move, and a destination refresh that does not report `refreshed` SHALL NOT stop the source removal;
+- refresh each note it published whatever that note's bytes, without the generic writers' `may_hold_tasks` gate, in the task tools' order: publication, refresh, event;
+- work on a note at an excluded sync-conflict path exactly as on any note, reporting a destination refresh that finds no index row as `index (destination): may lag (not_indexed)`, and print no exclusion notice;
 - log `path`, `id`, `to_path`, `to_section`, `dry_run`, `allow_duplicate`, `resume` and the presence of each hash, and never task text;
 - with `dry_run=true`, return both diffs and the moved lines, publishing nothing, refreshing nothing and recording no event.
 
@@ -257,7 +273,11 @@ The caller's task rule SHALL NOT be consulted for the move. When `to_path` lies 
 
 #### Scenario: A lagging destination refresh is reported, not hidden
 - **WHEN** another transaction holds the destination's row lock for longer than 2 seconds during a move
-- **THEN** the move SHALL complete, the response SHALL say `index (destination): may lag (lock_timeout)`, and the next index pass SHALL list the task in the destination (open question Q10 (a); under Q10 (b) this scenario becomes: the source SHALL be unchanged and the answer SHALL be `task_move_incomplete` with `reason` `destination_index_lagged`)
+- **THEN** the move SHALL complete, the response SHALL say `index (destination): may lag (lock_timeout)`, and the next index pass SHALL list the task in the destination
+
+#### Scenario: A move into an excluded conflict copy
+- **WHEN** `INDEX_EXCLUDE_CONFLICT_FILES` is true and a task moves into `N (conflict 2026-05-29-19-45-39).md`
+- **THEN** the move SHALL complete, the response SHALL say `index (destination): may lag (not_indexed)`, and it SHALL carry no exclusion notice line
 
 #### Scenario: Two events, attributed
 - **WHEN** an API key moves a task between two notes
@@ -273,7 +293,7 @@ The caller's task rule SHALL NOT be consulted for the move. When `to_path` lies 
 
 ### Requirement: The `move_task` response SHALL name the moved task's new line and id, and say when other ids changed
 
-A success SHALL report the destination line of the moved task and its id, the number of lines and tasks moved, the lines removed from the source, each published note's `content_hash`, and each refresh result. Every moved task SHALL keep its key. The id SHALL be bare when the destination holds one task with that key after the move, and suffixed otherwise. When a task in either note that shares a key with a moved task has its ordinal suffix renumbered by the move, the response SHALL say so. When the moved task was nested, the response SHALL say under which source line. When moved lines carry `^block` ids, the response SHALL name them and say that links to them in the source note no longer resolve (a collision with an id already in the destination is refused before publication). Every printed path SHALL be escaped as every task tool escapes one.
+A success SHALL report the destination line of the moved task and its id, the number of lines and tasks moved, the lines removed from the source, each published note's `content_hash`, and each refresh result. Every moved task SHALL keep its key. The id SHALL be bare when the destination holds one task with that key after the move, and suffixed otherwise. When a task in either note that shares a key with a moved task has its ordinal suffix renumbered by the move, the response SHALL say so. When moved lines carry `^block` ids, the response SHALL name them and say that links to them in the source note no longer resolve (a collision with an id already in the destination is refused before publication). Every printed path SHALL be escaped as every task tool escapes one.
 
 #### Scenario: The id survives the move
 - **WHEN** a task with the bare id `3f9a0c1b2d4e` moves to a note holding no task with that key
