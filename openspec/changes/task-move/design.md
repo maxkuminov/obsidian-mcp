@@ -175,7 +175,7 @@ When a match in (a) is byte-identical to the moved block (every line's content e
 
 The destination is published first because a failure after it leaves a duplicate, and a failure after a source-first removal would leave a loss. **The source is never written unless step 3 returned success (or `resume` found the copy) and the step 6(b) check passed in the same synchronous step as the write.** A destination refresh that reports `superseded` (the destination changed after step 3) does not by itself stop the move, but it can never be followed by a source removal unless the check in 6(b), run later, finds the moved lines still in place.
 
-In the table, `P` and `I` are the source path and id, `D` and `J` the destination path and the moved task's id there. Every partial outcome carries a `complete with:` line naming the exact call that completes the move (D11).
+In the table, `P` and `I` are the source path and id, `D` and `J` the destination path and the moved task's id there. Every partial outcome carries a `complete with:` line naming the exact call that completes the move (D11). **Every completing call omits `to_expected_hash` or passes a fresh destination `content_hash`** (Codex spec r3 #3): the destination publication changed the destination, so the original call's hash is stale, and the `complete with:` line says so whenever one was supplied.
 
 | # | Step | What happens | Destination | Source | Caller receives | `complete with:` |
 |---|---|---|---|---|---|---|
@@ -203,7 +203,7 @@ In the table, `P` and `I` are the source path and id, `D` and `J` the destinatio
 
 **Re-locating the block for a source retry (rows 9–12).** Nothing from the first read is trusted. The source is re-read through the same anchored descriptor; the tasks are re-derived; the moved key must resolve to exactly one task (the original id was bare, since a suffixed id carries `expected_hash` and never retries), and that task's block must be byte-identical to the moved block as read in step 1. Only then is a new removal planned, verified (D8) and published, again through step 6 with its presence check. If the task was edited after the destination copy was written, the source copy is not removed: removing it would lose the edit.
 
-**Nothing grows past two copies without the caller asking**, for one call and its completion, or for two concurrent calls. A plain retry of a partial move is refused `duplicate_task` (D9 (a)) and writes nothing. Only `allow_duplicate=true` adds a copy. Only `resume=true` removes the source copy, and only when exactly one identical copy is at the destination at the moment of the check. **The bound is per call, not global** (Codex spec r2 #6): N concurrent moves of one task to N different destinations can each publish their destination before one source removal wins, leaving one copy in each destination that published (N copies), never zero; the losers each answer `source_missing` (L12).
+**Nothing grows past two copies without the caller asking**, for one call and its completions, or for two concurrent calls once one of their source removals succeeds. A plain retry of a partial move is refused `duplicate_task` (D9 (a)) and writes nothing. Only `allow_duplicate=true` adds a copy. Only `resume=true` removes the source copy, and only when exactly one identical copy is at the destination at the moment of the check. **The bound is per call, not global** (Codex spec r2 #6): N concurrent moves of one task to N different destinations can each publish their destination before one source removal wins, leaving one copy in each destination that published (N copies), never zero; the losers each answer `source_missing` (L12). And when **every** source removal stops partial (Codex spec r3 #1; for example two calls whose source writes are both refused `permissions_not_applied`), the source copy remains as well: N + 1 copies, three for two calls.
 
 **Rejected (owner decision, Max, 2026-11-16: Q10):** stopping before step 6 whenever the destination refresh does not report `refreshed` (a `destination_index_lagged` partial outcome). It would make the list → move → list guarantee unconditional, at the cost of turning an index hiccup into a duplicate in the vault that the caller must clean up.
 ### D11. The partial outcome, `task_move_incomplete`
@@ -416,7 +416,7 @@ All pure, all run off the event loop; each returned plan has passed its verifier
 - **L9** Ordered list markers are kept as written and nothing is renumbered, in either note.
 - **L10** Suffixed ids sharing a key with a moved task are renumbered in both notes; an earlier listing's suffixed ids must be listed again.
 - **L11** A block containing a heading is refused; move such content with `edit_note`.
-- **L12** A partial outcome, or two concurrent moves of one task to different destinations, leaves the task in two notes; N concurrent moves to N destinations can leave it in N. There is no delete-task tool; the agent completes with the call the partial outcome names, or removes a copy with `edit_note`.
+- **L12** A partial outcome, or two concurrent moves of one task to different destinations, leaves the task in two notes; N concurrent moves to N destinations can leave it in N, or in N + 1 notes (source included) when every source removal stops partial. There is no delete-task tool; the agent completes with the call the partial outcome names, or removes a copy with `edit_note`.
 - **L13** Either refresh may lag (#428 L9). When the destination's refresh lags and the source's succeeds, `list_tasks` shows the task in **neither** note until the next pass; the response names the lagging note (owner decision, Max, 2026-11-16: Q10).
 - **L14** The change feed shows two `modified` events with `tool = 'move_task'`, not a task-level move.
 - **L15** Two paths to one inode are refused, not treated as one note.
@@ -547,6 +547,12 @@ The reviewer also judged Q3, Q5, Q7 and Q9 safe as recommended, Q1 and Q2 reason
 5. **MAJOR, fixed.** A plain checkbox moved under `fields` / `filter` vanished from default listings unexplained. The success and dry-run responses carry `task_rule.not_task_note` through the existing `_task_rule_note` (D16, D18, spec scenario, scenario 48).
 6. **MINOR, fixed.** The "no more than two copies" bound is per call or two concurrent calls; N concurrent moves to N destinations can leave N copies (D10, L12, spec).
 7. **MINOR, fixed.** The source-mode-change scenario now places the change between P1 and P2 and asserts the new mode is kept with no line lost (spec, scenario 44).
+
+**Spec review round 3 (Codex, verification of round 2): FAIL on 2 MAJOR + 1 MINOR scenario-wording findings, no loss path; all accepted as wording. Review budget for the spec ends here; implementation review follows.**
+
+1. **MAJOR, wording.** The two-copy bound held only where a source removal succeeds; two partial moves (both source writes refused) leave three copies. Bound restated in the spec, D10 and L12.
+2. **MAJOR, wording.** "The source removal conflicts" assumed the task stays in the source; it is now an unrelated edit that keeps the task (the removed or changed task is the row 9 re-read branch).
+3. **MINOR, wording.** Every completing call omits `to_expected_hash` or passes a fresh destination hash (spec reasons list, D10).
 
 ## Slice plan (independent agents, one git worktree each)
 
