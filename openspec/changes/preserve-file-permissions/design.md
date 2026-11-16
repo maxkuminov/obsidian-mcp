@@ -236,9 +236,9 @@ No other writer creates vault files. The indexer, the panel and the change feed 
 - **L10.** A directory's default ACL changed during a call is not seen by that call's create plan.
 - **L11.** A default ACL removed between the directory read and the `mkdirat` gives a folder of `0o777 & ~umask`.
 - **L12.** The upload refusal for D6 is a generic HTTP 500 with the claim released.
-- **L13.** On a filesystem without POSIX ACLs, an upload into a setgid folder whose group the server is not in is published with the server's gid and the mode-only translation, so the folder's group gets only other-class access. That is exactly what it gets today on that input, so nothing regresses and nothing is broadened. Notes and raw files are unaffected, because they stage in the destination directory and inherit its gid. The fix, staging uploads in the destination directory, is a redesign of transfer staging. A follow-up issue will be filed.
+- **L13.** On a filesystem without POSIX ACLs, an upload into a setgid folder whose group the server is not in is published with the server's gid and the mode-only translation, so the folder's group gets only other-class access. That is exactly what it gets today on that input, so nothing regresses and nothing is broadened. Notes and raw files are unaffected, because they stage in the destination directory and inherit its gid. The fix, staging uploads in the destination directory, is a redesign of transfer staging. Follow-up: #450.
 
-- **L14.** From the staged-bytes verification to the rename (the publish-point capture and the bounded comparison read), a named staged copy can still be altered by a principal the published permissions let write the note; that principal can write the note itself at any time. Closing it fully means staging overwrites namelessly or in a private directory; a follow-up issue will be filed.
+- **L14.** From the staged-bytes verification to the rename (the publish-point capture and the bounded comparison read), a named staged copy can still be altered by a principal the published permissions let write the note; that principal can write the note itself at any time. Closing it fully means staging overwrites namelessly or in a private directory; follow-up: #451.
 - **L15.** On a network filesystem whose server checks permissions on every read and gives the file's owner no override, the staged-bytes verification of an overwrite that keeps a mode without owner read (for example 0o200) can fail with `EACCES`. The write is then refused as `io_failure` and nothing is published. The server cannot read such a file at all, so only an unguarded `write_file(overwrite=True)` reaches this.
 
 ## Risks / Trade-offs
@@ -283,7 +283,7 @@ Codex spec review, round 1: FAIL, with 1 BLOCKER, 4 MAJOR and 3 MINOR findings. 
 - **F2 MAJOR.** When the owner uid differs, the server gains owner-class access. **Declined as a refusal, documented** (D4, L2).
 - **F3 MAJOR.** The P2 re-apply and second `fsync` lengthen the compare-to-rename window. **Accepted.** A P1/P2 difference is now the in-call conflict. Nothing is re-applied anywhere, uploads capture once, and the window is unchanged (D5).
 - **F4 MAJOR.** Clearing the group on a setgid upload loses access. **Accepted** through group translation. The "cleared" clause and the old L13 are deleted.
-- **F5 MAJOR.** Directories at 0o777 change umask-000 hosts. **Partly accepted.** 0o777 is used only under a default ACL; otherwise 0o755 as today (D8). The rest goes to a follow-up issue.
+- **F5 MAJOR.** Directories at 0o777 change umask-000 hosts. **Partly accepted.** 0o777 is used only under a default ACL; otherwise 0o755 as today (D8). The rest is follow-up #449.
 - **F6 MINOR.** Mixed mode/ACL capture. **Accepted.** A capture is `fstat`, read, `fstat`, and a change is a conflict (D5).
 - **F7 MINOR.** `getegid` is not the creating gid. **Accepted.** The creating gid is the setgid directory's, else the staged inode's (D1).
 - **F8 MINOR.** The create oracle ignored the gid. **Accepted.** `st_gid` is compared, and translation is tested with an effective-access helper.
@@ -292,12 +292,12 @@ Codex spec review, round 1: FAIL, with 1 BLOCKER, 4 MAJOR and 3 MINOR findings. 
 Codex spec review, round 2: FAIL, with 1 BLOCKER, 1 MAJOR and 2 MINOR findings. Codex confirmed that the ACL translation itself is sound. Dispositions:
 
 - **R2-1 BLOCKER.** The mode-only fallback after an unsupported translated-ACL write can drop a denying named entry. **Accepted.** Mode-only is allowed only for a rule without an ACL; otherwise the D6 refusal applies (D3, D6).
-- **R2-2 MAJOR.** On a filesystem without ACLs, an upload into a foreign setgid folder lacks the folder's group access. **Declined as a fix.** Recorded as L13, the create requirement states the narrower result, and a follow-up issue will be filed.
+- **R2-2 MAJOR.** On a filesystem without ACLs, an upload into a foreign setgid folder lacks the folder's group access. **Declined as a fix.** Recorded as L13, the create requirement states the narrower result, and follow-up #450 is filed.
 - **R2-3 MINOR.** The P2 metadata read sat between the comparison and the rename. **Accepted.** It is taken before the bytes are compared, and the window is exactly today's (D5).
 - **R2-4 MINOR.** The create oracle's gid equality was unqualified. **Accepted.** It is qualified to the group-kept case, and translation cases assert the staged gid and effective access.
 
 Implementation review round 1 (Codex): FAIL, 1 MAJOR (ACL capture required /proc). Accepted, fixed.
 
-Implementation review round 2 (Codex): FAIL — 1 BLOCKER (named staged copy writable under its final permissions before publication): accepted as staged-bytes verification, residual recorded as L14; 1 MAJOR: symlink mapping accepted, FIFO open declined as pre-existing with a follow-up issue; 1 MINOR (README) accepted.
+Implementation review round 2 (Codex): FAIL — 1 BLOCKER (named staged copy writable under its final permissions before publication): accepted as staged-bytes verification, residual recorded as L14; 1 MAJOR: symlink mapping accepted, FIFO open declined as pre-existing (follow-up #452); 1 MINOR (README) accepted.
 
 Implementation review round 3 (Codex, verification of the round-2 fixes only): FAIL. The fixes were verified: the staged-bytes check runs on both named publication paths, before P2 and the comparison; a mismatch publishes nothing; `ELOOP` is mapped only at the comparison open; the added tests fail without the fixes. One finding, MAJOR by the reviewer's rubric: on NFS the verification read can be refused for a kept mode without owner read. **Declined by triage and recorded as L15**: a mode-0o200 file overwritten unguarded on a server without owner override is not a plausible input, and the outcome is a refusal with nothing lost. The review budget ends here; no further round.

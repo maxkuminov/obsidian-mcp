@@ -33,7 +33,7 @@ The owner's decision for this change, in his words: "keep a note's existing perm
 - Repairing files that earlier releases already narrowed or widened.
 - NFSv4 and richacl ACLs. Other extended attributes (`user.*`, security labels), which are lost on edit as before. Hard links, which a rename breaks as before.
 - Changing the owner uid of a replaced file, or refusing when it differs (design D4).
-- The directory mode outside a default ACL (left at 0o755; a follow-up issue).
+- The directory mode outside a default ACL (left at 0o755; follow-up #449).
 - Changing what `move_note` does to the moved file: a rename keeps its inode, mode and ACL, as `mv` does.
 
 ## Capabilities
