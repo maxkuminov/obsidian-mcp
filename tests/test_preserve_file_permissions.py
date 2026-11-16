@@ -1546,3 +1546,26 @@ async def test_a_refused_read_back_still_checks_the_size(notes, monkeypatch):
     assert refusal_code(result) == "concurrent_write", result
     assert f.read_bytes() == b"old"
     assert [p.name for p in notes.iterdir() if p.name.startswith(".tmp-")] == []
+
+
+async def test_a_refused_read_back_of_an_owner_readable_copy_refuses_the_write(
+    notes, acl_fs, monkeypatch
+):
+    """L15, round 4: the skip is only for a copy the applied plan made
+    unreadable to its owner. Where the plan gives the owner read, a refused
+    read-back (someone revoked it) refuses the write rather than publishing
+    bytes nobody compared — here, a same-length alteration."""
+    d = notes / "Shared"
+    d.mkdir()
+    set_acl(d, group_rwx_default())
+    note = note_in(d, "ticket.md")
+    before = snapshot(note)
+    _after_the_staged_flush(monkeypatch, _alter_staged_copy(d, "same length"))
+    refused = _refuse_staged_read_back(monkeypatch)
+
+    result = await tools.edit_note_impl("Shared/ticket.md", "after, ours\n")
+
+    assert refused, "the read-back was never attempted"
+    assert refusal_code(result) == "io_failure", result
+    assert snapshot(note) == before
+    assert [p.name for p in d.iterdir() if p.name.startswith(".tmp-")] == []

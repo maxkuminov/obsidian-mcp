@@ -2477,7 +2477,7 @@ def _atomic_write_at(
             if leaf is not None
             else vault_fs.create_plan(directory, staged.st_gid)
         )
-        _permissions_step(
+        applied = _permissions_step(
             target, vault_fs.apply_plan, fd, plan, directory.acl_capable
         )
         os.fsync(fd)
@@ -2488,7 +2488,7 @@ def _atomic_write_at(
             # name are exactly ours **before** P2 and the comparison, so
             # nothing is added between the comparison and the rename (#447,
             # D5; the remaining interval is L14).
-            _require_staged_bytes(fd, dir_fd, tmp, staged, payload, name)
+            _require_staged_bytes(fd, dir_fd, tmp, staged, payload, name, applied)
 
         if overwrite and expected is not None:
             # P2 through the comparison's own descriptor, taken **before** the
@@ -2629,6 +2629,7 @@ def _require_staged_bytes(
     staged: os.stat_result,
     payload: bytes,
     name: str,
+    applied: vault_fs.Plan,
 ) -> None:
     """Refuse unless the staging name holds exactly `payload` (#447, D5).
 
@@ -2658,11 +2659,14 @@ def _require_staged_bytes(
         if os.pread(fd, 1, offset):
             raise conflict
     except PermissionError:
-        # A network filesystem that re-checks every read refused the read-back
-        # of a kept mode without owner read (L15). Identity and size are
-        # checked above; the content comparison is skipped, not the write.
-        # Only the owner can change this inode's mode, so nobody else can
-        # cause this to switch the comparison off.
+        # A network filesystem that re-checks every read may refuse the
+        # read-back (L15). The comparison is skipped only for a copy the
+        # applied plan itself made unreadable to its owner; identity and size
+        # are checked above. Otherwise the refusal stands (`io_failure`,
+        # nothing published): a read revoked by someone else must not switch
+        # the comparison off.
+        if applied.mode & 0o400:
+            raise
         return
 
 

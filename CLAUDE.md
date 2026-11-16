@@ -168,7 +168,7 @@ update it in the same change.** What stays here is the short list:
   the other rule, no uid `fchown`. A named staged copy carries those
   permissions from then on, so its bytes are compared with the payload
   after the `fsync` (`_require_staged_bytes`; a difference is
-  `concurrent_write`; a refused read-back skips only that comparison). The overwrite branch re-captures before
+  `concurrent_write`; a refused read-back skips that comparison only for a copy whose applied mode gives the owner no read, else refuses the write). The overwrite branch re-captures before
   the `expected=` comparison (a difference is `concurrent_write`), so the
   compare-to-rename window is unchanged. New folders get `mkdirat` 0o777
   only under a default ACL, else 0o755; `.transfer-tmp` stays 0700. See

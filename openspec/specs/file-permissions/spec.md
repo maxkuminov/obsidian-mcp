@@ -188,7 +188,7 @@ Staging inodes SHALL still be created with mode 0o600. Every write SHALL capture
 
 No write SHALL re-apply permissions or flush the staged file a second time.
 
-**Named staged copies.** Where a write stages under a name in the destination directory (a note or raw-file overwrite, and the named no-clobber fallback), the server SHALL verify after the flush, and before the publish-point capture and the `expected=` comparison, that the staging name is still the staged regular inode and, where the filesystem lets the server read the staged copy back, holds exactly the payload; any difference SHALL publish nothing and SHALL raise the in-call conflict.
+**Named staged copies.** Where a write stages under a name in the destination directory (a note or raw-file overwrite, and the named no-clobber fallback), the server SHALL verify after the flush, and before the publish-point capture and the `expected=` comparison, that the staging name is still the staged regular inode and, where the filesystem lets the server read the staged copy back or the applied permissions give the owner read, holds exactly the payload (a read-back refused despite owner read SHALL refuse the write); any difference SHALL publish nothing and SHALL raise the in-call conflict.
 
 **Uploads.** An upload's edit plan SHALL be captured once, from a leaf whose `(st_dev, st_ino, st_ctime_ns)` equals the token's fingerprint. Otherwise the upload SHALL be refused with HTTP 409.
 
