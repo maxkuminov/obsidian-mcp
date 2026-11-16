@@ -46,7 +46,7 @@ Refs #447. Read `proposal.md`, `design.md` (K1–K7, D1–D9, the scope inventor
   - every case listed there.
 - [x] 4.2 Invert `tests/test_transfer_service.py::test_overwrite_resets_the_incumbent_mode_to_server_policy`: the incumbent's 0600 is kept. Rename it and rewrite its docstring. Keep `test_written_note_keeps_the_umask_default_mode` and the umask-following upload test as they are.
 - [x] 4.3 `.github/workflows/ci.yml`, `tests` job, "Run the test suite" env: `OMCP_TEST_REQUIRE_POSIX_ACL: "1"`, with a comment that a skip of the ACL tests there is a failure.
-- [ ] 4.4 Run `pytest -q tests` and `make test-integration` once. Confirm `tests/test_conftest_env_hermeticity.py` passes unchanged and that no `Settings` field was added.
+- [x] 4.4 Run `pytest -q tests` and `make test-integration` once. Confirm `tests/test_conftest_env_hermeticity.py` passes unchanged and that no `Settings` field was added.
 - [x] 4.5 Implementation review round 2: verify a named staged copy's bytes after the flush and before P2 (in-call conflict on any difference, L14 for the rest); a symlink at the `expected=` comparison's open is the in-call conflict; tests for both.
 
 ## 5. Docs (last commits of the feature branch)
