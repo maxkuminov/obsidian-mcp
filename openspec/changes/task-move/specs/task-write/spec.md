@@ -119,9 +119,9 @@ Any other terminator change SHALL fail verification. A result over `MAX_NOTE_BYT
 
 The destination insert SHALL be published first, through the confirmed, descriptor-anchored publication path with the in-call conflict check. The source removal SHALL be attempted only after the destination publication returned success, or, with `resume=true`, after the destination was found to hold exactly one byte-identical copy.
 
-The source removal SHALL be one confirmed publication whose synchronous step performs, with no suspension point between them: the root confirmation; **the destination presence check**, which re-reads the destination through its anchored target and requires the lines at the position where the moved lines were inserted (or found) to have exactly their contents; and the source write, with `expected=` the source bytes the removal was planned against. When the presence check fails, the source SHALL NOT be written. A destination task refresh that reports `superseded` SHALL never be followed by a source write unless that check, run afterwards, passes.
+The source removal SHALL be one confirmed publication whose synchronous step performs, with no suspension point between them: the root confirmation; **the destination presence check**, which re-reads the destination through its anchored target and requires the lines at the position where the moved lines were inserted (or found) to have exactly their contents; and the source write, with `expected=` the source bytes the removal was planned against. When the presence check reads the destination and finds the moved lines absent or different at that position (or the file absent), the source SHALL NOT be written and the outcome SHALL be `destination_changed`. When the presence check cannot read the destination (a read error, a non-regular file, or a file over the read cap), the source SHALL NOT be written and the outcome SHALL be `destination_unverified`, which SHALL say that the destination's contents could not be verified and SHALL NOT say whether it holds the lines. A destination task refresh that reports `superseded` SHALL never be followed by a source write unless that check, run afterwards, passes.
 
-Both publications replace an existing regular file, and each SHALL get the edit rule of the `file-permissions` capability: each note SHALL keep its own permission bits, POSIX access ACL and group, and neither SHALL ever be published under the create rule. A difference between the two permission captures of either publication, or in its staged copy, SHALL be that note's in-call conflict, handled exactly as a byte conflict on that note.
+Both publications replace an existing regular file, and each SHALL apply the edit rule of the `file-permissions` capability to that note, never the create rule: the replaced file's permission bits, POSIX access ACL and group, including that capability's group translation when the server cannot set the note's group and its mode-only behaviour on a filesystem without POSIX ACLs. A difference between the two permission captures of either publication, or in its staged copy, SHALL be that note's in-call conflict, handled exactly as a byte conflict on that note.
 
 #### Scenario: An older destination saved between the steps stops the move
 - **WHEN** after the destination publication an outside editor saves an older `Project.md` without the moved lines, so the destination refresh reports `superseded`
@@ -136,24 +136,29 @@ Both publications replace an existing regular file, and each SHALL get the edit 
 - **THEN** `Inbox.md` SHALL be byte-identical, and the answer SHALL be the refusal, `io_failure` saying nothing was written for a permission rule that could not be applied, or `publication_uncertain` without `nothing_written` for any other OS error
 
 #### Scenario: Each note keeps its own permissions
-- **WHEN** `Inbox.md` has mode 0o600 and `Projects/Money.md` mode 0o664 with a named-group access ACL, and a task moves between them
+- **WHEN** `Inbox.md` has mode 0o600 and `Projects/Money.md` mode 0o664 with a named-group access ACL, each note's group is one the server can set, and a task moves between them
 - **THEN** after the move `Inbox.md` SHALL still have mode 0o600 and `Projects/Money.md` mode 0o664 with the same ACL and group
 
 #### Scenario: A permission change during the move is a conflict, not a loss
-- **WHEN** the mode of `Inbox.md` changes after the destination publication of a move called without `expected_hash`, its bytes unchanged
-- **THEN** the source removal SHALL be retried, and the move SHALL complete with no line lost
+- **WHEN** the mode of `Inbox.md` changes between the source write's first and second permission captures, during a move called without `expected_hash`, its bytes unchanged
+- **THEN** that source write SHALL publish nothing, the source removal SHALL be retried, and the move SHALL complete with no line lost and `Inbox.md` carrying the new mode under the edit rule
+
+#### Scenario: An unreadable destination is not reported as changed
+- **WHEN** after the destination publication the presence check's read of `Project.md` fails with a permission error
+- **THEN** `Inbox.md` SHALL be byte-identical, and the answer SHALL be `task_move_incomplete` with `reason` `destination_unverified`, whose `destination:` line says the contents could not be verified
 
 ### Requirement: Every failure after the destination publication SHALL be a named partial outcome that states only what the tool verified and names the call that completes the move
 
 - **Before the destination publication**, every refusal SHALL leave both notes byte-identical, and SHALL carry `nothing_written: true` wherever its code carries it for the other task write tools (the task codes, the precondition codes and `concurrent_write`); a body code such as `invalid_argument`, `content_unsafe` or `io_failure` SHALL render as it does for those tools. A destination in-call conflict without `to_expected_hash` SHALL repeat the whole sequence from reading both notes, at most 3 attempts, then refuse with `concurrent_write`, nothing written.
 - **An OS error from the destination publication** SHALL leave the source untouched. A permission rule that could not be applied (`PermissionsNotApplied`, raised before anything is published) SHALL be answered `io_failure`, nothing written in either note. Any other OS error SHALL be answered `publication_uncertain` as a partial outcome, saying the destination may hold the task and naming both completing calls (`resume=true` if `read_note` shows the lines there, the plain call otherwise).
-- **After the destination publication**, a stop SHALL be answered with the code `task_move_incomplete`, a partial outcome that SHALL NOT carry `nothing_written`. Its prose SHALL carry a `destination:` line and a `source:` line, each stating only what this call verified, and a `complete with:` line naming the exact call that completes the move. It SHALL NOT say the source holds the task unless a re-read in this call found it there. Its `MCP-REFUSAL` line SHALL carry `path` (the source), `destination_path`, `source_id`, `destination_id` (absent for `destination_changed`) and `reason`.
+- **After the destination publication**, a stop SHALL be answered with the code `task_move_incomplete`, a partial outcome that SHALL NOT carry `nothing_written`. Its prose SHALL carry a `destination:` line and a `source:` line, each stating only what this call verified, and a `complete with:` line naming the exact call that completes the move. It SHALL NOT say the source holds the task unless a re-read in this call found it there. Its `MCP-REFUSAL` line SHALL carry `path` (the source), `destination_path`, `source_id`, `destination_id` (absent for `destination_changed` and `destination_unverified`) and `reason`.
 - **Reasons and their completing calls:**
 
 | `reason` | when | `complete with:` |
 |---|---|---|
-| `destination_changed` | the presence check failed | the same call without `resume`; if that is refused `duplicate_task`, the same call with `resume=true` |
-| `concurrent_write` | the source changed during the call and no retry was allowed or the retries ran out | the same call with `resume=true` (and a fresh `expected_hash` if one was given) |
+| `destination_changed` | the presence check read the destination and did not find the moved lines at their position | the same call without `resume`; if that is refused `duplicate_task`, the same call with `resume=true` |
+| `destination_unverified` | the presence check could not read the destination | once the destination is readable, `read_note` of it: if it holds exactly one byte-identical copy, the same call with `resume=true`; otherwise the same call without `resume` (a `duplicate_task` refusal then names any copy elsewhere) |
+| `concurrent_write` | the source changed during the call and no retry was allowed or the retries ran out | `read_note` of the source, then: if the id still resolves to a block byte-identical to the moved one, the same call with `resume=true` (and that read's `content_hash` as `expected_hash` if one was given); if the key resolves once with a different block, the `source_changed` call (its current id and `allow_duplicate=true`); if the key is absent, as `source_missing` |
 | `source_missing` | a re-read found no task with the id's key | none if it was removed or moved; if its text was edited, `list_tasks(path=…)` for its new id, then the call with that id and `allow_duplicate=true` |
 | `source_changed` | a re-read found the key once with a different block | the call with the current id and `allow_duplicate=true` |
 | `source_ambiguous` | a re-read found the key on several tasks | `read_note` of the source, then the call with a suffixed id, `resume=true` and `expected_hash` |
@@ -165,7 +170,11 @@ Both publications replace an existing regular file, and each SHALL get the edit 
 
 #### Scenario: The source removal conflicts
 - **WHEN** another writer changes `Inbox.md` between the destination publication and the source removal of a move called with `expected_hash`
-- **THEN** the task SHALL be in both notes, the other writer's bytes SHALL be on disk unchanged, and the answer SHALL be `task_move_incomplete` with `reason` `concurrent_write`, both paths and both ids, a `complete with:` line naming `resume=true`, and no `nothing_written`
+- **THEN** the task SHALL be in both notes, the other writer's bytes SHALL be on disk unchanged, and the answer SHALL be `task_move_incomplete` with `reason` `concurrent_write`, both paths and both ids, a `complete with:` line that says to re-read the source and names `resume=true` for an unchanged block and the `source_changed` call otherwise, and no `nothing_written`
+
+#### Scenario: A conflicting change to the task's block is not completed by resume
+- **WHEN** a move called with `expected_hash` ends in `task_move_incomplete` with `reason` `concurrent_write` because another writer added a context line under the task in `Inbox.md`, and the caller re-reads `Inbox.md`
+- **THEN** `resume=true` SHALL be refused `resume_unmatched` writing nothing, and the call with the current id and `allow_duplicate=true` SHALL move the changed task beside the earlier copy, losing no line
 
 #### Scenario: A context line added in the source is kept
 - **WHEN** another writer adds a context line under the task in `Inbox.md` after the destination publication of a move called without `expected_hash`
@@ -193,7 +202,7 @@ Before planning an insertion, the destination's current bytes SHALL be checked, 
 
 `resume=true` SHALL mean only: the destination already holds this exact block; insert nothing and remove the source copy. It SHALL require exactly one destination task with the moved key whose block's line contents, terminators excluded, are byte-identical to the moved block's, and SHALL otherwise be refused with `resume_unmatched`, writing nothing. It SHALL then write the source removal through the destination presence check aimed at that copy. It SHALL NOT be combinable with `allow_duplicate`, with `to_section`, or with a move within one note.
 
-No sequence of `move_task` calls without `allow_duplicate` SHALL leave more than two copies of a moved block, and no call SHALL remove a source line whose content is not present at the destination at the moment of the presence check.
+A single `move_task` call without `allow_duplicate`, or two such calls running concurrently, SHALL NOT leave more than two copies of a moved block; more concurrent moves of one task to different destinations can leave one copy in each destination that published, and never fewer than one copy in all. No call SHALL remove a source line whose content is not present at the destination at the moment of the presence check.
 
 #### Scenario: An independent identical task at the destination is not deleted
 - **WHEN** `Inbox.md` and `Project.md` each hold an independent `- [ ] Call Alex` with identical context, before any move, and `move_task` moves the inbox task to `Project.md`
@@ -204,7 +213,7 @@ No sequence of `move_task` calls without `allow_duplicate` SHALL leave more than
 - **THEN** it SHALL be refused with `duplicate_task`, and neither note SHALL change
 
 #### Scenario: Resume completes a partial move
-- **WHEN** a move ended in `task_move_incomplete` with `reason` `concurrent_write`, the source task is unchanged, and the same call is made with `resume=true`
+- **WHEN** a move ended in `task_move_incomplete` with `reason` `concurrent_write`, a re-read shows the source task's block still byte-identical to the moved block, and the same call is made with `resume=true` (with that read's `content_hash` if `expected_hash` was used)
 - **THEN** nothing SHALL be inserted in the destination, the source copy SHALL be removed, and the response SHALL say the move was resumed, naming the destination line
 
 #### Scenario: Resume without exactly one copy is refused
@@ -265,7 +274,7 @@ When `to_path` resolves to the source note, the removal and the insertion SHALL 
 - log `path`, `id`, `to_path`, `to_section`, `dry_run`, `allow_duplicate`, `resume` and the presence of each hash, and never task text;
 - with `dry_run=true`, return both diffs and the moved lines, publishing nothing, refreshing nothing and recording no event.
 
-The caller's task rule SHALL NOT be consulted for the move. When `to_path` lies under a folder the caller's default task scope excludes and the source does not, the response SHALL say that default listings will not show the task and that `list_tasks(scope="all")` will.
+The caller's task rule SHALL NOT block or alter the move. After planning, the moved task's destination extraction SHALL be checked with the same task-rule test the other task write tools apply to the line they wrote (`task_rule.extracted_is_task` under the caller's effective rule), and when the moved task is not a task under that rule, the success and dry-run responses SHALL carry the same note line (`task_rule.not_task_note`) as `add_task` and `update_task`. When `to_path` lies under a folder the caller's default task scope excludes and the source does not, the response SHALL say that default listings will not show the task and that `list_tasks(scope="all")` will.
 
 #### Scenario: List, move, list
 - **WHEN** `list_tasks` shows a task in `Inbox.md`, `move_task` moves it to `Projects/Money.md` and reports `index (destination): refreshed` and `index (source): refreshed`, and `list_tasks` is called before any index pass
@@ -274,6 +283,10 @@ The caller's task rule SHALL NOT be consulted for the move. When `to_path` lies 
 #### Scenario: A lagging destination refresh is reported, not hidden
 - **WHEN** another transaction holds the destination's row lock for longer than 2 seconds during a move
 - **THEN** the move SHALL complete, the response SHALL say `index (destination): may lag (lock_timeout)`, and the next index pass SHALL list the task in the destination
+
+#### Scenario: A checkbox that is not a task under the rule is moved and said so
+- **WHEN** the caller's task rule is `fields` and `move_task` moves `- [ ] buy stamps`, which has no task field and no task tag, into an indexed note outside every excluded folder, with and without `dry_run`
+- **THEN** the move (or the dry run) SHALL proceed, and the response SHALL carry the note that the line is not a task under the `fields` rule and that `list_tasks(scope="all")` will show it
 
 #### Scenario: A move into an excluded conflict copy
 - **WHEN** `INDEX_EXCLUDE_CONFLICT_FILES` is true and a task moves into `N (conflict 2026-05-29-19-45-39).md`

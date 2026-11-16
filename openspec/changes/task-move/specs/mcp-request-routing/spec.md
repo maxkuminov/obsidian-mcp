@@ -52,7 +52,7 @@ The classification is a statement about the registry and the full list. A filter
 - **THEN** each of the 20 listed tools SHALL carry the same `title` and the same four hints as its entry in the full list
 
 ### Requirement: Tool metadata SHALL leave the published tool surface otherwise unchanged
-Adding titles, annotations and instructions, and shortening descriptions, SHALL NOT change the set of tool names, their listing order, any tool's `inputSchema`, or any tool's `outputSchema`.
+Adding titles, annotations and instructions, and shortening descriptions, SHALL NOT change the name, listing position, `inputSchema` or `outputSchema` of any existing tool; a change that adds a tool SHALL only append it to the listing (the task-move change appends `move_task`, #430, after the 32 existing tools, whose names, order and schemas stay unchanged).
 
 **Which list.** These statements describe the **full list**: the list served to every principal the `scoped-tools-list` rule does not filter (an API key of either permission, an OAuth grant with `readwrite`, sandbox mode, and an in-process caller with no principal). The list a read-only OAuth grant receives is defined by that rule as this list minus its hidden entries.
 
