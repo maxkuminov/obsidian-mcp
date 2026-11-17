@@ -1099,7 +1099,7 @@ def test_a_permission_change_with_a_hash_is_partial_and_resume_completes(world, 
     _after_the_nth_staged_flush(monkeypatch, 2, lambda: os.chmod(inbox, 0o600))
     out = run(tools.move_task_impl("Inbox.md", key, "Projects/Money.md", expected_hash=h(INBOX)))
     assert payload_of(out)["reason"] == "concurrent_write"
-    monkeypatch.setattr(os, "fsync", os.fsync.__wrapped__ if hasattr(os.fsync, "__wrapped__") else os.fsync)
+    # The hook fired on the second flush only; the resume below runs unhooked.
     out = run(tools.move_task_impl("Inbox.md", key, "Projects/Money.md", resume=True,
                                    expected_hash=h(INBOX)))
     assert code_of(out) is None, out
