@@ -9835,13 +9835,22 @@ def _move_incomplete(
     what this call verified; `complete with:` names the exact call."""
     P, D = _escape_task_path(src_rel), _escape_task_path(dst_rel)
     J = dest_id or "none"
-    holds = f"holds the task at line {dest_line}, id {J}"
-    unchanged = "not changed by this call"
+    # Every sentence below states only what this call verified (review r4).
+    if dest_published:
+        holds = (f"holds the task at line {dest_line}, id {J} (re-checked before the source "
+                 "write)")
+        written = (f"this call wrote the task at line {dest_line}, id {J}; it was not re-checked "
+                   "after that")
+    else:
+        holds = (f"held the task at line {dest_line}, id {J} (re-checked before the source "
+                 "write)")
+        written = f"held the task at line {dest_line}, id {J} when this call read it"
+    unchanged = "this call did not change it"
     plain = _completing_call(src_rel, task_id, dst_rel)
     resume = _completing_call(src_rel, task_id, dst_rel, resume=True)
     edited = _completing_call(src_rel, "<its new id>", dst_rel, allow_duplicate=True)
     if reason == "concurrent_write":
-        dest = holds + " (checked before the source write)"
+        dest = holds
         src = ("another writer changed it during this call; this call did not remove the "
                "task; re-read it to choose the completing call")
         complete = (
@@ -9855,37 +9864,40 @@ def _move_incomplete(
         )
     elif reason == "source_missing":
         dest = holds
-        src = (f"no longer holds a task with id {task_id} (it was removed, moved, or its "
-               "text was edited by another writer)")
+        src = (f"a re-read during this call found no task with id {task_id}; this call did not "
+               "change it")
         complete = (f"nothing, if it was removed or moved elsewhere; if its text was edited, "
                     f"list_tasks(path={_move_arg(src_rel)}) gives its new id and {edited} "
                     "moves the edited copy beside the earlier one")
     elif reason == "source_changed":
         dest = holds
-        src = (f"holds an edited version of the task, id {current_id}; it was not removed, "
-               "so the edit is kept")
+        src = (f"a re-read during this call found the task's text once with a different block, "
+               f"id {current_id}; this call did not remove it, so that version is kept")
         complete = _completing_call(src_rel, current_id or "<its current id>", dst_rel,
                                     allow_duplicate=True)
     elif reason == "source_ambiguous":
         dest = holds
-        src = "now holds several identical tasks with this text; none was removed"
+        src = ("a re-read during this call found several tasks with this text; this call "
+               "removed none")
         complete = (f"read_note(path={_move_arg(src_rel)}), then "
                     + _completing_call(src_rel, "<key>.<i>of<n>", dst_rel, resume=True)
                     + " naming the copy to remove")
     elif reason == "destination_changed":
         when = "this call wrote it" if dest_published else "this call read it"
-        dest = (f"no longer holds the moved lines at line {dest_line} (another writer "
-                f"changed the note after {when})")
+        dest = (f"did not hold the moved lines at line {dest_line} when re-read before the "
+                f"source write (the note changed, or was gone, after {when})")
         src = unchanged
         complete = (f"{plain}; if that is refused duplicate_task because the copy is still "
                     f"elsewhere in `{D}`, {resume}")
     elif reason == "destination_not_a_task":
-        dest = (f"still holds the moved lines at line {dest_line}, but they no longer read as a "
-                "task there (for example, they are inside an unclosed code fence)")
-        src = "not changed by this call: it still holds the task as this call read it"
+        dest = (f"held the moved lines at line {dest_line} when re-read before the source "
+                "write, but they no longer read as a task there (for example, they are inside "
+                "an unclosed code fence)")
+        src = unchanged
         complete = (f"repair `{D}` so the lines read as a task again (for example, close the "
-                    f"fence), then {resume}; if `{D}` cannot be repaired, the task is safe in the "
-                    f"source and the copy in `{D}` can be removed by hand with edit_note")
+                    f"fence), then {resume}; or, after read_note(path={_move_arg(src_rel)}) "
+                    f"confirms the source still holds the task, remove the copy in `{D}` by hand "
+                    "with edit_note")
     elif reason == "destination_unverified":
         dest = (f"could not be read to check that it still holds the moved lines ({detail}); "
                 "its contents are unverified")
@@ -9895,7 +9907,7 @@ def _move_incomplete(
                     f"duplicate_task refusal then names any copy elsewhere in `{D}`)")
     elif reason == "permissions_not_applied":
         dest = holds
-        src = (f"not changed by this call: its file permissions could not be applied "
+        src = (f"this call did not change it: its file permissions could not be applied "
                f"({detail}), so nothing was published")
         complete = f"{resume} once the permission problem is fixed"
     elif reason == "io_failure":
@@ -9904,8 +9916,8 @@ def _move_incomplete(
         complete = (f"read_note(path={_move_arg(src_rel)}); if it still holds the task, "
                     + resume
                     + "; otherwise the move is complete")
-    else:  # the three confirmation markers
-        dest = holds
+    else:  # the three confirmation markers: refused before the presence check
+        dest = written
         src = unchanged
         complete = f"{resume} once the vault assignment is restored"
     if to_hash_supplied and dest_published:
@@ -10182,7 +10194,7 @@ async def _move_between(*, tool, uid, src, dst, path, to_path, task_id, args, ef
             P, D = _escape_task_path(src_rel), _escape_task_path(dst_rel)
             return BodyOutcome(
                 f"{tool}: the write of `{D}` failed part-way ({_move_error_text(e)}), so it may "
-                f"or may not hold the task. `{P}` was not changed.\n"
+                f"or may not hold the task. This call did not change `{P}`.\n"
                 f"complete with: read_note(path={_move_arg(dst_rel)}); if it holds the moved "
                 f"lines, {_completing_call(src_rel, task_id, dst_rel, resume=True)}, "
                 f"otherwise {_completing_call(src_rel, task_id, dst_rel)}",

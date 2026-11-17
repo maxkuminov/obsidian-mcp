@@ -2423,7 +2423,8 @@ its block and its code masks) — with no `await` between that check and the
 source write. *Holds* lets the write run; *changed* (the lines absent or
 different, or no file) stops with `destination_changed`; the bytes in place but
 no longer read as the task (an unclosed fence above them) stops with
-`destination_not_a_task`, completed by repairing the note and `resume=true`; *unverified* (the read
+`destination_not_a_task`, completed by repairing the note and `resume=true`
+(or, after reading the source, removing the destination copy by hand); *unverified* (the read
 itself failed, or the bytes are not valid UTF-8) stops with `destination_unverified`, which claims nothing about
 the contents. An in-call conflict at the source without `expected_hash`
 re-reads the source and re-plans the removal only when the moved key
@@ -2449,7 +2450,8 @@ at the source (row 14a, not retried, completed by `resume=true`).
 `task_move_incomplete`: `disposition="partial"`, never `nothing_written`, its
 prose a fixed shape — `destination:` and `source:` lines stating only what
 this call verified (it never says the source holds the task unless a re-read
-found it there), a `complete with:` line naming the exact call that finishes
+found it there; a source it did not write is "this call did not change it";
+a destination line says when it was re-checked; review r4), a `complete with:` line naming the exact call that finishes
 the move (string arguments as ASCII-only JSON), the destination's
 `content_hash` and `index (destination): …`. Every completing call omits
 `to_expected_hash` or passes a fresh one, and the line says so when the call

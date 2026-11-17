@@ -650,8 +650,9 @@ def test_an_older_destination_saved_between_the_steps_stops_the_move(world, monk
     assert p["path"] == "Inbox.md" and p["destination_path"] == "Projects/Money.md"
     assert p["source_id"] == key and "nothing_written" not in p
     assert out.disposition == "partial"
-    assert line_of(out, "destination:").startswith("destination: no longer holds the moved lines at line 3")
-    assert line_of(out, "source:") == "source: not changed by this call"
+    assert line_of(out, "destination:").startswith(
+        "destination: did not hold the moved lines at line 3 when re-read before the source write")
+    assert line_of(out, "source:") == "source: this call did not change it"
     assert read(world, "Inbox.md") == INBOX
     # The destination event was recorded, the source's was not.
     assert order(world) == [("refresh", "Projects/Money.md"), ("event", "Projects/Money.md")]
@@ -780,7 +781,7 @@ def test_the_source_removal_conflicts_with_a_hash(world, monkeypatch):
     assert p["source_id"] == key and p["destination_id"] == key
     assert "nothing_written" not in p
     assert line_of(out, "destination:") == (
-        f"destination: holds the task at line 3, id {key} (checked before the source write)")
+        f"destination: holds the task at line 3, id {key} (re-checked before the source write)")
     complete = line_of(out, "complete with:")
     assert "read_note" in complete and "resume=true" in complete and "allow_duplicate=true" in complete
     other = INBOX + "unrelated\n"
@@ -866,7 +867,8 @@ def test_a_task_completed_in_the_source_is_reported_missing(world, monkeypatch):
     p = payload_of(out)
     assert p["reason"] == "source_missing"
     src = line_of(out, "source:")
-    assert src.startswith("source: no longer holds a task with id") and "holds the task" not in src
+    assert src.startswith("source: a re-read during this call found no task with id")
+    assert "holds the task" not in src
     assert done in read(world, "Inbox.md")
     # No call writes a third copy without allow_duplicate.
     monkeypatch.setattr(tools, "write_file_at", vault_service.write_file_at)
@@ -971,7 +973,7 @@ def test_permissions_not_applied_at_the_source_is_partial(world, monkeypatch):
     out = run(tools.move_task_impl("Inbox.md", key, "Projects/Money.md"))
     p = payload_of(out)
     assert p["reason"] == "permissions_not_applied" and len(calls) == 1
-    assert line_of(out, "source:").startswith("source: not changed by this call: its file permissions")
+    assert line_of(out, "source:").startswith("source: this call did not change it: its file permissions")
     assert "EIO" in line_of(out, "source:")
     assert line_of(out, "complete with:").startswith(
         f'complete with: move_task(path="Inbox.md", id="{key}", to_path="Projects/Money.md", resume=true)')
@@ -1578,6 +1580,9 @@ def test_an_unclosed_fence_above_the_moved_lines_stops_the_move(world, monkeypat
     def fence(n):
         if n == 2:
             write(world, "D.md", "```\n- [ ] x\n")
+            # A concurrent source edit too: the response must not claim the
+            # source still holds the task (review r4).
+            write(world, "Inbox.md", "- [ ] x\nunrelated\n")
 
     confirm_hook(monkeypatch, fence)
     out = run(tools.move_task_impl("Inbox.md", key_of("- [ ] x"), "D.md"))
@@ -1585,19 +1590,21 @@ def test_an_unclosed_fence_above_the_moved_lines_stops_the_move(world, monkeypat
     assert p["reason"] == "destination_not_a_task", out
     assert "destination_id" not in p
     dest = line_of(out, "destination:")
-    assert "still holds the moved lines at line 2" in dest and "no longer read as a task" in dest
-    assert "no longer holds" not in dest
+    assert "held the moved lines at line 2" in dest and "no longer read as a task" in dest
+    assert line_of(out, "source:") == "source: this call did not change it"
+    assert "still holds the task" not in out.split("complete with:")[0]
     complete = line_of(out, "complete with:")
     assert "close the fence" in complete and "edit_note" in complete
+    assert 'read_note(path="Inbox.md") confirms the source still holds the task' in complete
     resume_call = f'move_task(path="Inbox.md", id="{key_of("- [ ] x")}", to_path="D.md", resume=true)'
     assert resume_call in complete
-    assert read(world, "Inbox.md") == "- [ ] x\n"
+    assert read(world, "Inbox.md") == "- [ ] x\nunrelated\n"  # the other writer's bytes
     # Repair the destination (close the fence), then the printed resume completes.
     monkeypatch.setattr(tools, "confirmed_publication", vault_service.confirmed_publication)
     write(world, "D.md", "```\n```\n- [ ] x\n")
     out = run(tools.move_task_impl("Inbox.md", key_of("- [ ] x"), "D.md", resume=True))
     assert code_of(out) is None, out
-    assert read(world, "Inbox.md") == "" and read(world, "D.md") == "```\n```\n- [ ] x\n"
+    assert read(world, "Inbox.md") == "unrelated\n" and read(world, "D.md") == "```\n```\n- [ ] x\n"
 
 
 def test_every_completing_call_is_rendered_by_one_helper():
