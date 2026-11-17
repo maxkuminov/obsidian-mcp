@@ -119,6 +119,24 @@ TASK_CODES = frozenset({
     "task_not_found", "task_ambiguous", "task_changed", "already_completed",
     "task_cancelled", "task_malformed", "recurrence_unsupported",
     "on_completion_unsupported", "duplicate_task", "response_cap_too_small",
+    # #430 (`move_task`): nothing written, like their siblings.
+    "resume_unmatched", "block_id_conflict",
+})
+
+#: #430: `move_task`'s partial outcome. A **body** code, not a task code: it
+#: is rendered with `disposition="partial"` and never carries
+#: `nothing_written` (the destination was published). It is the only code
+#: that may carry the four move fields below.
+TASK_MOVE_INCOMPLETE = "task_move_incomplete"
+
+#: The `reason` values a `task_move_incomplete` refusal may carry (#430, D11),
+#: one per row of its outcome table.
+TASK_MOVE_INCOMPLETE_REASONS = frozenset({
+    "concurrent_write", "source_missing", "source_changed", "source_ambiguous",
+    "destination_changed", "destination_not_a_task", "destination_unverified",
+    "vault_assignment_changed",
+    "vault_anchor_lost_at_publish", "vault_confirmation_unavailable",
+    "permissions_not_applied", "io_failure",
 })
 
 # Body-only codes omit unrelated bucket fields. Existing gate codes retain
@@ -133,6 +151,7 @@ BODY_CODES = frozenset({
     "unsupported_filesystem", "io_failure", "index_not_ready",
     "transfer_unavailable", "credential_unusable", "fetch_refused",
     "transfer_busy", "transfer_timeout", "partial_completion", "publication_uncertain",
+    TASK_MOVE_INCOMPLETE,
 } | TASK_CODES)
 
 CODES = frozenset(
@@ -230,6 +249,19 @@ class Refusal:
     #: audit trail, not a mutation.
     nothing_written: bool | None = None
 
+    # ── the task-move fields (#430, D11) ───────────────────────────────────
+    #
+    # Absent, never null, like the precondition fields, and set **only** by a
+    # `task_move_incomplete` refusal (checked at construction): `path` is
+    # then the source note, `destination_path` the destination, `source_id`
+    # the id the call named, `destination_id` the moved task's id at the
+    # destination (absent when the destination was found changed, no longer a
+    # task, or could not be read), and `reason` one of `TASK_MOVE_INCOMPLETE_REASONS`.
+    destination_path: str | None = None
+    source_id: str | None = None
+    destination_id: str | None = None
+    reason: str | None = None
+
     def __post_init__(self) -> None:
         if self.code not in CODES:
             raise RefusalShapeError(
@@ -263,6 +295,25 @@ class Refusal:
                 "made the comparison impossible; it must carry cap_name and "
                 "cap_bytes."
             )
+        move_fields = (self.destination_path, self.source_id, self.destination_id, self.reason)
+        if self.code != TASK_MOVE_INCOMPLETE:
+            if any(v is not None for v in move_fields):
+                raise RefusalShapeError(
+                    "destination_path, source_id, destination_id and reason are "
+                    f"carried only by {TASK_MOVE_INCOMPLETE!r}, not {self.code!r}."
+                )
+        else:
+            if self.reason not in TASK_MOVE_INCOMPLETE_REASONS:
+                raise RefusalShapeError(
+                    f"{TASK_MOVE_INCOMPLETE!r} must carry a reason from "
+                    + ", ".join(sorted(TASK_MOVE_INCOMPLETE_REASONS))
+                    + f", not {self.reason!r}."
+                )
+            if self.nothing_written is not None:
+                raise RefusalShapeError(
+                    f"{TASK_MOVE_INCOMPLETE!r} is a partial outcome and never "
+                    "carries nothing_written."
+                )
 
     def as_payload(self) -> dict:
         """The JSON object the sentinel line carries.
@@ -282,7 +333,8 @@ class Refusal:
             payload["scope"] = self.scope
             payload["limit"] = self.limit
             payload["limit_unit"] = self.limit_unit
-        for name in ("path", "current_hash", "cap_name", "cap_bytes", "nothing_written"):
+        for name in ("path", "destination_path", "source_id", "destination_id", "reason",
+                     "current_hash", "cap_name", "cap_bytes", "nothing_written"):
             value = getattr(self, name)
             if value is not None:
                 payload[name] = value

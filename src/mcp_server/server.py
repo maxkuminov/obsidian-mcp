@@ -33,6 +33,7 @@ from src.mcp_server.tools import (
     list_notes_impl,
     list_tasks_impl,
     move_note_impl,
+    move_task_impl,
     read_file_impl,
     read_note_impl,
     request_download_impl,
@@ -118,7 +119,9 @@ def _origin_patterns(origins) -> list[str]:
 #   destructive = the write-bucket set (`_tracked(write_class=True)`) minus
 #                 `create_note` (no-clobber, additive) and `add_task` (inserts
 #                 one line, removes no byte; #428) plus `request_upload` (its
-#                 `overwrite=True` capability overwrites on redemption)
+#                 `overwrite=True` capability overwrites on redemption);
+#                 `move_task` (#430) removes lines from its source note, so it
+#                 is destructive under the rule
 #   open-world  = `import_from_url` only
 # A `.trash/` undo path does not make a delete non-destructive, and the hints
 # are per tool, not per call: `edit_note(dry_run=True)` is still "destructive".
@@ -171,7 +174,8 @@ SERVER_INSTRUCTIONS = (
     "`task_agenda` list checkbox tasks from the index (Tasks-plugin query "
     "blocks are text they do not evaluate); `complete_task` and `update_task` "
     "change one task, named by its note `path` plus the task id a listing "
-    "prints, and `add_task` inserts one."
+    "prints, `add_task` inserts one, and `move_task` moves one, with the lines "
+    "indented under it, to another note or section."
 )
 
 
@@ -1868,6 +1872,92 @@ async def add_task(
         path, text, section=section, due=due, scheduled=scheduled, start=start,
         priority=priority, tags=tags, recurrence=recurrence, context=context,
         allow_duplicate=allow_duplicate, dry_run=dry_run, expected_hash=expected_hash,
+    )
+
+
+@mcp.tool(title="Move task", annotations=_DESTRUCTIVE)
+async def move_task(
+    path: str,
+    id: str,
+    to_path: str,
+    to_section: str | None = None,
+    allow_duplicate: bool = False,
+    resume: bool = False,
+    dry_run: bool = False,
+    expected_hash: str | None = None,
+    to_expected_hash: str | None = None,
+) -> str:
+    """Move one task, with every line indented under it, to another note or to another section of its note. Requires write permission (a `readwrite` API key or OAuth scope).
+
+    Arguments: `path` and `id` (the task, both from a listing), `to_path` (an
+    existing note; never created), `to_section`, `allow_duplicate`, `resume`,
+    `dry_run`, and the preconditions `expected_hash` (binds the source note)
+    and `to_expected_hash` (binds the destination).
+    Every refusal the server raises ends with one machine-readable
+    `MCP-REFUSAL {"code":…}` line; an undeclared or mistyped argument is
+    rejected by protocol validation before the tool runs and carries no such
+    line.
+
+    The id is re-checked against the source's current text, never a line
+    number. An id shaped `<key>.<i>of<n>` is accepted only with
+    `expected_hash` (the source's `content_hash` from `read_note`). Only a
+    top-level, unquoted task moves: a nested task, a task in a callout, a
+    block holding a quote, fence or heading line, or a destination whose
+    last top-level task is quoted is refused `task_malformed` (`edit_note`
+    can move it by hand). The lines arrive
+    byte for byte; only their line endings follow the destination. They go
+    where `add_task` would put a new task: after the last top-level task of
+    `to_section` (or the whole note) and everything under it.
+
+    The destination is written first. Immediately before the source is
+    written, in the same step, the destination is re-read and must still
+    hold the moved lines; otherwise the source is left alone. A stop after
+    the destination was written answers `task_move_incomplete` (partial,
+    never `nothing_written`): its `destination:` and `source:` lines state
+    only what was checked, its `complete with:` line names the exact call
+    that finishes the move, and the sentinel carries `destination_path`,
+    `source_id`, `destination_id` and `reason`. One window remains: an
+    outside save of an older destination while the source is being written
+    can lose the task.
+
+    A destination task with the same id (an identical copy included), or an
+    open task with the same description, is refused `duplicate_task`;
+    `allow_duplicate=true` keeps both. `resume=true` finishes an interrupted
+    move: it inserts nothing and removes the source copy, only when the
+    destination holds exactly one byte-identical copy (else
+    `resume_unmatched`); never with `allow_duplicate`, `to_section` or one
+    note.
+
+    `dry_run=true` returns both diffs and writes nothing. Each hash is
+    optional (where preconditions are required, a bare id satisfies them and
+    the destination is exempt); a change by someone else during the call is
+    retried from a fresh read, at most 3 attempts, unless that note's hash
+    was given. The response gives the moved task's new line and id (the
+    key is kept; `.<i>of<n>` suffixes may renumber), each `content_hash`
+    and `index (destination): …` / `index (source): …`.
+
+    Codes: `task_move_incomplete`, `publication_uncertain`, `duplicate_task`,
+    `resume_unmatched`, `block_id_conflict`, `task_not_found`,
+    `task_ambiguous`, `task_changed`, `task_malformed`, `precondition_required`,
+    `stale_precondition`, `malformed_precondition`, `concurrent_write`,
+    `selector_unresolved`, `content_unsafe`, `size_limit`, `invalid_argument`,
+    `not_found`, `io_failure`, `permission_denied`.
+
+    Args:
+        path: The source note, unescaped.
+        id: A `list_tasks` / `task_agenda` row's task id.
+        to_path: The destination note; it must exist.
+        to_section: A destination heading, as `add_task` takes `section`.
+        allow_duplicate: Keep both copies of a duplicate.
+        resume: Finish an interrupted move.
+        dry_run: Preview both changes without writing.
+        expected_hash: The source's `content_hash`; required with a suffixed id.
+        to_expected_hash: The destination's `content_hash`.
+    """
+    return await move_task_impl(
+        path, id, to_path, to_section=to_section, allow_duplicate=allow_duplicate,
+        resume=resume, dry_run=dry_run, expected_hash=expected_hash,
+        to_expected_hash=to_expected_hash,
     )
 
 

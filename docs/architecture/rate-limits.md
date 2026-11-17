@@ -45,12 +45,14 @@ nothing to slow it and nothing to tell it to stop.
 | K | Key-creation budget (#323) — *upstream of every row above: it bounds how fast new principals appear* | `POST /api/keys` **and** `POST /admin/keys/create`, after validation, the unlimited rule and the cap | account (exact) **and** trusted address, both must admit | 10 / account and 20 / address per 3600 s (`KEY_CREATION_ACCOUNT_LIMIT`, `KEY_CREATION_ADDRESS_LIMIT`, `KEY_CREATION_WINDOW_SECONDS`; null ⇒ that counter off) | JSON **429** + `Retry-After`; form flash + 303 | `key_creation_throttled` event; no `usage_logs` row |
 | K2 | Active-key cap (#323) | the same two routes, under a `users` row lock | non-admin account | 25 active keys (`KEY_MAX_ACTIVE_PER_ACCOUNT`; null ⇒ off); admins and single-user exempt | JSON **409**; form flash + 303 | none — an ordinary, visible quota |
 
-The eleven write-class tools (L3) are `create_note`, `edit_note`, `move_note`,
+The twelve write-class tools (L3) are `create_note`, `edit_note`, `move_note`,
 `delete_note`, `set_frontmatter`, `write_file`, `delete_file`,
-`import_from_url`, and since #428 `complete_task`, `update_task` and
+`import_from_url`, since #428 `complete_task`, `update_task` and
 `add_task` (each publishes a note through `edit_note`'s envelope; all of one
 call's internal conflict retries are charged once, because the gates run once
-per `_tracked` call) — every `_tracked` tool that changes vault bytes and
+per `_tracked` call), and since #430 `move_task` (two publications, one per
+note, and **one** write token per call, like `move_note`'s rewrites: one move
+is one intent, owner decision Q7) — every `_tracked` tool that changes vault bytes and
 therefore amplifies into the next indexer pass — **plus `PUT /transfer/upload`**,
 which changes vault bytes without being a tool call at all.
 
@@ -934,7 +936,7 @@ the page to see. The full reading rules are in
 | `PANEL_LOGIN_FAILURE_WINDOW_SECONDS` | `900` | The window that budget is counted over. |
 | `MCP_RATE_LIMIT_PER_MINUTE` | `600` | Sustained tool calls per minute per principal. Null (with the burst) disables the general bucket. |
 | `MCP_RATE_LIMIT_BURST` | `120` | Capacity of the general bucket. |
-| `MCP_WRITE_RATE_LIMIT_PER_MINUTE` | `120` | Sustained vault-mutating calls per minute per principal (the eleven write tools plus `PUT /transfer/upload`). |
+| `MCP_WRITE_RATE_LIMIT_PER_MINUTE` | `120` | Sustained vault-mutating calls per minute per principal (the twelve write tools plus `PUT /transfer/upload`). |
 | `MCP_WRITE_RATE_LIMIT_BURST` | `30` | Capacity of the write bucket. |
 | `MCP_LIMITER_MAX_TRACKED_PRINCIPALS` | `10000` | Principals holding their own limiter entry before the shared overflow entry. |
 | `MCP_REFUSAL_LOG_INTERVAL_SECONDS` | `10` | How long one coalescing window stays open. |
@@ -1059,7 +1061,7 @@ ending in a 500, shared with the panel and `/token`.
 | --- | --- | --- | --- |
 | `embedding` | `semantic_search`, `hybrid_search` (#354, `CLASS_MAPPING_VERSION` 5) | 1 | 1 |
 | `vector` | `find_related` | 1 | 1 |
-| `write` | the eleven write-class tools (L3; `complete_task`, `update_task`, `add_task` since #428, `CLASS_MAPPING_VERSION` 6) | 1 | 2 |
+| `write` | the twelve write-class tools (L3; `complete_task`, `update_task`, `add_task` since #428, `CLASS_MAPPING_VERSION` 6; `move_task` since #430, `CLASS_MAPPING_VERSION` 7, one slot held through both of its publications) | 1 | 2 |
 | `scan` | `keyword_search`, `list_notes`, `get_tags`, `get_neighborhood`, `find_orphans`, `list_files`, `list_tasks` (#350, `CLASS_MAPPING_VERSION` 3), `get_changes` (#351, `CLASS_MAPPING_VERSION` 4), `task_agenda` (#428, `CLASS_MAPPING_VERSION` 6) | 2 | 1 |
 | `light` | `read_note`, `read_file`, `get_recent`, `get_vault_guide`, `get_backlinks`, `get_links`, `request_upload`, `check_upload`, `request_download` | 4 | 1 |
 

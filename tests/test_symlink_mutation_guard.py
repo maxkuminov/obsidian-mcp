@@ -272,6 +272,9 @@ def _mutations(path: str) -> dict:
         "update_task": lambda: tools.update_task_impl(path, "0123456789ab", due="today"),
         "add_task": lambda: tools.add_task_impl(path, "clobber"),
         "add_task_dry_run": lambda: tools.add_task_impl(path, "clobber", dry_run=True),
+        # #430: `move_task` acts on both notes it names, never through a link.
+        "move_task_source": lambda: tools.move_task_impl(path, "0123456789ab", "mover.md"),
+        "move_task_destination": lambda: tools.move_task_impl("mover.md", "0123456789ab", path),
     }
 
 
@@ -644,6 +647,11 @@ _SWAPPED_LEAF_CASES = {
         True,
     ),
     "add_task": (lambda: tools.add_task_impl("note.md", "after"), True),
+    # #430: either note of a move.
+    "move_task_source": (
+        lambda: tools.move_task_impl("note.md", "0123456789ab", "mover.md"), True),
+    "move_task_destination": (
+        lambda: tools.move_task_impl("mover.md", "0123456789ab", "note.md"), True),
     "create_note": (lambda: tools.create_note_impl("note.md", "body\n"), False),
     "write_file_overwrite": (
         lambda: tools.write_file_impl(

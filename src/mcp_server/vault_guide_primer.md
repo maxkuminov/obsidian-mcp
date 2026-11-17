@@ -203,7 +203,8 @@ without reading notes, and `task_agenda` returns a dated overview (overdue,
 due today, scheduled, upcoming). `complete_task`, `update_task` and
 `add_task` change one task line: the first two address it by the note path
 plus the task id a listing prints, and `add_task` inserts a new line into an
-existing note. Plain checkboxes work without the Tasks plugin; its emoji
+existing note. `move_task` moves one task, with the lines indented under it,
+to another note or section, addressed the same way. Plain checkboxes work without the Tasks plugin; its emoji
 fields (dates, priority, recurrence) are optional. Tasks-plugin query blocks
 (` ```tasks ... ``` `) are literal text this server does not evaluate.
 

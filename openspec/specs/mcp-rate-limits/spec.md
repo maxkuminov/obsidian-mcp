@@ -70,7 +70,7 @@ TBD - created by archiving change mcp-rate-limits. Update Purpose after archive.
 
 Every `_tracked` tool call SHALL pass a per-principal general token bucket before any other gate in the decorator, refilling at `MCP_RATE_LIMIT_PER_MINUTE` tokens per minute with capacity `MCP_RATE_LIMIT_BURST`.
 
-Every call to a vault-mutating tool SHALL additionally pass a second per-principal bucket, refilling at `MCP_WRITE_RATE_LIMIT_PER_MINUTE` with capacity `MCP_WRITE_RATE_LIMIT_BURST`, checked immediately after the general bucket. The vault-mutating tools are `create_note`, `edit_note`, `move_note`, `delete_note`, `set_frontmatter`, `write_file`, `delete_file`, `import_from_url`, `complete_task`, `update_task` and `add_task`.
+Every call to a vault-mutating tool SHALL additionally pass a second per-principal bucket, refilling at `MCP_WRITE_RATE_LIMIT_PER_MINUTE` with capacity `MCP_WRITE_RATE_LIMIT_BURST`, checked immediately after the general bucket. The vault-mutating tools are `create_note`, `edit_note`, `move_note`, `delete_note`, `set_frontmatter`, `write_file`, `delete_file`, `import_from_url`, `complete_task`, `update_task`, `add_task` and `move_task`. Each call SHALL take one token from each bucket however many publications it makes: a `move_note` that rewrites backlinks and a `move_task` that publishes two notes are each one call.
 
 Each bucket:
 
@@ -110,8 +110,13 @@ No additional query is required and no schema change is needed.
 
 #### Scenario: Write tools pass both buckets
 
-- **WHEN** a principal calls `delete_note`, or `complete_task`, at a rate under `MCP_RATE_LIMIT_PER_MINUTE` but above `MCP_WRITE_RATE_LIMIT_PER_MINUTE`
+- **WHEN** a principal calls `delete_note`, `complete_task` or `move_task` at a rate under `MCP_RATE_LIMIT_PER_MINUTE` but above `MCP_WRITE_RATE_LIMIT_PER_MINUTE`
 - **THEN** the excess calls SHALL be refused with a scope naming the write bucket, while that principal's read tools, `list_tasks` and `task_agenda` included, SHALL continue to be admitted
+
+#### Scenario: A two-note move takes one write token
+
+- **WHEN** a principal whose write bucket holds exactly one token calls `move_task` between two notes
+- **THEN** the call SHALL be admitted, both notes SHALL be published, and the write bucket SHALL then be empty
 
 #### Scenario: Sustained rate is admitted
 

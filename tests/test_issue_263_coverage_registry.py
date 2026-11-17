@@ -41,20 +41,22 @@ COVERAGE = {
     'complete_task': [('refused', 'test_task_tools_e2e.py::test_a_suffixed_id_without_a_hash_is_refused_before_any_read'), ('success', 'test_task_tools_e2e.py::test_complete_task_writes_refreshes_then_records_the_event')],
     'update_task': [('refused', 'test_task_tools_e2e.py::test_update_task_status_done_names_complete_task'), ('success', 'test_task_tools_e2e.py::test_update_task_sets_a_relative_due_date_and_echoes_it')],
     'add_task': [('refused', 'test_task_tools_e2e.py::test_add_task_refuses_a_missing_note_and_creates_nothing'), ('success', 'test_task_tools_e2e.py::test_add_task_inserts_after_the_task_list_and_lists_similar_tasks')],
+    'move_task': [('refused', 'test_task_move_e2e.py::test_a_missing_destination_is_never_created'), ('success', 'test_task_move_e2e.py::test_a_task_moves_with_its_context_and_sub_task'), ('partial', 'test_task_move_e2e.py::test_the_source_removal_conflicts_with_a_hash')],
 }
 
 # Tools registered after the typed-tool-outcomes inventory was archived. Their
 # outcome contract lives in their own change's spec rather than in that
 # inventory, which is a historical record and is not edited.
 ADDED_AFTER_INVENTORY = {'list_tasks', 'get_changes', 'hybrid_search',  # #350, #351, #354
-                         'task_agenda', 'complete_task', 'update_task', 'add_task'}  # #428
+                         'task_agenda', 'complete_task', 'update_task', 'add_task',  # #428
+                         'move_task'}  # #430
 
 
 def test_every_registered_tool_has_inventory_and_live_behavioral_references():
     from src.mcp_server.server import mcp
     registered = {tool.name for tool in mcp._tool_manager.list_tools()}
     assert set(COVERAGE) == registered
-    assert len(registered) == 32  # 25 → 28: `list_tasks` (#350), `get_changes` (#351), `hybrid_search` (#354); 28 → 32: the task tools (#428)
+    assert len(registered) == 33  # 25 → 28: `list_tasks` (#350), `get_changes` (#351), `hybrid_search` (#354); 28 → 32: the task tools (#428); 33: `move_task` (#430)
     root = Path(__file__).resolve().parents[1]
     inventory = (root / 'openspec/changes/archive/2026-09-06-typed-tool-outcomes/inventory.md').read_text()
     for tool, references in COVERAGE.items():

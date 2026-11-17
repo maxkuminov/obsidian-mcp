@@ -89,6 +89,8 @@ NEW_CODES = {
     "task_not_found", "task_ambiguous", "task_changed", "already_completed",
     "task_cancelled", "task_malformed", "recurrence_unsupported",
     "on_completion_unsupported", "duplicate_task", "response_cap_too_small",
+    # #430 (`move_task`): two more nothing-written task codes.
+    "resume_unmatched", "block_id_conflict",
 }
 
 

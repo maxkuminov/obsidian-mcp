@@ -892,5 +892,96 @@
       "title": "add_taskOutput",
       "type": "object"
     }
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_duplicate": {
+          "default": false,
+          "title": "Allow Duplicate",
+          "type": "boolean"
+        },
+        "dry_run": {
+          "default": false,
+          "title": "Dry Run",
+          "type": "boolean"
+        },
+        "expected_hash": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expected Hash"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "resume": {
+          "default": false,
+          "title": "Resume",
+          "type": "boolean"
+        },
+        "to_expected_hash": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "To Expected Hash"
+        },
+        "to_path": {
+          "title": "To Path",
+          "type": "string"
+        },
+        "to_section": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "To Section"
+        }
+      },
+      "required": [
+        "path",
+        "id",
+        "to_path"
+      ],
+      "title": "move_taskArguments",
+      "type": "object"
+    },
+    "name": "move_task",
+    "outputSchema": {
+      "properties": {
+        "result": {
+          "title": "Result",
+          "type": "string"
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "title": "move_taskOutput",
+      "type": "object"
+    }
   }
 ]

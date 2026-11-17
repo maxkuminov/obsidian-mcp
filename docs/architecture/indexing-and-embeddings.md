@@ -1669,8 +1669,21 @@ cursor rules are in [vault tools](vault-tools.md#list_tasks-rendering-and-the-cu
 
 ## The write-time task refresh (#428)
 
-`complete_task`, `update_task` and `add_task` promise read-your-writes: a
-`list_tasks` right after the write sees it. #350's D9 declined re-deriving
+**`move_task` refreshes twice (#430).** A two-note move refreshes each note it
+published, after that note's publication and before its event: the
+destination after the insert, then (once the source removal is published)
+the source. Each refresh is its own transaction holding at most one
+`notes_metadata` row lock, committed or rolled back before the next begins —
+**never two row locks at once**, so two opposite moves (`A → B`, `B → A`)
+cannot deadlock. A destination refresh that lags does not stop the source
+removal (owner decision Q10): the response says `index (destination): may
+lag (<code>)`, and `list_tasks` can then show the task in neither note until
+the next pass (L13). A `resume=true` call publishes no destination bytes and
+refreshes only the source; a same-note move refreshes once. No
+`may_hold_tasks` gate: both notes' bytes hold the moved checkbox.
+
+`complete_task`, `update_task`, `add_task` and `move_task` (#430) promise
+read-your-writes: a `list_tasks` right after the write sees it. #350's D9 declined re-deriving
 inside `edit_note`, because a derivation writer outside the pass would break
 "task rows are written only with the row" (task rows always describe the
 row's committed `content_hash`). #428 keeps that invariant in a weaker,

@@ -170,6 +170,28 @@ async def test_renaming_the_parent_mid_write_cannot_redirect_it(
     assert (decoy / "note.md").read_text(encoding="utf-8") == "before\n"
 
 
+async def test_renaming_the_source_parent_mid_move_task_cannot_redirect_it(vault, sabotage):
+    """#430: both of `move_task`'s publications are anchored to the parent
+    directory validation opened — the source removal lands in the renamed
+    directory, never in the decoy its old name now leads to."""
+    (vault / "Real").mkdir()
+    (vault / "Decoy").mkdir()
+    (vault / "Real" / "note.md").write_text("- [ ] t\n", encoding="utf-8")
+    (vault / "Decoy" / "note.md").write_text("- [ ] t\n", encoding="utf-8")
+    (vault / "Dest.md").write_text("", encoding="utf-8")
+    fired = sabotage(_swap_directory_for_a_link(vault / "Real", vault / "Decoy"))
+
+    from src.services import task_line
+
+    result = await tools.move_task_impl("Real/note.md", task_line.task_key("t"), "Dest.md")
+
+    assert fired, "the race never ran"
+    assert "MCP-REFUSAL" not in result, result
+    assert (vault / "Real-moved" / "note.md").read_text(encoding="utf-8") == ""
+    assert (vault / "Decoy" / "note.md").read_text(encoding="utf-8") == "- [ ] t\n"
+    assert (vault / "Dest.md").read_text(encoding="utf-8") == "- [ ] t"
+
+
 async def test_renaming_the_parent_mid_create_cannot_redirect_it(vault, sabotage):
     (vault / "Real").mkdir()
     (vault / "Decoy").mkdir()
@@ -459,6 +481,10 @@ needs_proc = pytest.mark.skipif(
         pytest.param(
             lambda i: tools.complete_task_impl("kept.md", "0123456789ab"),
             id="complete_task_refused",
+        ),
+        pytest.param(
+            lambda i: tools.move_task_impl("kept.md", "0123456789ab", f"n{i}.md"),
+            id="move_task_refused",
         ),
         pytest.param(
             lambda i: tools.write_file_impl(
@@ -825,6 +851,11 @@ async def test_a_source_replaced_mid_move_is_relocated_intact(vault, monkeypatch
             lambda: tools.add_task_impl("gone.md", "x"),
             "use create_note",
             id="add_task",
+        ),
+        pytest.param(
+            lambda: tools.move_task_impl("gone.md", "0123456789ab", "there.md"),
+            "Note not found",
+            id="move_task",
         ),
     ],
 )

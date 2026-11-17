@@ -2,6 +2,7 @@ import asyncio
 import base64
 import binascii
 import copy
+import dataclasses
 import enum
 import errno
 import hashlib
@@ -9708,6 +9709,645 @@ async def add_task_impl(
         plan_fn=lambda body: task_write.plan_add(body, args, effective, today),
         describe=describe, after_plan=scan,
     )
+
+
+# ── move_task (#430, design D1–D18) ─────────────────────────────────────────
+#
+# A two-note write, destination first (D10). Phase 1 reads both notes through
+# their anchored descriptors, plans and verifies both (off the loop) and
+# publishes the destination insert, retried from the read on an in-call
+# conflict when `to_expected_hash` is absent (row 4). The destination is then
+# refreshed and its event recorded. Phase 2 publishes the source removal in
+# ONE confirmed publication whose synchronous callback first re-reads the
+# destination and requires the moved lines still at their position (6(b)) —
+# no `await` between that check and the source write — and on an in-call
+# conflict without `expected_hash` re-locates the block (rows 9–12). Every
+# stop after the destination publication is `task_move_incomplete`, a partial
+# outcome that states only what this call verified (D11). A move within one
+# note is the ordinary single-note envelope (`_run_task_write`) around
+# `plan_move_within` (D13).
+
+
+class _DestinationCheckFailed(Exception):
+    """D10 6(b) failed inside the source publication's callback, before the
+    source write: nothing was written to the source. ``state`` is
+    ``changed`` or ``unverified``."""
+
+    def __init__(self, state: str, detail: str | None = None):
+        super().__init__(state)
+        self.state = state
+        self.detail = detail
+
+
+def _move_error_text(exc: BaseException) -> str:
+    code = getattr(exc, "errno", None)
+    label = errno.errorcode.get(code) if isinstance(code, int) else None
+    name = type(exc).__name__ + (f" {label}" if label else "")
+    return _task_quote(f"{name}: {exc}", 160)
+
+
+def _destination_presence(target, k: int, moved, cap_bytes: int) -> tuple[str, str | None]:
+    """D10 6(b), synchronous: ``holds``, ``changed`` (read, or no file at the
+    name, and the lines are absent or different at line ``k``) or
+    ``unverified`` (the read itself failed: no claim about the contents)."""
+    try:
+        data = read_bytes_at(target, max_bytes=cap_bytes, label=target.rel)
+    except FileNotFoundError:
+        return "changed", None
+    except Exception as exc:  # noqa: BLE001 - EACCES, ELOOP, not regular, over the cap
+        return "unverified", _move_error_text(exc)
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        # Read, but not text this server can compare: nothing is claimed
+        # about where the moved lines are (implementation review r1).
+        return "unverified", "its bytes are not valid UTF-8"
+    # The moved lines at their position AND still the moved task under the
+    # pass's own extraction (review r2: an unclosed fence opened above them
+    # keeps the bytes but hides the task).
+    if task_write.destination_still_holds_task(text, k, moved):
+        return "holds", None
+    if task_write.destination_still_holds(text, k, moved.lines):
+        # The bytes are in place but no longer read as the task (review r3).
+        return "not_a_task", None
+    return "changed", None
+
+
+def _move_arg(value: str) -> str:
+    """A string argument of a `complete with:` call: ASCII-only JSON, so no
+    path character can break the line or the call."""
+    return json.dumps(value, ensure_ascii=True)
+
+
+def _move_call(path: str, task_id: str, to_path: str, *, resume: bool = False,
+               allow_duplicate: bool = False, expected_hash: str | None = None) -> str:
+    parts = [f"path={_move_arg(path)}", f"id={task_id if task_id.startswith('<') else _move_arg(task_id)}",
+             f"to_path={_move_arg(to_path)}"]
+    if allow_duplicate:
+        parts.append("allow_duplicate=true")
+    if resume:
+        parts.append("resume=true")
+    if expected_hash is not None:
+        parts.append(f"expected_hash={expected_hash if expected_hash.startswith('<') else _move_arg(expected_hash)}")
+    return "move_task(" + ", ".join(parts) + ")"
+
+
+def _fresh_source_hash(src_rel: str) -> str:
+    return f"<the content_hash that read_note(path={_move_arg(src_rel)}) returns>"
+
+
+def _completing_call(src_rel: str, task_id: str, dst_rel: str, *, resume: bool = False,
+                     allow_duplicate: bool = False) -> str:
+    """The ONE renderer of every `complete with:` call (implementation
+    review r1, r2). No completing call ever carries the original call's
+    `expected_hash` (a concurrent source edit makes it stale). The id it
+    names decides the hash: a concrete bare id needs none; a concrete
+    suffixed id, or the `<key>.<i>of<n>` placeholder, needs the source's
+    fresh `content_hash`, named as the value a `read_note` of the source
+    returns; a placeholder id the caller will take from a current listing
+    (`<its new id>`, `<its current id>`) may be suffixed, so the call says to
+    add that hash when it is."""
+    parsed = task_line.parse_id(task_id)
+    fresh = _fresh_source_hash(src_rel)
+    if parsed is not None:
+        return _move_call(src_rel, task_id, dst_rel, resume=resume, allow_duplicate=allow_duplicate,
+                          expected_hash=fresh if parsed.suffixed else None)
+    if ".<i>of<n>" in task_id:
+        return _move_call(src_rel, task_id, dst_rel, resume=resume, allow_duplicate=allow_duplicate,
+                          expected_hash=fresh)
+    return (_move_call(src_rel, task_id, dst_rel, resume=resume, allow_duplicate=allow_duplicate)
+            + f" (adding expected_hash={fresh} if that id carries a .<i>of<n> suffix)")
+
+
+def _index_line(label: str, refresh) -> str:
+    if refresh is None:
+        return f"index ({label}): unchanged"
+    return f"index ({label}): " + refresh.line[len("index: "):]
+
+
+def _move_incomplete(
+    *, reason: str, src_rel: str, dst_rel: str, task_id: str, dest_line: int,
+    dest_id: str | None, expected_hash: str | None, to_hash_supplied: bool,
+    dest_published: bool, dest_hash: str | None, dest_refresh, detail: str | None = None,
+    current_id: str | None = None,
+) -> BodyOutcome:
+    """D11: `task_move_incomplete`, rendered partial. Each line states only
+    what this call verified; `complete with:` names the exact call."""
+    P, D = _escape_task_path(src_rel), _escape_task_path(dst_rel)
+    J = dest_id or "none"
+    # Every sentence below states only what this call verified (review r4).
+    if dest_published:
+        holds = (f"holds the task at line {dest_line}, id {J} (re-checked before the source "
+                 "write)")
+        written = (f"this call wrote the task at line {dest_line}, id {J}; it was not re-checked "
+                   "after that")
+    else:
+        holds = (f"held the task at line {dest_line}, id {J} (re-checked before the source "
+                 "write)")
+        written = f"held the task at line {dest_line}, id {J} when this call read it"
+    unchanged = "this call did not change it"
+    plain = _completing_call(src_rel, task_id, dst_rel)
+    resume = _completing_call(src_rel, task_id, dst_rel, resume=True)
+    edited = _completing_call(src_rel, "<its new id>", dst_rel, allow_duplicate=True)
+    if reason == "concurrent_write":
+        dest = holds
+        src = ("another writer changed it during this call; this call did not remove the "
+               "task; re-read it to choose the completing call")
+        complete = (
+            f"read_note(path={_move_arg(src_rel)}), then: if id {task_id} still resolves to a "
+            "block byte-identical to the moved one, "
+            + resume
+            + "; if the key resolves once with a different block, "
+            + _completing_call(src_rel, "<its current id>", dst_rel, allow_duplicate=True)
+            + "; if it is absent, nothing (it was removed or moved), or if its text was "
+            f"edited, list_tasks(path={_move_arg(src_rel)}) for its new id and {edited}"
+        )
+    elif reason == "source_missing":
+        dest = holds
+        src = (f"a re-read during this call found no task with id {task_id}; this call did not "
+               "change it")
+        complete = (f"nothing, if it was removed or moved elsewhere; if its text was edited, "
+                    f"list_tasks(path={_move_arg(src_rel)}) gives its new id and {edited} "
+                    "moves the edited copy beside the earlier one")
+    elif reason == "source_changed":
+        dest = holds
+        src = (f"a re-read during this call found the task's text once with a different block, "
+               f"id {current_id}; this call did not remove it, so that version is kept")
+        complete = _completing_call(src_rel, current_id or "<its current id>", dst_rel,
+                                    allow_duplicate=True)
+    elif reason == "source_ambiguous":
+        dest = holds
+        src = ("a re-read during this call found several tasks with this text; this call "
+               "removed none")
+        complete = (f"read_note(path={_move_arg(src_rel)}), then "
+                    + _completing_call(src_rel, "<key>.<i>of<n>", dst_rel, resume=True)
+                    + " naming the copy to remove")
+    elif reason == "destination_changed":
+        when = "this call wrote it" if dest_published else "this call read it"
+        dest = (f"did not hold the moved lines at line {dest_line} when re-read before the "
+                f"source write (the note changed, or was gone, after {when})")
+        src = unchanged
+        complete = (f"{plain}; if that is refused duplicate_task because the copy is still "
+                    f"elsewhere in `{D}`, {resume}")
+    elif reason == "destination_not_a_task":
+        dest = (f"held the moved lines at line {dest_line} when re-read before the source "
+                "write, but they no longer read as a task there (for example, they are inside "
+                "an unclosed code fence)")
+        src = unchanged
+        complete = (f"repair `{D}` so the lines read as a task again (for example, close the "
+                    f"fence), then {resume}; or, after read_note(path={_move_arg(src_rel)}) "
+                    f"confirms the source still holds the task, remove the copy in `{D}` by hand "
+                    "with edit_note")
+    elif reason == "destination_unverified":
+        dest = (f"could not be read to check that it still holds the moved lines ({detail}); "
+                "its contents are unverified")
+        src = unchanged
+        complete = (f"once `{D}` is readable, read_note(path={_move_arg(dst_rel)}): if it holds "
+                    f"exactly one byte-identical copy, {resume}; otherwise {plain} (a "
+                    f"duplicate_task refusal then names any copy elsewhere in `{D}`)")
+    elif reason == "permissions_not_applied":
+        dest = holds
+        src = (f"this call did not change it: its file permissions could not be applied "
+               f"({detail}), so nothing was published")
+        complete = f"{resume} once the permission problem is fixed"
+    elif reason == "io_failure":
+        dest = holds
+        src = "unknown: the removal failed part-way; read the note"
+        complete = (f"read_note(path={_move_arg(src_rel)}); if it still holds the task, "
+                    + resume
+                    + "; otherwise the move is complete")
+    else:  # the three confirmation markers: refused before the presence check
+        dest = written
+        src = unchanged
+        complete = f"{resume} once the vault assignment is restored"
+    if to_hash_supplied and dest_published:
+        complete += (" (omit to_expected_hash, or pass the destination's fresh content_hash: "
+                     "the one this call sent is stale)")
+    lines = [
+        f"move_task: the move of task {task_id} from `{P}` to `{D}` did not complete ({reason}).",
+        f"destination: {dest}",
+        f"source: {src}",
+        f"complete with: {complete}",
+    ]
+    if dest_published and dest_hash is not None:
+        lines.append(f"destination content_hash: {dest_hash}")
+    lines.append(_index_line("destination", dest_refresh))
+    timing.record("move_outcome", f"incomplete:{reason}")
+    return BodyOutcome(
+        "\n".join(lines),
+        refusals.Refusal(
+            code=refusals.TASK_MOVE_INCOMPLETE,
+            path=_precondition_path(src_rel),
+            destination_path=_precondition_path(dst_rel),
+            source_id=task_id,
+            destination_id=(None if reason in ("destination_changed", "destination_unverified",
+                                               "destination_not_a_task")
+                            else dest_id),
+            reason=reason,
+        ),
+        disposition="partial",
+    )
+
+
+def _move_read(tool: str, target, path: str, expected_hash: str | None, cap_name: str, cap_bytes: int):
+    """One note's read and precondition ladder, exactly as `_run_task_write`
+    runs them (D12: a bare id satisfies required mode for the source, and the
+    destination is exempt; a supplied hash is still compared)."""
+    try:
+        data = read_bytes_at(target, max_bytes=cap_bytes, label=path)
+    except ValueError as e:
+        if err := _precondition_error(
+            tool, path, None, expected_hash, cap_name=cap_name,
+            cap_bytes=cap_bytes, over_cap=True, enforceable=False,
+        ):
+            return err
+        return _body_refusal(f"Failed to read {path}: {e}", "size_limit")
+    except Exception as e:  # noqa: BLE001 - ELOOP and friends: a refusal
+        return _body_refusal(f"Failed to read {path}: {e}", "io_failure")
+    if err := _precondition_error(
+        tool, path, data, expected_hash, cap_name=cap_name, cap_bytes=cap_bytes, enforceable=False,
+    ):
+        return err
+    try:
+        return data, data.decode("utf-8")
+    except Exception as e:  # noqa: BLE001
+        return _body_refusal(f"Failed to read {path}: {e}", "io_failure")
+
+
+def _move_planner_refusal(tool: str, src_rel: str, dst_rel: str, r) -> BodyOutcome:
+    rel = dst_rel if r.note == "destination" else src_rel
+    if r.matches:
+        r = dataclasses.replace(r, matches=tuple(dataclasses.replace(m, path=rel) for m in r.matches))
+    return _task_write_refusal(tool, rel, r)
+
+
+def _in_excluded_folder(path: str, effective) -> bool:
+    """D16: the `folder_prefix_clause` semantics (a plain prefix match)."""
+    return any(path.startswith(f) for f in (getattr(effective, "excluded_folders", ()) or ()))
+
+
+_EXCLUDED_SCOPE_NOTE = (
+    "note: the destination is in a folder your default task scope excludes, so default "
+    'listings will not show this task; list_tasks(scope="all") will.'
+)
+
+
+def _moved_summary(lines_n: int, tasks_n: int, moved_ids) -> list[str]:
+    subs = tasks_n - 1
+    out = [f"moved: {lines_n} line{'s' if lines_n != 1 else ''}, {tasks_n} task"
+           f"{'s' if tasks_n != 1 else ''}" + (f" ({subs} sub-task{'s' if subs != 1 else ''})" if subs else "")]
+    for line, sid in list(moved_ids[1:])[:10]:
+        out.append(f"sub-task line {line}: id {sid or 'none'}")
+    if subs > 10:
+        out.append(f"+{subs - 10} more sub-tasks")
+    return out
+
+
+def _removed_line(removed) -> str:
+    t, e = removed
+    return f"source: removed line {t + 1}" if e - t == 1 else f"source: removed lines {t + 1}–{e}"
+
+
+def _block_ids_line(block_ids, src_rel: str) -> str | None:
+    if not block_ids:
+        return None
+    shown = ", ".join("^" + b for b in block_ids)
+    return f"block ids moved: {shown} (links to `{_escape_task_path(src_rel)}`#^{block_ids[0]} no longer resolve)"
+
+
+@_tracked(
+    "move_task",
+    ["path", "id", "to_path", "to_section", "dry_run", "allow_duplicate", "resume",
+     "expected_hash", "to_expected_hash"],
+    transforms={"expected_hash": lambda v: v is not None,
+                "to_expected_hash": lambda v: v is not None},
+    write_class=True,
+    arg_char_caps={"path": MAX_PATH_CHARS, "to_path": MAX_PATH_CHARS, "id": TASK_ID_ARG_MAX_CHARS},
+)
+async def move_task_impl(
+    path: str,
+    id: str,
+    to_path: str,
+    to_section: str | None = None,
+    allow_duplicate: bool = False,
+    resume: bool = False,
+    dry_run: bool = False,
+    expected_hash: str | None = None,
+    to_expected_hash: str | None = None,
+) -> str:
+    """Move one top-level task, with its whole continuation block, to another
+    note or another place in its note (#430). See `server.move_task`. The
+    usage row records the arguments' presence and the outcome, never task
+    text (D15)."""
+    tool = "move_task"
+    if err := _require_write():
+        return err
+    if err := _task_id_error(tool, id, expected_hash, path):
+        return err
+    if resume and allow_duplicate:
+        return _task_refusal(
+            f"{tool}: resume=true (insert nothing, remove the source copy) and "
+            "allow_duplicate=true (insert a further copy) cannot be combined. Nothing was written.",
+            "invalid_argument", path)
+    if resume and to_section is not None:
+        return _task_refusal(
+            f"{tool}: resume=true inserts nothing, so to_section cannot be given with it. "
+            "Nothing was written.", "invalid_argument", path)
+    if err := _precondition_syntax_error(tool, expected_hash, path=path):
+        return err
+    if err := _precondition_syntax_error(tool, to_expected_hash, path=to_path):
+        return err.with_prose(err.prose.replace(f"{tool}: expected_hash", f"{tool}: to_expected_hash", 1))
+    uid = current_user_id.get()
+    effective = await _effective_task_settings(uid)
+    args = task_write.MoveArgs(
+        id=id, hash_supplied=expected_hash is not None, to_section=to_section,
+        allow_duplicate=bool(allow_duplicate), resume=bool(resume),
+    )
+    try:
+        src = open_mutable(path, user_id=uid)
+    except ValueError as e:
+        return _body_refusal(str(e), "validation_failed")
+    with src:
+        if err := _leaf_state_error(
+            src, path,
+            missing=f"Note not found: `{_escape_task_path(path)}`. Nothing was written.",
+        ):
+            return err
+        try:
+            dst = open_mutable(to_path, user_id=uid)
+        except ValueError as e:
+            return _body_refusal(str(e), "validation_failed")
+        with dst:
+            if err := _leaf_state_error(
+                dst, to_path,
+                missing=f"Note not found: `{_escape_task_path(to_path)}`. {tool} never creates a "
+                "note; use create_note to create it. Nothing was written.",
+            ):
+                return err
+            same = src.rel == dst.rel
+            if not same:
+                a, b = src.lstat(), dst.lstat()
+                if a is not None and b is not None and (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino):
+                    return _task_refusal(
+                        f"{tool}: `path` and `to_path` name the same file through two different "
+                        "paths (a hard link or an aliased folder), so it cannot be moved as if "
+                        "it were two notes. Nothing was written.", "invalid_argument", path)
+                return await _move_between(
+                    tool=tool, uid=uid, src=src, dst=dst, path=path, to_path=to_path, task_id=id,
+                    args=args, effective=effective, dry_run=dry_run,
+                    expected_hash=expected_hash, to_expected_hash=to_expected_hash,
+                )
+    # D13: the same note.
+    if resume:
+        return _task_refusal(
+            f"{tool}: `path` and `to_path` name the same note, and a move within one note has "
+            "no partial outcome to resume. Nothing was written.", "invalid_argument", path)
+    if to_expected_hash is not None and to_expected_hash != expected_hash:
+        return _task_refusal(
+            f"{tool}: `path` and `to_path` name the same note, so to_expected_hash must be "
+            "omitted or equal to expected_hash. Nothing was written.", "invalid_argument", path)
+
+    def describe(plan, rel, _extra, dry_run):
+        verb = "Would move" if dry_run else "Moved"
+        k, task_id_new = plan.moved_ids[0] if plan.moved_ids else (None, None)
+        lines = [f"{verb} task within `{_escape_task_path(rel)}`"]
+        if k is not None:
+            nl = _plan_line(plan, "task")
+            lines.append(f"line {k}: {_one_line(nl.text if nl is not None else '')}")
+            if note := _task_rule_note(plan, k, effective):
+                lines.append(note)
+        lines.append(f"id: {task_id_new or 'none'}")
+        t, e = plan.removed
+        lines.extend(_moved_summary(e - t, len(plan.moved_ids), plan.moved_ids))
+        if plan.renumbered:
+            lines.append("ids renumbered: tasks sharing a moved key now carry new .<i>of<n> "
+                         f"suffixes in `{_escape_task_path(rel)}`")
+        if not dry_run:
+            timing.record("move_outcome", "moved_within")
+        return lines
+
+    out = await _run_task_write(
+        tool=tool, path=path, expected_hash=expected_hash, dry_run=dry_run,
+        plan_fn=lambda text: task_write.plan_move_within(text, args, effective),
+        describe=describe,
+    )
+    if not isinstance(out, BodyOutcome) and out.startswith("No changes for "):
+        timing.record("move_outcome", "no_change")
+    return out
+
+
+async def _move_between(*, tool, uid, src, dst, path, to_path, task_id, args, effective, dry_run,
+                        expected_hash, to_expected_hash):
+    """D10 for two notes. Both targets are open and anchored."""
+    src_rel, dst_rel = src.rel, dst.rel
+    cap_name, cap_bytes = _note_precondition_cap()
+    p1 = p2 = 1
+    plan = None
+    for attempt in range(1, TASK_WRITE_MAX_ATTEMPTS + 1):
+        p1 = attempt
+        got = _move_read(tool, src, path, expected_hash, cap_name, cap_bytes)
+        if isinstance(got, str):
+            return got
+        src_bytes, src_text = got
+        got = _move_read(tool, dst, to_path, to_expected_hash, cap_name, cap_bytes)
+        if isinstance(got, str):
+            return got
+        dst_bytes, dst_text = got
+        plan = await asyncio.to_thread(task_write.plan_move, src_text, dst_text, args, effective)
+        if isinstance(plan, task_write.TaskWriteRefusal):
+            return _move_planner_refusal(tool, src_rel, dst_rel, plan)
+        if plan.insert is not None and (err := _note_size_error(plan.insert.new_text)):
+            return err
+        if err := _note_size_error(plan.removal.new_text):
+            return err
+        if dry_run:
+            timing.record("task_refresh", "skipped")
+            timing.record("task_refresh_to", "skipped")
+            return _move_dry_run(plan, src_rel, dst_rel, src_text, dst_text, effective)
+        if plan.insert is None:
+            break  # resume: the destination already holds the block (D9)
+        new_d = plan.insert.new_text
+        try:
+            err, _ = await _confirmed_publication(
+                uid, lambda c, t=dst, b=new_d, o=dst_bytes: write_file_at(t, b, expected=o, confirmation=c),
+            )
+            if err:
+                return err
+        except vault_fs.PermissionsNotApplied as e:
+            # Row 6a: raised before anything was published.
+            return _body_refusal(
+                f"Failed to write {to_path}: {e}. Neither note was changed.", "io_failure")
+        except (ValueError, RuntimeError, vault_fs.VaultFSError) as e:
+            if _is_in_call_conflict(e):
+                if to_expected_hash is None and attempt < TASK_WRITE_MAX_ATTEMPTS:
+                    continue
+                if to_expected_hash is None:
+                    timing.record("task_write_attempts", f"{attempt}/0")
+                    return _concurrent_write_refusal(
+                        f"{e} — {attempt} attempts, each re-reading both notes, met a concurrent "
+                        "change to the destination. Nothing was written; call again.", to_path)
+                return _concurrent_write_refusal(str(e), to_path)
+            return _body_refusal(str(e), "validation_failed")
+        except OSError as e:
+            # Row 6: the rename may or may not have happened.
+            timing.record("move_outcome", "uncertain")
+            P, D = _escape_task_path(src_rel), _escape_task_path(dst_rel)
+            return BodyOutcome(
+                f"{tool}: the write of `{D}` failed part-way ({_move_error_text(e)}), so it may "
+                f"or may not hold the task. This call did not change `{P}`.\n"
+                f"complete with: read_note(path={_move_arg(dst_rel)}); if it holds the moved "
+                f"lines, {_completing_call(src_rel, task_id, dst_rel, resume=True)}, "
+                f"otherwise {_completing_call(src_rel, task_id, dst_rel)}",
+                refusals.Refusal(code="publication_uncertain", path=_precondition_path(dst_rel)),
+                disposition="partial",
+            )
+        break
+    else:  # pragma: no cover - every attempt returns, continues or breaks
+        raise AssertionError("unreachable")
+
+    dest_line, n = plan.dest_lines
+    dest_id = plan.dest_ids[0][1] if plan.dest_ids else None
+    dest_published = plan.insert is not None
+    dest_refresh = None
+    dest_hash = None
+    if dest_published:
+        new_d_bytes = plan.insert.new_text.encode("utf-8")
+        dest_hash = content_hash_for_bytes(new_d_bytes)
+        # D10 steps 4–5, before the source removal is attempted.
+        dest_refresh = await _refresh_task_rows(uid, dst, new_d_bytes)
+        timing.record("task_refresh_to", dest_refresh.usage)
+        await _record_note_events(uid, [_content_event("modified", dst_rel, new_d_bytes)])
+    else:
+        timing.record("task_refresh_to", "skipped")
+
+    def incomplete(reason: str, **kw) -> BodyOutcome:
+        if p1 > 1 or p2 > 1:
+            timing.record("task_write_attempts", f"{p1}/{p2}")
+        timing.record("task_refresh", "skipped")
+        return _move_incomplete(
+            reason=reason, src_rel=src_rel, dst_rel=dst_rel, task_id=task_id,
+            dest_line=dest_line, dest_id=dest_id, expected_hash=expected_hash,
+            to_hash_supplied=to_expected_hash is not None, dest_published=dest_published,
+            dest_hash=dest_hash, dest_refresh=dest_refresh, **kw,
+        )
+
+    removal = plan.removal
+    moved = plan.moved
+    for attempt in range(1, TASK_WRITE_MAX_ATTEMPTS + 1):
+        p2 = attempt
+
+        def publish_source(c, r=removal, o=src_bytes):
+            # D10 6(b) then 6(c), synchronously: no suspension point between
+            # the presence check and the source write.
+            state, detail = _destination_presence(dst, dest_line, moved, cap_bytes)
+            if state != "holds":
+                raise _DestinationCheckFailed(state, detail)
+            return write_file_at(src, r.new_text, expected=o, confirmation=c)
+
+        try:
+            err, _ = await _confirmed_publication(uid, publish_source)
+        except _DestinationCheckFailed as exc:
+            reason = {"changed": "destination_changed",
+                      "not_a_task": "destination_not_a_task"}.get(exc.state, "destination_unverified")
+            return incomplete(reason, detail=exc.detail)
+        except VaultConfirmationUnavailable:
+            return incomplete(_CONFIRMATION_UNAVAILABLE_MARKER)
+        except UnconfirmedPublication:
+            raise
+        except vault_fs.PermissionsNotApplied as exc:
+            # Row 14a: nothing was published; not retried.
+            label = errno.errorcode.get(exc.code, str(exc.code))
+            return incomplete("permissions_not_applied", detail=f"{exc.step}: {label}")
+        except (ValueError, RuntimeError, vault_fs.VaultFSError) as exc:
+            if not _is_in_call_conflict(exc):
+                return incomplete("io_failure")
+            if expected_hash is not None or attempt >= TASK_WRITE_MAX_ATTEMPTS:
+                return incomplete("concurrent_write")
+            # Rows 9–12: re-read and re-locate; nothing from the first read is trusted.
+            try:
+                fresh = read_bytes_at(src, max_bytes=cap_bytes, label=path)
+            except FileNotFoundError:
+                return incomplete("source_missing")
+            except Exception:  # noqa: BLE001
+                return incomplete("concurrent_write")
+            try:
+                fresh_text = fresh.decode("utf-8")
+            except UnicodeDecodeError:
+                return incomplete("concurrent_write")
+            again = await asyncio.to_thread(task_write.plan_relocated_removal, fresh_text, moved)
+            if isinstance(again, task_write.TaskWriteRefusal):
+                if again.code == refusals.TASK_MOVE_INCOMPLETE and isinstance(again.detail, tuple):
+                    return incomplete(again.detail[0], current_id=again.detail[1])
+                return incomplete("concurrent_write")
+            removal, src_bytes = again, fresh
+            continue
+        except OSError:
+            return incomplete("io_failure")
+        if err:
+            return incomplete(err.marker)
+        break
+
+    if p1 > 1 or p2 > 1:
+        timing.record("task_write_attempts", f"{p1}/{p2}")
+    new_s_bytes = removal.new_text.encode("utf-8")
+    src_refresh = await _refresh_task_rows(uid, src, new_s_bytes)
+    timing.record("task_refresh", src_refresh.usage)
+    await _record_note_events(uid, [_content_event("modified", src_rel, new_s_bytes)])
+    timing.record("move_outcome", "moved" if dest_published else "resumed")
+    lines = _move_lines(plan, removal, src_rel, dst_rel, dst_text, effective, dry_run=False)
+    if dest_published:
+        lines.append(f"destination content_hash: {dest_hash}")
+    lines.append(f"source content_hash: {content_hash_for_bytes(new_s_bytes)}")
+    lines.append(_index_line("destination", dest_refresh))
+    lines.append(_index_line("source", src_refresh))
+    return "\n".join(lines)
+
+
+def _move_lines(plan, removal, src_rel: str, dst_rel: str, dst_text: str, effective, *, dry_run: bool) -> list[str]:
+    """The D18 body shared by the success and the dry run."""
+    P, D = _escape_task_path(src_rel), _escape_task_path(dst_rel)
+    moved = plan.moved
+    k = plan.dest_lines[0]
+    dest_id = (plan.dest_ids[0][1] if plan.dest_ids else None) or "none"
+    if plan.insert is None:
+        if dry_run:
+            lines = [f"Would resume move: the destination already holds this task at line {k}, id "
+                     f"{dest_id}; nothing would be inserted, and the source copy would be removed"]
+        else:
+            lines = [f"Resumed move: the destination already held this task at line {k}, id "
+                     f"{dest_id}; nothing was inserted, and the source copy was removed"]
+        rule_plan = SimpleNamespace(new_text=dst_text)
+    else:
+        verb = "Would move" if dry_run else "Moved"
+        lines = [f"{verb} task from `{P}` to `{D}`", f"line {k}: {_one_line(moved.lines[0])}"]
+        rule_plan = plan.insert
+    if note := _task_rule_note(rule_plan, k, effective):
+        lines.append(note)
+    if plan.insert is not None:
+        lines.append(f"id: {dest_id}")
+        lines.extend(_moved_summary(len(moved.lines), len(moved.tasks), plan.dest_ids))
+    lines.append(_removed_line(removal.removed))
+    renumbered = [f"`{name}`" for name, flag in (
+        (P, removal.renumbered), (D, plan.insert is not None and plan.insert.renumbered)) if flag]
+    if renumbered:
+        lines.append("ids renumbered: tasks sharing a moved key now carry new .<i>of<n> suffixes in "
+                     + " and ".join(renumbered))
+    if plan.insert is not None and (bl := _block_ids_line(moved.block_ids, src_rel)):
+        lines.append(bl)
+    if _in_excluded_folder(dst_rel, effective) and not _in_excluded_folder(src_rel, effective):
+        lines.append(_EXCLUDED_SCOPE_NOTE)
+    return lines
+
+
+def _move_dry_run(plan, src_rel: str, dst_rel: str, src_text: str, dst_text: str, effective) -> str:
+    lines = ["Dry run — nothing was written.",
+             *_move_lines(plan, plan.removal, src_rel, dst_rel, dst_text, effective, dry_run=True)]
+    if plan.insert is not None:
+        lines.append("destination diff:")
+        lines.append(_task_diff(_escape_task_path(dst_rel), dst_text, plan.insert.new_text))
+    lines.append("source diff:")
+    lines.append(_task_diff(_escape_task_path(src_rel), src_text, plan.removal.new_text))
+    return "\n".join(lines)
 
 
 # ════════════════════════════════════════════════════════════════════════════

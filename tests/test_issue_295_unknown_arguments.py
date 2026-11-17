@@ -51,7 +51,7 @@ def test_setting_defaults_on():
 
 def test_every_tool_is_covered():
     # The registry the rest of this module iterates is the real one, not empty.
-    assert len(TOOLS) == 32  # 25 → 28: `list_tasks` (#350), `get_changes` (#351), `hybrid_search` (#354); 28 → 32: the task tools (#428)
+    assert len(TOOLS) == 33  # 25 → 28: `list_tasks` (#350), `get_changes` (#351), `hybrid_search` (#354); 28 → 32: the task tools (#428); 33: `move_task` (#430)
 
 
 class _Sentinel:
@@ -194,7 +194,7 @@ _ROLLBACK_SCRIPT = textwrap.dedent(
 
     async def main():
         tools = mcp._tool_manager.list_tools()
-        assert len(tools) == 32
+        assert len(tools) == 33
         for tool in tools:
             assert "additionalProperties" not in tool.parameters, tool.name
             assert tool.fn_metadata.arg_model.model_config.get("extra") is None, tool.name

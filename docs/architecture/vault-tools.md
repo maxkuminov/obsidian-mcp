@@ -38,7 +38,7 @@ worst case (not read-only, destructive, open-world), which is how a
 | --- | --- | --- | --- | --- | --- |
 | `_READ_ONLY` | true | false | true | false | `keyword_search`, `semantic_search`, `read_note`, `list_notes`, `get_tags`, `get_recent`, `get_vault_guide`, `read_file`, `list_files`, `get_backlinks`, `get_links`, `get_neighborhood`, `find_related`, `find_orphans`, `check_upload`, `list_tasks` (#350), `get_changes` (#351), `hybrid_search` (#354), `task_agenda` (#428) |
 | `_ADDITIVE` | false | false | false | false | `create_note` (no-clobber), `request_download` (mints a capability, destroys nothing), `add_task` (#428: inserts one line, removes no byte) |
-| `_DESTRUCTIVE` | false | true | false | false | `edit_note`, `move_note`, `delete_note`, `set_frontmatter`, `write_file`, `delete_file`, `request_upload`, `complete_task` and `update_task` (#428) |
+| `_DESTRUCTIVE` | false | true | false | false | `edit_note`, `move_note`, `delete_note`, `set_frontmatter`, `write_file`, `delete_file`, `request_upload`, `complete_task` and `update_task` (#428), `move_task` (#430: removes lines from its source note) |
 | `_DESTRUCTIVE_OPEN_WORLD` | false | true | false | true | `import_from_url` |
 
 **Annotations are hints; `_tracked` enforces.** Nothing server-side reads them.
@@ -50,7 +50,7 @@ destructive ones prompting) and nothing else. The MCP spec tells clients to
 treat annotations as untrusted unless the server is trusted.
 
 **The classification is derived, not listed.** With `W` the write-bucket set
-(`_tracked(write_class=True)`, eleven tools since #428, equal to the `write`
+(`_tracked(write_class=True)`, twelve tools since #430, equal to the `write`
 class of `concurrency.TOOL_CLASSES`):
 
 - destructive = `(W − {create_note, add_task}) ∪ {request_upload}` —
@@ -140,9 +140,9 @@ returning only the tools the caller's granted scopes permit".
 
 | Request | `tools/list` |
 | --- | --- |
-| OAuth grant whose scope lacks `readwrite` | **20** — the full list minus the twelve write-required tools (19 before #428) |
-| OAuth grant with `readwrite`, API key (`read` or `readwrite`) | 32 (28 before #428), byte-identical to `tools_list_full_v2.json` |
-| `MCP_SANDBOX_MODE`, stdio, in-process (no principal) | 32 |
+| OAuth grant whose scope lacks `readwrite` | **20** — the full list minus the thirteen write-required tools (19 before #428) |
+| OAuth grant with `readwrite`, API key (`read` or `readwrite`) | 33 (28 before #428, 32 before #430), byte-identical to `tools_list_full_v3.json` |
+| `MCP_SANDBOX_MODE`, stdio, in-process (no principal) | 33 |
 | No credential | never reaches the handler: the middleware answers 401 |
 
 Read-only **API keys** keep the full list by owner decision (2026-10-31): a
@@ -150,10 +150,10 @@ key's permission is set and shown by its owner in the panel, and keeping it
 full leaves every script and registry byte-identical (L1).
 
 **One registry, two consumers.** `WRITE_REQUIRED_TOOLS` in
-`src/mcp_server/tool_permissions.py` is a `frozenset` literal of twelve names:
+`src/mcp_server/tool_permissions.py` is a `frozenset` literal of thirteen names:
 `create_note`, `edit_note`, `move_note`, `delete_note`, `set_frontmatter`,
-`write_file`, `delete_file`, `import_from_url`, `request_upload`, and since
-#428 `complete_task`, `update_task`, `add_task`. It drives
+`write_file`, `delete_file`, `import_from_url`, `request_upload`, since
+#428 `complete_task`, `update_task`, `add_task`, and since #430 `move_task`. It drives
 
 - **the gate**: `_tracked` calls `_require_write()` for a member at the *body
   boundary* — after every admission gate (rate buckets, vault root, argument
@@ -212,12 +212,14 @@ No setting.
 **Fixtures.** `tests/fixtures/tools_list_full_v1.json` is the complete
 pre-change `tools/list` result for an API key — every field of all 28 tools —
 captured over HTTP before the code changed. It is the 1.0 freeze fixture and is
-kept as that record. Since #428 the byte-identity oracle is
-`tests/fixtures/tools_list_full_v2.json` (32 tools): the full list is asserted
+kept as that record. Since #430 the byte-identity oracle is
+`tests/fixtures/tools_list_full_v3.json` (33 tools): the full list is asserted
 byte-identical to it (canonical JSON) for a `read` key, a `readwrite` key and a
-`readwrite` grant, and a test derives v1 from v2 — v2 minus the four task
-tools equals v1 except for `list_tasks`'s description and its added optional
-properties. A change that alters the published surface regenerates the oracle
+`readwrite` grant. `tools_list_full_v2.json` (32 tools, the #428 oracle) is
+kept unedited as the 1.3 record, and a test derives it from v3 — v3 minus
+`move_task` equals v2 byte for byte (owner decision Q9). A second test derives
+v1 from v2 — v2 minus the four task tools equals v1 except for `list_tasks`'s
+description and its added optional properties. A change that alters the published surface regenerates the oracle
 deliberately and says so in its spec.
 `tests/fixtures/tools_list_readonly_oauth.json` pins the 20 names in order.
 `tests/test_issue_358_scoped_tools_list.py` also races, through one barrier,
@@ -466,7 +468,7 @@ Every publication puts a **new inode** at the name: an overwrite renames a stage
 
 **The two rules.** The owner's decision, in his words: "keep a note's existing permissions on edit". Everything else in this section is the change's design.
 
-- **Edit** — the publication replaces an existing regular file: the published file gets that file's permission bits (`st_mode & 0o777`; setuid, setgid and sticky are never carried), its POSIX access ACL (`system.posix_acl_access`, or none if it had none — an ACL the staged inode inherited from the folder is *removed*) and its gid. All three are read from the replaced file through a descriptor. This covers `edit_note`, `set_frontmatter`, the three task write tools, `move_note`'s link rewrites in other notes and `write_file(overwrite=True)` over an existing file.
+- **Edit** — the publication replaces an existing regular file: the published file gets that file's permission bits (`st_mode & 0o777`; setuid, setgid and sticky are never carried), its POSIX access ACL (`system.posix_acl_access`, or none if it had none — an ACL the staged inode inherited from the folder is *removed*) and its gid. All three are read from the replaced file through a descriptor. This covers `edit_note`, `set_frontmatter`, the three task write tools, both publications of `move_task` (#430: the destination insert and the source removal each keep their own note's bits, ACL and group; `to_path` must exist, so neither is ever a create), `move_note`'s link rewrites in other notes and `write_file(overwrite=True)` over an existing file.
 - **Create** — the name did not exist (or held something other than a regular file): exactly what `open(O_CREAT, 0o666)` gets in the destination directory. Where the directory has a default ACL, its `USER_OBJ`, `MASK` (or `GROUP_OBJ` without one) and `OTHER` are ANDed with `rw-`, named entries are copied, and the umask is not applied — the kernel's own create rule. Without one, `0o666 & ~umask` (`default_file_mode()`, whose only caller this now is). The gid is the directory's when it is setgid, otherwise the gid observed on the staged inode this call just created — never `os.getegid()`, which is not what an ordinary create gets. This covers `create_note`, `write_file` by default and `write_file(overwrite=True)` at an absent name. Because the rule follows the folder exactly, a folder whose default ACL grants write to "other" gives a world-writable note, as it does any other program's file.
 
 Every publication computes one plan, `(wanted_gid, mode, acl | None)`, and **no plan falls back to the other**. `apply_plan` writes it onto the staged inode in a fixed order: the gid (`fchown(fd, -1, gid)`, only when it differs), then the ACL (written explicitly, or removed — never left to inheritance), then the mode (`fchmod`, consistent with the ACL). The ACL is encoded and decoded in-process (`parse_acl`, `pack_acl`: little-endian version 2, then `<HHI` entries) and written with `os.setxattr`, so there is no `setfacl` or ACL library dependency. `parse_acl` refuses a wrong version, a bad length, an unknown tag, permission bits outside `rwx`, a missing base entry, named entries without a mask, and out-of-order or repeated entries; the kernel never returns those, and one that arrives anyway is not something to guess about.
@@ -1617,9 +1619,10 @@ first seen at this path (L3); edits outside MCP are `human/sync` (L2).
 
 ## Task tools (#428)
 
-Five tools work on markdown checkbox tasks: `list_tasks` (extended) and
+Six tools work on markdown checkbox tasks: `list_tasks` (extended) and
 `task_agenda` read the `note_tasks` index; `complete_task`, `update_task` and
-`add_task` change one task line. Plain `- [ ]` checkboxes are complete tasks;
+`add_task` change one task line; `move_task` (#430) moves one task with the
+lines under it (see "Moving a task (#430)"). Plain `- [ ]` checkboxes are complete tasks;
 the Tasks-plugin emoji fields are optional and are read and written in the
 plugin's format. The modules: `src/services/task_line.py` (the line anatomy
 and the minimal editor, pure), `task_recurrence.py` (the closed grammar,
@@ -1953,6 +1956,18 @@ published, and there is no event and no refresh. A success states the new
 line and id, a next occurrence's line, position and id, `content_hash`, the
 timezone and resolved dates when a relative date or "today" was used, and
 `index: refreshed` or `index: may lag (<code>)`.
+
+Since #430 (`move_task`): `resume_unmatched` and `block_id_conflict` join
+`refusals.TASK_CODES` (nothing written), and `task_move_incomplete` is a
+**body** code rendered `disposition="partial"`, never with
+`nothing_written` — the destination was published. Its sentinel carries four
+optional fields that no other code may carry (a `Refusal` construction
+check): `destination_path`, `source_id`, `destination_id` (absent for
+`destination_changed`, `destination_not_a_task` and `destination_unverified`) and `reason`, one of
+`concurrent_write`, `source_missing`, `source_changed`, `source_ambiguous`,
+`destination_changed`, `destination_not_a_task`, `destination_unverified`, `vault_assignment_changed`,
+`vault_anchor_lost_at_publish`, `vault_confirmation_unavailable`,
+`permissions_not_applied`, `io_failure`. See "Moving a task (#430)".
 
 ### `list_tasks`: the new arguments, scope and cursor version 2
 
@@ -2308,15 +2323,231 @@ are almost always the same intent (`update_task` can date that line;
 - **L11** A `scope="all"` response does not mention the caller's rule; its
   query line says `scope: all`.
 
+### Moving a task (#430)
+
+`move_task(path, id, to_path, to_section=None, allow_duplicate=False,
+resume=False, dry_run=False, expected_hash=None, to_expected_hash=None)` moves
+one task line with its whole uncapped continuation block from one note to
+another, or to another place (`to_section`) in the same note. A move is a
+two-note write; the bar, from the issue, is **a duplicate is acceptable, a
+loss is not**. The record is the `task-move` change under `openspec/`
+(design D1–D19, the D10 outcome table, the D11 partial outcome). The pure
+half is `task_write.plan_move`, `plan_move_within`, `plan_relocated_removal`,
+`destination_still_holds`, `verify_move_insert` and `verify_removal`; the
+wiring is `move_task_impl` / `_move_between` in `src/mcp_server/tools.py`.
+
+**This is the smaller first version (owner decision Q0).** The moved task is
+a top-level, unquoted task (indentation width 0, no blockquote prefix), and
+its block may hold only plain indented lines, blank lines and indented
+sub-tasks. A nested task, a callout task, a block holding a blockquote line
+(after its indentation, `>`), a fence line (after its indentation, three or
+more backticks or tildes, whether the fence closes inside the block or not)
+or a heading line, and a destination region whose last top-level task is
+quoted are all refused `task_malformed`, nothing written in either note, the
+refusal naming the line and pointing at `edit_note`. So the moved lines'
+contents arrive **byte for byte**: no prefix is added or removed, every list
+marker is kept (an ordered `3.` stays `3.`, nothing is renumbered), and no
+field, tag, status, rule text, block link or trailing whitespace changes. The
+heading refusal matches the masked line *after its indentation*: the vault's
+heading scan recognises only unindented `#`, and every line of a block is
+indented, so the plain scan could never fire there (`  # Notes` under a task
+is a heading inside the list item in Obsidian). The wider design — nested and
+callout tasks through prefix re-framing — is kept at the end of the change's
+`design.md` as the documented next step, not built.
+
+**Resolution and the block.** Exactly `complete_task`'s resolution from the
+source's bytes read through its anchored descriptor (#428 D2): any checkbox
+of any status, whatever the task rule; a suffixed id needs `expected_hash`
+in every mode. The block is `continuation_block`'s, uncapped (the index's
+8-line / 600-character context cap never applies to a write). A task moves
+with its subtree; the line alone is never moved, because its children would
+silently change owner. Every moved task keeps its key (its text is
+unchanged); `.<i>of<n>` suffixes renumber in document order in either note,
+and the response says so.
+
+**Placement and terminators.** `add_task`'s placement on the destination (on
+the note with the block removed, for the same note): after the full block of
+the region's last top-level task (never a task of the moved block), else
+after the region's last non-blank line, else after the heading or at body
+start. Unlike `add_task`, the moved task keeps its own marker and gets no
+prefix. Every moved line takes the destination's terminator `T` (the line it
+follows, else the note's first terminator, else LF), so a CRLF note never
+receives LF lines (Q8). Exactly two pre-existing terminators can change: an
+insertion at the end of a destination without a final terminator gives the
+old last line `T` and leaves the last moved line unterminated; a removal of a
+block that ends a source without a final terminator takes the terminator of
+the line before it (D7), so both files keep their final-terminator state.
+
+**Verification.** A removal is the one span kind `verify` refuses, so the move
+has its own verifiers and the #428 planners and `verify` are unchanged.
+`verify_move_insert` re-derives from the two texts: exactly one whole-line
+insertion with the moved contents and `T`; every pre-existing line, task,
+owner, code mask and heading unchanged; the frontmatter unchanged; every moved
+task re-extracting with the same text, key, status, dates, priority, tags,
+recurrence and cuts as at the source, owned as in the block, with its source
+code mask. `verify_removal` checks the D7 span, the remaining lines and their
+terminators (but for the end-of-file case), the task set losing exactly the
+moved tasks, owners, masks, headings and frontmatter. A same-note plan is
+verified as that removal followed by that insertion on the intermediate text.
+A `^block` id carried by a moved line that already ends a destination line
+(case-insensitive) is refused `block_id_conflict` (Q6); a moved block id is
+named in the response, with the warning that links to it in the source no
+longer resolve (L4).
+
+**Duplicates and `resume` (Q4, Q5).** Decided from the destination's current
+bytes, never the index. A destination task with the moved key, whatever its
+block, or (for an open moved task) an open task with the same normalised
+description, is `duplicate_task` unless `allow_duplicate=true`; when the match
+is byte-identical, the refusal names both `allow_duplicate=true` and
+`resume=true`. **An identical block is never taken as proof of an earlier
+move**: two notes can hold independent identical tasks. `resume=true` means
+only "the destination already holds this exact block; insert nothing and
+remove the source copy", and needs exactly one byte-identical copy
+(`resume_unmatched` otherwise); it cannot be combined with `allow_duplicate`,
+`to_section` or a same-note move.
+
+**Publication order (D10): destination first, and the source written only
+after a re-check in the same synchronous step.** Phase 1 reads both notes,
+runs both precondition ladders (`expected_hash` binds the source, a bare id
+satisfies required mode there; `to_expected_hash` binds the destination,
+which is exempt like `add_task`), plans and verifies both off the loop, and
+publishes the destination with `write_file_at(…, expected=)`; an in-call
+conflict without `to_expected_hash` repeats from reading both notes, at most
+3 attempts. The destination is refreshed, then its `modified` event recorded.
+Phase 2 publishes the source removal through **one** confirmed publication
+whose synchronous callback first re-reads the destination through its
+anchored target and requires the moved lines at their position
+(`destination_still_holds_task`: the bytes at their position and, under the
+pass's own extraction with code masking, still the moved task, its sub-tasks,
+its block and its code masks) — with no `await` between that check and the
+source write. *Holds* lets the write run; *changed* (the lines absent or
+different, or no file) stops with `destination_changed`; the bytes in place but
+no longer read as the task (an unclosed fence above them) stops with
+`destination_not_a_task`, completed by repairing the note and `resume=true`
+(or, after reading the source, removing the destination copy by hand); *unverified* (the read
+itself failed, or the bytes are not valid UTF-8) stops with `destination_unverified`, which claims nothing about
+the contents. An in-call conflict at the source without `expected_hash`
+re-reads the source and re-plans the removal only when the moved key
+resolves to exactly one task whose block is byte-identical to what was moved
+(`plan_relocated_removal`), else stops `source_missing`, `source_changed` or
+`source_ambiguous`. A destination refresh that reports `superseded` can never
+be followed by a source write unless the later check passes. Rejected: source
+first (a failure between leaves a loss), one atomic two-file publication (no
+primitive), a journal, rolling back the destination (itself a racing,
+byte-removing publication), and automatic convergence on an identical copy
+(Codex spec r1 #2).
+
+**File permissions (#447).** Both publications replace an existing regular
+file, so each applies the edit rule to its own note (bits, access ACL, group,
+with #447's group translation and mode-only behaviour), never the create
+rule. A P1/P2 or staged-bytes difference is that note's in-call conflict
+(row 4 at the destination, rows 9–12 at the source). `PermissionsNotApplied`,
+told apart from other `OSError`s by type, is a nothing-written `io_failure`
+at the destination (row 6a) and the partial reason `permissions_not_applied`
+at the source (row 14a, not retried, completed by `resume=true`).
+
+**Partial outcomes (D11).** Every stop after the destination publication is
+`task_move_incomplete`: `disposition="partial"`, never `nothing_written`, its
+prose a fixed shape — `destination:` and `source:` lines stating only what
+this call verified (it never says the source holds the task unless a re-read
+found it there; a source it did not write is "this call did not change it";
+a destination line says when it was re-checked; review r4), a `complete with:` line naming the exact call that finishes
+the move (string arguments as ASCII-only JSON), the destination's
+`content_hash` and `index (destination): …`. Every completing call omits
+`to_expected_hash` or passes a fresh one, and the line says so when the call
+supplied one. No completing call repeats the original `expected_hash` (a
+concurrent source edit makes it stale); one helper (`_completing_call`)
+renders every call: none for a bare id, the source's fresh `content_hash`
+for a suffixed id, and, for an id taken from a listing, an instruction to
+add it if the id carries a suffix. An OS
+error from the destination publication other than
+`PermissionsNotApplied` is `publication_uncertain` (partial) naming both
+completing calls. A plain retry of a partial move is refused `duplicate_task`
+and writes nothing; only `allow_duplicate` adds a copy and only `resume`
+removes the source copy.
+
+**Same note (D13).** Detected after both `open_mutable`s by `rel` equality;
+two different `rel` paths to one inode (a hard link) are refused
+`invalid_argument`. A same-note move is the ordinary single-note envelope
+(`_run_task_write`) around `plan_move_within`: one read, one ladder
+(`to_expected_hash` absent or equal to `expected_hash`), one plan of
+non-overlapping spans over the original text, one publication, one refresh,
+one event; a task already last among the region's top-level tasks (whatever blank or paragraph lines precede it) is left in place, and that or any unchanged result answers `No changes`. No duplicate check
+against the moved block itself, no block-id check, no partial outcome.
+
+**Refresh, events, usage, rate.** Each published note is refreshed after its
+publication and before its event, in the task tools' order (not the generic
+writers'), with no `may_hold_tasks` gate: `index (destination): …` and
+`index (source): …` (`unchanged` for a `resume`, which publishes no
+destination bytes). A destination refresh that does not report `refreshed`
+does not stop the source removal (Q10). Each refresh is its own transaction
+holding at most one `notes_metadata` row lock, ended before the next begins,
+so two opposite moves cannot deadlock. One write-bucket token per call (Q7),
+one `write` concurrency slot held through both publications
+(`CLASS_MAPPING_VERSION` 7). The usage row logs `path`, `id`, `to_path`,
+`to_section`, `dry_run`, `allow_duplicate`, `resume` and the presence of each
+hash, plus `move_outcome`, `task_refresh` (source), `task_refresh_to`
+(destination) and `task_write_attempts` as `<phase 1>/<phase 2>`; never task
+text. The task rule never blocks or alters a move; the response states its
+verdict (`task_rule.not_task_note`) like the other task writes, and says when
+the destination is in a folder the default scope excludes and the source is
+not.
+
+**Accepted limitations** (the change's L1–L20, in short):
+
+- **L1** The shared publish path's residual window (#431) is inherited, once
+  per note.
+- **L2** A process killed between the two publications leaves the task in
+  both notes and returns nothing; the agent completes with `resume=true`.
+- **L3** `resume=true` trusts the caller that the identical copy is the one
+  an earlier move wrote.
+- **L4** Links and block references to the moved lines are not rewritten.
+- **L5** Only the two end-of-file terminators described above change.
+- **L6** Nested and callout tasks, blocks with a quote, fence or heading line,
+  and a quoted destination anchor are refused in this version.
+- **L8** The default-scope note covers excluded folders, not excluded note
+  tags.
+- **L9** Ordered markers are kept as written; nothing is renumbered.
+- **L10** Suffixed ids sharing a moved key renumber in both notes.
+- **L11** A block holding a heading is refused.
+- **L12** A partial outcome, or concurrent moves of one task to different
+  destinations, can leave it in two notes (N concurrent moves: N, or N + 1
+  when every source removal stops partial); never in none.
+- **L13** When the destination refresh lags and the source's succeeds,
+  `list_tasks` shows the task in neither note until the next pass.
+- **L14** The change feed shows two `modified` events, not a task-level move.
+- **L15** Two paths to one inode are refused.
+- **L16** Verification proves task identity, ownership, code status and
+  headings, not identical Markdown rendering.
+- **L17** **The one window that can still lose the task**: an outside writer
+  replacing the destination with a version lacking the moved lines after the
+  presence check and before the source rename (or at any time after the
+  move) leaves the task in neither note while the move reports success. It is
+  the #431 residual across two files; the moved lines are in the response.
+  #447's captures sit between the check and the rename, so the window is
+  longer by those steps.
+- **L18** A harmless edit above the inserted lines fails the presence check:
+  a stop and a duplicate, never a loss.
+- **L19** A move into an excluded sync-conflict copy (#443) completes with
+  `index (destination): may lag (not_indexed)`; no exclusion notice is
+  printed.
+- **L20** A permission-only change to either note during the call is an
+  in-call conflict.
+- **L21** The source write's own compare-to-rename window (#431): an outside
+  save of the source between the byte comparison and the rename is
+  overwritten, as with `edit_note`; inherited, not introduced.
+
 ### Metadata and visibility
 
-The four new tools are registered after `hybrid_search`, in the order
+The four #428 tools are registered after `hybrid_search`, in the order
 `task_agenda`, `complete_task`, `update_task`, `add_task`, so the first 28
-entries keep their order. The counts: 32 tools; 19 read-only (`task_agenda`
-added); 12 names in `WRITE_REQUIRED_TOOLS`; 11 in the write bucket; a
-read-only grant lists 20; `CLASS_MAPPING_VERSION` 6. `complete_task` and
-`update_task` are `_DESTRUCTIVE`, `add_task` is `_ADDITIVE`, and the
-destructive rule is `(W − {create_note, add_task}) ∪ {request_upload}`. Each
-description is at most 4,000 characters and leads with its contract.
-`SERVER_INSTRUCTIONS` keeps its 512-character lead byte-identical and names
-the five tools in one sentence, within the 2,000-character cap.
+entries keep their order; `move_task` (#430) is appended after `add_task`, so
+the first 32 keep theirs. The counts: 33 tools; 19 read-only (`task_agenda`
+added by #428); 13 names in `WRITE_REQUIRED_TOOLS`; 12 in the write bucket; a
+read-only grant lists 20; `CLASS_MAPPING_VERSION` 7. `complete_task`,
+`update_task` and `move_task` are `_DESTRUCTIVE`, `add_task` is `_ADDITIVE`,
+and the destructive rule is `(W − {create_note, add_task}) ∪
+{request_upload}`. Each description is at most 4,000 characters and leads
+with its contract. `SERVER_INSTRUCTIONS` keeps its 512-character lead
+byte-identical and names the six task tools in one sentence, within the
+2,000-character cap.

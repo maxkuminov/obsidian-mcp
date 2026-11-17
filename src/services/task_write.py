@@ -122,6 +122,9 @@ class TaskWriteRefusal:
     reason: str
     matches: tuple[TaskRef, ...] = ()
     detail: object = None
+    #: `move_task` (#430): which note the refusal is about, ``"source"`` or
+    #: ``"destination"``; None for every other planner.
+    note: str | None = None
 
     def __post_init__(self) -> None:
         if self.code not in refusals.CODES:
@@ -213,6 +216,20 @@ class Plan:
     #: index-side exact duplicate may have (`duplicate_scan(extra_norms=…)`);
     #: empty under any other rule.
     dup_norms: tuple[str, ...] = ()
+    # ── move_task (#430, D19). Defaults leave every other planner, and
+    # `verify`, exactly as they were.
+    #: The removed old lines, 0-based ``[t, e)`` (a removal plan).
+    removed: tuple[int, int] | None = None
+    #: Where the moved lines sit in the NEW text: ``(0-based first, count)``.
+    inserted_at: tuple[int, int] | None = None
+    #: A task outside the moved block that shares a moved key changed its
+    #: ``.<i>of<n>`` suffix in this plan's note (D1).
+    renumbered: bool = False
+    #: ``(new 1-based line, rendered id)`` of every moved task, document
+    #: order, the moved task first (an insertion or a same-note plan).
+    moved_ids: tuple[tuple[int, str | None], ...] = ()
+    #: The ``^block`` ids the moved lines carry (D8, Q6).
+    block_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1738,6 +1755,756 @@ def _heading_lines(v: _NoteView) -> list[tuple[int, int, str]]:
     return out
 
 
+# ── move_task (#430, design D1–D9, D13, D19) ─────────────────────────────────
+#
+# The smaller first version (owner decision Q0): a top-level, unquoted task
+# whose block holds no blockquote, fence or heading line, so its lines arrive
+# byte for byte (only their terminators follow the destination, D6) and no
+# re-framing exists. Every plan here is a `Plan` of spans over the ORIGINAL
+# text, verified by `verify_move_insert` / `verify_removal` (which re-derive
+# everything from the two texts) before it is returned. `verify` and the
+# other planners are untouched: a removal is the one span kind `verify`
+# refuses, so the move has verifiers of its own.
+
+
+@dataclass(frozen=True)
+class MoveArgs:
+    """`move_task` arguments the planner needs (D1)."""
+
+    id: str
+    hash_supplied: bool
+    to_section: str | None = None
+    allow_duplicate: bool = False
+    resume: bool = False
+
+
+@dataclass(frozen=True)
+class MovedBlock:
+    """What was read at the source, for verification and the phase-2
+    re-locate (D10 rows 9–12). ``lines`` are the contents of lines
+    ``t … e−1`` without terminators, as read; ``tasks`` the source
+    `ExtractedTask` of every moved task (source coordinates); ``masks`` each
+    line's code mask at the source; ``task_offsets`` each moved task's offset
+    within ``lines``."""
+
+    key: str
+    lines: tuple[str, ...]
+    tasks: tuple
+    block_ids: tuple[str, ...]
+    masks: tuple[str, ...] = ()
+    task_offsets: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class MovePlan:
+    """A two-note move (D19). ``insert`` is None only for ``resume=true``
+    (D9). ``dest_lines`` is ``(k, n)``: the moved lines sit at destination
+    lines ``k … k+n−1`` (1-based) — where ``insert`` puts them, or where
+    ``resume`` found the copy — for the D10 6(b) presence check.
+    ``dest_ids`` is ``(line, id)`` of every moved task at the destination."""
+
+    insert: Plan | None
+    dest_lines: tuple[int, int]
+    removal: Plan
+    moved: MovedBlock
+    dest_ids: tuple[tuple[int, str | None], ...] = ()
+
+
+_MOVE_BY_HAND = "edit_note can make this move by hand"
+_FENCE_LINE_RE = re.compile(r"[ \t]*+(?:`{3,}|~{3,})")
+_HEADING_AFTER_INDENT_RE = re.compile(r"[ \t]*+#{1,6}(?:[ \t]|$)")
+_BLOCK_ID_RE = re.compile(r"(?:^|\s)\^([a-zA-Z0-9-]+)$")
+#: D8 check 4: what each moved task must re-extract as, at the destination,
+#: exactly as at the source (its line, heading and ordinal may differ).
+_MOVED_COMPARED = ("status_char", "state", "text", "text_cut", "due", "scheduled", "start",
+                   "done_on", "priority", "tags", "tags_cut", "task_key", "description_key",
+                   "recurrence", "recurrence_cut", "created", "cancelled")
+
+
+def _block_id(line: str) -> str | None:
+    """A line's trailing ``^block`` id (D8, Q6), read on the unmasked text as
+    the plugin reads a task's block link: whitespace, ``^``, the id, end."""
+    m = _BLOCK_ID_RE.search(line.rstrip())
+    return m.group(1) if m else None
+
+
+def _tag(r: TaskWriteRefusal, note: str) -> TaskWriteRefusal:
+    return r if r.note is not None else dataclasses.replace(r, note=note)
+
+
+def _move_scope(view: _NoteView, tasks: Sequence, target, i: int):
+    """D3: ``(e, MovedBlock)`` for task line ``i``, or the scope refusal."""
+    contents = view.contents()
+    n = i + 1
+    depth, width, _blank = _shape(contents[i])
+    if depth > 0:
+        return _refuse(
+            "task_malformed",
+            f"the task on line {n} is inside a blockquote or callout, and this version "
+            f"of move_task moves only unquoted top-level tasks; {_MOVE_BY_HAND}",
+        )
+    owners = _owners(contents, {t.line - 1 for t in tasks})
+    if width > 0 or owners[i] is not None:
+        return _refuse(
+            "task_malformed",
+            f"the task on line {n} is nested under another task, and this version of "
+            f"move_task moves only top-level tasks (with everything under them); {_MOVE_BY_HAND}",
+        )
+    e = continuation_block(contents, i)
+    for j in range(i + 1, e):
+        line = contents[j]
+        if line.lstrip(" \t").startswith(">"):
+            why = "is a blockquote line"
+        elif _FENCE_LINE_RE.match(line):
+            why = "opens or closes a fenced code block"
+        elif _HEADING_AFTER_INDENT_RE.match(view.masked_line(j)):
+            why = "is a heading"
+        else:
+            continue
+        return _refuse(
+            "task_malformed",
+            f"line {j + 1}, under the task on line {n}, {why}, which this version of "
+            f"move_task does not move; {_MOVE_BY_HAND}",
+        )
+    block_tasks = tuple(t for t in tasks if i <= t.line - 1 < e)
+    lines = tuple(contents[i:e])
+    moved = MovedBlock(
+        key=target.task_key,
+        lines=lines,
+        tasks=block_tasks,
+        block_ids=tuple(b for b in (_block_id(c) for c in lines) if b),
+        masks=tuple(view.masked_line(j) for j in range(i, e)),
+        task_offsets=tuple(t.line - 1 - i for t in block_tasks),
+    )
+    return e, moved
+
+
+def _removal_span(view: _NoteView, t: int, e: int) -> Span:
+    """D7: lines ``t … e−1`` with their terminators; when the block ends a
+    file without a final terminator (and is not the whole file), the span
+    takes the preceding terminator instead, so the file still ends without
+    one."""
+    n = len(view.lines)
+    if e == n and view.lines[e - 1].term == "" and t > 0:
+        start = view.lines[t - 1].end
+    else:
+        start = view.lines[t].start
+    end = view.lines[e].start if e < n else len(view.text)
+    return Span(start, end, "")
+
+
+def _renumbered(old_tasks: Sequence, new_tasks: Sequence, keys: set, mapping: Mapping[int, int]) -> bool:
+    new_by = {u.line - 1: u for u in new_tasks}
+    for t in old_tasks:
+        k = t.line - 1
+        if t.task_key in keys and k in mapping:
+            u = new_by.get(mapping[k])
+            if u is None or (u.key_ordinal, u.key_count) != (t.key_ordinal, t.key_count):
+                return True
+    return False
+
+
+def _plan_removal(view: _NoteView, tasks: Sequence, t: int, e: int, moved: MovedBlock) -> Plan | TaskWriteRefusal:
+    span = _removal_span(view, t, e)
+    try:
+        new_text = _compose(view.text, [span])
+    except ValueError as exc:
+        return _refuse("task_malformed", str(exc))
+    plan = Plan(spans=(span,), new_text=new_text, new_lines=(), new_ids={}, removed=(t, e),
+                block_ids=moved.block_ids)
+    problem = verify_removal(view.text, new_text, plan, moved)
+    if problem is not None:
+        return problem
+    got = _extract(new_text)
+    removed = e - t
+    mapping = {k: (k if k < t else k - removed) for k in range(len(view.lines)) if not t <= k < e}
+    keys = {m.task_key for m in moved.tasks}
+    return dataclasses.replace(plan, renumbered=_renumbered(tasks, got[0], keys, mapping))
+
+
+def _insert_index(view: _NoteView, after: int | None) -> int:
+    if view.text == "":
+        return 0
+    return after + 1 if after is not None else view.body_first
+
+
+def _plan_insert(view: _NoteView, tasks: Sequence, after: int | None, term: str,
+                 moved: MovedBlock) -> Plan | TaskWriteRefusal:
+    span = _insertion(view, after, moved.lines, term)
+    try:
+        new_text = _compose(view.text, [span])
+    except ValueError as exc:
+        return _refuse("task_malformed", str(exc))
+    j = _insert_index(view, after)
+    n = len(moved.lines)
+    plan = Plan(spans=(span,), new_text=new_text, new_lines=(), new_ids={}, inserted_at=(j, n),
+                block_ids=moved.block_ids)
+    problem = verify_move_insert(view.text, new_text, plan, moved)
+    if problem is not None:
+        return problem
+    new_tasks = _extract(new_text)[0]
+    by = {u.line - 1: u for u in new_tasks}
+    ids = tuple((j + o + 1, _render(by[j + o]) if j + o in by else None) for o in moved.task_offsets)
+    n_old = 0 if view.text == "" else len(view.lines)
+    mapping = {k: (k if k < j else k + n) for k in range(n_old)}
+    keys = {m.task_key for m in moved.tasks}
+    lines = tuple(NewLine("task" if o == 0 else "subtask", j + o + 1, moved.lines[o])
+                  for o in moved.task_offsets)
+    return dataclasses.replace(
+        plan, moved_ids=ids, new_lines=lines,
+        new_ids={"task": ids[0][1]} if ids and ids[0][1] else {},
+        renumbered=_renumbered(tasks, new_tasks, keys, mapping),
+    )
+
+
+def _move_placement(view: _NoteView, tasks: Sequence, section: str | None):
+    """D5 on the destination: ``(after, term)`` exactly as `plan_add`
+    places, or a refusal (the section's, or a quoted anchor)."""
+    region = _region(view, section)
+    if isinstance(region, TaskWriteRefusal):
+        return region
+    region_lines, heading_line = region
+    contents = view.contents()
+    task_idx = {t.line - 1 for t in tasks}
+    anchor = None
+    for idx in reversed(region_lines):
+        if idx in task_idx and _shape(contents[idx])[1] == 0:
+            anchor = idx
+            break
+    if anchor is not None:
+        if _shape(contents[anchor])[0] > 0:
+            return _refuse(
+                "task_malformed",
+                f"the destination's last top-level task (line {anchor + 1}) is inside a "
+                "blockquote or callout, and this version of move_task cannot place an "
+                f"unquoted task after it; {_MOVE_BY_HAND}",
+            )
+        after = continuation_block(contents, anchor) - 1
+    else:
+        nonblank = [idx for idx in region_lines if contents[idx].strip(" \t") != ""]
+        after = nonblank[-1] if nonblank else heading_line
+    if after is not None:
+        term = view.term_for(after)
+    else:
+        term = view.term_for(view.body_first - 1 if view.body_first > 0 else None)
+    return after, term
+
+
+def _identical_copies(view: _NoteView, tasks: Sequence, moved: MovedBlock) -> list:
+    """Destination tasks with the moved key whose block's line contents
+    (terminators excluded) equal the moved block's (D9)."""
+    contents = view.contents()
+    out = []
+    for t in tasks:
+        if t.task_key != moved.key:
+            continue
+        d = t.line - 1
+        if tuple(contents[d:continuation_block(contents, d)]) == moved.lines:
+            out.append(t)
+    return out
+
+
+def _move_duplicates(view: _NoteView, tasks: Sequence, moved: MovedBlock, moved_tl) -> TaskWriteRefusal | None:
+    """D9 (a) a task with the moved key, whatever its block; (b) for an open
+    moved task, an open task with the same normalised description."""
+    identical = {t.line for t in _identical_copies(view, tasks, moved)}
+    norm = None
+    if moved.tasks and moved.tasks[0].state == STATE_OPEN:
+        norm = tl_mod.normalise_description(moved_tl.full_text)
+    dups = []
+    for t in tasks:
+        hit = t.task_key == moved.key
+        if not hit and norm is not None and t.state == STATE_OPEN:
+            p = view.parse(t.line - 1)
+            hit = p is not None and tl_mod.normalise_description(p.full_text) == norm
+        if hit:
+            dups.append(TaskRef(line=t.line, id=_render(t), text=t.text))
+    if not dups:
+        return None
+    if any(d.line in identical for d in dups):
+        reason = (
+            "the destination already holds a byte-identical copy of this task and every "
+            "line under it; if it is the copy an earlier move_task wrote, call again with "
+            "resume=true to remove the source copy; to keep both copies, pass "
+            "allow_duplicate=true"
+        )
+    else:
+        reason = (
+            "the destination already holds a task with this id or an open task with the "
+            "same description; pass allow_duplicate=true to move it anyway"
+        )
+    return _refuse("duplicate_task", reason, matches=tuple(dups[:_DUPLICATE_LIST_MAX]))
+
+
+def _block_id_conflict(view: _NoteView, moved: MovedBlock) -> TaskWriteRefusal | None:
+    """D8 / Q6: a moved ``^block`` id already ending a destination line,
+    compared case-insensitively."""
+    if not moved.block_ids:
+        return None
+    present: dict[str, int] = {}
+    for k in range(view.body_first, len(view.lines)):
+        bid = _block_id(view.content(k))
+        if bid is not None:
+            present.setdefault(bid.lower(), k)
+    for bid in moved.block_ids:
+        k = present.get(bid.lower())
+        if k is not None:
+            return _refuse(
+                "block_id_conflict",
+                f"the moved lines carry the block id ^{bid}, and line {k + 1} of the "
+                "destination already ends with that id (compared case-insensitively); two "
+                "blocks with one id make a [[note#^id]] link ambiguous, so rename one "
+                "with edit_note first",
+            )
+    return None
+
+
+def plan_move(source_text: str, dest_text: str, args: MoveArgs, settings) -> MovePlan | TaskWriteRefusal:
+    """D2–D9: resolve the task in ``source_text``, check the scope, then plan
+    and verify the destination insert (or, with ``resume``, find the one
+    identical copy) and the source removal. Every refusal is tagged with the
+    note it concerns (`TaskWriteRefusal.note`). Pure; nothing is published."""
+    if args.resume and args.allow_duplicate:
+        return _refuse("invalid_argument", "resume=true and allow_duplicate=true cannot be combined")
+    if args.resume and args.to_section is not None:
+        return _refuse("invalid_argument", "resume=true inserts nothing, so to_section cannot be given")
+    got = _locate(source_text, args.id, args.hash_supplied)
+    if isinstance(got, TaskWriteRefusal):
+        return _tag(got, "source")
+    view, tasks, target, i, tl = got
+    scope = _move_scope(view, tasks, target, i)
+    if isinstance(scope, TaskWriteRefusal):
+        return _tag(scope, "source")
+    e, moved = scope
+
+    dview = _view(dest_text)
+    if isinstance(dview, TaskWriteRefusal):
+        return _tag(dview, "destination")
+    bad = _frontmatter_refusal(dest_text)
+    if bad is not None:
+        return _tag(bad, "destination")
+    dgot = _extract(dest_text)
+    if isinstance(dgot, TaskWriteRefusal):
+        return _tag(dgot, "destination")
+    dtasks, dtrunc = dgot
+    if dtrunc:
+        return _refuse("size_limit", "the destination already holds the per-note task cap",
+                       note="destination")
+
+    removal = _plan_removal(view, tasks, i, e, moved)
+    if isinstance(removal, TaskWriteRefusal):
+        return _tag(removal, "source")
+    n = len(moved.lines)
+
+    if args.resume:
+        copies = _identical_copies(dview, dtasks, moved)
+        if len(copies) != 1:
+            cands = tuple(TaskRef(line=t.line, id=_render(t), text=t.text)
+                          for t in dtasks if t.task_key == moved.key)
+            which = "no" if not copies else f"{len(copies)}"
+            return _refuse(
+                "resume_unmatched",
+                f"resume=true needs exactly one byte-identical copy of the task and its block "
+                f"in the destination, and it holds {which} such copies; nothing was removed",
+                matches=cands[:_DUPLICATE_LIST_MAX], note="destination",
+            )
+        d = copies[0].line - 1
+        by = {t.line - 1: t for t in dtasks}
+        ids = tuple((d + o + 1, _render(by[d + o]) if d + o in by else None) for o in moved.task_offsets)
+        return MovePlan(insert=None, dest_lines=(d + 1, n), removal=removal, moved=moved, dest_ids=ids)
+
+    placement = _move_placement(dview, dtasks, args.to_section)
+    if isinstance(placement, TaskWriteRefusal):
+        return _tag(placement, "destination")
+    if not args.allow_duplicate:
+        dup = _move_duplicates(dview, dtasks, moved, tl)
+        if dup is not None:
+            return _tag(dup, "destination")
+    clash = _block_id_conflict(dview, moved)
+    if clash is not None:
+        return _tag(clash, "destination")
+    after, term = placement
+    insert = _plan_insert(dview, dtasks, after, term, moved)
+    if isinstance(insert, TaskWriteRefusal):
+        return _tag(insert, "destination")
+    return MovePlan(insert=insert, dest_lines=(insert.inserted_at[0] + 1, n), removal=removal,
+                    moved=moved, dest_ids=insert.moved_ids)
+
+
+def plan_move_within(note_text: str, args: MoveArgs, settings) -> Plan | TaskWriteRefusal:
+    """D13: the removal and the insertion as one plan over the original text,
+    the insertion point computed on the note with the block removed (so the
+    moved task is never its own anchor). Verified as the D7 removal followed
+    by the D5 insertion on the intermediate text. A plan that leaves the note
+    unchanged has ``changed=False``."""
+    if args.resume:
+        return _refuse("invalid_argument", "a move within one note has no partial outcome to resume")
+    got = _locate(note_text, args.id, args.hash_supplied)
+    if isinstance(got, TaskWriteRefusal):
+        return got
+    view, tasks, target, i, tl = got
+    scope = _move_scope(view, tasks, target, i)
+    if isinstance(scope, TaskWriteRefusal):
+        return scope
+    e, moved = scope
+    # D13 "already in place" (spec verifier): the task is already the last
+    # top-level task of the destination region — with any blank or paragraph
+    # lines before it — so the move is a no-op rather than a hop over them.
+    region = _region(view, args.to_section)
+    if isinstance(region, TaskWriteRefusal):
+        return region
+    region_lines = region[0]
+    contents = view.contents()
+    task_idx = {t.line - 1 for t in tasks}
+    if i in region_lines and not any(
+            idx > i and idx in task_idx and _shape(contents[idx])[1] == 0 for idx in region_lines):
+        return Plan(spans=(), new_text=note_text, new_lines=(), new_ids={}, changed=False,
+                    removed=(i, e), block_ids=moved.block_ids)
+    removal = _plan_removal(view, tasks, i, e, moved)
+    if isinstance(removal, TaskWriteRefusal):
+        return removal
+    mid = removal.new_text
+    mview = _view(mid)
+    if isinstance(mview, TaskWriteRefusal):
+        return mview
+    mtasks = _extract(mid)[0]
+    placement = _move_placement(mview, mtasks, args.to_section)
+    if isinstance(placement, TaskWriteRefusal):
+        return placement
+    if not args.allow_duplicate:
+        # D9 / D13: the moved block is not in the intermediate text, so it is
+        # excluded from both checks against its own note.
+        dup = _move_duplicates(mview, mtasks, moved, tl)
+        if dup is not None:
+            return dup
+    after, term = placement
+    insert = _plan_insert(mview, mtasks, after, term, moved)
+    if isinstance(insert, TaskWriteRefusal):
+        return insert
+    new_text = insert.new_text
+    meta = dict(removed=(i, e), inserted_at=insert.inserted_at, moved_ids=insert.moved_ids,
+                new_lines=insert.new_lines, new_ids=insert.new_ids, block_ids=moved.block_ids)
+    if new_text == note_text:
+        return Plan(spans=(), new_text=note_text, changed=False, **meta)
+    (rs,) = removal.spans
+    (ins,) = insert.spans
+    if ins.start <= rs.start:
+        spans = (Span(ins.start, ins.start, ins.text), rs)
+    else:
+        shift = rs.end - rs.start
+        spans = (rs, Span(ins.start + shift, ins.start + shift, ins.text))
+    try:
+        if _compose(note_text, spans) != new_text:
+            return _fail("the combined spans do not give the planned text")
+    except ValueError:
+        return _fail("the combined spans overlap")
+    # D1: suffixes renumbered among tasks outside the block that share a key.
+    keys = {m.task_key for m in moved.tasks}
+    removed_n = e - i
+    j, n = insert.inserted_at
+    to_mid = {k: (k if k < i else k - removed_n) for k in range(len(view.lines)) if not i <= k < e}
+    mapping = {k: (m if m < j else m + n) for k, m in to_mid.items()}
+    renum = _renumbered(tasks, _extract(new_text)[0], keys, mapping)
+    return Plan(spans=spans, new_text=new_text, renumbered=renum, **meta)
+
+
+def plan_relocated_removal(source_text: str, moved: MovedBlock) -> Plan | TaskWriteRefusal:
+    """D10 rows 9–12: re-derive the source's tasks and plan the removal again
+    only when the moved key resolves to exactly one task whose block is
+    byte-identical to ``moved``. Otherwise a ``task_move_incomplete`` refusal
+    whose ``detail`` is ``(reason, current id or None)`` with reason
+    ``source_missing``, ``source_changed`` or ``source_ambiguous``; a source
+    the planner cannot read at all is that refusal's own code."""
+    view = _view(source_text)
+    if isinstance(view, TaskWriteRefusal):
+        return view
+    bad = _frontmatter_refusal(source_text)
+    if bad is not None:
+        return bad
+    got = _extract(source_text)
+    if isinstance(got, TaskWriteRefusal):
+        return got
+    tasks, truncated = got
+    if truncated:
+        return _refuse("size_limit", "the source now holds more tasks than the per-note task cap")
+    matches = [t for t in tasks if t.task_key == moved.key]
+    if not matches:
+        return _refuse("task_move_incomplete", "the source no longer holds a task with this id",
+                       detail=("source_missing", None))
+    if len(matches) > 1:
+        return _refuse("task_move_incomplete", "the source now holds several identical tasks",
+                       detail=("source_ambiguous", None))
+    t0 = matches[0]
+    i = t0.line - 1
+    contents = view.contents()
+    e = continuation_block(contents, i)
+    if tuple(contents[i:e]) != moved.lines:
+        return _refuse("task_move_incomplete", "the source holds an edited version of the task",
+                       detail=("source_changed", _render(t0)))
+    return _plan_removal(view, tasks, i, e, moved)
+
+
+def destination_still_holds(dest_text: str, k: int, inserted: tuple[str, ...]) -> bool:
+    """D10 6(b), pure: lines ``k … k+n−1`` (1-based) of ``dest_text`` have
+    exactly the contents of ``inserted``, byte for byte (terminators
+    excluded)."""
+    lines = _LINE_BREAK_RE.split(dest_text)
+    start = k - 1
+    if start < 0 or not inserted or start + len(inserted) > len(lines):
+        return False
+    return tuple(lines[start:start + len(inserted)]) == tuple(inserted)
+
+
+def destination_still_holds_task(dest_text: str, k: int, moved: MovedBlock) -> bool:
+    """D10 6(b), pure, the full form the wiring runs (implementation review
+    r2): the moved lines' contents at lines ``k … k+n−1`` (as
+    `destination_still_holds`) AND, under the same extraction the pass uses
+    (`tasks.tasks_from_note_text`, code masking included), the moved task
+    still a task there with its key, every moved sub-task at its offset with
+    its key and no other task in the block, the block still exactly the
+    moved task's continuation block, and every moved line's code mask the
+    one it had at the source. A preceding edit that, say, opens an unclosed
+    fence keeps the bytes but fails this, so the source is never removed."""
+    if not destination_still_holds(dest_text, k, moved.lines):
+        return False
+    view = _view(dest_text)
+    if isinstance(view, TaskWriteRefusal):
+        return False
+    got = _extract(dest_text)
+    if isinstance(got, TaskWriteRefusal) or got[1]:
+        return False
+    by = {t.line - 1: t for t in got[0]}
+    start, n = k - 1, len(moved.lines)
+    in_block = {idx for idx in by if start <= idx < start + n}
+    if in_block != {start + o for o in moved.task_offsets}:
+        return False
+    for src, o in zip(moved.tasks, moved.task_offsets):
+        if by[start + o].task_key != src.task_key:
+            return False
+    if by[start].task_key != moved.key:
+        return False
+    if continuation_block(view.contents(), start) != start + n:
+        return False
+    if moved.masks and any(view.masked_line(start + o) != moved.masks[o] for o in range(n)):
+        return False
+    return True
+
+
+def verify_move_insert(old: str, new: str, plan: Plan, moved: MovedBlock) -> TaskWriteRefusal | None:
+    """D8, destination: ``new`` is ``old`` with exactly the moved lines
+    inserted as one whole-line insertion (contents byte-identical, the
+    destination's terminator, the D6 end-of-file rules), every pre-existing
+    line, task, owner, code mask and heading unchanged, the frontmatter block
+    unchanged, and every moved task re-extracting as at the source, owned as
+    planned and with its source code mask. None when safe; otherwise
+    ``task_malformed`` (``size_limit`` over the task cap)."""
+    if "\x00" in new:
+        return _fail("the new text contains NUL")
+    if len(plan.spans) != 1 or plan.spans[0].start != plan.spans[0].end:
+        return _fail("the destination plan is not exactly one insertion")
+    span = plan.spans[0]
+    try:
+        if _compose(old, plan.spans) != new:
+            return _fail("the new text is not the old text with the declared insertion")
+        ov = _NoteView(old)
+        nv = _NoteView(new)
+    except ValueError as e:
+        return _fail(str(e))
+    n = len(moved.lines)
+    if n == 0 or not moved.task_offsets or moved.task_offsets[0] != 0:
+        return _fail("the moved block is empty or does not start with its task")
+    n_old = 0 if old == "" else len(ov.lines)
+    eof = old != "" and span.start == len(old) and not old.endswith(("\n", "\r"))
+    if old == "":
+        if span.start != 0:
+            return _fail("an insertion into an empty note is not at its start")
+        j = 0
+        term = "\n"
+    else:
+        if eof:
+            j = n_old
+        else:
+            starts = {ln.start: k for k, ln in enumerate(ov.lines)}
+            if span.start not in starts:
+                return _fail("the insertion is not at a line boundary")
+            j = starts[span.start]
+        term = ov.term_for(j - 1 if j > 0 else None)
+    if plan.inserted_at is not None and plan.inserted_at != (j, n):
+        return _fail("the insertion is not where the plan declares it")
+    if len(nv.lines) != n_old + n:
+        return _fail("the new text has an unexpected number of lines")
+    old_to_new = [k if k < j else k + n for k in range(n_old)]
+    for k in range(n_old):
+        if ov.content(k) != nv.content(old_to_new[k]):
+            return _fail("a pre-existing destination line would change")
+        a, b = ov.lines[k].term, nv.lines[old_to_new[k]].term
+        if a != b and not (eof and k == n_old - 1 and a == "" and b == term):
+            return _fail("a pre-existing destination line terminator would change")
+    unterminated_last = eof or old == ""
+    for o in range(n):
+        idx = j + o
+        if nv.content(idx) != moved.lines[o]:
+            return _fail("an inserted line differs from the moved line")
+        want = "" if (unterminated_last and o == n - 1) else term
+        if nv.lines[idx].term != want:
+            return _fail("an inserted line would not end with the destination's terminator")
+    if nv.body_first != (0 if old == "" else ov.body_first) or new[: ov.body_offset] != old[: ov.body_offset]:
+        return _fail("the destination's frontmatter block would change")
+
+    got_old = _extract(old)
+    got_new = _extract(new)
+    if isinstance(got_old, TaskWriteRefusal):
+        return got_old
+    if isinstance(got_new, TaskWriteRefusal):
+        return got_new
+    old_tasks, old_trunc = got_old
+    new_tasks, new_trunc = got_new
+    if new_trunc:
+        return _refuse("size_limit", "the destination would hold more tasks than the per-note task cap; nothing was written")
+    if old_trunc:
+        return _fail("the destination exceeds the per-note task cap")
+    old_by = {t.line - 1: t for t in old_tasks}
+    new_by = {t.line - 1: t for t in new_tasks}
+    moved_new = {j + o for o in moved.task_offsets}
+    if set(new_by) != {old_to_new[k] for k in old_by} | moved_new:
+        return _fail("the destination's task set would change beyond the moved tasks")
+    for k, t in old_by.items():
+        u = new_by[old_to_new[k]]
+        for name in _COMPARED:
+            if getattr(t, name) != getattr(u, name):
+                return _fail(f"another destination task's {name} would change")
+    if len(moved.tasks) != len(moved.task_offsets):
+        return _fail("the moved block's tasks do not match its offsets")
+    for src, o in zip(moved.tasks, moved.task_offsets):
+        u = new_by[j + o]
+        for name in _MOVED_COMPARED:
+            if getattr(src, name) != getattr(u, name):
+                return _fail(f"a moved task's {name} would not re-extract as at the source")
+
+    old_own = _owners(ov.contents()[:n_old], set(old_by))
+    new_own = _owners(nv.contents(), set(new_by))
+    for k in range(n_old):
+        want = None if old_own[k] is None else old_to_new[old_own[k]]
+        if new_own[old_to_new[k]] != want:
+            return _fail("a pre-existing destination line would change its owning task")
+    block_own = _owners(list(moved.lines), set(moved.task_offsets))
+    for o in range(n):
+        want = None if (o == 0 or block_own[o] is None) else j + block_own[o]
+        if new_own[j + o] != want:
+            return _fail("a moved line would not be owned as planned")
+
+    for k in range(n_old):
+        if k < ov.body_first:
+            continue
+        if ov.masked_line(k) != nv.masked_line(old_to_new[k]):
+            return _fail("a destination line's code status would change")
+    if len(moved.masks) != n:
+        return _fail("the moved block carries no source code masks")
+    for o in range(n):
+        if nv.masked_line(j + o) != moved.masks[o]:
+            return _fail("a moved line's code status would change")
+    oh = _heading_lines(ov) if old != "" else []
+    if [(old_to_new[k], d, t) for k, d, t in oh] != _heading_lines(nv):
+        return _fail("the destination's headings would change")
+    return None
+
+
+def verify_removal(old: str, new: str, plan: Plan, moved: MovedBlock) -> TaskWriteRefusal | None:
+    """D8, source: ``new`` is ``old`` with exactly the D7 span of the moved
+    block removed, every remaining line keeping its content and terminator
+    (but for the D7 end-of-file case), every remaining task, owner, code mask
+    and heading unchanged, the frontmatter block unchanged, and the task set
+    losing exactly the moved tasks. None when safe; otherwise
+    ``task_malformed``."""
+    if plan.removed is None:
+        return _fail("the removal plan declares no removed lines")
+    t, e = plan.removed
+    try:
+        ov = _NoteView(old)
+    except ValueError as exc:
+        return _fail(str(exc))
+    n_old = len(ov.lines)
+    if not 0 <= t < e <= n_old:
+        return _fail("the removed lines are outside the note")
+    contents = ov.contents()
+    if tuple(contents[t:e]) != moved.lines or continuation_block(contents, t) != e:
+        return _fail("the removed lines are not exactly the moved task and its block")
+    if tuple(plan.spans) != (_removal_span(ov, t, e),):
+        return _fail("the removal is not the moved block's span")
+    try:
+        if _compose(old, plan.spans) != new:
+            return _fail("the new text is not the old text with the declared removal")
+        nv = _NoteView(new)
+    except ValueError as exc:
+        return _fail(str(exc))
+    removed = e - t
+    eof = e == n_old and ov.lines[e - 1].term == "" and t > 0
+    expected_n = n_old - removed
+    if expected_n == 0:
+        if new != "":
+            return _fail("removing the whole note would leave text behind")
+    elif len(nv.lines) != expected_n:
+        return _fail("the new text has an unexpected number of lines")
+    old_to_new = {k: (k if k < t else k - removed) for k in range(n_old) if not t <= k < e}
+    for k, m in old_to_new.items():
+        if ov.content(k) != nv.content(m):
+            return _fail("a remaining source line would change")
+        a, b = ov.lines[k].term, nv.lines[m].term
+        if a != b and not (eof and k == t - 1 and b == ""):
+            return _fail("a remaining source line terminator would change")
+    if expected_n and (nv.body_first != ov.body_first
+                       or any(ov.content(k) != nv.content(k) for k in range(ov.body_first))):
+        return _fail("the source's frontmatter block would change")
+
+    got_old = _extract(old)
+    got_new = _extract(new)
+    if isinstance(got_old, TaskWriteRefusal):
+        return got_old
+    if isinstance(got_new, TaskWriteRefusal):
+        return got_new
+    old_tasks, old_trunc = got_old
+    new_tasks, _new_trunc = got_new
+    if old_trunc:
+        return _fail("the source exceeds the per-note task cap")
+    old_by = {x.line - 1: x for x in old_tasks}
+    new_by = {x.line - 1: x for x in new_tasks}
+    in_block = {k for k in old_by if t <= k < e}
+    if in_block != {t + o for o in moved.task_offsets} or old_by.get(t) is None \
+            or old_by[t].task_key != moved.key:
+        return _fail("the removed lines' tasks are not exactly the moved tasks")
+    if set(new_by) != {old_to_new[k] for k in old_by if k not in in_block}:
+        return _fail("the source's task set would change beyond the moved tasks")
+    for k, x in old_by.items():
+        if k in in_block:
+            continue
+        u = new_by[old_to_new[k]]
+        for name in _COMPARED:
+            if getattr(x, name) != getattr(u, name):
+                return _fail(f"another source task's {name} would change")
+
+    old_own = _owners(contents, set(old_by))
+    new_own = _owners(nv.contents(), set(new_by)) if expected_n else []
+    for k, m in old_to_new.items():
+        own = old_own[k]
+        if own is not None and t <= own < e:
+            return _fail("a remaining source line was owned by a moved task")
+        want = None if own is None else old_to_new[own]
+        if new_own[m] != want:
+            return _fail("a remaining source line would change its owning task")
+    for k, m in old_to_new.items():
+        if k < ov.body_first:
+            continue
+        if ov.masked_line(k) != nv.masked_line(m):
+            return _fail("a source line's code status would change")
+    oh = _heading_lines(ov)
+    if any(t <= k < e for k, _d, _t in oh):
+        return _fail("the moved block holds a heading")
+    nh = _heading_lines(nv) if expected_n else []
+    if [(old_to_new[k], d, h) for k, d, h in oh] != nh:
+        return _fail("the source's headings would change")
+    return None
+
+
 # ── duplicate scan (D9) ──────────────────────────────────────────────────────
 
 
@@ -1834,8 +2601,11 @@ def _ref(row, score: float | None = None) -> TaskRef:
 
 
 __all__ = [
-    "AddArgs", "CompleteArgs", "Expect", "Inserted", "Intent", "NewLine", "Plan",
-    "Span", "TaskRef", "TaskWriteRefusal", "UpdateArgs", "continuation_block",
-    "contains", "duplicate_scan", "extracted_task_at", "jaccard", "plan_add", "plan_complete", "plan_update",
-    "resolve", "similarity_terms", "term_set", "verify",
+    "AddArgs", "CompleteArgs", "Expect", "Inserted", "Intent", "MoveArgs", "MovePlan",
+    "MovedBlock", "NewLine", "Plan", "Span", "TaskRef", "TaskWriteRefusal", "UpdateArgs",
+    "continuation_block", "contains", "destination_still_holds", "destination_still_holds_task",
+    "duplicate_scan",
+    "extracted_task_at", "jaccard", "plan_add", "plan_complete", "plan_move", "plan_move_within",
+    "plan_relocated_removal", "plan_update", "resolve", "similarity_terms", "term_set", "verify",
+    "verify_move_insert", "verify_removal",
 ]

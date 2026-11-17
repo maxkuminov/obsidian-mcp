@@ -629,8 +629,9 @@ def test_the_concurrency_class_is_unchanged():
 
     assert concurrency.TOOL_CLASSES["semantic_search"] == "embedding"
     assert concurrency.TOOL_CLASSES["hybrid_search"] == "embedding"
-    # 6 since #428 (the task tools); the rerank change itself bumped nothing.
-    assert concurrency.CLASS_MAPPING_VERSION == 6
+    # 6 since #428 (the task tools), 7 since #430 (`move_task`); the rerank
+    # change itself bumped nothing.
+    assert concurrency.CLASS_MAPPING_VERSION == 7
 
 
 # ── #355 merge: the transition line and the locator on rerank=true pages ───

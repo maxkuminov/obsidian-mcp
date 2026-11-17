@@ -39,7 +39,8 @@ from src.services.pool_budget import CLASS_CONNECTIONS, budget_terms
 # 4: `get_changes` added to `scan` (#351).
 # 5: hybrid_search added to embedding (#354).
 # 6: complete_task, update_task, add_task added to write; task_agenda to scan (#428).
-CLASS_MAPPING_VERSION = 6
+# 7: move_task added to write (#430).
+CLASS_MAPPING_VERSION = 7
 
 TOOL_CLASSES = {
     # `hybrid_search` makes the same provider round trip as `semantic_search`,
@@ -51,7 +52,10 @@ TOOL_CLASSES = {
                      "import_from_url",
                      # #428: the three task write tools publish a note through
                      # the same envelope as `edit_note` (mapping version 6).
-                     "complete_task", "update_task", "add_task"), "write"),
+                     "complete_task", "update_task", "add_task",
+                     # #430: two publications, one write slot held through
+                     # both (mapping version 7).
+                     "move_task"), "write"),
     **dict.fromkeys(("keyword_search", "list_notes", "get_tags",
                      "get_neighborhood", "find_orphans", "list_files",
                      "list_tasks", "get_changes",

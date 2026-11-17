@@ -107,6 +107,7 @@ The events SHALL be:
 | `create_note` | `created` |
 | `edit_note`, `set_frontmatter` | `modified` |
 | `complete_task`, `update_task`, `add_task` | `modified` (recorded after the write-time task refresh, whatever its result) |
+| `move_task` | one `modified` per note it published, each recorded after that note's write-time task refresh: the destination's before the source removal is attempted, then the source's; one event for a move within one note |
 | `write_file`, `import_from_url`, `PUT /transfer/upload` on a `.md` path | `created` without an incumbent, `modified` with one |
 | `move_note` | `moved`, inside its metadata transaction, plus one `modified` per backlink source whose rewrite it published |
 | `delete_note` | `deleted` with `reason = 'removed'` |
@@ -115,7 +116,7 @@ The events SHALL be:
 
 A transfer upload SHALL be attributed to the actor and principal that minted the capability. That is the same principal the write-bucket charge at redemption already uses (`transfer.minting_principal`), so this reuses that rule rather than defining a second one.
 
-A publication the tool reports as `publication_uncertain` SHALL record no event. A dry run, a refusal and a call that changed no byte SHALL record no event.
+A publication the tool reports as `publication_uncertain` SHALL record no event. A dry run, a refusal and a call that changed no byte SHALL record no event. A `move_task` that ends in `task_move_incomplete` SHALL record the destination's event and no source event, unless the source outcome is `io_failure`, which, like `publication_uncertain`, records none for the source.
 
 #### Scenario: An edit is attributed to the calling key
 - **WHEN** an API key named `laptop` (id 12) edits `A.md`
@@ -133,6 +134,14 @@ A publication the tool reports as `publication_uncertain` SHALL record no event.
 - **WHEN** an OAuth grant completes a task in `Projects/Alpha.md`
 - **THEN** one `modified` event SHALL be recorded with `tool = 'complete_task'`, the grant as its principal and the canonical hash of the bytes written, after the write-time task refresh
 
+#### Scenario: A task move records both notes
+- **WHEN** an OAuth grant moves a task from `Inbox.md` to `Projects/Alpha.md`
+- **THEN** two `modified` events SHALL be recorded with `tool = 'move_task'` and the grant as their principal, `Projects/Alpha.md` first, each with the canonical hash of the bytes that note published
+
+#### Scenario: A partial task move records the destination only
+- **WHEN** `move_task` publishes the destination and its source removal ends in `task_move_incomplete` with `reason` `concurrent_write`
+- **THEN** exactly one `modified` event SHALL be recorded, for the destination
+
 #### Scenario: A transfer upload is attributed to the minting principal
 - **WHEN** an OAuth grant mints an upload link for `Inbox/x.md` and a person redeems it
 - **THEN** the event SHALL carry the minting grant as its principal and the minting client's label, with `tool = 'transfer_upload'`, exactly the principal the redemption's write-bucket charge used
@@ -146,7 +155,7 @@ A publication the tool reports as `publication_uncertain` SHALL record no event.
 - **THEN** no event SHALL be recorded
 
 #### Scenario: A refused or dry-run task write records nothing
-- **WHEN** `update_task` is refused with `task_changed`, or `add_task` runs with `dry_run=true`
+- **WHEN** `update_task` is refused with `task_changed`, or `add_task` or `move_task` runs with `dry_run=true`
 - **THEN** no event SHALL be recorded
 
 ### Requirement: The index pass SHALL record only the changes it commits that no tool already recorded

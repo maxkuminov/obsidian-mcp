@@ -707,6 +707,14 @@ The procedure:
    `kubectl -n obsidian-mcp exec deploy/obsidian-mcp -- alembic check` should print
    "No new upgrade operations detected."
 
+**Upgrading to the task-move release (#430)** there is no migration, no
+new setting and no operator step. One new tool, `move_task`, brings the
+list to 33 (a read-only OAuth grant still lists 20); the write bucket covers
+twelve tools, one token per move. `move_task` joins the `write` class, so
+`CLASS_MAPPING_VERSION` moves to 7, which starts a new readiness epoch for
+`make concurrency-report`. Rolling the image back is a plain redeploy. The
+details are in [`DEPLOYMENT.md`](../DEPLOYMENT.md#upgrading-to-the-task-move-release-430).
+
 **Across migration 040 (task rule, #434)** nothing changes until a task
 rule is chosen: the default, `all`, keeps every checkbox a task, and every
 response and outstanding cursor stays as it was. 040 adds three columns and

@@ -119,9 +119,9 @@ def _events(records, name):
     return [r for r in records if r.getMessage() == name]
 
 
-#: Every call site the write gate guards, with a call that reaches it. Ten
+#: Every call site the write gate guards, with a call that reaches it. Eleven
 #: tools call `_require_write` as their first statement (the three task write
-#: tools since #428); `request_upload` and
+#: tools since #428, `move_task` since #430); `request_upload` and
 #: `import_from_url` reach it through `_mint_preflight(need_write=True)`.
 GATED = [
     ("create_note", lambda: tools.create_note_impl("a.md", "body")),
@@ -140,6 +140,8 @@ GATED = [
     ("complete_task", lambda: tools.complete_task_impl("a.md", "0123456789ab")),
     ("update_task", lambda: tools.update_task_impl("a.md", "0123456789ab", due="today")),
     ("add_task", lambda: tools.add_task_impl("a.md", "a task")),
+    # #430: `move_task`, at the same one definition.
+    ("move_task", lambda: tools.move_task_impl("a.md", "0123456789ab", "b.md")),
 ]
 
 REFUSAL = (

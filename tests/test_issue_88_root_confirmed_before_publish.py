@@ -364,6 +364,8 @@ async def _call(ctx, name: str):
         return await tools.update_task_impl("tasks.md", _task_id(), priority="high")
     if name == "add_task":
         return await tools.add_task_impl("tasks.md", "repot the fern")
+    if name == "move_task":
+        return await tools.move_task_impl("tasks.md", _task_id(), "note.md")
     raise AssertionError(name)  # pragma: no cover
 
 
@@ -379,6 +381,7 @@ MUTATING_TOOLS = [
     "complete_task",  # #428
     "update_task",
     "add_task",
+    "move_task",  # #430: two publications, each confirmed
 ]
 
 
@@ -551,8 +554,8 @@ async def test_an_unchanged_assignment_publishes_with_exactly_one_re_read(
 async def test_every_single_publication_tool_re_reads_exactly_once(
     multi_user_vault, tool_name
 ):
-    if tool_name == "move_note":
-        pytest.skip("move_note publishes more than once; covered below")
+    if tool_name in ("move_note", "move_task"):
+        pytest.skip(f"{tool_name} publishes more than once; covered below")
     ctx = multi_user_vault
     seed(ctx)
 
@@ -560,6 +563,20 @@ async def test_every_single_publication_tool_re_reads_exactly_once(
 
     assert "Vault assignment changed" not in result, result
     assert ctx.assignment["reads"] == 1, result
+
+
+async def test_move_task_confirms_each_of_its_two_publications(multi_user_vault):
+    """#430 D10: the destination insert and the source removal are two
+    publications, each through its own confirmed publication."""
+    ctx = multi_user_vault
+    seed(ctx)
+
+    result = await _call(ctx, "move_task")
+
+    assert "Vault assignment changed" not in result, result
+    assert ctx.assignment["reads"] == 2, result
+    assert (ctx.vault / "tasks.md").read_text(encoding="utf-8") == ""
+    assert "water plants" in (ctx.vault / "note.md").read_text(encoding="utf-8")
 
 
 async def test_a_read_tool_issues_no_assignment_re_read(multi_user_vault):
@@ -1633,6 +1650,7 @@ def test_the_write_tool_detector_finds_the_tools_we_know_about():
         "complete_task",  # #428
         "update_task",
         "add_task",
+        "move_task",  # #430
     } <= found, found
     # A read-only mint shares `_mint_preflight` and must not be swept in.
     assert "request_download" not in found
