@@ -1404,3 +1404,33 @@ def test_the_refusal_shape_checks():
         'MCP-REFUSAL {"code":"task_move_incomplete","path":"A.md","destination_path":"B.md",'
         '"source_id":"0123456789ab","reason":"destination_changed"}')
     assert refusals.Refusal("not_found").as_payload() == {"code": "not_found"}
+
+
+def test_two_concurrent_moves_of_one_task_to_the_same_note(world, monkeypatch):
+    """Scenario 9: the second move, landing between the first's destination
+    publication and its source write, is refused `duplicate_task`; the
+    destination never holds three copies (two never either: the first
+    completes)."""
+    key = setup_pair(world)
+    inner = {}
+
+    def on_call(n, t):
+        if t.rel == "Inbox.md" and not inner:
+            inner["out"] = run_in_thread(tools.move_task_impl("Inbox.md", key, "Projects/Money.md"))
+
+    write_hook(monkeypatch, on_call)
+    out = run(tools.move_task_impl("Inbox.md", key, "Projects/Money.md"))
+    assert code_of(inner["out"]) == "duplicate_task", inner["out"]
+    assert code_of(out) is None, out
+    assert read(world, "Projects/Money.md") == MOVED_MONEY and read(world, "Inbox.md") == LEFT_INBOX
+
+
+def test_a_destination_over_the_note_size_cap_is_refused_before_publishing(world, monkeypatch):
+    """Scenario 25: a result over `MAX_NOTE_BYTES` is `size_limit` before the
+    destination publication; nothing written in either note."""
+    key = setup_pair(world)
+    monkeypatch.setattr(tools, "MAX_NOTE_BYTES", len(MONEY.encode()) + 10)
+    out = run(tools.move_task_impl("Inbox.md", key, "Projects/Money.md"))
+    assert code_of(out) == "size_limit"
+    assert read(world, "Inbox.md") == INBOX and read(world, "Projects/Money.md") == MONEY
+    assert world.events == []

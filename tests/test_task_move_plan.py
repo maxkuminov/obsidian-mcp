@@ -532,3 +532,13 @@ def test_same_note_moves_are_permutations(si):
                 continue
             assert sorted(_split(got.new_text)) == sorted(_split(note)), (si, tid, section)
             assert tw._compose(note, got.spans) == got.new_text
+
+
+def test_a_task_over_the_stored_text_cut_resolves_and_moves():
+    """Scenario 23: a task text over 1,000 characters (stored cut): the key is
+    over the uncut text, the move resolves, and the line arrives whole."""
+    line = "- [ ] " + "long " * 300 + "end"
+    plan = ok(line + "\n", "", line)
+    assert plan.insert.new_text == line
+    assert plan.moved.tasks[0].text_cut is True
+    assert plan.dest_ids[0][1] == key_of(line)
