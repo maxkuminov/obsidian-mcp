@@ -2147,6 +2147,19 @@ def plan_move_within(note_text: str, args: MoveArgs, settings) -> Plan | TaskWri
     if isinstance(scope, TaskWriteRefusal):
         return scope
     e, moved = scope
+    # D13 "already in place" (spec verifier): the task is already the last
+    # top-level task of the destination region — with any blank or paragraph
+    # lines before it — so the move is a no-op rather than a hop over them.
+    region = _region(view, args.to_section)
+    if isinstance(region, TaskWriteRefusal):
+        return region
+    region_lines = region[0]
+    contents = view.contents()
+    task_idx = {t.line - 1 for t in tasks}
+    if i in region_lines and not any(
+            idx > i and idx in task_idx and _shape(contents[idx])[1] == 0 for idx in region_lines):
+        return Plan(spans=(), new_text=note_text, new_lines=(), new_ids={}, changed=False,
+                    removed=(i, e), block_ids=moved.block_ids)
     removal = _plan_removal(view, tasks, i, e, moved)
     if isinstance(removal, TaskWriteRefusal):
         return removal

@@ -24,7 +24,7 @@ There are four slices (design §"Slice plan"): **M1** and **M2** in wave 1, in p
 - [x] 1.6 `verify_move_insert` and `verify_removal` (D8), and the combined same-note verification (D13).
 - [x] 1.7 Duplicates at the destination and `resume` (D9); the block-id collision check (D8); `destination_still_holds` (D10 6(b)).
 - [x] 1.8 `plan_relocated_removal` for the phase-2 retry (D10 rows 9–12, returning which of `source_missing`, `source_changed`, `source_ambiguous`).
-- [x] 1.9 `tests/test_task_move_plan.py`: the unit cases and the corpus property test in design §"Test plan" (not the full design's frame-pair matrix); `tests/test_task_write.py` runs unmodified and green.
+- [x] 1.9 `tests/test_task_move_plan.py`: the unit cases and the corpus property test in design §"Test plan" (not the full design's frame-pair matrix); `tests/test_task_write.py` green, its only change being the two new codes added to its pinned task-code set (per 2.1).
 
 ## 2. M2: wiring and the partial outcome
 

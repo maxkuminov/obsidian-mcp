@@ -39,6 +39,7 @@ from src.services import vault as vault_service  # noqa: E402
 from src.services.note_hash import canonical_note_hash  # noqa: E402
 from src.services.task_settings import EffectiveTaskSettings  # noqa: E402
 from src.services.vault import (  # noqa: E402
+    VaultAnchorUnavailable,
     VaultAssignmentChanged,
     VaultConfirmationUnavailable,
     content_hash_for_bytes,
@@ -262,6 +263,11 @@ def test_a_task_moves_with_its_context_and_sub_task(world):
     (row,) = world.usage
     assert row["move_outcome"] == "moved"
     assert row["task_refresh"] == "refreshed" and row["task_refresh_to"] == "refreshed"
+    # Scenario: The id survives the move — the printed id resolves at the destination.
+    printed = lines[2].split("id: ", 1)[1]
+    out = run(tools.complete_task_impl("Projects/Money.md", printed))
+    assert code_of(out) is None, out
+    assert "- [x] Call the bank 📅 2026-11-20 ✅" in read(world, "Projects/Money.md")
 
 
 def test_the_usage_row_holds_the_arguments_and_no_task_text(world):
@@ -275,6 +281,24 @@ def test_the_usage_row_holds_the_arguments_and_no_task_text(world):
         assert name in row, name
     assert row["expected_hash"] is True and row["to_expected_hash"] is False
     run(tools.move_task_impl("Inbox.md", key_of("- [ ] Pay rent"), "Projects/Money.md"))  # refused
+    write(world, "Inbox.md", INBOX)
+    write(world, "Projects/Money.md", MONEY)
+    pna = []
+
+    def fail(n, t):
+        if t.rel == "Inbox.md":
+            pna.append(1)
+            raise vault_fs.PermissionsNotApplied("fchmod the staged copy", errno.EIO)
+
+    mp = pytest.MonkeyPatch()
+    write_hook(mp, fail)
+    try:
+        out = run(tools.move_task_impl("Inbox.md", key, "Projects/Money.md"))  # partial
+    finally:
+        mp.undo()
+    assert payload_of(out)["code"] == "task_move_incomplete" and pna
+    assert world.usage[-1]["move_outcome"] == "incomplete:permissions_not_applied"
+    assert len(world.usage) == 3
     for row in world.usage:
         flat = json.dumps(row, ensure_ascii=False)
         assert "Call the bank" not in flat and "account number" not in flat and "Pay rent" not in flat
@@ -895,6 +919,7 @@ def run_in_thread(coro):
 
 @pytest.mark.parametrize("exc,reason", [
     (VaultAssignmentChanged("changed"), "vault_assignment_changed"),
+    (VaultAnchorUnavailable("anchor gone"), "vault_anchor_lost_at_publish"),
     (VaultConfirmationUnavailable("db down"), "vault_confirmation_unavailable"),
 ])
 def test_a_reassignment_between_the_steps_is_partial(world, monkeypatch, exc, reason):
@@ -1434,3 +1459,105 @@ def test_a_destination_over_the_note_size_cap_is_refused_before_publishing(world
     assert code_of(out) == "size_limit"
     assert read(world, "Inbox.md") == INBOX and read(world, "Projects/Money.md") == MONEY
     assert world.events == []
+
+
+# ── implementation review round 1 ───────────────────────────────────────────
+
+
+def test_a_destination_that_is_not_utf8_is_unverified_not_changed(world, monkeypatch):
+    """Review r1 MAJOR: a destination that reads but fails UTF-8 decoding,
+    with the moved lines still in place, is `destination_unverified` — the
+    response never claims the lines are gone."""
+    key = setup_pair(world)
+
+    def corrupt(n):
+        if n == 2:
+            p = world.root / "Projects/Money.md"
+            p.write_bytes(p.read_bytes() + b"\xff\xfe stray\n")
+
+    confirm_hook(monkeypatch, corrupt)
+    out = run(tools.move_task_impl("Inbox.md", key, "Projects/Money.md"))
+    p = payload_of(out)
+    assert p["reason"] == "destination_unverified" and "destination_id" not in p
+    dest = line_of(out, "destination:")
+    assert "UTF-8" in dest and "no longer holds" not in dest
+    assert read(world, "Inbox.md") == INBOX
+
+
+def test_a_completing_call_never_repeats_a_stale_source_hash(world, monkeypatch):
+    """Review r1 MAJOR: with a bare id the `complete with:` calls omit the
+    original `expected_hash`; after a concurrent source edit the named call,
+    made exactly as printed, completes the move."""
+    key = setup_pair(world)
+
+    def both(n):
+        if n == 2:  # an unrelated source edit and an older destination save
+            src = world.root / "Inbox.md"
+            src.write_bytes(src.read_bytes() + b"unrelated\n")
+            write(world, "Projects/Money.md", MONEY)
+
+    confirm_hook(monkeypatch, both)
+    out = run(tools.move_task_impl("Inbox.md", key, "Projects/Money.md", expected_hash=h(INBOX)))
+    assert payload_of(out)["reason"] == "destination_changed"
+    complete = line_of(out, "complete with:")
+    assert "expected_hash" not in complete and h(INBOX) not in out
+    monkeypatch.setattr(tools, "confirmed_publication", vault_service.confirmed_publication)
+    out = run(tools.move_task_impl("Inbox.md", key, "Projects/Money.md"))  # as printed
+    assert code_of(out) is None, out
+    assert read(world, "Inbox.md") == LEFT_INBOX + "unrelated\n"
+
+
+@pytest.mark.parametrize("fail_at", ["destination_changed", "permissions_not_applied", "reassigned"])
+def test_a_suffixed_id_completing_call_reads_the_source_first(world, monkeypatch, fail_at):
+    """Review r1 MAJOR, every row that names a call with the task id: a
+    suffixed id is told to read the source and pass its fresh
+    `content_hash`, never the original call's hash."""
+    note = "- [ ] Call\n    - first\n- [ ] Call\n"
+    write(world, "Inbox.md", note)
+    write(world, "B.md", "")
+    k = key_of("- [ ] Call")
+    if fail_at == "destination_changed":
+        confirm_hook(monkeypatch, lambda n: write(world, "B.md", "") if n == 2 else None)
+    elif fail_at == "reassigned":
+        def refuse(n):
+            if n == 2:
+                raise VaultAssignmentChanged("changed")
+        confirm_hook(monkeypatch, refuse)
+    else:
+        def fail(n, t):
+            if t.rel == "Inbox.md":
+                raise vault_fs.PermissionsNotApplied("fchmod the staged copy", errno.EIO)
+        write_hook(monkeypatch, fail)
+    out = run(tools.move_task_impl("Inbox.md", f"{k}.1of2", "B.md", expected_hash=h(note)))
+    assert code_of(out) == "task_move_incomplete", out
+    complete = line_of(out, "complete with:")
+    assert complete.startswith('complete with: read_note(path="Inbox.md") for the source\'s content_hash, then ')
+    assert "expected_hash=<the content_hash that read_note returns>" in complete
+    assert h(note) not in complete
+
+
+class _Killed(BaseException):
+    """Stands in for the process dying: nothing after it runs."""
+
+
+def test_a_real_move_interrupted_after_the_destination_publish_is_resumable(world, monkeypatch):
+    """Review r1 MINOR (row 16, L2): a real move stopped at the step boundary
+    right after the destination publication leaves the task in BOTH notes on
+    disk (destination first), and the prescribed `resume=true` completes."""
+    key = setup_pair(world)
+    original = task_index.refresh_note_tasks
+
+    async def die(**kw):
+        raise _Killed()
+
+    monkeypatch.setattr(task_index, "refresh_note_tasks", die)
+    with pytest.raises(_Killed):
+        run(tools.move_task_impl("Inbox.md", key, "Projects/Money.md"))
+    assert read(world, "Projects/Money.md") == MOVED_MONEY
+    assert read(world, "Inbox.md") == INBOX
+    monkeypatch.setattr(task_index, "refresh_note_tasks", original)
+    out = run(tools.move_task_impl("Inbox.md", key, "Projects/Money.md"))
+    assert code_of(out) == "duplicate_task"
+    out = run(tools.move_task_impl("Inbox.md", key, "Projects/Money.md", resume=True))
+    assert code_of(out) is None, out
+    assert read(world, "Inbox.md") == LEFT_INBOX and read(world, "Projects/Money.md") == MOVED_MONEY

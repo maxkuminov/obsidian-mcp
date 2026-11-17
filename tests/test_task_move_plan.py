@@ -542,3 +542,15 @@ def test_a_task_over_the_stored_text_cut_resolves_and_moves():
     assert plan.insert.new_text == line
     assert plan.moved.tasks[0].text_cut is True
     assert plan.dest_ids[0][1] == key_of(line)
+
+
+@pytest.mark.parametrize("between", ["\n", "A paragraph.\n", "\nA paragraph.\n\n"])
+def test_same_note_already_in_place_with_lines_before_it(between):
+    """Scenario: A task already in place — the last top-level task of the
+    section stays put (no change) even with a blank line or a paragraph
+    between it and the previous task (spec verifier)."""
+    note = f"# Later\n- [ ] b\n{between}- [ ] c\n    - ctx\n# Next\n"
+    plan = tw.plan_move_within(note, args("- [ ] c", to_section="Later"), None)
+    assert plan.changed is False and plan.spans == () and plan.new_text == note
+    whole = tw.plan_move_within(f"- [ ] b\n{between}- [ ] c\n", args("- [ ] c"), None)
+    assert whole.changed is False

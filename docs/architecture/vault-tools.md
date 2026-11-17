@@ -2420,7 +2420,7 @@ anchored target and requires the moved lines at their position
 (`destination_still_holds`) — with no `await` between that check and the
 source write. *Holds* lets the write run; *changed* (the lines absent or
 different, or no file) stops with `destination_changed`; *unverified* (the read
-itself failed) stops with `destination_unverified`, which claims nothing about
+itself failed, or the bytes are not valid UTF-8) stops with `destination_unverified`, which claims nothing about
 the contents. An in-call conflict at the source without `expected_hash`
 re-reads the source and re-plans the removal only when the moved key
 resolves to exactly one task whose block is byte-identical to what was moved
@@ -2449,7 +2449,10 @@ found it there), a `complete with:` line naming the exact call that finishes
 the move (string arguments as ASCII-only JSON), the destination's
 `content_hash` and `index (destination): …`. Every completing call omits
 `to_expected_hash` or passes a fresh one, and the line says so when the call
-supplied one. An OS error from the destination publication other than
+supplied one. No completing call repeats the original `expected_hash` (a
+concurrent source edit makes it stale): a bare id omits it, and a suffixed id
+is told to `read_note` the source first and pass that `content_hash`. An OS
+error from the destination publication other than
 `PermissionsNotApplied` is `publication_uncertain` (partial) naming both
 completing calls. A plain retry of a partial move is refused `duplicate_task`
 and writes nothing; only `allow_duplicate` adds a copy and only `resume`
@@ -2461,7 +2464,7 @@ two different `rel` paths to one inode (a hard link) are refused
 (`_run_task_write`) around `plan_move_within`: one read, one ladder
 (`to_expected_hash` absent or equal to `expected_hash`), one plan of
 non-overlapping spans over the original text, one publication, one refresh,
-one event; an unchanged result answers `No changes`. No duplicate check
+one event; a task already last among the region's top-level tasks (whatever blank or paragraph lines precede it) is left in place, and that or any unchanged result answers `No changes`. No duplicate check
 against the moved block itself, no block-id check, no partial outcome.
 
 **Refresh, events, usage, rate.** Each published note is refreshed after its
@@ -2522,6 +2525,9 @@ not.
   printed.
 - **L20** A permission-only change to either note during the call is an
   in-call conflict.
+- **L21** The source write's own compare-to-rename window (#431): an outside
+  save of the source between the byte comparison and the rename is
+  overwritten, as with `edit_note`; inherited, not introduced.
 
 ### Metadata and visibility
 

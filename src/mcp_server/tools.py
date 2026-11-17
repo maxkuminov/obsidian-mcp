@@ -9759,7 +9759,9 @@ def _destination_presence(target, k: int, inserted: tuple[str, ...], cap_bytes: 
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
-        return "changed", None
+        # Read, but not text this server can compare: nothing is claimed
+        # about where the moved lines are (implementation review r1).
+        return "unverified", "its bytes are not valid UTF-8"
     if task_write.destination_still_holds(text, k, inserted):
         return "holds", None
     return "changed", None
@@ -9787,6 +9789,18 @@ def _move_call(path: str, task_id: str, to_path: str, *, resume: bool = False,
 _FRESH_HASH = "<the content_hash that read_note returns>"
 
 
+def _completion_source_hash(task_id: str, src_rel: str) -> tuple[str, str | None]:
+    """`(prefix, expected_hash)` for a completing call (implementation review
+    r1): no completing call ever repeats the original call's `expected_hash`,
+    which a concurrent source edit makes stale. A bare id needs no hash; a
+    suffixed id needs a fresh one, so the call is preceded by a source read."""
+    parsed = task_line.parse_id(task_id)
+    if parsed is not None and parsed.suffixed:
+        return (f"read_note(path={_move_arg(src_rel)}) for the source's content_hash, then ",
+                _FRESH_HASH)
+    return "", None
+
+
 def _index_line(label: str, refresh) -> str:
     if refresh is None:
         return f"index ({label}): unchanged"
@@ -9805,9 +9819,10 @@ def _move_incomplete(
     J = dest_id or "none"
     holds = f"holds the task at line {dest_line}, id {J}"
     unchanged = "not changed by this call"
-    plain = _move_call(src_rel, task_id, dst_rel, expected_hash=expected_hash)
-    resume = _move_call(src_rel, task_id, dst_rel, resume=True, expected_hash=expected_hash)
-    reread_hash = _FRESH_HASH if expected_hash is not None else None
+    first, src_hash = _completion_source_hash(task_id, src_rel)
+    plain = _move_call(src_rel, task_id, dst_rel, expected_hash=src_hash)
+    resume = _move_call(src_rel, task_id, dst_rel, resume=True, expected_hash=src_hash)
+    reread_hash = src_hash
     edited = _move_call(src_rel, "<its new id>", dst_rel, allow_duplicate=True)
     if reason == "concurrent_write":
         dest = holds + " (checked before the source write)"
@@ -9846,20 +9861,20 @@ def _move_incomplete(
         dest = (f"no longer holds the moved lines at line {dest_line} (another writer "
                 f"changed the note after {when})")
         src = unchanged
-        complete = (f"{plain}; if that is refused duplicate_task because the copy is still "
+        complete = (f"{first}{plain}; if that is refused duplicate_task because the copy is still "
                     f"elsewhere in `{D}`, {resume}")
     elif reason == "destination_unverified":
         dest = (f"could not be read to check that it still holds the moved lines ({detail}); "
                 "its contents are unverified")
         src = unchanged
-        complete = (f"once `{D}` is readable, read_note(path={_move_arg(dst_rel)}): if it holds "
+        complete = (f"{first}once `{D}` is readable, read_note(path={_move_arg(dst_rel)}): if it holds "
                     f"exactly one byte-identical copy, {resume}; otherwise {plain} (a "
                     f"duplicate_task refusal then names any copy elsewhere in `{D}`)")
     elif reason == "permissions_not_applied":
         dest = holds
         src = (f"not changed by this call: its file permissions could not be applied "
                f"({detail}), so nothing was published")
-        complete = f"{resume} once the permission problem is fixed"
+        complete = f"{first}{resume} once the permission problem is fixed"
     elif reason == "io_failure":
         dest = holds
         src = "unknown: the removal failed part-way; read the note"
@@ -9869,7 +9884,7 @@ def _move_incomplete(
     else:  # the three confirmation markers
         dest = holds
         src = unchanged
-        complete = f"{resume} once the vault assignment is restored"
+        complete = f"{first}{resume} once the vault assignment is restored"
     if to_hash_supplied and dest_published:
         complete += (" (omit to_expected_hash, or pass the destination's fresh content_hash: "
                      "the one this call sent is stale)")
@@ -10140,13 +10155,14 @@ async def _move_between(*, tool, uid, src, dst, path, to_path, task_id, args, ef
         except OSError as e:
             # Row 6: the rename may or may not have happened.
             timing.record("move_outcome", "uncertain")
+            first, src_hash = _completion_source_hash(task_id, src_rel)
             P, D = _escape_task_path(src_rel), _escape_task_path(dst_rel)
             return BodyOutcome(
                 f"{tool}: the write of `{D}` failed part-way ({_move_error_text(e)}), so it may "
                 f"or may not hold the task. `{P}` was not changed.\n"
-                f"complete with: read_note(path={_move_arg(dst_rel)}); if it holds the moved "
-                f"lines, {_move_call(src_rel, task_id, dst_rel, resume=True, expected_hash=expected_hash)}, "
-                f"otherwise {_move_call(src_rel, task_id, dst_rel, expected_hash=expected_hash)}",
+                f"complete with: {first}read_note(path={_move_arg(dst_rel)}); if it holds the moved "
+                f"lines, {_move_call(src_rel, task_id, dst_rel, resume=True, expected_hash=src_hash)}, "
+                f"otherwise {_move_call(src_rel, task_id, dst_rel, expected_hash=src_hash)}",
                 refusals.Refusal(code="publication_uncertain", path=_precondition_path(dst_rel)),
                 disposition="partial",
             )
