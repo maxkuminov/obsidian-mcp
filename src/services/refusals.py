@@ -133,7 +133,8 @@ TASK_MOVE_INCOMPLETE = "task_move_incomplete"
 #: one per row of its outcome table.
 TASK_MOVE_INCOMPLETE_REASONS = frozenset({
     "concurrent_write", "source_missing", "source_changed", "source_ambiguous",
-    "destination_changed", "destination_unverified", "vault_assignment_changed",
+    "destination_changed", "destination_not_a_task", "destination_unverified",
+    "vault_assignment_changed",
     "vault_anchor_lost_at_publish", "vault_confirmation_unavailable",
     "permissions_not_applied", "io_failure",
 })
@@ -254,8 +255,8 @@ class Refusal:
     # `task_move_incomplete` refusal (checked at construction): `path` is
     # then the source note, `destination_path` the destination, `source_id`
     # the id the call named, `destination_id` the moved task's id at the
-    # destination (absent when the destination was found changed or could not
-    # be read), and `reason` one of `TASK_MOVE_INCOMPLETE_REASONS`.
+    # destination (absent when the destination was found changed, no longer a
+    # task, or could not be read), and `reason` one of `TASK_MOVE_INCOMPLETE_REASONS`.
     destination_path: str | None = None
     source_id: str | None = None
     destination_id: str | None = None

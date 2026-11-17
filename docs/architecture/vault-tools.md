@@ -1963,9 +1963,9 @@ Since #430 (`move_task`): `resume_unmatched` and `block_id_conflict` join
 `nothing_written` — the destination was published. Its sentinel carries four
 optional fields that no other code may carry (a `Refusal` construction
 check): `destination_path`, `source_id`, `destination_id` (absent for
-`destination_changed` and `destination_unverified`) and `reason`, one of
+`destination_changed`, `destination_not_a_task` and `destination_unverified`) and `reason`, one of
 `concurrent_write`, `source_missing`, `source_changed`, `source_ambiguous`,
-`destination_changed`, `destination_unverified`, `vault_assignment_changed`,
+`destination_changed`, `destination_not_a_task`, `destination_unverified`, `vault_assignment_changed`,
 `vault_anchor_lost_at_publish`, `vault_confirmation_unavailable`,
 `permissions_not_applied`, `io_failure`. See "Moving a task (#430)".
 
@@ -2421,7 +2421,9 @@ anchored target and requires the moved lines at their position
 pass's own extraction with code masking, still the moved task, its sub-tasks,
 its block and its code masks) — with no `await` between that check and the
 source write. *Holds* lets the write run; *changed* (the lines absent or
-different, or no file) stops with `destination_changed`; *unverified* (the read
+different, or no file) stops with `destination_changed`; the bytes in place but
+no longer read as the task (an unclosed fence above them) stops with
+`destination_not_a_task`, completed by repairing the note and `resume=true`; *unverified* (the read
 itself failed, or the bytes are not valid UTF-8) stops with `destination_unverified`, which claims nothing about
 the contents. An in-call conflict at the source without `expected_hash`
 re-reads the source and re-plans the removal only when the moved key

@@ -1567,10 +1567,11 @@ def test_a_real_move_interrupted_after_the_destination_publish_is_resumable(worl
 
 
 def test_an_unclosed_fence_above_the_moved_lines_stops_the_move(world, monkeypatch):
-    """Review r2: another writer turns the line above the moved lines into an
-    unclosed fence; the moved bytes are still at their position but no longer
-    parse as a task, so the presence check (re-extracting with the pass's
-    extractor) stops with `destination_changed` and the source is kept."""
+    """Review r2/r3: another writer turns the line above the moved lines into
+    an unclosed fence; the moved bytes are still at their position but no
+    longer parse as a task, so the presence check stops with
+    `destination_not_a_task` (not `destination_changed`), the source is kept,
+    and the printed resume works once the fence is closed."""
     write(world, "Inbox.md", "- [ ] x\n")
     write(world, "D.md", "Notes\n")
 
@@ -1580,8 +1581,23 @@ def test_an_unclosed_fence_above_the_moved_lines_stops_the_move(world, monkeypat
 
     confirm_hook(monkeypatch, fence)
     out = run(tools.move_task_impl("Inbox.md", key_of("- [ ] x"), "D.md"))
-    assert payload_of(out)["reason"] == "destination_changed", out
+    p = payload_of(out)
+    assert p["reason"] == "destination_not_a_task", out
+    assert "destination_id" not in p
+    dest = line_of(out, "destination:")
+    assert "still holds the moved lines at line 2" in dest and "no longer read as a task" in dest
+    assert "no longer holds" not in dest
+    complete = line_of(out, "complete with:")
+    assert "close the fence" in complete and "edit_note" in complete
+    resume_call = f'move_task(path="Inbox.md", id="{key_of("- [ ] x")}", to_path="D.md", resume=true)'
+    assert resume_call in complete
     assert read(world, "Inbox.md") == "- [ ] x\n"
+    # Repair the destination (close the fence), then the printed resume completes.
+    monkeypatch.setattr(tools, "confirmed_publication", vault_service.confirmed_publication)
+    write(world, "D.md", "```\n```\n- [ ] x\n")
+    out = run(tools.move_task_impl("Inbox.md", key_of("- [ ] x"), "D.md", resume=True))
+    assert code_of(out) is None, out
+    assert read(world, "Inbox.md") == "" and read(world, "D.md") == "```\n```\n- [ ] x\n"
 
 
 def test_every_completing_call_is_rendered_by_one_helper():

@@ -9767,6 +9767,9 @@ def _destination_presence(target, k: int, moved, cap_bytes: int) -> tuple[str, s
     # keeps the bytes but hides the task).
     if task_write.destination_still_holds_task(text, k, moved):
         return "holds", None
+    if task_write.destination_still_holds(text, k, moved.lines):
+        # The bytes are in place but no longer read as the task (review r3).
+        return "not_a_task", None
     return "changed", None
 
 
@@ -9876,6 +9879,13 @@ def _move_incomplete(
         src = unchanged
         complete = (f"{plain}; if that is refused duplicate_task because the copy is still "
                     f"elsewhere in `{D}`, {resume}")
+    elif reason == "destination_not_a_task":
+        dest = (f"still holds the moved lines at line {dest_line}, but they no longer read as a "
+                "task there (for example, they are inside an unclosed code fence)")
+        src = "not changed by this call: it still holds the task as this call read it"
+        complete = (f"repair `{D}` so the lines read as a task again (for example, close the "
+                    f"fence), then {resume}; if `{D}` cannot be repaired, the task is safe in the "
+                    f"source and the copy in `{D}` can be removed by hand with edit_note")
     elif reason == "destination_unverified":
         dest = (f"could not be read to check that it still holds the moved lines ({detail}); "
                 "its contents are unverified")
@@ -9918,7 +9928,8 @@ def _move_incomplete(
             path=_precondition_path(src_rel),
             destination_path=_precondition_path(dst_rel),
             source_id=task_id,
-            destination_id=(None if reason in ("destination_changed", "destination_unverified")
+            destination_id=(None if reason in ("destination_changed", "destination_unverified",
+                                               "destination_not_a_task")
                             else dest_id),
             reason=reason,
         ),
@@ -10224,8 +10235,9 @@ async def _move_between(*, tool, uid, src, dst, path, to_path, task_id, args, ef
         try:
             err, _ = await _confirmed_publication(uid, publish_source)
         except _DestinationCheckFailed as exc:
-            return incomplete("destination_changed" if exc.state == "changed" else "destination_unverified",
-                              detail=exc.detail)
+            reason = {"changed": "destination_changed",
+                      "not_a_task": "destination_not_a_task"}.get(exc.state, "destination_unverified")
+            return incomplete(reason, detail=exc.detail)
         except VaultConfirmationUnavailable:
             return incomplete(_CONFIRMATION_UNAVAILABLE_MARKER)
         except UnconfirmedPublication:
