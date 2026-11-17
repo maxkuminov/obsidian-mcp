@@ -1223,13 +1223,13 @@ The classification SHALL be:
 | `openWorldHint=true` | exactly `import_from_url` |
 | `idempotentHint=true` | exactly the read-only set |
 
-The write-bucket set used for these comparisons SHALL be derived from the production tools only, so that a `_tracked(write_class=True)` decoration performed by a test module cannot change it. An undo path through `.trash/` SHALL NOT make a deleting tool non-destructive.
+The write-bucket set used for these comparisons SHALL be derived from the production tools only, so that a `_tracked(write_class=True)` decoration performed by a test module cannot change it. An undo path through `.trash/` SHALL NOT make a deleting tool non-destructive. `move_task` (#430) removes lines from its source note and is therefore destructive under this rule.
 
 The classification is a statement about the registry and the full list. A filtered list SHALL carry each kept tool's annotations unchanged. Annotations are a client-side hint, and no server-side gate SHALL consult them. The tool-list filter SHALL NOT consult them either: it reads the write-required registry `WRITE_REQUIRED_TOOLS`. Read-only enforcement SHALL remain `_tracked`'s admission and `_require_write`'s permission check, unchanged.
 
 #### Scenario: Every listed tool carries complete metadata
 - **WHEN** a client authenticated with an API key lists tools
-- **THEN** each of the 32 tools SHALL carry a non-empty `title`, distinct from every other tool's
+- **THEN** each of the 33 tools SHALL carry a non-empty `title`, distinct from every other tool's
 - **AND** each SHALL carry `annotations` with `readOnlyHint`, `destructiveHint`, `idempotentHint` and `openWorldHint` each `true` or `false`, none absent
 
 #### Scenario: The read tools are marked read-only
@@ -1239,13 +1239,13 @@ The classification is a statement about the registry and the full list. A filter
 
 #### Scenario: The destructive set is the write bucket minus the additive writers plus request_upload
 - **WHEN** the set of tools carrying `destructiveHint=true` is compared with the production write-bucket set, read from the code rather than from a list kept in the test
-- **THEN** the destructive set SHALL equal the write-bucket set with `create_note` and `add_task` removed and `request_upload` added: `edit_note`, `move_note`, `delete_note`, `set_frontmatter`, `write_file`, `delete_file`, `import_from_url`, `complete_task`, `update_task`, `request_upload`
+- **THEN** the destructive set SHALL equal the write-bucket set with `create_note` and `add_task` removed and `request_upload` added: `edit_note`, `move_note`, `delete_note`, `set_frontmatter`, `write_file`, `delete_file`, `import_from_url`, `complete_task`, `update_task`, `move_task`, `request_upload`
 - **AND** the write-bucket set SHALL equal the `write` class of `concurrency.TOOL_CLASSES`
 - **AND** `create_note`, `add_task` and `request_download` SHALL carry `readOnlyHint=false` and `destructiveHint=false`
 
 #### Scenario: A test probe cannot pollute the write-bucket set
 - **WHEN** a test module decorates a function with `_tracked("probe_write", [], write_class=True)` and another with `_tracked("edit_note", [], write_class=False)`, without registering either on the production server
-- **THEN** the production write-bucket set the metadata test derives SHALL be unchanged: still exactly the eleven production tools
+- **THEN** the production write-bucket set the metadata test derives SHALL be unchanged: still exactly the twelve production tools
 
 #### Scenario: Only import_from_url is open-world
 - **WHEN** a client authenticated with an API key lists tools
@@ -1253,7 +1253,7 @@ The classification is a statement about the registry and the full list. A filter
 - **AND** every other tool SHALL carry `openWorldHint=false`
 
 #### Scenario: A hint gates nothing
-- **WHEN** a credential with read-only permission calls `edit_note`, `create_note`, `complete_task`, `add_task` or `request_upload`
+- **WHEN** a credential with read-only permission calls `edit_note`, `create_note`, `complete_task`, `add_task`, `move_task` or `request_upload`
 - **THEN** the call SHALL be refused with `permission_denied` by `_require_write`, exactly as for the pre-existing write tools
 - **AND** no code path that admits or refuses a tool call SHALL read the tool's `annotations`
 
@@ -1320,13 +1320,13 @@ Every tool's published description — the string the registry holds, which is t
 - **AND** the extractor SHALL accept `read_note.frontmatter_yaml` and SHALL flag `read_notes.frontmatter_yaml`
 
 ### Requirement: Tool metadata SHALL leave the published tool surface otherwise unchanged
-Adding titles, annotations and instructions, and shortening descriptions, SHALL NOT change the set of tool names, their listing order, any tool's `inputSchema`, or any tool's `outputSchema`.
+Adding titles, annotations and instructions, and shortening descriptions, SHALL NOT change the name, listing position, `inputSchema` or `outputSchema` of any existing tool; a change that adds a tool SHALL only append it to the listing (the task-move change appends `move_task`, #430, after the 32 existing tools, whose names, order and schemas stay unchanged).
 
 **Which list.** These statements describe the **full list**: the list served to every principal the `scoped-tools-list` rule does not filter (an API key of either permission, an OAuth grant with `readwrite`, sandbox mode, and an in-process caller with no principal). The list a read-only OAuth grant receives is defined by that rule as this list minus its hidden entries.
 
 **Fixtures.**
 - The first 25 entries of the full listing SHALL be compared against the frozen fixture generated from the registry on `main` at 5a391ca.
-- Every entry after them SHALL be compared, in order, against `tests/fixtures/tools_list_schema_additions.json`, which a tool-adding change regenerates deliberately. Its entries are `list_tasks` (#350), `get_changes` (#351), `hybrid_search` (#354), and then the task-tools change's `task_agenda`, `complete_task`, `update_task` and `add_task`. The listing therefore holds 32 tools.
+- Every entry after them SHALL be compared, in order, against `tests/fixtures/tools_list_schema_additions.json`, which a tool-adding change regenerates deliberately. Its entries are `list_tasks` (#350), `get_changes` (#351), `hybrid_search` (#354), then the task-tools change's `task_agenda`, `complete_task`, `update_task` and `add_task`, and then the task-move change's `move_task` (#430). The listing therefore holds 33 tools.
 - A deliberate schema change to one of the first 25 tools SHALL be recorded as a full replacement entry in `tests/fixtures/tools_list_schema_amendments.json`, and that entry SHALL be compared instead of the frozen one. The frozen fixture itself SHALL NOT be edited.
 
 **Recorded changes.**
@@ -1337,13 +1337,14 @@ Adding titles, annotations and instructions, and shortening descriptions, SHALL 
 | `hybrid-search` (#354) | no amendment: the three search tools' descriptions change and their schemas do not |
 | reranker (#367) | a third amendment, `semantic_search`, differing from its frozen entry only by the optional boolean `rerank` input property (default false); it also regenerates the `hybrid_search` additions entry, which then differs from its #354 form only by the same optional `rerank` property |
 | task-tools | regenerates the `list_tasks` additions entry, which differs from its prior form only by its description and by optional input properties (`due_from`, `scheduled_from`, `done_from`, `done_by`, `undated`, `has_due`, `text`, `priority`, `recurring`, `exclude_tags`, `path`, `order_by`, `detail`, `context`, `scope`), none of them required |
+| task-move (#430) | appends the `move_task` additions entry; no other entry of any fixture changes |
 
 A schema change to an existing tool SHALL be a deliberate fixture regeneration and never a side effect.
 
 #### Scenario: The same 25 tools in the same order, then the additions
 - **WHEN** a client authenticated with an API key lists tools, and again when the listing is taken in-process with no principal
 - **THEN** the first 25 names SHALL equal the sequence recorded in `tests/fixtures/tools_list_schema_5a391ca.json`
-- **AND** the remaining names SHALL equal the sequence recorded in `tests/fixtures/tools_list_schema_additions.json`, which after this change is exactly `list_tasks`, `get_changes`, `hybrid_search`, `task_agenda`, `complete_task`, `update_task`, `add_task`, for 32 tools in all
+- **AND** the remaining names SHALL equal the sequence recorded in `tests/fixtures/tools_list_schema_additions.json`, which after this change is exactly `list_tasks`, `get_changes`, `hybrid_search`, `task_agenda`, `complete_task`, `update_task`, `add_task`, `move_task`, for 33 tools in all
 
 #### Scenario: Every schema is identical to the fixture
 - **WHEN** each tool's `inputSchema` and `outputSchema` are compared with the entry of the same name in the amendments fixture if it holds one, and otherwise in whichever of the two other fixtures holds it
@@ -1356,8 +1357,8 @@ A schema change to an existing tool SHALL be a deliberate fixture regeneration a
 - **THEN** every predecessor property SHALL be present with an identical schema, every new property SHALL be optional, and `required` SHALL be unchanged
 
 #### Scenario: Unknown-argument refusal is unaffected
-- **WHEN** `tests/test_issue_295_unknown_arguments.py` runs with its tool count at 32
-- **THEN** it SHALL pass, and every `inputSchema`, the four new tools' included, SHALL carry `additionalProperties: false`
+- **WHEN** `tests/test_issue_295_unknown_arguments.py` runs with its tool count at 33
+- **THEN** it SHALL pass, and every `inputSchema`, `move_task`'s included, SHALL carry `additionalProperties: false`
 
 #### Scenario: The semantic_search amendment carries only rerank
 - **WHEN** the `semantic_search` amendment entry is compared with its frozen entry
@@ -1369,14 +1370,14 @@ A schema change to an existing tool SHALL be a deliberate fixture regeneration a
 
 #### Scenario: The full list is byte-identical to the committed oracle
 - **WHEN** `tools/list` is requested over HTTP with a `readwrite` API key, a `read` API key, and a `readwrite` OAuth grant
-- **THEN** each `result` object, serialised canonically (UTF-8 JSON, keys sorted, no insignificant whitespace), SHALL be byte-identical to `tests/fixtures/tools_list_full_v2.json`. That file is the complete `tools/list` result: all 32 tools, every field (`name`, `title`, `description`, `inputSchema`, `outputSchema`, `annotations`, and any other field the SDK serialises), generated deliberately by the task-tools change
-- **AND** `tests/fixtures/tools_list_full_v1.json` SHALL be kept unedited as the 1.0 record, and a test SHALL assert that v2, with the four task-tools entries removed, equals v1 except for `list_tasks`'s description and its added optional input properties
-- **AND** the v2 oracle SHALL be edited only by a change that deliberately alters the published tool surface, which then states the edit in its own spec delta
+- **THEN** each `result` object, serialised canonically (UTF-8 JSON, keys sorted, no insignificant whitespace), SHALL be byte-identical to `tests/fixtures/tools_list_full_v3.json`. That file is the complete `tools/list` result: all 33 tools, every field (`name`, `title`, `description`, `inputSchema`, `outputSchema`, `annotations`, and any other field the SDK serialises), generated deliberately by the task-move change
+- **AND** `tests/fixtures/tools_list_full_v1.json` and `tests/fixtures/tools_list_full_v2.json` SHALL be kept unedited as the 1.0 and 1.3 records; a test SHALL assert that v3 with the `move_task` entry removed equals v2 byte for byte under the canonical serialisation, and the existing test deriving v1 from v2 SHALL keep passing
+- **AND** the v3 oracle SHALL be edited only by a change that deliberately alters the published tool surface, which then states the edit in its own spec delta
 
 ### Requirement: `tools/list` SHALL omit the write-requiring tools for an OAuth grant without the `readwrite` scope, and only for it
 When the request's principal is an OAuth grant (`current_principal` of kind `"oauth"`) and the request's permission is not `readwrite`, the `tools/list` result SHALL be the full list with every tool named in the write-required registry (`WRITE_REQUIRED_TOOLS`) removed. The permission is `current_permission`, the value `_require_write` reads, derived from the token's scope by `token_has_write`. The kept tools SHALL appear in the full list's order, each entry identical to its full-list entry.
 
-**The registry** SHALL name exactly `create_note`, `edit_note`, `move_note`, `delete_note`, `set_frontmatter`, `write_file`, `delete_file`, `import_from_url`, `request_upload`, `complete_task`, `update_task` and `add_task`, so such a grant lists 20.
+**The registry** SHALL name exactly `create_note`, `edit_note`, `move_note`, `delete_note`, `set_frontmatter`, `write_file`, `delete_file`, `import_from_url`, `request_upload`, `complete_task`, `update_task`, `add_task` and `move_task`, so such a grant lists 20.
 
 **Everyone else** gets the full list: an API-key principal of either permission, an OAuth grant with `readwrite`, `MCP_SANDBOX_MODE`, the stdio entry point, and any in-process call with no principal.
 
@@ -1390,16 +1391,16 @@ When the request's principal is an OAuth grant (`current_principal` of kind `"oa
 
 #### Scenario: A read-only grant lists 20 tools in a fixed order
 - **WHEN** an OAuth grant whose scope lacks `readwrite` sends `tools/list`
-- **THEN** the result SHALL list exactly the names in `tests/fixtures/tools_list_readonly_oauth.json`, in this order: `keyword_search`, `read_note`, `list_notes`, `get_tags`, `get_recent`, `semantic_search`, `get_vault_guide`, `get_backlinks`, `get_links`, `get_neighborhood`, `find_related`, `find_orphans`, `read_file`, `list_files`, `check_upload`, `request_download`, `list_tasks`, `get_changes`, `hybrid_search`, `task_agenda`
-- **AND** each entry SHALL be byte-identical, under the canonical serialisation, to the entry of the same name in `tests/fixtures/tools_list_full_v2.json`
+- **THEN** the result SHALL list exactly the names in `tests/fixtures/tools_list_readonly_oauth.json`, which this change does not edit, in this order: `keyword_search`, `read_note`, `list_notes`, `get_tags`, `get_recent`, `semantic_search`, `get_vault_guide`, `get_backlinks`, `get_links`, `get_neighborhood`, `find_related`, `find_orphans`, `read_file`, `list_files`, `check_upload`, `request_download`, `list_tasks`, `get_changes`, `hybrid_search`, `task_agenda`
+- **AND** each entry SHALL be byte-identical, under the canonical serialisation, to the entry of the same name in `tests/fixtures/tools_list_full_v3.json`
 
 #### Scenario: Full list for everyone else
 - **WHEN** `tools/list` is sent with a `readwrite` OAuth grant, a `readwrite` API key or a `read` API key
-- **THEN** the result SHALL list all 32 tools in the full list's order
+- **THEN** the result SHALL list all 33 tools in the full list's order
 
 #### Scenario: Sandbox and in-process callers get the full list
 - **WHEN** `tools/list` is served with `MCP_SANDBOX_MODE=true`, or `await mcp.list_tools()` is called with no principal set
-- **THEN** the result SHALL list all 32 tools
+- **THEN** the result SHALL list all 33 tools
 
 #### Scenario: An unauthenticated list never reaches the handler
 - **WHEN** `tools/list` is sent to `/mcp` with no credential and sandbox mode is off
@@ -1438,13 +1439,13 @@ When the request's principal is an OAuth grant (`current_principal` of kind `"oa
 - **THEN** the pre-body gate SHALL NOT refuse it (the in-body check still does), proving the gate reads the registry; and when a read-only tool's name is added, the pre-body gate SHALL refuse it and `tools/list` SHALL hide it
 
 #### Scenario: Reconciliation with the call sites
-- **WHEN** each of the 28 registered tools is called with minimal valid arguments under a read-only OAuth principal
+- **WHEN** each of the 33 registered tools is called with minimal valid arguments under a read-only OAuth principal
 - **THEN** the tools refused with `permission_denied` SHALL be exactly `WRITE_REQUIRED_TOOLS`
 - **AND** an AST scan of `src/mcp_server/tools.py` SHALL find every `_require_write()` and `_mint_preflight(…, need_write=True)` call inside a tool implementation whose `_tracked` name is in the registry
 
 #### Scenario: Reconciliation with the other derived sets
 - **WHEN** the registry is compared with the production write-bucket set and the `destructiveHint=true` set
-- **THEN** it SHALL equal the write-bucket set plus `request_upload`, and the destructive set plus `create_note`
+- **THEN** it SHALL equal the write-bucket set plus `request_upload`, and the destructive set plus `create_note` and `add_task`
 - **AND** it SHALL NOT contain `request_download` or `check_upload`, and SHALL be a subset of the registered tool names
 
 ### Requirement: Hiding a tool from `tools/list` SHALL NOT change whether a call to it is admitted or refused
