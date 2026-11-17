@@ -1519,6 +1519,30 @@ because the agent's own `modified` line already describes those bytes.
 `edit_note`, or `move_note` it to an ordinary name, after which the next
 pass indexes it.
 
+## Upgrading to the task-move release (#430)
+
+No migration, no new setting and no operator step. One new tool,
+`move_task`, moves a top-level task with the lines indented under it to
+another note or section, destination first.
+
+- **33 tools.** A read-only OAuth grant still lists 20: `move_task` needs
+  write permission and joins `WRITE_REQUIRED_TOOLS` (13 names), so it is
+  hidden from such a grant. API keys and `readwrite` grants list 33.
+- **The write bucket covers twelve tools.** `move_task` takes one write
+  token per call (`MCP_WRITE_RATE_LIMIT_*`), however many notes it
+  publishes.
+- **A new concurrency-readiness epoch.** `move_task` joins the `write`
+  class, so `CLASS_MAPPING_VERSION` moves from 6 to 7. The mapping version
+  is part of the readiness epoch: evidence gathered before the upgrade does
+  not count, and a window that spans it reads `INSUFFICIENT_DATA`. Collect
+  a fresh window before promoting `MCP_CONCURRENCY_MODE`. The tool ceilings
+  and their defaults are unchanged.
+- **New refusal codes:** `task_move_incomplete` (partial: the destination
+  was written, the source was not, and the response names the call that
+  completes the move), `resume_unmatched` and `block_id_conflict`.
+- **Rollback** is a plain redeploy of the previous image; a client still
+  calling `move_task` is then refused as an unknown tool.
+
 ## Upgrading across migration 040 (task rule, #434)
 
 This release adds a per-user **task rule**: which markdown checkboxes count

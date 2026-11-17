@@ -814,6 +814,7 @@ The task tools log through the same `_tracked` named-parameter list and the
 | `complete_task` | `path`, `id`, `done_on`, `dry_run`, `expected_hash` (as presence: `true` / `false`) | `task_refresh`, `task_write_attempts` |
 | `update_task` | `path`, `id`, `status`, `clear`, `dry_run`, `expected_hash` (presence) | `fields` (the **names** of the fields set), `task_refresh`, `task_write_attempts` |
 | `add_task` | `path`, `section`, `dry_run`, `allow_duplicate` | `similar_count`, `task_refresh`, `task_write_attempts` |
+| `move_task` (#430) | `path`, `id`, `to_path`, `to_section`, `dry_run`, `allow_duplicate`, `resume`, `expected_hash` and `to_expected_hash` (each as presence) | `move_outcome`, `task_refresh` (source), `task_refresh_to` (destination), `task_write_attempts` (as `<phase 1>/<phase 2>`) |
 | `task_agenda` | `date`, `days`, `folder`, `tags`, `exclude_tags`, `scope` | |
 | `list_tasks` | the #350 arguments plus every new one, `text` included | |
 
@@ -837,8 +838,20 @@ The task tools log through the same `_tracked` named-parameter list and the
 - `task_write_attempts` appears only when the in-call conflict retry ran (2
   or 3); `similar_count` is the number of similar open tasks `add_task`
   listed.
+- **`move_task` (#430)** records `move_outcome` — `moved`, `moved_within`,
+  `resumed`, `no_change`, `incomplete:<reason>` (the `task_move_incomplete`
+  reason) or `uncertain` (`publication_uncertain` at the destination); none
+  for a dry run or a refusal. `task_refresh` is the source's refresh and
+  `task_refresh_to` the destination's (`skipped` for a dry run, for a
+  `resume`, which publishes no destination bytes, and for the source of a
+  partial outcome). `task_write_attempts` reads `<phase 1>/<phase 2>` (for
+  example `1/2`: the source removal was retried once) and appears only when
+  either phase retried. The outcome is classified from the typed
+  `BodyOutcome` only: `task_move_incomplete` and `publication_uncertain` are
+  `disposition="partial"`.
 - Attribution, actor columns and change-feed principals are exactly
-  `edit_note`'s, with `tool` set to the task tool's name.
+  `edit_note`'s, with `tool` set to the task tool's name (`move_task`
+  records one `modified` event per note it published).
 
 ## The change feed's actor columns (#351)
 
