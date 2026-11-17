@@ -54,8 +54,8 @@ There are four slices (design §"Slice plan"): **M1** and **M2** in wave 1, in p
 ## 5. Verification on the merged result
 
 - [x] 5.1 Grep for a production caller of every seam in design §"Slice plan".
-- [ ] 5.2 Full offline suite; the task and move integration modules on a throwaway database; `openspec validate task-move --strict`.
-- [ ] 5.3 `openspec-verifier` against this change.
-- [ ] 5.4 Adversarial Codex, mandatory (a write tool on the destructive-write surface): focused passes over the 48 scenarios in design §"Adversarial scenarios", each traced to SAFE or a finding with file and line; triage per the review budget.
+- [x] 5.2 Full offline suite; the task and move integration modules on a throwaway database; `openspec validate task-move --strict`.
+- [x] 5.3 `openspec-verifier` against this change.
+- [x] 5.4 Adversarial Codex, mandatory (a write tool on the destructive-write surface): focused passes over the 48 scenarios in design §"Adversarial scenarios", each traced to SAFE or a finding with file and line; triage per the review budget.
 - [ ] 5.5 After deploy: an end-to-end exercise of `move_task` against the live server (two notes, same note, a task with an indented sub-task, a nested task refused, a dry run, the duplicate refusal by moving onto an identical copy, then `resume=true` on it; a partial outcome cannot be forced live), naming the tools actually called. No `user-representative` pass (no panel change).
 - [ ] 5.6 Archive with `openspec archive task-move -y` as the last commit of the feature branch, with the docs.
