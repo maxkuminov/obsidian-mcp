@@ -9746,7 +9746,7 @@ def _move_error_text(exc: BaseException) -> str:
     return _task_quote(f"{name}: {exc}", 160)
 
 
-def _destination_presence(target, k: int, inserted: tuple[str, ...], cap_bytes: int) -> tuple[str, str | None]:
+def _destination_presence(target, k: int, moved, cap_bytes: int) -> tuple[str, str | None]:
     """D10 6(b), synchronous: ``holds``, ``changed`` (read, or no file at the
     name, and the lines are absent or different at line ``k``) or
     ``unverified`` (the read itself failed: no claim about the contents)."""
@@ -9762,7 +9762,10 @@ def _destination_presence(target, k: int, inserted: tuple[str, ...], cap_bytes: 
         # Read, but not text this server can compare: nothing is claimed
         # about where the moved lines are (implementation review r1).
         return "unverified", "its bytes are not valid UTF-8"
-    if task_write.destination_still_holds(text, k, inserted):
+    # The moved lines at their position AND still the moved task under the
+    # pass's own extraction (review r2: an unclosed fence opened above them
+    # keeps the bytes but hides the task).
+    if task_write.destination_still_holds_task(text, k, moved):
         return "holds", None
     return "changed", None
 
@@ -9786,19 +9789,31 @@ def _move_call(path: str, task_id: str, to_path: str, *, resume: bool = False,
     return "move_task(" + ", ".join(parts) + ")"
 
 
-_FRESH_HASH = "<the content_hash that read_note returns>"
+def _fresh_source_hash(src_rel: str) -> str:
+    return f"<the content_hash that read_note(path={_move_arg(src_rel)}) returns>"
 
 
-def _completion_source_hash(task_id: str, src_rel: str) -> tuple[str, str | None]:
-    """`(prefix, expected_hash)` for a completing call (implementation review
-    r1): no completing call ever repeats the original call's `expected_hash`,
-    which a concurrent source edit makes stale. A bare id needs no hash; a
-    suffixed id needs a fresh one, so the call is preceded by a source read."""
+def _completing_call(src_rel: str, task_id: str, dst_rel: str, *, resume: bool = False,
+                     allow_duplicate: bool = False) -> str:
+    """The ONE renderer of every `complete with:` call (implementation
+    review r1, r2). No completing call ever carries the original call's
+    `expected_hash` (a concurrent source edit makes it stale). The id it
+    names decides the hash: a concrete bare id needs none; a concrete
+    suffixed id, or the `<key>.<i>of<n>` placeholder, needs the source's
+    fresh `content_hash`, named as the value a `read_note` of the source
+    returns; a placeholder id the caller will take from a current listing
+    (`<its new id>`, `<its current id>`) may be suffixed, so the call says to
+    add that hash when it is."""
     parsed = task_line.parse_id(task_id)
-    if parsed is not None and parsed.suffixed:
-        return (f"read_note(path={_move_arg(src_rel)}) for the source's content_hash, then ",
-                _FRESH_HASH)
-    return "", None
+    fresh = _fresh_source_hash(src_rel)
+    if parsed is not None:
+        return _move_call(src_rel, task_id, dst_rel, resume=resume, allow_duplicate=allow_duplicate,
+                          expected_hash=fresh if parsed.suffixed else None)
+    if ".<i>of<n>" in task_id:
+        return _move_call(src_rel, task_id, dst_rel, resume=resume, allow_duplicate=allow_duplicate,
+                          expected_hash=fresh)
+    return (_move_call(src_rel, task_id, dst_rel, resume=resume, allow_duplicate=allow_duplicate)
+            + f" (adding expected_hash={fresh} if that id carries a .<i>of<n> suffix)")
 
 
 def _index_line(label: str, refresh) -> str:
@@ -9819,11 +9834,9 @@ def _move_incomplete(
     J = dest_id or "none"
     holds = f"holds the task at line {dest_line}, id {J}"
     unchanged = "not changed by this call"
-    first, src_hash = _completion_source_hash(task_id, src_rel)
-    plain = _move_call(src_rel, task_id, dst_rel, expected_hash=src_hash)
-    resume = _move_call(src_rel, task_id, dst_rel, resume=True, expected_hash=src_hash)
-    reread_hash = src_hash
-    edited = _move_call(src_rel, "<its new id>", dst_rel, allow_duplicate=True)
+    plain = _completing_call(src_rel, task_id, dst_rel)
+    resume = _completing_call(src_rel, task_id, dst_rel, resume=True)
+    edited = _completing_call(src_rel, "<its new id>", dst_rel, allow_duplicate=True)
     if reason == "concurrent_write":
         dest = holds + " (checked before the source write)"
         src = ("another writer changed it during this call; this call did not remove the "
@@ -9831,9 +9844,9 @@ def _move_incomplete(
         complete = (
             f"read_note(path={_move_arg(src_rel)}), then: if id {task_id} still resolves to a "
             "block byte-identical to the moved one, "
-            + _move_call(src_rel, task_id, dst_rel, resume=True, expected_hash=reread_hash)
+            + resume
             + "; if the key resolves once with a different block, "
-            + _move_call(src_rel, "<its current id>", dst_rel, allow_duplicate=True)
+            + _completing_call(src_rel, "<its current id>", dst_rel, allow_duplicate=True)
             + "; if it is absent, nothing (it was removed or moved), or if its text was "
             f"edited, list_tasks(path={_move_arg(src_rel)}) for its new id and {edited}"
         )
@@ -9848,43 +9861,43 @@ def _move_incomplete(
         dest = holds
         src = (f"holds an edited version of the task, id {current_id}; it was not removed, "
                "so the edit is kept")
-        complete = _move_call(src_rel, current_id or "<its current id>", dst_rel, allow_duplicate=True)
+        complete = _completing_call(src_rel, current_id or "<its current id>", dst_rel,
+                                    allow_duplicate=True)
     elif reason == "source_ambiguous":
         dest = holds
         src = "now holds several identical tasks with this text; none was removed"
         complete = (f"read_note(path={_move_arg(src_rel)}), then "
-                    + _move_call(src_rel, "<key>.<i>of<n>", dst_rel, resume=True,
-                                 expected_hash=_FRESH_HASH)
+                    + _completing_call(src_rel, "<key>.<i>of<n>", dst_rel, resume=True)
                     + " naming the copy to remove")
     elif reason == "destination_changed":
         when = "this call wrote it" if dest_published else "this call read it"
         dest = (f"no longer holds the moved lines at line {dest_line} (another writer "
                 f"changed the note after {when})")
         src = unchanged
-        complete = (f"{first}{plain}; if that is refused duplicate_task because the copy is still "
+        complete = (f"{plain}; if that is refused duplicate_task because the copy is still "
                     f"elsewhere in `{D}`, {resume}")
     elif reason == "destination_unverified":
         dest = (f"could not be read to check that it still holds the moved lines ({detail}); "
                 "its contents are unverified")
         src = unchanged
-        complete = (f"{first}once `{D}` is readable, read_note(path={_move_arg(dst_rel)}): if it holds "
+        complete = (f"once `{D}` is readable, read_note(path={_move_arg(dst_rel)}): if it holds "
                     f"exactly one byte-identical copy, {resume}; otherwise {plain} (a "
                     f"duplicate_task refusal then names any copy elsewhere in `{D}`)")
     elif reason == "permissions_not_applied":
         dest = holds
         src = (f"not changed by this call: its file permissions could not be applied "
                f"({detail}), so nothing was published")
-        complete = f"{first}{resume} once the permission problem is fixed"
+        complete = f"{resume} once the permission problem is fixed"
     elif reason == "io_failure":
         dest = holds
         src = "unknown: the removal failed part-way; read the note"
         complete = (f"read_note(path={_move_arg(src_rel)}); if it still holds the task, "
-                    + _move_call(src_rel, task_id, dst_rel, resume=True, expected_hash=reread_hash)
+                    + resume
                     + "; otherwise the move is complete")
     else:  # the three confirmation markers
         dest = holds
         src = unchanged
-        complete = f"{first}{resume} once the vault assignment is restored"
+        complete = f"{resume} once the vault assignment is restored"
     if to_hash_supplied and dest_published:
         complete += (" (omit to_expected_hash, or pass the destination's fresh content_hash: "
                      "the one this call sent is stale)")
@@ -10155,14 +10168,13 @@ async def _move_between(*, tool, uid, src, dst, path, to_path, task_id, args, ef
         except OSError as e:
             # Row 6: the rename may or may not have happened.
             timing.record("move_outcome", "uncertain")
-            first, src_hash = _completion_source_hash(task_id, src_rel)
             P, D = _escape_task_path(src_rel), _escape_task_path(dst_rel)
             return BodyOutcome(
                 f"{tool}: the write of `{D}` failed part-way ({_move_error_text(e)}), so it may "
                 f"or may not hold the task. `{P}` was not changed.\n"
-                f"complete with: {first}read_note(path={_move_arg(dst_rel)}); if it holds the moved "
-                f"lines, {_move_call(src_rel, task_id, dst_rel, resume=True, expected_hash=src_hash)}, "
-                f"otherwise {_move_call(src_rel, task_id, dst_rel, expected_hash=src_hash)}",
+                f"complete with: read_note(path={_move_arg(dst_rel)}); if it holds the moved "
+                f"lines, {_completing_call(src_rel, task_id, dst_rel, resume=True)}, "
+                f"otherwise {_completing_call(src_rel, task_id, dst_rel)}",
                 refusals.Refusal(code="publication_uncertain", path=_precondition_path(dst_rel)),
                 disposition="partial",
             )
@@ -10204,7 +10216,7 @@ async def _move_between(*, tool, uid, src, dst, path, to_path, task_id, args, ef
         def publish_source(c, r=removal, o=src_bytes):
             # D10 6(b) then 6(c), synchronously: no suspension point between
             # the presence check and the source write.
-            state, detail = _destination_presence(dst, dest_line, moved.lines, cap_bytes)
+            state, detail = _destination_presence(dst, dest_line, moved, cap_bytes)
             if state != "holds":
                 raise _DestinationCheckFailed(state, detail)
             return write_file_at(src, r.new_text, expected=o, confirmation=c)

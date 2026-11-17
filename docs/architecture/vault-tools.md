@@ -2417,7 +2417,9 @@ conflict without `to_expected_hash` repeats from reading both notes, at most
 Phase 2 publishes the source removal through **one** confirmed publication
 whose synchronous callback first re-reads the destination through its
 anchored target and requires the moved lines at their position
-(`destination_still_holds`) — with no `await` between that check and the
+(`destination_still_holds_task`: the bytes at their position and, under the
+pass's own extraction with code masking, still the moved task, its sub-tasks,
+its block and its code masks) — with no `await` between that check and the
 source write. *Holds* lets the write run; *changed* (the lines absent or
 different, or no file) stops with `destination_changed`; *unverified* (the read
 itself failed, or the bytes are not valid UTF-8) stops with `destination_unverified`, which claims nothing about
@@ -2450,8 +2452,10 @@ the move (string arguments as ASCII-only JSON), the destination's
 `content_hash` and `index (destination): …`. Every completing call omits
 `to_expected_hash` or passes a fresh one, and the line says so when the call
 supplied one. No completing call repeats the original `expected_hash` (a
-concurrent source edit makes it stale): a bare id omits it, and a suffixed id
-is told to `read_note` the source first and pass that `content_hash`. An OS
+concurrent source edit makes it stale); one helper (`_completing_call`)
+renders every call: none for a bare id, the source's fresh `content_hash`
+for a suffixed id, and, for an id taken from a listing, an instruction to
+add it if the id carries a suffix. An OS
 error from the destination publication other than
 `PermissionsNotApplied` is `publication_uncertain` (partial) naming both
 completing calls. A plain retry of a partial move is refused `duplicate_task`

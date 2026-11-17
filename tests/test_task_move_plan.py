@@ -554,3 +554,14 @@ def test_same_note_already_in_place_with_lines_before_it(between):
     assert plan.changed is False and plan.spans == () and plan.new_text == note
     whole = tw.plan_move_within(f"- [ ] b\n{between}- [ ] c\n", args("- [ ] c"), None)
     assert whole.changed is False
+
+
+def test_destination_still_holds_task_requires_the_task_not_just_the_bytes():
+    """D10 6(b) full form (review r2): bytes in place but hidden by an
+    unclosed fence, or a block that gained a line, do not hold."""
+    plan = ok("- [ ] x\n    - c\n", "Notes\n", "- [ ] x")
+    k = plan.dest_lines[0]
+    assert tw.destination_still_holds_task(plan.insert.new_text, k, plan.moved)
+    assert not tw.destination_still_holds_task("```\n- [ ] x\n    - c\n", k, plan.moved)
+    assert not tw.destination_still_holds_task("Notes\n- [ ] x\n    - c\n    - extra\n", k, plan.moved)
+    assert not tw.destination_still_holds_task("Top\nNotes\n- [ ] x\n    - c\n", k, plan.moved)

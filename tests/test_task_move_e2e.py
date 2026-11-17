@@ -1531,8 +1531,8 @@ def test_a_suffixed_id_completing_call_reads_the_source_first(world, monkeypatch
     out = run(tools.move_task_impl("Inbox.md", f"{k}.1of2", "B.md", expected_hash=h(note)))
     assert code_of(out) == "task_move_incomplete", out
     complete = line_of(out, "complete with:")
-    assert complete.startswith('complete with: read_note(path="Inbox.md") for the source\'s content_hash, then ')
-    assert "expected_hash=<the content_hash that read_note returns>" in complete
+    assert 'expected_hash=<the content_hash that read_note(path="Inbox.md") returns>' in complete
+    assert f'id="{k}.1of2"' in complete
     assert h(note) not in complete
 
 
@@ -1561,3 +1561,81 @@ def test_a_real_move_interrupted_after_the_destination_publish_is_resumable(worl
     out = run(tools.move_task_impl("Inbox.md", key, "Projects/Money.md", resume=True))
     assert code_of(out) is None, out
     assert read(world, "Inbox.md") == LEFT_INBOX and read(world, "Projects/Money.md") == MOVED_MONEY
+
+
+# ── implementation review round 2 ───────────────────────────────────────────
+
+
+def test_an_unclosed_fence_above_the_moved_lines_stops_the_move(world, monkeypatch):
+    """Review r2: another writer turns the line above the moved lines into an
+    unclosed fence; the moved bytes are still at their position but no longer
+    parse as a task, so the presence check (re-extracting with the pass's
+    extractor) stops with `destination_changed` and the source is kept."""
+    write(world, "Inbox.md", "- [ ] x\n")
+    write(world, "D.md", "Notes\n")
+
+    def fence(n):
+        if n == 2:
+            write(world, "D.md", "```\n- [ ] x\n")
+
+    confirm_hook(monkeypatch, fence)
+    out = run(tools.move_task_impl("Inbox.md", key_of("- [ ] x"), "D.md"))
+    assert payload_of(out)["reason"] == "destination_changed", out
+    assert read(world, "Inbox.md") == "- [ ] x\n"
+
+
+def test_every_completing_call_is_rendered_by_one_helper():
+    """Review r2, at the root: `_move_call` is reached only through
+    `_completing_call`, which decides the hash from the id it names."""
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(tools))
+    callers = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Call) and getattr(sub.func, "id", None) == "_move_call":
+                    callers.add(node.name)
+    assert callers == {"_completing_call"}
+    fresh = '<the content_hash that read_note(path="S.md") returns>'
+    bare = tools._completing_call("S.md", "0123456789ab", "D.md", resume=True)
+    assert "expected_hash" not in bare
+    assert f"expected_hash={fresh}" in tools._completing_call("S.md", "0123456789ab.2of2", "D.md")
+    assert f"expected_hash={fresh}" in tools._completing_call("S.md", "<key>.<i>of<n>", "D.md")
+    listed = tools._completing_call("S.md", "<its new id>", "D.md", allow_duplicate=True)
+    assert listed.endswith(f"(adding expected_hash={fresh} if that id carries a .<i>of<n> suffix)")
+
+
+def test_a_source_missing_call_with_a_newly_suffixed_id_asks_for_a_fresh_hash(world, monkeypatch):
+    """Review r2 MAJOR (the `source_missing` and `concurrent_write` families):
+    the source task A is edited into a second B; the completing call names a
+    listed id, so it says to add the source's fresh `content_hash` when that
+    id carries a suffix."""
+    write(world, "Inbox.md", "- [ ] A\n- [ ] B\n")
+    write(world, "D.md", "")
+    source_hook(monkeypatch, world, lambda p: p.write_bytes(b"- [ ] B\n- [ ] B\n"))
+    out = run(tools.move_task_impl("Inbox.md", key_of("- [ ] A"), "D.md"))
+    assert payload_of(out)["reason"] == "source_missing"
+    complete = line_of(out, "complete with:")
+    assert ('(adding expected_hash=<the content_hash that read_note(path="Inbox.md") returns> '
+            "if that id carries a .<i>of<n> suffix)") in complete
+
+
+def test_the_ambiguous_and_conflict_families_name_fresh_hashes(world, monkeypatch):
+    """Review r2 (the `source_ambiguous` family): the suffixed placeholder
+    always carries the fresh-hash instruction; the `concurrent_write`
+    family's listed-id calls carry the conditional one."""
+    key = setup_pair(world)
+    source_hook(monkeypatch, world, lambda p: p.write_bytes(p.read_bytes() + (TASK + "\n").encode()))
+    out = run(tools.move_task_impl("Inbox.md", key, "Projects/Money.md"))
+    assert payload_of(out)["reason"] == "source_ambiguous"
+    assert ('id=<key>.<i>of<n>, to_path="Projects/Money.md", resume=true, expected_hash=<the '
+            'content_hash that read_note(path="Inbox.md") returns>') in line_of(out, "complete with:")
+    text = tools._move_incomplete(
+        reason="concurrent_write", src_rel="S.md", dst_rel="D.md", task_id="0123456789ab",
+        dest_line=1, dest_id="0123456789ab", expected_hash="sha256:" + "0" * 64,
+        to_hash_supplied=False, dest_published=True, dest_hash=None, dest_refresh=None)
+    complete = line_of(text, "complete with:")
+    assert "sha256:" not in complete
+    assert complete.count("if that id carries a .<i>of<n> suffix") == 2

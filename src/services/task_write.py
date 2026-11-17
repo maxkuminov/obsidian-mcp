@@ -2255,6 +2255,41 @@ def destination_still_holds(dest_text: str, k: int, inserted: tuple[str, ...]) -
     return tuple(lines[start:start + len(inserted)]) == tuple(inserted)
 
 
+def destination_still_holds_task(dest_text: str, k: int, moved: MovedBlock) -> bool:
+    """D10 6(b), pure, the full form the wiring runs (implementation review
+    r2): the moved lines' contents at lines ``k … k+n−1`` (as
+    `destination_still_holds`) AND, under the same extraction the pass uses
+    (`tasks.tasks_from_note_text`, code masking included), the moved task
+    still a task there with its key, every moved sub-task at its offset with
+    its key and no other task in the block, the block still exactly the
+    moved task's continuation block, and every moved line's code mask the
+    one it had at the source. A preceding edit that, say, opens an unclosed
+    fence keeps the bytes but fails this, so the source is never removed."""
+    if not destination_still_holds(dest_text, k, moved.lines):
+        return False
+    view = _view(dest_text)
+    if isinstance(view, TaskWriteRefusal):
+        return False
+    got = _extract(dest_text)
+    if isinstance(got, TaskWriteRefusal) or got[1]:
+        return False
+    by = {t.line - 1: t for t in got[0]}
+    start, n = k - 1, len(moved.lines)
+    in_block = {idx for idx in by if start <= idx < start + n}
+    if in_block != {start + o for o in moved.task_offsets}:
+        return False
+    for src, o in zip(moved.tasks, moved.task_offsets):
+        if by[start + o].task_key != src.task_key:
+            return False
+    if by[start].task_key != moved.key:
+        return False
+    if continuation_block(view.contents(), start) != start + n:
+        return False
+    if moved.masks and any(view.masked_line(start + o) != moved.masks[o] for o in range(n)):
+        return False
+    return True
+
+
 def verify_move_insert(old: str, new: str, plan: Plan, moved: MovedBlock) -> TaskWriteRefusal | None:
     """D8, destination: ``new`` is ``old`` with exactly the moved lines
     inserted as one whole-line insertion (contents byte-identical, the
@@ -2568,7 +2603,8 @@ def _ref(row, score: float | None = None) -> TaskRef:
 __all__ = [
     "AddArgs", "CompleteArgs", "Expect", "Inserted", "Intent", "MoveArgs", "MovePlan",
     "MovedBlock", "NewLine", "Plan", "Span", "TaskRef", "TaskWriteRefusal", "UpdateArgs",
-    "continuation_block", "contains", "destination_still_holds", "duplicate_scan",
+    "continuation_block", "contains", "destination_still_holds", "destination_still_holds_task",
+    "duplicate_scan",
     "extracted_task_at", "jaccard", "plan_add", "plan_complete", "plan_move", "plan_move_within",
     "plan_relocated_removal", "plan_update", "resolve", "similarity_terms", "term_set", "verify",
     "verify_move_insert", "verify_removal",
